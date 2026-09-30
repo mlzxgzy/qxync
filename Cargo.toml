@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/qxync-core",
+    "crates/qxync-client",
+    "crates/qxync-cli",
+    "crates/qxync-fuse",
+    "crates/qxync-daemon",
+    "crates/qxync-proto-test",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+percent-encoding = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "sync", "signal", "net"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+    "multipart",
+    "stream",
+] }
+futures-util = "0.3"
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

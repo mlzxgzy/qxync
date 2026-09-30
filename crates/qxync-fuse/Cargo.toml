@@ -1,0 +1,14 @@
+[package]
+name = "qxync-fuse"
+description = "只读 FUSE + on-demand 整文件水合（M1）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+qxync-core = { path = "../qxync-core" }
+qxync-client = { path = "../qxync-client" }
+fuser = "0.17"
+libc = "0.2"
+tokio = { workspace = true }
+tracing.workspace = true

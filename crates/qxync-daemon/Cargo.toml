@@ -1,0 +1,24 @@
+[package]
+name = "qxync-daemon"
+description = "qxyncd —— 常驻守护：FUSE + 同步引擎 + 本地 IPC 服务端"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "qxyncd"
+path = "src/main.rs"
+
+[dependencies]
+qxync-core = { path = "../qxync-core" }
+qxync-client = { path = "../qxync-client" }
+qxync-fuse = { path = "../qxync-fuse" }
+clap.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender = "0.2"
+libc = "0.2"
