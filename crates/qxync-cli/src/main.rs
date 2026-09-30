@@ -125,6 +125,9 @@ enum Cmd {
         /// 单个文件的水合超时秒数（默认 60，对应 Qsync 的 CANCEL_FETCH_DATA）
         #[arg(long, default_value_t = 60)]
         hydrate_timeout: u64,
+        /// 读写挂载（M2b 写路径：本地改动会经上传队列推回 NAS）
+        #[arg(long)]
+        rw: bool,
     },
     /// 卸载 FUSE 挂载点
     Umount { mountpoint: PathBuf },
@@ -425,6 +428,7 @@ async fn main() -> Result<()> {
             threads,
             auto_unmount,
             hydrate_timeout,
+            rw,
         } => {
             let (client, link) = connect(&cli, true).await?;
             let cache = cache_dir.clone().unwrap_or_else(|| {
@@ -433,27 +437,47 @@ async fn main() -> Result<()> {
                     .unwrap_or_else(|_| PathBuf::from("/tmp/qxync-cache"))
             });
             let client = Arc::new(client);
-            let fs = QxyncFs::new(client, remote.clone(), cache.clone())
+            let mut fs = QxyncFs::new(client.clone(), remote.clone(), cache.clone())
                 .context("初始化 FUSE 文件系统失败")?
                 .with_hydrate_timeout(std::time::Duration::from_secs(*hydrate_timeout));
+            let mut queue = None;
+            if *rw {
+                // 写路径：上传队列（worker 线程把本地改动推回 NAS）
+                let marker_dir = paths()
+                    .map(|p| p.data_dir.join("upload-queue"))
+                    .unwrap_or_else(|_| cache.join("upload-queue"));
+                let q = qxync_fuse::upload::UploadQueue::new(
+                    client.clone(),
+                    tokio::runtime::Handle::current(),
+                    marker_dir,
+                )
+                .context("创建上传队列失败")?;
+                q.spawn_worker().context("启动上传 worker 失败")?;
+                fs = fs.with_write_mode().with_upload_queue(q.clone());
+                queue = Some(q);
+            }
             println!(
                 "挂载 {} -> {}",
                 format_args!("{}:{}", link.host, remote),
                 mountpoint.display()
             );
             println!("  缓存目录 : {}", cache.display());
-            println!("  只读 + on-demand（M1 整文件水合；TTL=0.5s，{threads} 线程，auto_unmount={auto_unmount}）");
+            println!(
+                "  {} + on-demand 区间水合（TTL=0.5s，{threads} 线程，auto_unmount={auto_unmount}）",
+                if *rw { "读写" } else { "只读" }
+            );
             println!(
                 "  卸载     : qsync umount {}  （或 fusermount3 -u）",
                 mountpoint.display()
             );
             let mnt = mountpoint.clone();
-            let (n, au) = (*threads, *auto_unmount);
+            let (n, au, ro) = (*threads, *auto_unmount, !*rw);
+            let _ = &queue;
             // 用普通 OS 线程跑 FUSE 会话：tokio 的 spawn_blocking 线程带着 runtime 上下文，
             // 在回调里再 block_on 另一个 runtime 会踩 "Cannot start a runtime from within a runtime"。
             let handle = std::thread::Builder::new()
                 .name("qxync-fuse".into())
-                .spawn(move || qxync_fuse::mount(fs, &mnt, n, au))
+                .spawn(move || qxync_fuse::mount(fs, &mnt, n, au, ro))
                 .context("创建 FUSE 线程失败")?;
             handle
                 .join()
@@ -462,6 +486,8 @@ async fn main() -> Result<()> {
             println!("已卸载 {}", mountpoint.display());
         }
         Cmd::Umount { mountpoint } => {
+            // 注意：直连模式下队列在挂载进程里，这里只负责卸载；
+            // daemon 模式由 daemon 侧排空队列后再卸载。
             let out = std::process::Command::new("fusermount3")
                 .arg("-u")
                 .arg(mountpoint)
@@ -544,6 +570,7 @@ fn to_request(cli: &Cli) -> Option<Request> {
             threads,
             auto_unmount,
             hydrate_timeout,
+            rw,
         } => Request::Mount {
             mountpoint: mountpoint.clone(),
             remote: Some(remote.clone()),
@@ -551,6 +578,7 @@ fn to_request(cli: &Cli) -> Option<Request> {
             threads: Some(*threads),
             auto_unmount: Some(*auto_unmount),
             hydrate_timeout_secs: Some(*hydrate_timeout),
+            read_write: Some(*rw),
         },
         Cmd::Umount { mountpoint } => Request::Umount {
             mountpoint: mountpoint.clone(),

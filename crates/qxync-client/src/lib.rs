@@ -19,6 +19,17 @@ use qxync_core::{
 };
 use std::time::Duration;
 
+/// `qbox_write_log` 的 action 码。
+///
+/// **推断值**：报告未确认枚举；这里的取值来自真机 sync log 里观察到的真实事件
+/// （另一台已配对设备的操作日志）：`12` = 新建目录、`14` = 文件新增/修改、`1` = 删除。
+/// 服务端对 action **不做校验**（0..5 全回 status 1），所以这些值只影响对端语义。
+pub mod write_action {
+    pub const DELETE: i64 = 1;
+    pub const CREATE_DIR: i64 = 12;
+    pub const UPSERT_FILE: i64 = 14;
+}
+
 /// 登录后拿到的会话信息。
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -294,10 +305,11 @@ impl Client {
             .map_err(|e| Error::Transport(e.to_string()))?;
         let listing: Listing = parse_listing(&body)?;
         listing.ensure_ok(format!("stat {dir}/{file_name}"))?;
-        Ok(listing
-            .single()
-            .cloned()
-            .filter(|e| e.exist || !e.filename.is_empty()))
+        // ★ 只能靠 `exist` 判定：不存在的路径也会返回「占位条目」
+        //   （filename 是请求的名字、filesize=0、owner/privilege 为空），但 `exist=0`。
+        //   早期用 `!filename.is_empty()` 兜底 → 把不存在的文件当存在，FUSE lookup 误报正项
+        //   → `mkdir` 直接 EEXIST（实测踩过）。
+        Ok(listing.single().cloned().filter(|e| e.exist))
     }
 
     pub async fn mkdir(&self, parent: &str, name: &str) -> Result<()> {
@@ -490,6 +502,115 @@ impl Client {
             .await
             .map_err(|e| Error::Transport(e.to_string()))?;
         parse_listing(&body)?.ensure_ok(format!("stat&settime {dir}/{name}"))?;
+        Ok(())
+    }
+}
+
+impl Client {
+    /// 同目录重命名：FileStation `func=rename`。
+    /// 实测 body 字段是 `{path, source_name, dest_name}`（`filename/dest_name` 会被 status 20 拒）。
+    /// 大小写改名实测可直接成功（本机 NAS 不需要两阶段）。
+    pub async fn rename(&self, dir: &str, from: &str, to: &str) -> Result<()> {
+        let sid = self.require_sid()?.to_string();
+        let url = self.url(
+            "cgi-bin/filemanager/utilRequest.cgi",
+            &[("func", "rename"), ("sid", sid.as_str())],
+        );
+        let resp = self
+            .http
+            .post(&url)
+            .form(&[("path", dir), ("source_name", from), ("dest_name", to)])
+            .send()
+            .await
+            .map_err(|e| Error::Transport(format!("rename: {e}")))?;
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| Error::Transport(e.to_string()))?;
+        parse_listing(&body)?.ensure_ok(format!("rename {dir}/{from} -> {to}"))?;
+        Ok(())
+    }
+
+    /// 把条目移动到另一个目录：FileStation `func=move`。
+    ///
+    /// 实测两个坑：
+    /// 1. 必须带 **`source_total=1`**（不带会静默不动）；
+    /// 2. **`dest_file` 会被忽略** —— 文件在目标目录里保持原文件名，
+    ///    所以「跨目录 + 改名」必须拆成 `move_into` + `rename` 两步。
+    ///
+    /// 服务端异步执行并回 `{"status":1,"pid":N}`，这里轮询 `to_dir/from_name` 出现为止。
+    pub async fn move_into(&self, from_dir: &str, from_name: &str, to_dir: &str) -> Result<()> {
+        let sid = self.require_sid()?.to_string();
+        let url = self.url(
+            "cgi-bin/filemanager/utilRequest.cgi",
+            &[("func", "move"), ("sid", sid.as_str()), ("no_fork", "1")],
+        );
+        let resp = self
+            .http
+            .post(&url)
+            .form(&[
+                ("source_path", from_dir),
+                ("source_file", from_name),
+                ("dest_path", to_dir),
+                ("dest_file", from_name),
+                ("source_total", "1"),
+            ])
+            .send()
+            .await
+            .map_err(|e| Error::Transport(format!("move: {e}")))?;
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| Error::Transport(e.to_string()))?;
+        parse_listing(&body)?.ensure_ok(format!("move {from_dir}/{from_name} -> {to_dir}"))?;
+
+        for _ in 0..40 {
+            if self.stat(to_dir, from_name).await?.is_some() {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        Err(Error::Transport(format!(
+            "move 超时：{to_dir}/{from_name} 未出现（服务端可能仍在后台执行）"
+        )))
+    }
+
+    /// 删除文件或目录：`qsyncsrv.cgi?func=delete`，body `{path, file_name, file_total=1}`（实测）。
+    pub async fn delete_entry(&self, dir: &str, name: &str) -> Result<()> {
+        let sid = self.require_sid()?.to_string();
+        let url = self.url(
+            "cgi-bin/qsync/qsyncsrv.cgi",
+            &[("func", "delete"), ("sid", sid.as_str())],
+        );
+        let resp = self
+            .http
+            .post(&url)
+            .form(&[("path", dir), ("file_name", name), ("file_total", "1")])
+            .send()
+            .await
+            .map_err(|e| Error::Transport(format!("delete: {e}")))?;
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| Error::Transport(e.to_string()))?;
+        parse_listing(&body)?.ensure_ok(format!("delete {dir}/{name}"))?;
+        Ok(())
+    }
+
+    /// `qbox_write_log`：把本机改动记进服务端日志（让其它设备能发现）。
+    ///
+    /// ⚠️ 实测：服务端接受任何 action 并回 status 1，但**只有路径落在已注册的同步文件夹里**
+    /// 才会真正出现在 `qbox_get_sync_log`（本机测试账号没有注册同步对，所以看不到）。
+    /// 设备注册（`qbox_save_device_config`）不在 M2b 范围内，这里做「尽力而为」。
+    pub async fn write_log(&self, filepath: &str, action: i64) -> Result<()> {
+        let action_s = action.to_string();
+        let body = self
+            .qsync_func(
+                "qbox_write_log",
+                &[("filepath", filepath), ("action", action_s.as_str())],
+            )
+            .await?;
+        parse_listing(&body)?.ensure_ok(format!("qbox_write_log {filepath}"))?;
         Ok(())
     }
 }

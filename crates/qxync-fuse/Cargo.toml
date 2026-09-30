@@ -10,5 +10,7 @@ qxync-core = { path = "../qxync-core" }
 qxync-client = { path = "../qxync-client" }
 fuser = "0.17"
 libc = "0.2"
+serde.workspace = true
+serde_json.workspace = true
 tokio = { workspace = true }
 tracing.workspace = true

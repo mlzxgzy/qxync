@@ -212,6 +212,102 @@ if [ "$BIG" = "1" ]; then
 fi
 
 echo
+echo
+echo "=== M2b 写路径（读写挂载：create / read-modify-write / mkdir / rename / move / unlink）==="
+MNTW="$RUNDIR/mnt-rw"; CACHEW="$RUNDIR/cache-rw"
+mkdir -p "$MNTW"; rm -rf "$CACHEW"
+"$QS" mount "$MNTW" --remote "${QSYNC_REMOTE_ROOT:-/home}" --cache-dir "$CACHEW" \
+      --threads 4 --rw >>"$LOG" 2>&1 &
+for _ in $(seq 1 40); do grep -qF "$MNTW" /proc/mounts && break; sleep 0.5; done
+if ! grep -qF "$MNTW" /proc/mounts; then
+  bad "读写挂载失败（跳过写路径检查）"
+else
+  MW="$MNTW$(echo "$FIXTURE" | sed 's#^/home##')"
+  # $1=dir $2=name $3=期望(1=存在,0=不存在)，最多等 30s
+  wait_remote() {
+    local i
+    for i in $(seq 1 60); do
+      if "$QS" --direct stat "$1" "$2" >/dev/null 2>&1; then
+        [ "$3" = "1" ] && return 0
+      else
+        [ "$3" = "0" ] && return 0
+      fi
+      sleep 0.5
+    done
+    return 1
+  }
+
+  # 1) 新文件 create+write → 远端内容一致
+  printf 'matrix rw test\nline2\n' >"$MW/mx-new.txt"
+  wait_remote "$FIXTURE" mx-new.txt 1
+  check "$([ $? = 0 ] && echo 0 || echo 1)" "新文件已上传"
+  "$QS" --direct get "$FIXTURE" mx-new.txt -o "$RUNDIR/mx-new.out" >/dev/null 2>&1
+  if cmp -s <(printf 'matrix rw test\nline2\n') "$RUNDIR/mx-new.out"; then
+    ok "新文件内容一致"
+  else
+    bad "新文件内容不一致"
+  fi
+
+  # 2) ★ read-modify-write：对已存在的 10 KB 远端文件做尾部追加 + 中间改写
+  python3 -c "open('$RUNDIR/rmw-src.bin','wb').write(bytes((i*37+11)&0xFF for i in range(10240)))"
+  "$QS" --direct put "$RUNDIR/rmw-src.bin" "$FIXTURE" --name mx-rmw.bin >/dev/null 2>&1
+  printf 'APPENDED\n' >>"$MW/mx-rmw.bin"
+  python3 -c "
+d=open('$MW/mx-rmw.bin','r+b'); d.seek(5000); d.write(b'MIDDLE-PATCH'); d.close()"
+  wait_remote "$FIXTURE" mx-rmw.bin 1
+  "$QS" --direct get "$FIXTURE" mx-rmw.bin -o "$RUNDIR/mx-rmw.out" >/dev/null 2>&1
+  if python3 -c "
+import sys
+src=open('$RUNDIR/rmw-src.bin','rb').read()
+exp=bytearray(src+b'APPENDED\n'); exp[5000:5012]=b'MIDDLE-PATCH'
+got=open('$RUNDIR/mx-rmw.out','rb').read()
+sys.exit(0 if got==bytes(exp) else 1)"; then
+    ok "read-modify-write 正确（原内容未被清零）"
+  else
+    bad "read-modify-write 损坏了原内容"
+  fi
+
+  # 3) mkdir / rmdir
+  mkdir "$MW/mx-dir" 2>/dev/null
+  wait_remote "$FIXTURE" mx-dir 1
+  check "$([ $? = 0 ] && echo 0 || echo 1)" "远端出现 mx-dir"
+  rmdir "$MW/mx-dir"
+  wait_remote "$FIXTURE" mx-dir 0
+  check "$([ $? = 0 ] && echo 0 || echo 1)" "远端删除 mx-dir"
+
+  # 4) 同目录改名 + 只改大小写
+  mv "$MW/mx-new.txt" "$MW/mx-renamed.txt"
+  wait_remote "$FIXTURE" mx-renamed.txt 1
+  check "$([ $? = 0 ] && echo 0 || echo 1)" "同目录改名生效"
+  mv "$MW/mx-renamed.txt" "$MW/MX-RENAMED.TXT"
+  wait_remote "$FIXTURE" MX-RENAMED.TXT 1
+  check "$([ $? = 0 ] && echo 0 || echo 1)" "只改大小写生效"
+
+  # 5) 跨目录 move（实现是 move + rename 两步：FileStation move 会忽略 dest_file）
+  mkdir -p "$MW/mx-a" "$MW/mx-b"; wait_remote "$FIXTURE" mx-a 1
+  printf 'movable\n' >"$MW/mx-a/m.txt"
+  wait_remote "$FIXTURE/mx-a" m.txt 1
+  if mv "$MW/mx-a/m.txt" "$MW/mx-b/m2.txt" 2>/dev/null; then
+    wait_remote "$FIXTURE/mx-b" m2.txt 1
+    check "$([ $? = 0 ] && echo 0 || echo 1)" "跨目录 move + 改名生效"
+    "$QS" --direct get "$FIXTURE/mx-b" m2.txt -o "$RUNDIR/mx-mv.out" >/dev/null 2>&1
+    if cmp -s <(printf 'movable\n') "$RUNDIR/mx-mv.out"; then
+      ok "移动后内容一致"
+    else
+      bad "移动后内容不一致"
+    fi
+  else
+    bad "跨目录 move 失败"
+  fi
+
+  # 6) 清理产物
+  rm -f "$MW/mx-b/m2.txt" "$MW/MX-RENAMED.TXT" "$MW/mx-rmw.bin"
+  rmdir "$MW/mx-a" "$MW/mx-b" 2>/dev/null
+  wait_remote "$FIXTURE" mx-rmw.bin 0
+  check "$([ $? = 0 ] && echo 0 || echo 1)" "测试产物已清理"
+  unmount_retry "$MNTW"
+fi
+
 echo "=== 卸载干净（无残留）==="
 if [ "$KEEP" = "0" ]; then
   unmount_retry "$MNT"

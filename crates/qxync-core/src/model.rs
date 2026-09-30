@@ -84,6 +84,21 @@ pub struct DirEntry {
 }
 
 impl DirEntry {
+    /// 本地新建的文件/目录（M2b 写路径用）。
+    pub fn local(filename: impl Into<String>, is_folder: bool, size: u64, epochmt: i64) -> Self {
+        Self {
+            filename: filename.into(),
+            filesize: size,
+            isfolder: is_folder,
+            epochmt,
+            have_child: false,
+            exist: true,
+            privilege: None,
+            versioning_support: false,
+            mtime_text: None,
+        }
+    }
+
     /// 占位符要展示的大小：目录不关心，文件用真实字节数。
     pub fn display_size(&self) -> u64 {
         if self.isfolder {

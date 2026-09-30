@@ -167,3 +167,77 @@ async fn upload_roundtrip() {
         .expect("download 回读");
     assert_eq!(back, payload, "上传后回读必须逐字节一致");
 }
+
+/// M2b 写接口契约：rename/move/delete + `stat` 的 `exist` 语义。
+///
+/// 会写入真机（在 `<fixture>/rust-write-api/` 下），跑完自己清理。
+#[tokio::test]
+#[ignore = "需要真机 NAS，且会写入 NAS"]
+async fn write_api_contract() {
+    let Some(client) = logged_in().await else {
+        return;
+    };
+    let root = fixture_root();
+    let dir = format!("{root}/rust-write-api");
+    let sub = format!("{dir}/sub");
+    let _ = client.mkdir(&root, "rust-write-api").await; // 已存在时服务端回成功变体
+    let _ = client.mkdir(&dir, "sub").await;
+
+    client
+        .upload_bytes(&dir, "a.txt", b"AAA\n".to_vec())
+        .await
+        .expect("upload");
+
+    // 1) 不存在的路径必须回 None（不能靠「文件名非空」判存在）
+    assert!(
+        client
+            .stat(&dir, "definitely-missing")
+            .await
+            .unwrap()
+            .is_none(),
+        "stat 必须用 exist 判存在，缺失路径应返回 None"
+    );
+
+    // 2) 同目录改名（含只改大小写）
+    client.rename(&dir, "a.txt", "b.txt").await.expect("rename");
+    assert!(client.stat(&dir, "b.txt").await.unwrap().is_some());
+    assert!(client.stat(&dir, "a.txt").await.unwrap().is_none());
+    client
+        .rename(&dir, "b.txt", "B.txt")
+        .await
+        .expect("case rename");
+
+    // 3) 跨目录移动：FileStation move 会忽略 dest_file（保持原名），
+    //    所以实现是 move_into + rename 两步
+    client.move_into(&dir, "B.txt", &sub).await.expect("move");
+    assert!(client.stat(&sub, "B.txt").await.unwrap().is_some());
+    assert!(client.stat(&dir, "B.txt").await.unwrap().is_none());
+    client
+        .rename(&sub, "B.txt", "c.txt")
+        .await
+        .expect("rename after move");
+    let e = client.stat(&sub, "c.txt").await.unwrap().expect("c.txt");
+    assert_eq!(e.filesize, 4);
+
+    // 4) 内容回读 + 删除
+    let back = client
+        .download_range(&sub, "c.txt", 0, 3)
+        .await
+        .expect("download");
+    assert_eq!(back, b"AAA\n");
+    client
+        .delete_entry(&sub, "c.txt")
+        .await
+        .expect("delete file");
+    assert!(client.stat(&sub, "c.txt").await.unwrap().is_none());
+    client.delete_entry(&dir, "sub").await.expect("delete dir");
+    client
+        .delete_entry(&root, "rust-write-api")
+        .await
+        .expect("cleanup dir");
+    assert!(client
+        .stat(&root, "rust-write-api")
+        .await
+        .unwrap()
+        .is_none());
+}

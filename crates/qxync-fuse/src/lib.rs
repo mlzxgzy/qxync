@@ -15,8 +15,12 @@
 
 use fuser::{
     Config, FileAttr, FileType, Filesystem, FopenFlags, Generation, INodeNo, OpenAccMode,
-    ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyXattr, Request,
+    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
+    ReplyWrite, ReplyXattr, Request, TimeOrNow,
 };
+
+pub mod upload;
+
 use qxync_client::Client;
 use qxync_core::DirEntry;
 use std::collections::HashMap;
@@ -24,7 +28,8 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use upload::{UploadJob, UploadQueue, UploadSnapshot};
 
 const ENTRY_TTL: Duration = Duration::from_millis(500);
 /// 水合超时：对应 Qsync 的 `CANCEL_FETCH_DATA` = 60s（M2 起是**单区间**的超时）。
@@ -47,6 +52,8 @@ struct Node {
     cache: Option<PathBuf>,
     /// 每个 128 KiB 区间的完成标记；长度 = 区间数，在创建缓存文件时初始化。
     chunks_done: Vec<bool>,
+    /// 本地有未上传的改动。
+    dirty: bool,
 }
 
 impl Node {
@@ -120,6 +127,10 @@ pub struct QxyncFs {
     cache_dir: PathBuf,
     uid: u32,
     gid: u32,
+    /// 只读模式（默认）。M2b 起可用 `with_write_mode()` 打开写路径。
+    read_only: bool,
+    /// 上传队列（写模式下必须提供）。
+    upload: Option<Arc<UploadQueue>>,
     /// 水合粒度（M2：128 KiB，与 Qsync 的 CfAPI FETCH_DATA 对齐）。
     chunk_size: u64,
     hydrate_timeout: Duration,
@@ -169,6 +180,7 @@ impl QxyncFs {
             attr: root_attr,
             cache: None,
             chunks_done: Vec::new(),
+            dirty: false,
         };
         let mut nodes = HashMap::new();
         let mut by_remote = HashMap::new();
@@ -182,6 +194,8 @@ impl QxyncFs {
             cache_dir,
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
+            read_only: true,
+            upload: None,
             chunk_size: DEFAULT_CHUNK_SIZE,
             hydrate_timeout: HYDRATE_TIMEOUT,
             hydro: Arc::new(HydroCounters::default()),
@@ -213,6 +227,23 @@ impl QxyncFs {
     /// 共享计数器句柄（daemon 在把实例移进挂载线程前取一份）。
     pub fn counters(&self) -> Arc<HydroCounters> {
         self.hydro.clone()
+    }
+
+    /// 打开写路径（读写挂载；写操作需要上传队列）。
+    pub fn with_write_mode(mut self) -> Self {
+        self.read_only = false;
+        self
+    }
+
+    /// 注入上传队列（写模式下必须）。
+    pub fn with_upload_queue(mut self, queue: Arc<UploadQueue>) -> Self {
+        self.upload = Some(queue);
+        self
+    }
+
+    /// 上传队列快照（daemon `status` 用）。
+    pub fn upload_stats(&self) -> Option<UploadSnapshot> {
+        self.upload.as_ref().map(|q| q.snapshot())
     }
 
     /// 覆盖水合粒度（默认 128 KiB）。
@@ -337,6 +368,7 @@ impl QxyncFs {
             attr,
             cache: None,
             chunks_done: Vec::new(),
+            dirty: false,
         };
         g.nodes.insert(ino, node.clone());
         g.by_remote.insert(remote.to_string(), ino);
@@ -366,6 +398,151 @@ impl QxyncFs {
             out.push(self.insert_node(ino, &e.filename, &child_remote, e));
         }
         Ok(out)
+    }
+
+    /// 远端路径的目录部分。
+    fn remote_dir_of(&self, remote: &str) -> String {
+        remote
+            .rsplit_once('/')
+            .map(|(d, _)| d.to_string())
+            .unwrap_or_else(|| self.remote_root.clone())
+    }
+
+    fn epoch_of(t: SystemTime) -> i64 {
+        t.duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+
+    /// 把所有区间取回本地。
+    ///
+    /// ★ **read-modify-write 的前提**：写一个还没取全的占位符文件时，未取回的区间在本地是 0，
+    /// 直接写+整文件上传会把远端内容清零。所以写之前必须补齐（`skip` 可用于跳过将被整块覆盖的区间）。
+    fn hydrate_all(&self, ino: INodeNo, skip: Option<(u64, u64)>) -> Result<(), fuser::Errno> {
+        let (total, chunk_size, local_authoritative) = {
+            let g = self.inner.lock().unwrap();
+            let n = g.nodes.get(&ino).ok_or(fuser::Errno::ENOENT)?;
+            // ★ 本地有未上传改动（或队列里还挂着）时，**本地缓存就是权威内容**：
+            //   此时去远端拉取既可能拿到旧内容，也可能 404（本地新建的文件远端还没有）——
+            //   实测过的坑：本地新建文件写第二次时报 HTTP 404。
+            let pending = self
+                .upload
+                .as_ref()
+                .map(|q| q.has_pending(&n.remote))
+                .unwrap_or(false);
+            (n.attr.size, self.chunk_size, n.dirty || pending)
+        };
+        if local_authoritative {
+            self.cache_file_for(ino)?;
+            return Ok(());
+        }
+        // 缓存文件必须先存在（ensure_chunk 要往里 pwrite），它同时也是「区间表」的初始化点
+        self.cache_file_for(ino)?;
+        if total == 0 {
+            return Ok(());
+        }
+        let nchunks = total.div_ceil(chunk_size);
+        let write = skip.filter(|(_, len)| *len > 0);
+        for idx in 0..nchunks {
+            // ★ 只有「写范围**完整覆盖**该区间」时才能跳过。
+            //   注意不能只看「写到了这个区间」：区间内只改几个字节时，
+            //   其余字节仍是远端原内容，跳过就会把它们当 0 上传（实测过：尾部追加把前 10 KB 清零）。
+            let c_start = idx * chunk_size;
+            let c_end = ((idx + 1) * chunk_size).min(total);
+            if let Some((off, len)) = write {
+                if c_start >= off && c_end <= off + len {
+                    continue;
+                }
+            }
+            self.ensure_chunk(ino, idx)?;
+        }
+        Ok(())
+    }
+
+    /// 删除文件/目录（`unlink`/`rmdir` 共用）。
+    fn remove_entry(&self, parent: INodeNo, name: &OsStr, is_dir: bool, reply: ReplyEmpty) {
+        if self.read_only {
+            return reply.error(fuser::Errno::EROFS);
+        }
+        let Some(name) = name.to_str() else {
+            return reply.error(fuser::Errno::EINVAL);
+        };
+        let (parent_remote, _ino, dirty) = {
+            let g = self.inner.lock().unwrap();
+            let Some(p) = g.nodes.get(&parent) else {
+                return reply.error(fuser::Errno::ENOENT);
+            };
+            let remote = join_path(&p.remote, name);
+            let ino = g.by_remote.get(&remote).copied();
+            let dirty = ino
+                .and_then(|i| g.nodes.get(&i))
+                .map(|n| n.dirty)
+                .unwrap_or(false);
+            (p.remote.clone(), ino, dirty)
+        };
+        if dirty {
+            if let Some(q) = &self.upload {
+                if !q.drain(Duration::from_secs(30)) {
+                    tracing::warn!("删除前排空上传队列超时: {parent_remote}/{name}");
+                    return reply.error(fuser::Errno::EBUSY);
+                }
+            }
+        }
+        let client = self.client.clone();
+        let (dir, n) = (parent_remote.clone(), name.to_string());
+        if let Err(e) = self
+            .rt
+            .block_on(async move { client.delete_entry(&dir, &n).await })
+        {
+            tracing::warn!("delete 失败 {parent_remote}/{name}: {e}");
+            return reply.error(fuser::Errno::EIO);
+        }
+        {
+            let mut g = self.inner.lock().unwrap();
+            let remote = join_path(&parent_remote, name);
+            if let Some(i) = g.by_remote.remove(&remote) {
+                g.nodes.remove(&i);
+            }
+        }
+        tracing::debug!(
+            "{} {}",
+            if is_dir { "rmdir" } else { "unlink" },
+            join_path(&parent_remote, name)
+        );
+        reply.ok();
+    }
+
+    /// 标记节点为脏并入队上传（写路径的统一出口）。
+    fn mark_dirty(&self, ino: INodeNo) -> Result<(), fuser::Errno> {
+        let queue = match &self.upload {
+            Some(q) => q.clone(),
+            None => return Err(fuser::Errno::EROFS),
+        };
+        let (remote, name, mtime, cache) = {
+            let mut g = self.inner.lock().unwrap();
+            let n = g.nodes.get_mut(&ino).ok_or(fuser::Errno::ENOENT)?;
+            n.dirty = true;
+            let cache = n.cache.clone().ok_or(fuser::Errno::EIO)?;
+            (
+                n.remote.clone(),
+                n.name.clone(),
+                Self::epoch_of(n.attr.mtime),
+                cache,
+            )
+        };
+        let job = UploadJob {
+            remote_dir: self.remote_dir_of(&remote),
+            remote_name: name,
+            local: cache,
+            mtime,
+            attempts: 0,
+        };
+        queue.enqueue(job).map_err(|e| {
+            tracing::error!("入队上传失败: {e}");
+            fuser::Errno::EIO
+        })?;
+        tracing::debug!("已入队上传: {remote} (mtime={mtime})");
+        Ok(())
     }
 
     /// 缓存文件（懒创建）：**apparent size = 文件大小**，用 `set_len` 造稀疏文件。
@@ -518,6 +695,11 @@ impl QxyncFs {
     }
 }
 
+/// 拼远端路径。
+fn join_path(dir: &str, name: &str) -> String {
+    format!("{}/{}", dir.trim_end_matches('/'), name)
+}
+
 /// FNV-1a 64 位：实现简单、跨版本稳定（不像 `DefaultHasher` 那样无保证）。
 fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -611,8 +793,8 @@ impl Filesystem for QxyncFs {
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, flags: fuser::OpenFlags, reply: ReplyOpen) {
-        // M1 只读：任何写意图一律 EACCES（M2 再实现写路径）
-        if flags.acc_mode() != OpenAccMode::O_RDONLY {
+        // 只读挂载时拒绝任何写意图；读写挂载下放行（写前的 read-modify-write 在 write/setattr 里做）
+        if self.read_only && flags.acc_mode() != OpenAccMode::O_RDONLY {
             return reply.error(fuser::Errno::EACCES);
         }
         let exists = { self.inner.lock().unwrap().nodes.contains_key(&ino) };
@@ -658,6 +840,352 @@ impl Filesystem for QxyncFs {
             Ok(buf) => reply.data(&buf),
             Err(e) => reply.error(e),
         }
+    }
+
+    // ------------------------------------------------------------ M2b 写路径
+
+    fn write(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: fuser::FileHandle,
+        offset: u64,
+        data: &[u8],
+        _write_flags: fuser::WriteFlags,
+        _flags: fuser::OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
+        reply: ReplyWrite,
+    ) {
+        use std::os::unix::fs::FileExt;
+        if self.read_only {
+            return reply.error(fuser::Errno::EROFS);
+        }
+        // ★ read-modify-write：先把会被整块覆盖之外的区间补齐，
+        //   否则未取回的区间是 0，整文件上传会把远端内容清零。
+        if let Err(e) = self.hydrate_all(ino, Some((offset, data.len() as u64))) {
+            return reply.error(e);
+        }
+        let path = match self.cache_file_for(ino) {
+            Ok(p) => p,
+            Err(e) => return reply.error(e),
+        };
+        let f = match std::fs::OpenOptions::new().write(true).open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::error!("打开缓存写失败 {}: {e}", path.display());
+                return reply.error(fuser::Errno::EIO);
+            }
+        };
+        let end = offset + data.len() as u64;
+        let cur = {
+            let g = self.inner.lock().unwrap();
+            g.nodes.get(&ino).map(|n| n.attr.size).unwrap_or(0)
+        };
+        if end > cur {
+            if f.set_len(end).is_err() {
+                return reply.error(fuser::Errno::EIO);
+            }
+            let mut g = self.inner.lock().unwrap();
+            if let Some(n) = g.nodes.get_mut(&ino) {
+                n.attr.size = end;
+                n.attr.blocks = end.div_ceil(512);
+            }
+        }
+        if f.write_all_at(data, offset).is_err() {
+            return reply.error(fuser::Errno::EIO);
+        }
+        let now = SystemTime::now();
+        {
+            let mut g = self.inner.lock().unwrap();
+            if let Some(n) = g.nodes.get_mut(&ino) {
+                n.attr.mtime = now;
+                n.attr.ctime = now;
+            }
+        }
+        if let Err(e) = self.mark_dirty(ino) {
+            return reply.error(e);
+        }
+        reply.written(data.len() as u32);
+    }
+
+    fn setattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        _fh: Option<fuser::FileHandle>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<fuser::BsdFileFlags>,
+        reply: ReplyAttr,
+    ) {
+        if self.read_only && (size.is_some() || mtime.is_some()) {
+            return reply.error(fuser::Errno::EROFS);
+        }
+        let mut size_changed = false;
+
+        if let Some(new_size) = size {
+            let cur = {
+                let g = self.inner.lock().unwrap();
+                match g.nodes.get(&ino) {
+                    Some(n) => n.attr.size,
+                    None => return reply.error(fuser::Errno::ENOENT),
+                }
+            };
+            if new_size != cur {
+                // 截断到 0 不需要旧内容；否则要先补齐（未取回区间是 0，直接改大小会丢数据）
+                if new_size > 0 {
+                    if let Err(e) = self.hydrate_all(ino, None) {
+                        return reply.error(e);
+                    }
+                }
+                let path = match self.cache_file_for(ino) {
+                    Ok(p) => p,
+                    Err(e) => return reply.error(e),
+                };
+                let f = match std::fs::OpenOptions::new().write(true).open(&path) {
+                    Ok(f) => f,
+                    Err(_) => return reply.error(fuser::Errno::EIO),
+                };
+                if f.set_len(new_size).is_err() {
+                    return reply.error(fuser::Errno::EIO);
+                }
+                let mut g = self.inner.lock().unwrap();
+                if let Some(n) = g.nodes.get_mut(&ino) {
+                    n.attr.size = new_size;
+                    n.attr.blocks = new_size.div_ceil(512);
+                }
+                size_changed = true;
+            }
+        }
+
+        if let Some(t) = mtime {
+            let ts = match t {
+                TimeOrNow::Now => SystemTime::now(),
+                TimeOrNow::SpecificTime(st) => st,
+            };
+            {
+                let mut g = self.inner.lock().unwrap();
+                if let Some(n) = g.nodes.get_mut(&ino) {
+                    n.attr.mtime = ts;
+                }
+            }
+            // 只改 mtime（例如 `touch`）：不必整文件上传，直接推服务端 mtime 即可
+            if !size_changed {
+                let (remote, dir, name, epoch) = {
+                    let g = self.inner.lock().unwrap();
+                    match g.nodes.get(&ino) {
+                        Some(n) => (
+                            n.remote.clone(),
+                            self.remote_dir_of(&n.remote),
+                            n.name.clone(),
+                            Self::epoch_of(ts),
+                        ),
+                        None => return reply.error(fuser::Errno::ENOENT),
+                    }
+                };
+                let client = self.client.clone();
+                let res = self
+                    .rt
+                    .block_on(async move { client.set_mtime(&dir, &name, epoch).await });
+                if let Err(e) = res {
+                    tracing::warn!("set_mtime 远端失败 {remote}: {e}");
+                }
+            }
+        }
+
+        if size_changed {
+            if let Err(e) = self.mark_dirty(ino) {
+                return reply.error(e);
+            }
+        }
+
+        let attr = {
+            let g = self.inner.lock().unwrap();
+            g.nodes.get(&ino).map(|n| n.attr)
+        };
+        match attr {
+            Some(a) => reply.attr(&ENTRY_TTL, &a),
+            None => reply.error(fuser::Errno::ENOENT),
+        }
+    }
+
+    fn create(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        _flags: i32,
+        reply: ReplyCreate,
+    ) {
+        if self.read_only {
+            return reply.error(fuser::Errno::EROFS);
+        }
+        let Some(name) = name.to_str() else {
+            return reply.error(fuser::Errno::EINVAL);
+        };
+        let parent_remote = {
+            let g = self.inner.lock().unwrap();
+            match g.nodes.get(&parent) {
+                Some(n) => n.remote.clone(),
+                None => return reply.error(fuser::Errno::ENOENT),
+            }
+        };
+        let remote = join_path(&parent_remote, name);
+        let entry = DirEntry::local(name, false, 0, Self::epoch_of(SystemTime::now()));
+        let node = self.insert_node(parent, name, &remote, &entry);
+        if let Err(e) = self.cache_file_for(node.ino) {
+            return reply.error(e);
+        }
+        if let Err(e) = self.mark_dirty(node.ino) {
+            return reply.error(e);
+        }
+        tracing::debug!("create {remote}");
+        reply.created(
+            &ENTRY_TTL,
+            &node.attr,
+            Generation(0),
+            fuser::FileHandle(u64::from(node.ino)),
+            FopenFlags::FOPEN_KEEP_CACHE,
+        );
+    }
+
+    fn mkdir(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
+        if self.read_only {
+            return reply.error(fuser::Errno::EROFS);
+        }
+        let Some(name) = name.to_str() else {
+            return reply.error(fuser::Errno::EINVAL);
+        };
+        let parent_remote = {
+            let g = self.inner.lock().unwrap();
+            match g.nodes.get(&parent) {
+                Some(n) => n.remote.clone(),
+                None => return reply.error(fuser::Errno::ENOENT),
+            }
+        };
+        let client = self.client.clone();
+        let (p, n) = (parent_remote.clone(), name.to_string());
+        if let Err(e) = self.rt.block_on(async move { client.mkdir(&p, &n).await }) {
+            tracing::warn!("mkdir 失败 {parent_remote}/{name}: {e}");
+            return reply.error(fuser::Errno::EIO);
+        }
+        let remote = join_path(&parent_remote, name);
+        let entry = DirEntry::local(name, true, 0, Self::epoch_of(SystemTime::now()));
+        let node = self.insert_node(parent, name, &remote, &entry);
+        reply.entry(&ENTRY_TTL, &node.attr, Generation(0));
+    }
+
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        self.remove_entry(parent, name, false, reply);
+    }
+
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        self.remove_entry(parent, name, true, reply);
+    }
+
+    fn rename(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        _flags: fuser::RenameFlags,
+        reply: ReplyEmpty,
+    ) {
+        if self.read_only {
+            return reply.error(fuser::Errno::EROFS);
+        }
+        let (Some(name), Some(newname)) = (name.to_str(), newname.to_str()) else {
+            return reply.error(fuser::Errno::EINVAL);
+        };
+        let (old_remote, new_remote, parent_remote, newparent_remote, ino, dirty) = {
+            let g = self.inner.lock().unwrap();
+            let (Some(p), Some(np)) = (g.nodes.get(&parent), g.nodes.get(&newparent)) else {
+                return reply.error(fuser::Errno::ENOENT);
+            };
+            let old = join_path(&p.remote, name);
+            let new = join_path(&np.remote, newname);
+            let ino = g.by_remote.get(&old).copied();
+            let dirty = ino
+                .and_then(|i| g.nodes.get(&i))
+                .map(|n| n.dirty)
+                .unwrap_or(false);
+            (old, new, p.remote.clone(), np.remote.clone(), ino, dirty)
+        };
+
+        // 有未上传的改动时先冲刷：否则队列里的作业还指着旧名字，会和改名打架
+        if dirty {
+            if let Some(q) = &self.upload {
+                if !q.drain(Duration::from_secs(60)) {
+                    tracing::warn!("改名前排空上传队列超时: {old_remote}");
+                    return reply.error(fuser::Errno::EBUSY);
+                }
+            }
+        }
+
+        let client = self.client.clone();
+        let res = if parent_remote == newparent_remote {
+            // 同目录：FileStation rename（实测 body: path/source_name/dest_name；大小写改名可直接成功）
+            let (dir, from, to) = (parent_remote.clone(), name.to_string(), newname.to_string());
+            self.rt
+                .block_on(async move { client.rename(&dir, &from, &to).await })
+        } else {
+            // 跨目录：FileStation move 会**忽略 dest_file**（保持原名），
+            // 所以先搬过去，需要改名再在目标目录里 rename 一次。
+            let (fd, nn, td, tn) = (
+                parent_remote.clone(),
+                name.to_string(),
+                newparent_remote.clone(),
+                newname.to_string(),
+            );
+            let r = self
+                .rt
+                .block_on(async { client.move_into(&fd, &nn, &td).await });
+            if r.is_ok() && tn != nn {
+                let client2 = self.client.clone();
+                let (td2, nn2) = (td.clone(), nn.clone());
+                self.rt
+                    .block_on(async move { client2.rename(&td2, &nn2, &tn).await })
+            } else {
+                r
+            }
+        };
+        if let Err(e) = res {
+            tracing::warn!("rename 失败 {old_remote} -> {new_remote}: {e}");
+            return reply.error(fuser::Errno::EIO);
+        }
+
+        if let Some(ino) = ino {
+            let mut g = self.inner.lock().unwrap();
+            g.by_remote.remove(&old_remote);
+            g.by_remote.insert(new_remote.clone(), ino);
+            if let Some(n) = g.nodes.get_mut(&ino) {
+                n.name = newname.to_string();
+                n.remote = new_remote.clone();
+                n.parent = newparent;
+            }
+        }
+        tracing::debug!("rename {old_remote} -> {new_remote}");
+        reply.ok();
     }
 
     fn readdir(
@@ -842,10 +1370,10 @@ impl Filesystem for QxyncFs {
 ///
 /// `auto_unmount` 在 fuser 0.17 里要求 `SessionACL != Owner`（即 `allow_other`），
 /// 非特权挂载还需要 `/etc/fuse.conf` 里的 `user_allow_other`；因此做成开关，默认关闭。
-pub fn mount_options(auto_unmount: bool) -> Vec<fuser::MountOption> {
+pub fn mount_options(auto_unmount: bool, read_only: bool) -> Vec<fuser::MountOption> {
     use fuser::MountOption::*;
     let mut opts = vec![
-        RO,
+        if read_only { RO } else { RW },
         FSName("qxync".to_string()),
         Subtype("qxync".to_string()),
         DefaultPermissions,
@@ -865,10 +1393,10 @@ pub fn mount_options(auto_unmount: bool) -> Vec<fuser::MountOption> {
 ///
 /// 单线程会让「并发读同一文件」退化成串行，看不出水合去重是否真的生效；
 /// 报告 12 §6.3 也推荐 FUSE 多线程 + 共享状态。
-pub fn mount_config(n_threads: usize, auto_unmount: bool) -> Config {
+pub fn mount_config(n_threads: usize, auto_unmount: bool, read_only: bool) -> Config {
     // `Config` 是 #[non_exhaustive]，外部 crate 不能写字面量，只能 default + 逐字段赋值
     let mut cfg = Config::default();
-    cfg.mount_options = mount_options(auto_unmount);
+    cfg.mount_options = mount_options(auto_unmount, read_only);
     cfg.n_threads = Some(n_threads.max(1));
     cfg.clone_fd = std::env::var("QSYNC_CLONE_FD")
         .map(|v| v != "0")
@@ -886,8 +1414,13 @@ pub fn mount(
     mountpoint: &Path,
     n_threads: usize,
     auto_unmount: bool,
+    read_only: bool,
 ) -> std::io::Result<()> {
-    fuser::mount2(fs, mountpoint, &mount_config(n_threads, auto_unmount))
+    fuser::mount2(
+        fs,
+        mountpoint,
+        &mount_config(n_threads, auto_unmount, read_only),
+    )
 }
 
 #[cfg(test)]
@@ -935,6 +1468,7 @@ mod tests {
             attr,
             cache: None,
             chunks_done: vec![false; 3],
+            dirty: false,
         };
         assert_eq!(n.state_str(), "placeholder");
         n.chunks_done[0] = true;

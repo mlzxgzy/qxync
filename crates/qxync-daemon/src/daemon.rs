@@ -30,6 +30,8 @@ struct MountEntry {
     /// 挂载线程结束时回传结果，用于 `umount` 时确认线程真的退出了。
     done: std::sync::mpsc::Receiver<std::io::Result<()>>,
     counters: Arc<HydroCounters>,
+    /// 读写挂载时的上传队列（卸载前要排空）。
+    upload: Option<Arc<qxync_fuse::upload::UploadQueue>>,
 }
 
 struct State {
@@ -211,6 +213,7 @@ async fn dispatch(state: &Arc<State>, req: Request, shutdown: &mpsc::Sender<()>)
             threads,
             auto_unmount,
             hydrate_timeout_secs,
+            read_write,
         } => {
             mount(
                 state,
@@ -220,6 +223,7 @@ async fn dispatch(state: &Arc<State>, req: Request, shutdown: &mpsc::Sender<()>)
                 threads.unwrap_or(4),
                 auto_unmount.unwrap_or(false),
                 Duration::from_secs(hydrate_timeout_secs.unwrap_or(60)),
+                read_write.unwrap_or(false),
             )
             .await
         }
@@ -399,7 +403,7 @@ async fn status(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
         (None, None, false)
     };
 
-    let (mounts, hydro) = snapshot_mounts(state);
+    let (mounts, hydro, uploads) = snapshot_mounts(state);
     to_value(StatusData {
         daemon: DaemonInfo {
             version: state.version.to_string(),
@@ -423,6 +427,7 @@ async fn status(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
         server,
         cursors,
         hydro,
+        uploads,
         mounts,
     })
 }
@@ -549,6 +554,7 @@ async fn mount(
     threads: usize,
     auto_unmount: bool,
     hydrate_timeout: Duration,
+    read_write: bool,
 ) -> Result<serde_json::Value, IpcError> {
     ensure_session(state).await?;
     let sid = require_sid(state).await?;
@@ -591,18 +597,35 @@ async fn mount(
     let mut fuse_client = Client::new(&state.link).map_err(map_err)?;
     fuse_client.set_sid(sid);
     let counters = Arc::new(HydroCounters::default());
-    let fs = QxyncFs::new(Arc::new(fuse_client), remote.clone(), cache.clone())
+    let fuse_client = Arc::new(fuse_client);
+    let mut fs = QxyncFs::new(fuse_client.clone(), remote.clone(), cache.clone())
         .map_err(|e| IpcError::new(ErrorKind::Io, e.to_string()))?
         .with_hydrate_timeout(hydrate_timeout)
         .with_counters(counters.clone())
         .with_pins(state.pins.clone());
+    let mut upload_queue = None;
+    if read_write {
+        let marker_dir = ConfigPaths::discover()
+            .map(|p| p.data_dir.join("upload-queue"))
+            .unwrap_or_else(|_| cache.join("upload-queue"));
+        let q = qxync_fuse::upload::UploadQueue::new(
+            fuse_client.clone(),
+            tokio::runtime::Handle::current(),
+            marker_dir,
+        )
+        .map_err(|e| IpcError::new(ErrorKind::Io, format!("创建上传队列失败: {e}")))?;
+        q.spawn_worker()
+            .map_err(|e| IpcError::new(ErrorKind::Io, format!("启动上传 worker 失败: {e}")))?;
+        fs = fs.with_write_mode().with_upload_queue(q.clone());
+        upload_queue = Some(q);
+    }
 
     let (tx, done) = std::sync::mpsc::channel();
     let mp_thread = mp.clone();
     std::thread::Builder::new()
         .name("qxync-fuse".into())
         .spawn(move || {
-            let r = qxync_fuse::mount(fs, &mp_thread, threads, auto_unmount);
+            let r = qxync_fuse::mount(fs, &mp_thread, threads, auto_unmount, !read_write);
             let _ = tx.send(r);
         })
         .map_err(|e| IpcError::new(ErrorKind::Io, format!("创建 FUSE 线程失败: {e}")))?;
@@ -635,7 +658,7 @@ async fn mount(
     let info = MountInfo {
         mountpoint: mp.clone(),
         remote,
-        readonly: true,
+        readonly: !read_write,
     };
     state.mounts.lock().unwrap().insert(
         mp.clone(),
@@ -643,6 +666,7 @@ async fn mount(
             info: info.clone(),
             done,
             counters,
+            upload: upload_queue,
         },
     );
     tracing::info!(
@@ -662,6 +686,13 @@ async fn umount(state: &Arc<State>, mountpoint: PathBuf) -> Result<serde_json::V
         )
     })?;
 
+    // 先把未完成的上传做完，避免卸载丢改动
+    if let Some(q) = &entry.upload {
+        if !q.drain(Duration::from_secs(120)) {
+            tracing::warn!("卸载前上传队列未排空（继续卸载，标记文件保留，下次启动会重试）");
+        }
+        q.shutdown();
+    }
     let out = std::process::Command::new("fusermount3")
         .arg("-u")
         .arg(&mp)
@@ -692,20 +723,35 @@ async fn umount(state: &Arc<State>, mountpoint: PathBuf) -> Result<serde_json::V
 }
 
 fn mounts(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
-    let (list, _) = snapshot_mounts(state);
+    let (list, _, _) = snapshot_mounts(state);
     to_value(list)
 }
 
-fn snapshot_mounts(state: &Arc<State>) -> (Vec<MountInfo>, HydroStats) {
+fn snapshot_mounts(
+    state: &Arc<State>,
+) -> (
+    Vec<MountInfo>,
+    HydroStats,
+    Option<qxync_core::ipc::UploadInfo>,
+) {
     let g = state.mounts.lock().unwrap();
     let list = g.values().map(|m| m.info.clone()).collect();
     let (mut count, mut bytes) = (0u64, 0u64);
+    let mut uploads: Option<qxync_core::ipc::UploadInfo> = None;
     for m in g.values() {
         let (c, b) = m.counters.snapshot();
         count += c;
         bytes += b;
+        if let Some(u) = m.upload.as_ref().map(|q| q.snapshot()) {
+            let e = uploads.get_or_insert_with(Default::default);
+            e.pending += u.pending;
+            e.done += u.done;
+            e.failed += u.failed;
+            e.retries += u.retries;
+            e.bytes += u.bytes;
+        }
     }
-    (list, HydroStats { count, bytes })
+    (list, HydroStats { count, bytes }, uploads)
 }
 
 async fn shutdown_all_mounts(state: &Arc<State>) -> usize {

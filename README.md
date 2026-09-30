@@ -15,7 +15,8 @@
 | **M1 只读 FUSE + on-demand 整文件水合** | ✅ **真机挂载验收通过**（`fuse-matrix.sh` 快测 16/16；`--big` 含 128 MiB 水合与并发去重 **20/20**） |
 | **M1.5 daemon（`qxyncd`）+ 本地 IPC + CLI 完善 + 滚动日志** | ✅ **真机验收通过**（IPC 端到端测试 + 16/16 FUSE 矩阵在 daemon 持有挂载下复跑） |
 | **M2a 区间水合（128 KiB）** | ✅ **已实现并验收**：`head -c 100 big.bin` 只下载 1 个 128 KiB 区间（`chunks=1/1024`） |
-| M2b 双向同步（FUSE 写路径 + 上传队列）/ 脱水 / GUI | ⏳ 下一步 |
+| **M2b 写路径**（FUSE 写操作 + 上传队列 + dirty 标记崩溃恢复） | ✅ **已实现并验收**（矩阵 30/30，其中写路径 10 项） |
+| M2c 变更发现（三游标轮询 + 冲突）/ M3 脱水 / M4 GUI | ⏳ 下一步 |
 
 真机验证对象：`TS-464C` / `QTS 5.2.9` / Qsync QPKG `5.0.0.7`（build `20260723`）。
 
@@ -43,6 +44,7 @@ xtask/tests/
 docs/
 ├── 开发规划.md             第一版（MVP）规划
 ├── M1.5-设计.md           daemon/IPC 契约、生命周期、pin 语义、验收标准
+├── M2b-写路径.md          ★ 写路径：真机写接口契约、read-modify-write 铁则、上传队列、已知限制
 ├── 执行方案-M0M1.md        ★ 真机验证后的修正版：实测事实 + 修正项 + 执行顺序 + 风险门
 └── 测试环境.local.md       测试 NAS 与账号（已 gitignore，禁止提交）
 report/                 逆向报告 + probe 工具（qs_probe.py / qs_fixture.py）
@@ -88,7 +90,8 @@ qsync status                # 同上（自动路由到 daemon）
 qsync ls /home/qxync-test   # 所有命令默认走 daemon
 qsync pin /home/qxync-test/hello.txt pinned      # 设 pin（getfattr -n user.qsync.pin 可读）
 qsync state /home/qxync-test/hello.txt           # 占位符状态 + pin
-qsync mount ~/qsync-mnt --remote /home           # FUSE 由 daemon 持有
+qsync mount ~/qsync-mnt --remote /home           # FUSE 由 daemon 持有（默认只读）
+qsync mount ~/qsync-mnt --remote /home --rw      # M2b：读写挂载（本地改动经队列推回 NAS）
 qsync umount ~/qsync-mnt
 qsync daemon stop           # 干净退出：卸载全部挂载 + 删 socket/pid
 ```
@@ -100,7 +103,7 @@ IPC 契约见 [`docs/M1.5-设计.md`](docs/M1.5-设计.md)：unix socket + **一
 M1 验收矩阵（挂载 → 16 项检查 → 卸载）：
 
 ```bash
-xtask/tests/fuse-matrix.sh          # 快测 20 项（含 M2 区间水合），~40s
+xtask/tests/fuse-matrix.sh          # 快测 30 项（M1 + M2a 区间水合 + M2b 写路径），~2min
 xtask/tests/fuse-matrix.sh --big    # 追加 128 MiB 全量读 + 并发去重（~5min，取决于带宽）
 ```
 
@@ -136,19 +139,26 @@ cargo test -p qxync-proto-test -- --ignored --test-threads=1 --nocapture   # 协
 
 写 FUSE 时踩到的（M1）：
 
-9. **`listxattr` 的返回值必须以 NUL 结尾**：内核 `fuse_verify_xattr_list()` 会逐项 `strnlen`，
+9. **写操作命名空间分工**（实测）：`rename`/`move` 只能在 FileStation（`utilRequest.cgi`）做，
+   `createdir`/`delete` 用 `qsyncsrv.cgi`；`move` 必须带 `source_total=1`，且 **`dest_file` 会被忽略**
+   （跨目录改名 = move + rename 两步）。
+10. **`stat` 用 `exist` 判存在**：不存在的路径也返回占位条目（名字是你请求的名字、`filesize=0`），
+   只有 `exist=0` 能区分；判错会让 `lookup` 误报正项、`mkdir` 直接 `EEXIST`。
+11. **写前必须 read-modify-write**：写占位符前要把「不会被完整覆盖」的区间补齐，否则未取回的区间是 0，
+    整文件上传会把远端内容清零（实测踩过）。
+12. **`listxattr` 的返回值必须以 NUL 结尾**：内核 `fuse_verify_xattr_list()` 会逐项 `strnlen`，
    最后一项少了终止符就**把整个 listxattr 判成 `-EIO`** —— 表现是 `ls -l` 全目录报「输入/输出错误」，
    而 `stat`/`cat` 都正常（coreutils 的 `ls -l` 会查 ACL 从而调 `listxattr`）。
    实测判据：`size<66` 回 `ERANGE`，`size>=66` 反而 `EIO`，就是这个校验触发的。
-10. **`attr_timeout`/`entry_timeout`/`max_read` 不是 fusermount 挂载选项**，传给 `-o` 会直接
+13. **`attr_timeout`/`entry_timeout`/`max_read` 不是 fusermount 挂载选项**，传给 `-o` 会直接
     `unknown option` 挂载失败；TTL 应通过每次 `reply.entry/attr(&ttl, ..)` 传，`max_readahead` 在 `init()` 里设。
-11. **fuser 0.17 的 `AutoUnmount` 要求 `SessionACL != Owner`**（即 `allow_other`，非特权挂载还需
+14. **fuser 0.17 的 `AutoUnmount` 要求 `SessionACL != Owner`**（即 `allow_other`，非特权挂载还需
     `/etc/fuse.conf` 的 `user_allow_other`），否则 mount 报 `auto_unmount requires acl != Owner`。
 12. **整文件水合 + 60s 超时在大文件/慢链路上必然失败**：实测对端 ~1.1 MB/s 时 128 MiB 要 116s。
     M1 的应对是 `--hydrate-timeout` 可调；根治是 M2 的 128 KiB 区间水合（只取需要的分片）。
-13. FUSE 调用里 `block_on` 要用**独立运行时**，且挂载线程别用 `tokio::spawn_blocking`
+16. FUSE 调用里 `block_on` 要用**独立运行时**，且挂载线程别用 `tokio::spawn_blocking`
     （blocking 线程带 runtime 上下文，再 `block_on` 另一个 runtime 会 panic）。
-14. 对端同时发布 AAAA 但 IPv6 路由不通时，会出现 `Network is unreachable` 或传输中途 body 解码失败 →
+17. 对端同时发布 AAAA 但 IPv6 路由不通时，会出现 `Network is unreachable` 或传输中途 body 解码失败 →
     用 `--ipv4`（客户端 `local_address` 绑 IPv4 源地址）规避。
 
 ## 两条铁则（整个项目不许违反）

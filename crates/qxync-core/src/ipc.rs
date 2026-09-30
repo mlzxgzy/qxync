@@ -99,6 +99,9 @@ pub enum Request {
         auto_unmount: Option<bool>,
         #[serde(default)]
         hydrate_timeout_secs: Option<u64>,
+        /// 读写挂载（默认只读）。开写路径必须为 true，否则写操作回 EROFS。
+        #[serde(default)]
+        read_write: Option<bool>,
     },
     Umount {
         mountpoint: PathBuf,
@@ -300,6 +303,16 @@ pub struct HydroStats {
     pub bytes: u64,
 }
 
+/// 上传队列快照（M2b）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UploadInfo {
+    pub pending: u64,
+    pub done: u64,
+    pub failed: u64,
+    pub retries: u64,
+    pub bytes: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MountInfo {
     pub mountpoint: PathBuf,
@@ -316,6 +329,8 @@ pub struct StatusData {
     pub server: Option<ServerInfo>,
     pub cursors: Option<CursorInfo>,
     pub hydro: HydroStats,
+    #[serde(default)]
+    pub uploads: Option<UploadInfo>,
     pub mounts: Vec<MountInfo>,
 }
 
@@ -408,6 +423,7 @@ mod tests {
             threads: Some(4),
             auto_unmount: Some(true),
             hydrate_timeout_secs: Some(600),
+            read_write: Some(false),
         });
         let line = encode_line(&e).unwrap();
         let back: RequestEnvelope = decode_line(&line).unwrap();
