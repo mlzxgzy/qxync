@@ -166,6 +166,9 @@ async fn upload_roundtrip() {
         .await
         .expect("download 回读");
     assert_eq!(back, payload, "上传后回读必须逐字节一致");
+    // 清理：别在 NAS 的 fixture 里留产物（M0 起这条测试一直漏了清理）
+    let _ = client.delete_entry(&dir, "rust-upload.bin").await;
+    let _ = client.delete_entry(&fixture_root(), "rust-proto").await;
 }
 
 /// M2b 写接口契约：rename/move/delete + `stat` 的 `exist` 语义。
