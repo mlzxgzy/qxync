@@ -14,7 +14,8 @@
 | `qxync-proto-test`（真机集成测试） | ✅ 完成（`#[ignore]` 手动跑，5/5 通过） |
 | **M1 只读 FUSE + on-demand 整文件水合** | ✅ **真机挂载验收通过**（`fuse-matrix.sh` 快测 16/16；`--big` 含 128 MiB 水合与并发去重 **20/20**） |
 | **M1.5 daemon（`qxyncd`）+ 本地 IPC + CLI 完善 + 滚动日志** | ✅ **真机验收通过**（IPC 端到端测试 + 16/16 FUSE 矩阵在 daemon 持有挂载下复跑） |
-| M2 区间水合（128 KiB）/ 双向同步（FUSE 写路径 + 上传队列）/ 脱水 / GUI | ⏳ 下一步 |
+| **M2a 区间水合（128 KiB）** | ✅ **已实现并验收**：`head -c 100 big.bin` 只下载 1 个 128 KiB 区间（`chunks=1/1024`） |
+| M2b 双向同步（FUSE 写路径 + 上传队列）/ 脱水 / GUI | ⏳ 下一步 |
 
 真机验证对象：`TS-464C` / `QTS 5.2.9` / Qsync QPKG `5.0.0.7`（build `20260723`）。
 
@@ -22,7 +23,10 @@ M1 实现说明（`crates/qxync-fuse`）：
 **元数据不走数据面**（`ls -l` 直接答 NAS 元数据，真实大小、零下载）；`read()` 首次触发**整文件水合**到
 `~/.local/share/qsync/cache`（single-flight 去重 + 可配置超时，默认 60s）；读不满即 `EIO`（铁则 1）；
 `user.qsync.*` xattr 可观测（`placeholder`/`hydrated`）；mount 参数 `ro,default_permissions,noatime`。
-本版故意用「整文件水合」把 FUSE 语义问题一次性暴露，M2 再换 128 KiB 区间（数据面已实测支持 `Range`→206）。
+**M2a 已把「整文件水合」换成 128 KiB 区间水合**：缓存是「apparent size = 文件大小」的稀疏文件，
+只把读到的区间 `pwrite` 进去；`user.qsync.state` 会显示 `placeholder`/`partial`/`hydrated`，
+`user.qsync.chunks` 显示 `已就绪/总数`。缓存文件名用**远端路径的稳定哈希**（不能用 ino，
+否则两次挂载里同一个 ino 可能对应不同文件 → 读到错的缓存）。
 
 ## 目录结构
 
@@ -96,8 +100,8 @@ IPC 契约见 [`docs/M1.5-设计.md`](docs/M1.5-设计.md)：unix socket + **一
 M1 验收矩阵（挂载 → 16 项检查 → 卸载）：
 
 ```bash
-xtask/tests/fuse-matrix.sh          # 快测 16 项，~30s
-xtask/tests/fuse-matrix.sh --big    # 追加 128 MiB 水合 + 并发去重，共 20 项（~5min，取决于带宽）
+xtask/tests/fuse-matrix.sh          # 快测 20 项（含 M2 区间水合），~40s
+xtask/tests/fuse-matrix.sh --big    # 追加 128 MiB 全量读 + 并发去重（~5min，取决于带宽）
 ```
 
 > **沙箱/受限环境注意**：若 `~/.cargo` / `~/.config` 不可写，用工作区内的路径：

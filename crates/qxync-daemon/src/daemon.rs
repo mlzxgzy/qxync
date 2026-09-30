@@ -566,17 +566,32 @@ async fn mount(
     }
 
     let remote = remote.unwrap_or_else(|| HOME_ROOT.to_string());
-    let cache = cache_dir.unwrap_or_else(|| {
-        ConfigPaths::discover()
-            .map(|p| p.data_dir.join("cache"))
-            .unwrap_or_else(|_| PathBuf::from("/tmp/qxync/cache"))
-    });
+    // 缓存按「主机」隔离：不同 NAS 上的同名路径不能共用缓存文件
+    let host_ns: String = state
+        .link
+        .host
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let cache = cache_dir
+        .unwrap_or_else(|| {
+            ConfigPaths::discover()
+                .map(|p| p.data_dir.join("cache"))
+                .unwrap_or_else(|_| PathBuf::from("/tmp/qxync/cache"))
+        })
+        .join(host_ns);
 
     // 给 FUSE 一个独立 Client（只带 sid），避免和 daemon 主体抢同一把锁
     let mut fuse_client = Client::new(&state.link).map_err(map_err)?;
     fuse_client.set_sid(sid);
     let counters = Arc::new(HydroCounters::default());
-    let fs = QxyncFs::new(Arc::new(fuse_client), remote.clone(), cache)
+    let fs = QxyncFs::new(Arc::new(fuse_client), remote.clone(), cache.clone())
         .map_err(|e| IpcError::new(ErrorKind::Io, e.to_string()))?
         .with_hydrate_timeout(hydrate_timeout)
         .with_counters(counters.clone())

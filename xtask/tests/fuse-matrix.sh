@@ -44,8 +44,19 @@ LOG="$RUNDIR/fuse-matrix.log"
 
 if ! [ -x "$QS" ]; then echo "缺少 $QS，先 cargo build"; exit 1; fi
 
+# 卸载带退避重试：FUSE 会话可能正卡在一次慢下载上，fusermount 偶尔会忙
+unmount_retry() {
+  local mp="$1" i
+  for i in 1 2 3 4 5; do
+    grep -qF "$mp" /proc/mounts || return 0
+    "$QS" umount "$mp" >/dev/null 2>&1 || fusermount3 -u "$mp" >/dev/null 2>&1
+    sleep 1
+  done
+  ! grep -qF "$mp" /proc/mounts
+}
+
 cleanup() {
-  if [ "$KEEP" = "0" ]; then "$QS" umount "$MNT" >/dev/null 2>&1; fi
+  if [ "$KEEP" = "0" ]; then unmount_retry "$MNT" >/dev/null 2>&1; fi
 }
 trap cleanup EXIT
 
@@ -87,6 +98,26 @@ sys.exit(0 if (len(m)==1024 and m[0]==0 and m[255]==255 and m[256]==0) else 1)
 "; then ok "mmap 读取正确、无 SIGBUS"; else bad "mmap 失败"; fi
 
 echo
+echo "=== M2 区间水合：head -c 100 只下 1 个 128 KiB 区间 ==="
+head -c 100 "$M/big.bin" >"$RUNDIR/head100.bin" 2>/dev/null
+if cmp -s "$RUNDIR/head100.bin" <(head -c 100 "$LOCAL_FIXTURE/big.bin"); then
+  ok "head -c 100 数据正确"
+else
+  bad "head -c 100 数据不正确"
+fi
+bigcache=$(ls -S "$CACHE" 2>/dev/null | head -1)
+if [ -n "$bigcache" ]; then
+  apparent=$(stat -c %s "$CACHE/$bigcache")
+  alloc_kib=$(( $(stat -c %b "$CACHE/$bigcache") / 2 ))
+  echo "  缓存 $bigcache: apparent=${apparent}B allocated=${alloc_kib}KiB"
+  check "$([ "$apparent" = "134217728" ] && echo 0 || echo 1)" "稀疏缓存 apparent size = 文件大小（128 MiB）"
+  # 128 KiB 区间 + 文件系统开销，宽限到 300 KiB；M1 的整文件水合会是 128 MiB
+  check "$([ "$alloc_kib" -le 300 ] && echo 0 || echo 1)" "只下载了 1 个区间（allocated ≤ 300 KiB，M1 整文件会是 131072 KiB）"
+else
+  bad "缓存目录里没有 big.bin 的缓存文件"
+fi
+
+echo
 echo "=== xattr 可观测（M1.7）==="
 state=$(python3 -c "
 import os
@@ -98,16 +129,25 @@ check "$([ "$state" = "hydrated" ] && echo 0 || echo 1)" "读取后状态 = hydr
 check "$(python3 -c "
 import os,sys
 names=os.listxattr('$M/hello.txt')
-sys.exit(0 if 'user.qsync.state' in names and 'user.qsync.vsize' in names else 1)
+sys.exit(0 if 'user.qsync.state' in names and 'user.qsync.vsize' in names and 'user.qsync.chunks' in names else 1)
 " && echo 0 || echo 1)" "listxattr 返回全部键（含末尾 NUL 校验）"
+chunks=$(python3 -c "
+import os
+print(os.getxattr('$M/big.bin','user.qsync.chunks').decode())
+")
+echo "  big.bin 区间: $chunks（head -c 100 之后应是 1/1024）"
+check "$([ "$chunks" = "1/1024" ] && echo 0 || echo 1)" "区间计数 = 1/1024（M2 粒度）"
 
 echo
 echo "=== #11 水合失败 → EIO，不挂死、不零填充 ==="
-# 用 1s 超时挂第二个只读视图来模拟「网络慢/断」时水合失败
+# 用 0 秒水合超时模拟「水合不可用」。
+# 注意：M2 之后单区间只有 128 KiB，1 秒足够下完（所以老版用 1s 已拦不住），
+# 0 秒是确定性的失败注入。
 MNT2="$RUNDIR/mnt-timeout"
 mkdir -p "$MNT2"
+rm -f "$CACHE"/*          # 别让上一个挂载的缓存把这步短路
 "$QS" mount "$MNT2" --remote "${QSYNC_REMOTE_ROOT:-/home}" --cache-dir "$CACHE" \
-      --threads 2 --auto-unmount --hydrate-timeout 1 >>"$LOG" 2>&1 &
+      --threads 2 --auto-unmount --hydrate-timeout 0 >>"$LOG" 2>&1 &
 for _ in $(seq 1 30); do grep -q "$MNT2" /proc/mounts && break; sleep 0.5; done
 M2="$MNT2$( echo "$FIXTURE" | sed 's#^/home##' )"
 timeout 30 cat "$M2/big.bin" >"$RUNDIR/eio.out" 2>"$RUNDIR/eio.err"
@@ -117,15 +157,15 @@ echo "  cat 退出码=$rc 输出字节=$n  stderr=$(cat "$RUNDIR/eio.err")"
 check "$([ "$rc" = "1" ] && echo 0 || echo 1)" "返回 EIO（退出码 1，而非挂死 124）"
 check "$([ "$n" = "0" ] && echo 0 || echo 1)" "失败时不吐零填充假数据"
 check "$(ls "$M2" >/dev/null 2>&1 && echo 0 || echo 1)" "失败后文件系统仍存活"
-check "$([ -z "$(ls -A "$CACHE" | grep qsync-part)" ] && echo 0 || echo 1)" "不残留 .qsync-part 半截文件"
-"$QS" umount "$MNT2" >/dev/null 2>&1
+check "$([ -z "$(ls -A "$CACHE" | grep qsync-part)" ] && echo 0 || echo 1)" "不残留半截文件"
+unmount_retry "$MNT2"
 
 if [ "$BIG" = "1" ]; then
   echo
   echo "=== 128 MiB 整文件水合 + md5（水合超时 ${HYD}s）==="
-  "$QS" umount "$MNT" >/dev/null 2>&1
+  unmount_retry "$MNT"
   rm -f "$CACHE"/*; : >"$LOG"
-  "$QS" mount "$MNT" --remote "${QSYNC_REMOTE_ROOT:-/home}" --cache-dir "$CACHE" \
+  RUST_LOG=debug "$QS" mount "$MNT" --remote "${QSYNC_REMOTE_ROOT:-/home}" --cache-dir "$CACHE" \
         --threads 4 --auto-unmount --hydrate-timeout "$HYD" >>"$LOG" 2>&1 &
   for _ in $(seq 1 30); do grep -q "$MNT" /proc/mounts && break; sleep 0.5; done
   read_big() {  # 输出 "字节数 md5"；失败输出 "0 -"
@@ -150,11 +190,11 @@ if [ "$BIG" = "1" ]; then
 
   echo
   echo "=== 水合去重（4 并发读同一文件）==="
-  "$QS" umount "$MNT" >/dev/null 2>&1
+  unmount_retry "$MNT"
   # 重新挂载以清掉内核 page cache，否则读到的是内核缓存，测不出并发
   rm -f "$CACHE"/* "$RUNDIR"/dedup-*.txt
   : >"$LOG"
-  "$QS" mount "$MNT" --remote "${QSYNC_REMOTE_ROOT:-/home}" --cache-dir "$CACHE" \
+  RUST_LOG=debug "$QS" mount "$MNT" --remote "${QSYNC_REMOTE_ROOT:-/home}" --cache-dir "$CACHE" \
         --threads 4 --auto-unmount --hydrate-timeout "$HYD" >>"$LOG" 2>&1 &
   for _ in $(seq 1 30); do grep -q "$MNT" /proc/mounts && break; sleep 0.5; done
   # 注意：不能裸用 wait —— 后台还挂着 FUSE 挂载进程，wait 会一直等它。
@@ -162,19 +202,20 @@ if [ "$BIG" = "1" ]; then
   for i in 1 2 3 4; do (md5sum "$M/big.bin" >"$RUNDIR/dedup-$i.txt" 2>&1) & pids+=($!); done
   for pid in "${pids[@]}"; do wait "$pid"; done
   n_ok=$(grep -c "$h1" "$RUNDIR"/dedup-*.txt | grep -c ':1$')
-  n_hyd=$(grep -c "水合完成" "$LOG")
+  n_chunks=$(grep -c "区间就绪" "$LOG")
   n_files=$(ls "$CACHE" | wc -l)
-  echo "  4 路 md5 一致数=$n_ok  水合次数=$n_hyd  缓存文件数=$n_files"
+  chunks_total=$(( 134217728 / 131072 ))
+  echo "  4 路 md5 一致数=$n_ok  区间下载=$n_chunks（文件共 $chunks_total 个区间）  缓存文件数=$n_files"
   check "$([ "$n_ok" = "4" ] && echo 0 || echo 1)" "4 路读取结果一致"
-  check "$([ "$n_hyd" = "1" ] && echo 0 || echo 1)" "并发读只下载一次（single-flight）"
+  # 没有去重的话 4 个读者会把 1024 个区间各取 4 次（≈4096）；留 20% 余量
+  check "$([ "$n_chunks" -le $(( chunks_total * 12 / 10 )) ] && echo 0 || echo 1)" "并发读没有重复下载（区间下载 ≤ 1.2×$chunks_total）"
 fi
 
 echo
 echo "=== 卸载干净（无残留）==="
 if [ "$KEEP" = "0" ]; then
-  "$QS" umount "$MNT" >/dev/null 2>&1
-  sleep 1
-  check "$(grep -q "$MNT" /proc/mounts && echo 1 || echo 0)" "卸载后无残留挂载"
+  unmount_retry "$MNT"
+  check "$(grep -qF "$MNT" /proc/mounts && echo 1 || echo 0)" "卸载后无残留挂载"
   grep -E "unmount: 水合" "$LOG" | tail -1 | sed 's/^/  /'
 fi
 
