@@ -29,6 +29,9 @@ pub struct UploadJob {
     pub mtime: i64,
     #[serde(default)]
     pub attempts: u32,
+    /// 临时内容（冲突副本的 stash）：上传成功后把本地文件删掉。
+    #[serde(default)]
+    pub ephemeral: bool,
 }
 
 impl UploadJob {
@@ -61,6 +64,9 @@ pub struct UploadStats {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct UploadSnapshot {
     pub pending: u64,
+    /// 是否正有作业在上传（在途作业不占 `pending`，但**内容可能还没落地** —
+    /// 冲突判定/测试等待都必须看这个，实测踩过：pending=0 时最后一次上传还在飞）。
+    pub active: bool,
     pub done: u64,
     pub failed: u64,
     pub retries: u64,
@@ -148,6 +154,40 @@ impl UploadQueue {
         Ok(())
     }
 
+    /// 是否有作业正在上传（在途）。
+    pub fn is_active(&self) -> bool {
+        self.state.lock().unwrap().active
+    }
+
+    /// 取消某路径**还没开始**的上传作业（含标记文件）。
+    /// 返回是否取消了作业；已经在途的那个取消不了，要用 [`Self::drain`] 等它结束。
+    pub fn cancel(&self, remote_path: &str) -> bool {
+        let removed: Vec<UploadJob> = {
+            let mut st = self.state.lock().unwrap();
+            let mut kept = VecDeque::new();
+            let mut removed = Vec::new();
+            while let Some(j) = st.pending.pop_front() {
+                if j.remote_path() == remote_path {
+                    removed.push(j);
+                } else {
+                    kept.push_back(j);
+                }
+            }
+            st.pending = kept;
+            removed
+        };
+        for j in &removed {
+            let _ = std::fs::remove_file(j.marker(&self.marker_dir));
+        }
+        if !removed.is_empty() {
+            self.stats
+                .pending
+                .store(self.pending_len(), Ordering::Relaxed);
+            tracing::info!("已取消 {remote_path} 的 {} 个待上传作业", removed.len());
+        }
+        removed.is_empty()
+    }
+
     /// 该远端路径是否还有未完成的上传（含崩溃恢复出来的标记）。
     pub fn has_pending(&self, remote_path: &str) -> bool {
         self.state
@@ -165,6 +205,7 @@ impl UploadQueue {
     pub fn snapshot(&self) -> UploadSnapshot {
         UploadSnapshot {
             pending: self.pending_len(),
+            active: self.is_active(),
             done: self.stats.done.load(Ordering::Relaxed),
             failed: self.stats.failed.load(Ordering::Relaxed),
             retries: self.stats.retries.load(Ordering::Relaxed),
@@ -228,6 +269,10 @@ impl UploadQueue {
             match self.rt.block_on(self.upload_one(&job)) {
                 Ok(()) => {
                     let _ = std::fs::remove_file(job.marker(&self.marker_dir));
+                    if job.ephemeral {
+                        // 冲突副本的 stash 是一次性的：传完就删
+                        let _ = std::fs::remove_file(&job.local);
+                    }
                     let n = std::fs::metadata(&job.local).map(|m| m.len()).unwrap_or(0);
                     self.stats.done.fetch_add(1, Ordering::Relaxed);
                     self.stats.bytes.fetch_add(n, Ordering::Relaxed);
@@ -319,6 +364,7 @@ mod tests {
             local: PathBuf::from("/tmp/x"),
             mtime: 1,
             attempts: 0,
+            ephemeral: false,
         };
         assert_eq!(j.remote_path(), "/home/qxync-test/a b.txt");
         let m1 = j.marker(std::path::Path::new("/tmp/q"));

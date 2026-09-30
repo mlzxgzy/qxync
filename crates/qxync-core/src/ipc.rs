@@ -102,11 +102,36 @@ pub enum Request {
         /// 读写挂载（默认只读）。开写路径必须为 true，否则写操作回 EROFS。
         #[serde(default)]
         read_write: Option<bool>,
+        /// ★ M2c：本地大批删除熔断阈值（60 秒窗口内的删除次数；0 = 关闭）。
+        #[serde(default)]
+        delete_limit: Option<usize>,
     },
     Umount {
         mountpoint: PathBuf,
     },
     Mounts,
+    /// ★ M2c：变更发现（三游标轮询 + baseline 对账）。
+    ///
+    /// * `once=true`  → 立即跑一轮，返回 [`SyncInfo`]；
+    /// * `once=false` → 只返回当前状态（与 `status` 里的 `sync` 相同）；
+    /// * `force_deletes=true` → 解除删除熔断并允许这一轮执行批量删除；
+    /// * `max_deletes` → 临时覆盖「一次对账最多删多少项」；
+    /// * `interval_secs` → 调整后台轮询间隔（0 = 暂停轮询）。
+    Sync {
+        #[serde(default)]
+        once: Option<bool>,
+        #[serde(default)]
+        force_deletes: Option<bool>,
+        #[serde(default)]
+        max_deletes: Option<usize>,
+        #[serde(default)]
+        interval_secs: Option<u64>,
+    },
+    /// 删除远端条目（M2c 测试/脚本用；FUSE 的 unlink 走同一客户端方法）。
+    Rm {
+        dir: String,
+        name: String,
+    },
     /// 干净退出：卸载所有挂载点、删 socket/pid。
     Shutdown,
 }
@@ -127,6 +152,8 @@ impl Request {
             Request::Mount { .. } => "mount",
             Request::Umount { .. } => "umount",
             Request::Mounts => "mounts",
+            Request::Sync { .. } => "sync",
+            Request::Rm { .. } => "rm",
             Request::Shutdown => "shutdown",
         }
     }
@@ -135,7 +162,10 @@ impl Request {
     pub fn is_long_running(&self) -> bool {
         matches!(
             self,
-            Request::Get { .. } | Request::Put { .. } | Request::Mount { .. }
+            Request::Get { .. }
+                | Request::Put { .. }
+                | Request::Mount { .. }
+                | Request::Sync { .. }
         )
     }
 }
@@ -307,6 +337,9 @@ pub struct HydroStats {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UploadInfo {
     pub pending: u64,
+    /// 是否有作业正在上传（在途）。
+    #[serde(default)]
+    pub active: bool,
     pub done: u64,
     pub failed: u64,
     pub retries: u64,
@@ -320,6 +353,42 @@ pub struct MountInfo {
     pub readonly: bool,
 }
 
+/// 三个持久化游标（M2c；对应 Windows 版注册表里的 `QSYNC_PROCESSED_MAX_*_LOG_INDEX_64`）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SyncCursors {
+    pub config: i64,
+    pub notify: i64,
+    pub global_notify: i64,
+    pub max_log_seen: u64,
+    pub log_missing_count: u64,
+}
+
+/// 变更发现状态（`status` / `sync` 共用）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SyncInfo {
+    /// 轮询是否在跑。
+    pub enabled: bool,
+    pub interval_secs: u64,
+    pub polls: u64,
+    /// 距离上次轮询的秒数（没跑过 = 0）。
+    pub last_poll_age_secs: u64,
+    pub cursors: SyncCursors,
+    pub baseline_entries: u64,
+    /// 最近一次轮询的统计。
+    pub refreshed: u64,
+    pub conflicts: u64,
+    pub uploaded: u64,
+    pub deleted: u64,
+    pub deletes_blocked: u64,
+    pub events: u64,
+    /// 事件里出现过的设备（`uid:次数`），诊断「事件是谁产生的」。
+    pub devices: Vec<String>,
+    pub last_error: Option<String>,
+    /// 删除保护熔断的原因（有值 = 当前有删除被挡住，`--force-deletes` 可放行）。
+    pub delete_block_reason: Option<String>,
+    pub note: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusData {
     pub daemon: DaemonInfo,
@@ -331,6 +400,8 @@ pub struct StatusData {
     pub hydro: HydroStats,
     #[serde(default)]
     pub uploads: Option<UploadInfo>,
+    #[serde(default)]
+    pub sync: Option<SyncInfo>,
     pub mounts: Vec<MountInfo>,
 }
 
@@ -424,6 +495,7 @@ mod tests {
             auto_unmount: Some(true),
             hydrate_timeout_secs: Some(600),
             read_write: Some(false),
+            delete_limit: Some(0),
         });
         let line = encode_line(&e).unwrap();
         let back: RequestEnvelope = decode_line(&line).unwrap();
@@ -432,14 +504,45 @@ mod tests {
                 threads,
                 hydrate_timeout_secs,
                 remote,
+                delete_limit,
                 ..
             } => {
                 assert_eq!(threads, Some(4));
                 assert_eq!(hydrate_timeout_secs, Some(600));
                 assert_eq!(remote.as_deref(), Some("/home"));
+                assert_eq!(delete_limit, Some(0));
             }
             other => panic!("解成了 {other:?}"),
         }
+    }
+
+    #[test]
+    fn sync_request_round_trip_and_flag() {
+        let e = RequestEnvelope::new(Request::Sync {
+            once: Some(true),
+            force_deletes: Some(false),
+            max_deletes: Some(5),
+            interval_secs: None,
+        });
+        let back: RequestEnvelope = decode_line(&encode_line(&e).unwrap()).unwrap();
+        match back.req {
+            Request::Sync {
+                once, max_deletes, ..
+            } => {
+                assert_eq!(once, Some(true));
+                assert_eq!(max_deletes, Some(5));
+            }
+            other => panic!("解成了 {other:?}"),
+        }
+        assert!(e.req.is_long_running());
+        assert_eq!(
+            Request::Rm {
+                dir: "/home".into(),
+                name: "a".into()
+            }
+            .method(),
+            "rm"
+        );
     }
 
     #[test]

@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 use qxync_client::Client;
 use qxync_core::ipc::{
     default_socket_path, CursorInfo, ErrorKind, GetData, LsData, MountInfo, PingData, PutData,
-    Request, StatusData,
+    Request, StatusData, SyncInfo,
 };
 use qxync_core::{ConfigPaths, Credentials, DirEntry, LinkConfig, HOME_ROOT};
 use qxync_fuse::QxyncFs;
@@ -128,9 +128,31 @@ enum Cmd {
         /// 读写挂载（M2b 写路径：本地改动会经上传队列推回 NAS）
         #[arg(long)]
         rw: bool,
+        /// ★ M2c：本地大批删除熔断阈值（60 秒窗口内最多删多少项；0 = 关闭，默认 100）
+        #[arg(long)]
+        delete_limit: Option<usize>,
     },
     /// 卸载 FUSE 挂载点
     Umount { mountpoint: PathBuf },
+
+    /// ★ M2c：变更发现（三游标轮询 + baseline 对账 + 冲突/删除保护）
+    Sync {
+        /// 立即跑一轮（否则只显示状态）
+        #[arg(long)]
+        once: bool,
+        /// 解除删除保护熔断（放行这一轮的批量删除；同时解除 FUSE 侧本地删除熔断）
+        #[arg(long)]
+        force_deletes: bool,
+        /// 临时改「一次对账最多删多少项」
+        #[arg(long)]
+        max_deletes: Option<usize>,
+        /// 调整后台轮询间隔秒数（0 = 暂停）
+        #[arg(long)]
+        interval: Option<u64>,
+    },
+
+    /// 删除远端文件/目录（M2c 脚本/测试用；挂在挂载点上 rm 走 FUSE）
+    Rm { dir: String, name: String },
 
     /// 查看/设置 pin：`qsync pin <远端路径> [pinned|unpinned|unspecified|excluded]`
     Pin { path: String, state: Option<String> },
@@ -417,8 +439,19 @@ async fn main() -> Result<()> {
             client.mkdir(parent, name).await?;
             println!("✅ 已建目录 {parent}/{name}");
         }
-        Cmd::Pin { .. } | Cmd::State { .. } => {
-            bail!("`pin`/`state` 需要 daemon：先 `qsync daemon start`（或用 --socket 指向运行中的 daemon）");
+        Cmd::Pin { .. } | Cmd::State { .. } | Cmd::Sync { .. } => {
+            bail!("`pin`/`state`/`sync` 需要 daemon：先 `qsync daemon start`（或用 --socket 指向运行中的 daemon）");
+        }
+        Cmd::Rm { dir, name } => {
+            let (client, _) = connect(&cli, true).await?;
+            client.delete_entry(dir, name).await?;
+            let _ = client
+                .write_log(
+                    &format!("{}/{}", dir.trim_end_matches('/'), name),
+                    qxync_client::write_action::DELETE,
+                )
+                .await;
+            println!("✅ 已删除 {dir}/{name}");
         }
         Cmd::Daemon { .. } => unreachable!("daemon 命令在路由前已处理"),
         Cmd::Mount {
@@ -429,6 +462,7 @@ async fn main() -> Result<()> {
             auto_unmount,
             hydrate_timeout,
             rw,
+            delete_limit,
         } => {
             let (client, link) = connect(&cli, true).await?;
             let cache = cache_dir.clone().unwrap_or_else(|| {
@@ -440,6 +474,9 @@ async fn main() -> Result<()> {
             let mut fs = QxyncFs::new(client.clone(), remote.clone(), cache.clone())
                 .context("初始化 FUSE 文件系统失败")?
                 .with_hydrate_timeout(std::time::Duration::from_secs(*hydrate_timeout));
+            if let Some(limit) = delete_limit {
+                fs = fs.with_delete_limit(*limit);
+            }
             let mut queue = None;
             if *rw {
                 // 写路径：上传队列（worker 线程把本地改动推回 NAS）
@@ -571,6 +608,7 @@ fn to_request(cli: &Cli) -> Option<Request> {
             auto_unmount,
             hydrate_timeout,
             rw,
+            delete_limit,
         } => Request::Mount {
             mountpoint: mountpoint.clone(),
             remote: Some(remote.clone()),
@@ -579,6 +617,7 @@ fn to_request(cli: &Cli) -> Option<Request> {
             auto_unmount: Some(*auto_unmount),
             hydrate_timeout_secs: Some(*hydrate_timeout),
             read_write: Some(*rw),
+            delete_limit: *delete_limit,
         },
         Cmd::Umount { mountpoint } => Request::Umount {
             mountpoint: mountpoint.clone(),
@@ -586,6 +625,21 @@ fn to_request(cli: &Cli) -> Option<Request> {
         Cmd::Pin { path, state } => Request::Pin {
             path: path.clone(),
             state: state.clone(),
+        },
+        Cmd::Sync {
+            once,
+            force_deletes,
+            max_deletes,
+            interval,
+        } => Request::Sync {
+            once: Some(*once),
+            force_deletes: Some(*force_deletes),
+            max_deletes: *max_deletes,
+            interval_secs: *interval,
+        },
+        Cmd::Rm { dir, name } => Request::Rm {
+            dir: dir.clone(),
+            name: name.clone(),
         },
         Cmd::State { .. } | Cmd::Daemon { .. } => return None,
     })
@@ -701,13 +755,25 @@ async fn route_via_daemon(
             ipc_client::call_ok(&socket, req).await?;
             println!("✅ 已建目录 {parent}/{name}（经 daemon）");
         }
-        Cmd::Mount { .. } => {
+        Cmd::Mount { rw, .. } => {
             let m: MountInfo = ipc_client::call(&socket, req).await?;
             println!(
-                "✅ 已挂载 {} -> {}（只读，daemon 持有，pid 见 `qsync daemon status`）",
+                "✅ 已挂载 {} -> {}（{}，daemon 持有，pid 见 `qsync daemon status`）",
                 m.mountpoint.display(),
-                m.remote
+                m.remote,
+                if *rw { "读写" } else { "只读" }
             );
+        }
+        Cmd::Sync { once, .. } => {
+            let info: SyncInfo = ipc_client::call(&socket, req).await?;
+            print_sync(&info);
+            if *once {
+                println!("（以上为累计计数；本轮详情见 daemon 日志）");
+            }
+        }
+        Cmd::Rm { dir, name } => {
+            ipc_client::call_ok(&socket, req).await?;
+            println!("✅ 已删除 {dir}/{name}（经 daemon）");
         }
         Cmd::Umount { mountpoint } => {
             ipc_client::call_ok(&socket, req).await?;
@@ -733,6 +799,44 @@ async fn route_via_daemon(
         Cmd::State { .. } | Cmd::Daemon { .. } => unreachable!(),
     }
     Ok(())
+}
+
+/// 变更发现状态（`qsync sync` / `status` 共用）。
+fn print_sync(s: &SyncInfo) {
+    println!(
+        "变更发现  : {}，每 {}s 一轮，已轮询 {} 次（上次 {}s 前）",
+        if s.enabled { "启用" } else { "暂停" },
+        s.interval_secs,
+        s.polls,
+        s.last_poll_age_secs
+    );
+    println!(
+        "  游标    : notify={} config={} global_notify={} max_log_seen={}（日志空 -17 × {}）",
+        s.cursors.notify,
+        s.cursors.config,
+        s.cursors.global_notify,
+        s.cursors.max_log_seen,
+        s.cursors.log_missing_count
+    );
+    println!(
+        "  baseline: {} 项｜事件 {}｜远端刷新 {}｜入队上传 {}｜冲突 {}｜删除 {}｜删除被挡 {}",
+        s.baseline_entries,
+        s.events,
+        s.refreshed,
+        s.uploaded,
+        s.conflicts,
+        s.deleted,
+        s.deletes_blocked
+    );
+    if !s.devices.is_empty() {
+        println!("  事件设备: {}", s.devices.join("  "));
+    }
+    if let Some(r) = &s.delete_block_reason {
+        println!("  ⚠️  {r}（`qsync sync --force-deletes` 放行）");
+    }
+    if let Some(e) = &s.last_error {
+        println!("  ⚠️  最近错误: {e}");
+    }
 }
 
 fn print_status(st: &StatusData) {
@@ -786,6 +890,20 @@ fn print_status(st: &StatusData) {
             "游标      : max_log={} global_notify={} sync_signal={}",
             c.max_log, c.global_notify, c.sync_signal
         );
+    }
+    if let Some(u) = &st.uploads {
+        println!(
+            "上传队列  : 待上传 {}｜上传中 {}｜完成 {}｜失败 {}｜重试 {}｜{} 字节",
+            u.pending,
+            if u.active { "yes" } else { "no" },
+            u.done,
+            u.failed,
+            u.retries,
+            u.bytes
+        );
+    }
+    if let Some(s) = &st.sync {
+        print_sync(s);
     }
     println!(
         "水合统计  : {} 次 / {} 字节",

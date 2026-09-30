@@ -23,12 +23,12 @@ pub mod upload;
 
 use qxync_client::Client;
 use qxync_core::DirEntry;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use upload::{UploadJob, UploadQueue, UploadSnapshot};
 
 const ENTRY_TTL: Duration = Duration::from_millis(500);
@@ -38,6 +38,10 @@ const HYDRATE_TIMEOUT: Duration = Duration::from_secs(60);
 pub const DEFAULT_CHUNK_SIZE: u64 = 128 * 1024;
 /// 目录列举分页上限（对应服务端 `Max_File_List`）。
 const LIST_LIMIT: usize = 200;
+/// ★ M2c：本地大批删除熔断的默认阈值（60 秒窗口内最多 100 次删除）。
+/// 超过就熔断并把后续删除回 `EACCES`；`qsync sync --force-deletes` 可解除。
+pub const DEFAULT_DELETE_LIMIT: usize = 100;
+pub const DEFAULT_DELETE_WINDOW: Duration = Duration::from_secs(60);
 
 /// 一个远端节点。
 #[derive(Debug, Clone)]
@@ -119,6 +123,397 @@ impl HydroCounters {
     }
 }
 
+// ---------------------------------------------------------------- M2c：本地视图
+
+/// 一个本地节点的快照（同步引擎只读这份数据做三向比较）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalNode {
+    /// NAS 上的绝对路径（Qsync 视图命名空间，如 `/home/x`）。
+    pub remote: String,
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub mtime: i64,
+    /// 有未上传改动（FUSE write/setattr 置位）。
+    pub dirty: bool,
+    /// 稀疏缓存文件（未水合时为 `None`）。
+    pub cache: Option<PathBuf>,
+}
+
+/// ★ M2c 的关键抽象：同步引擎只依赖这个 trait，因此**可以不挂载 FUSE 就测**。
+///
+/// 实现方：
+/// * [`FsHandle`] —— 真实挂载视图（daemon 用）；
+/// * 测试里的 `FakeLocalView` —— 用内存 map 复现同样的语义。
+pub trait LocalView: Send + Sync {
+    /// 挂载根（`/home`）。
+    fn remote_root(&self) -> &str;
+    fn node(&self, remote: &str) -> Option<LocalNode>;
+    fn nodes(&self) -> Vec<LocalNode>;
+    /// 已知目录（节点表里所有目录）——对账时按目录列远端，避免全盘扫描。
+    fn known_dirs(&self) -> Vec<String>;
+    /// 上传队列里是否还有该路径的作业。
+    fn has_pending(&self, remote: &str) -> bool;
+    /// 远端元数据变了：更新 attr；若大小/mtime 变了则**失效已缓存内容**。
+    /// 返回 true 表示确实更新了（节点存在）。
+    fn apply_remote_meta(&self, remote: &str, is_dir: bool, size: u64, mtime: i64) -> bool;
+    /// 丢弃已缓存内容（下次 `read()` 重新按区间水合），元数据不动。
+    fn invalidate_content(&self, remote: &str) -> bool;
+    /// 远端已删除：移除节点 + 缓存（目录连后代一起）。
+    fn remove_remote(&self, remote: &str) -> bool;
+    /// 把本地节点标脏并入队上传（`remote` 必须已有缓存内容）。
+    fn mark_dirty(&self, remote: &str) -> std::io::Result<()>;
+    /// 冲突副本：把本地缓存内容复制到一个稳定的 stash 文件，返回该路径。
+    fn stash_conflict(&self, remote: &str, conflict_name: &str) -> std::io::Result<PathBuf>;
+    /// 直接入队一个上传作业（冲突副本用）。
+    fn enqueue_upload(
+        &self,
+        remote_dir: &str,
+        remote_name: &str,
+        local: PathBuf,
+        mtime: i64,
+    ) -> std::io::Result<()>;
+}
+
+/// 挂载视图句柄：daemon 在把 [`QxyncFs`] 交给 FUSE 挂载线程后，用它继续操作节点表。
+#[derive(Clone)]
+pub struct FsHandle {
+    inner: Arc<Mutex<Inner>>,
+    cache_dir: PathBuf,
+    chunk_size: u64,
+    remote_root: String,
+    upload: Option<Arc<UploadQueue>>,
+    delete_guard: Arc<DeleteGuard>,
+    read_only: bool,
+}
+
+impl FsHandle {
+    pub fn cache_dir(&self) -> &Path {
+        &self.cache_dir
+    }
+    pub fn delete_guard(&self) -> Arc<DeleteGuard> {
+        self.delete_guard.clone()
+    }
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+}
+
+impl LocalView for FsHandle {
+    fn remote_root(&self) -> &str {
+        &self.remote_root
+    }
+
+    fn node(&self, remote: &str) -> Option<LocalNode> {
+        let g = self.inner.lock().unwrap();
+        let ino = *g.by_remote.get(remote)?;
+        g.nodes.get(&ino).map(node_snapshot)
+    }
+
+    fn nodes(&self) -> Vec<LocalNode> {
+        let g = self.inner.lock().unwrap();
+        g.nodes.values().map(node_snapshot).collect()
+    }
+
+    fn known_dirs(&self) -> Vec<String> {
+        let g = self.inner.lock().unwrap();
+        g.nodes
+            .values()
+            .filter(|n| n.attr.kind == FileType::Directory)
+            .map(|n| n.remote.clone())
+            .collect()
+    }
+
+    fn has_pending(&self, remote: &str) -> bool {
+        self.upload
+            .as_ref()
+            .map(|q| q.has_pending(remote))
+            .unwrap_or(false)
+    }
+
+    fn apply_remote_meta(&self, remote: &str, is_dir: bool, size: u64, mtime: i64) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        let Some(ino) = g.by_remote.get(remote).copied() else {
+            return false;
+        };
+        let chunk_size = self.chunk_size;
+        let Some(n) = g.nodes.get_mut(&ino) else {
+            return false;
+        };
+        let was_dir = n.attr.kind == FileType::Directory;
+        let kind_changed = was_dir != is_dir;
+        let content_changed =
+            !n.dirty && (n.attr.size != size || epoch_secs(n.attr.mtime) != mtime);
+        n.attr.size = if is_dir { 0 } else { size };
+        n.attr.blocks = n.attr.size.div_ceil(512);
+        let t = UNIX_EPOCH + Duration::from_secs(mtime.max(0) as u64);
+        n.attr.mtime = t;
+        n.attr.ctime = t;
+        n.attr.kind = if is_dir {
+            FileType::Directory
+        } else {
+            FileType::RegularFile
+        };
+        n.attr.perm = if is_dir { 0o755 } else { 0o644 };
+        n.attr.nlink = if is_dir { 2 } else { 1 };
+        if kind_changed {
+            n.attr.size = if is_dir { 0 } else { size };
+        }
+        if content_changed || kind_changed {
+            // 缓存内容已过期：删掉稀疏缓存、清空区间表 → 下次 read 重新水合
+            if let Some(p) = n.cache.take() {
+                let _ = std::fs::remove_file(p);
+            }
+            n.chunks_done = vec![false; n.chunk_count(chunk_size)];
+        }
+        true
+    }
+
+    fn invalidate_content(&self, remote: &str) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        let Some(ino) = g.by_remote.get(remote).copied() else {
+            return false;
+        };
+        let chunk_size = self.chunk_size;
+        let Some(n) = g.nodes.get_mut(&ino) else {
+            return false;
+        };
+        if let Some(p) = n.cache.take() {
+            let _ = std::fs::remove_file(p);
+        }
+        n.chunks_done = vec![false; n.chunk_count(chunk_size)];
+        n.dirty = false;
+        true
+    }
+
+    fn remove_remote(&self, remote: &str) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        let prefix = format!("{}/", remote.trim_end_matches('/'));
+        let victims: Vec<INodeNo> = g
+            .by_remote
+            .iter()
+            .filter(|(p, _)| p.as_str() == remote || p.starts_with(&prefix))
+            .map(|(_, ino)| *ino)
+            .collect();
+        if victims.is_empty() {
+            return false;
+        }
+        for ino in victims {
+            if let Some(n) = g.nodes.remove(&ino) {
+                g.by_remote.remove(&n.remote);
+                if let Some(p) = n.cache {
+                    let _ = std::fs::remove_file(p);
+                }
+            }
+        }
+        true
+    }
+
+    fn mark_dirty(&self, remote: &str) -> std::io::Result<()> {
+        let q = self
+            .upload
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("只读挂载，没有上传队列"))?;
+        let (name, mtime, cache) = {
+            let mut g = self.inner.lock().unwrap();
+            let Some(ino) = g.by_remote.get(remote).copied() else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("{remote} 不在节点表里"),
+                ));
+            };
+            let n = g.nodes.get_mut(&ino).unwrap();
+            n.dirty = true;
+            let cache = n
+                .cache
+                .clone()
+                .ok_or_else(|| std::io::Error::other(format!("{remote} 没有本地缓存，无法上传")))?;
+            (n.name.clone(), epoch_secs(n.attr.mtime), cache)
+        };
+        let dir = remote
+            .rsplit_once('/')
+            .map(|(d, _)| d.to_string())
+            .unwrap_or_else(|| self.remote_root.clone());
+        q.enqueue(UploadJob {
+            remote_dir: dir,
+            remote_name: name,
+            local: cache,
+            mtime,
+            attempts: 0,
+            ephemeral: false,
+        })
+    }
+
+    fn stash_conflict(&self, remote: &str, conflict_name: &str) -> std::io::Result<PathBuf> {
+        let conflict_remote = format!(
+            "{}/{}",
+            remote.rsplit_once('/').map(|(d, _)| d).unwrap_or(""),
+            conflict_name
+        );
+        let src = {
+            let g = self.inner.lock().unwrap();
+            let ino = g.by_remote.get(remote).copied().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("{remote} 不在节点表里"),
+                )
+            })?;
+            g.nodes
+                .get(&ino)
+                .and_then(|n| n.cache.clone())
+                .ok_or_else(|| {
+                    std::io::Error::other(format!("{remote} 没有本地缓存，无法做冲突副本"))
+                })?
+        };
+        let stash_dir = self.cache_dir.join("conflicts");
+        std::fs::create_dir_all(&stash_dir)?;
+        let dest = stash_dir.join(format!(
+            "{:016x}_{}",
+            fnv1a64(conflict_remote.as_bytes()),
+            sanitize_filename(conflict_name)
+        ));
+        std::fs::copy(&src, &dest)?;
+        Ok(dest)
+    }
+
+    fn enqueue_upload(
+        &self,
+        remote_dir: &str,
+        remote_name: &str,
+        local: PathBuf,
+        mtime: i64,
+    ) -> std::io::Result<()> {
+        let q = self
+            .upload
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("只读挂载，没有上传队列"))?;
+        q.enqueue(UploadJob {
+            remote_dir: remote_dir.to_string(),
+            remote_name: remote_name.to_string(),
+            local,
+            mtime,
+            attempts: 0,
+            ephemeral: true,
+        })
+    }
+}
+
+fn node_snapshot(n: &Node) -> LocalNode {
+    LocalNode {
+        remote: n.remote.clone(),
+        name: n.name.clone(),
+        is_dir: n.attr.kind == FileType::Directory,
+        size: n.attr.size,
+        mtime: n
+            .attr
+            .mtime
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
+        dirty: n.dirty,
+        cache: n.cache.clone(),
+    }
+}
+
+/// 本地大批删除熔断（M2c）：60 秒窗口内删除数超过阈值就熔断，
+/// 之后所有删除回 `EACCES`，直到 `qsync sync --force-deletes`（或重新挂载）。
+#[derive(Debug)]
+pub struct DeleteGuard {
+    limit: usize,
+    window: Duration,
+    inner: Mutex<DeleteGuardState>,
+}
+
+#[derive(Debug)]
+struct DeleteGuardState {
+    hits: VecDeque<Instant>,
+    blocked: bool,
+    reason: Option<String>,
+}
+
+impl DeleteGuard {
+    pub fn new(limit: usize, window: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            limit,
+            window,
+            inner: Mutex::new(DeleteGuardState {
+                hits: VecDeque::new(),
+                blocked: false,
+                reason: None,
+            }),
+        })
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// 记录/允许一次删除：`false` = 熔断中，调用方必须回 `EACCES`。
+    pub fn allow(&self) -> bool {
+        if self.limit == 0 {
+            return true;
+        }
+        let mut g = self.inner.lock().unwrap();
+        if g.blocked {
+            return false;
+        }
+        let now = Instant::now();
+        while let Some(t) = g.hits.front() {
+            if now.duration_since(*t) > self.window {
+                g.hits.pop_front();
+            } else {
+                break;
+            }
+        }
+        if g.hits.len() >= self.limit {
+            let reason = format!(
+                "{} 秒内删除超过 {} 项，已熔断（`qsync sync --force-deletes` 可解除）",
+                self.window.as_secs(),
+                self.limit
+            );
+            g.blocked = true;
+            g.reason = Some(reason.clone());
+            tracing::error!("{reason}");
+            return false;
+        }
+        g.hits.push_back(now);
+        true
+    }
+
+    pub fn blocked(&self) -> bool {
+        self.inner.lock().unwrap().blocked
+    }
+
+    pub fn reason(&self) -> Option<String> {
+        self.inner.lock().unwrap().reason.clone()
+    }
+
+    pub fn hits(&self) -> usize {
+        self.inner.lock().unwrap().hits.len()
+    }
+
+    /// 解除熔断（`--force-deletes`）。
+    pub fn reset(&self) {
+        let mut g = self.inner.lock().unwrap();
+        g.hits.clear();
+        g.blocked = false;
+        g.reason = None;
+    }
+}
+
+/// 文件名安全化（冲突副本的 stash 文件名用）。
+fn sanitize_filename(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 pub struct QxyncFs {
     rt: tokio::runtime::Runtime,
     client: Arc<Client>,
@@ -137,7 +532,11 @@ pub struct QxyncFs {
     hydro: Arc<HydroCounters>,
     /// pin 状态（与 daemon 共享）；为空 map 时一律回 `unspecified`。
     pins: PinMap,
-    inner: Mutex<Inner>,
+    /// ★ M2c：节点表用 `Arc<Mutex<..>>` 共享 —— daemon 的同步引擎通过 [`FsHandle`]
+    /// 在挂载线程之外刷新远端变更（改元数据 / 失效缓存 / 删节点）。
+    inner: Arc<Mutex<Inner>>,
+    /// ★ M2c：本地大批删除熔断（`rm -rf` 保护）。
+    delete_guard: Arc<DeleteGuard>,
 }
 
 impl QxyncFs {
@@ -200,12 +599,13 @@ impl QxyncFs {
             hydrate_timeout: HYDRATE_TIMEOUT,
             hydro: Arc::new(HydroCounters::default()),
             pins: Arc::new(Mutex::new(HashMap::new())),
-            inner: Mutex::new(Inner {
+            inner: Arc::new(Mutex::new(Inner {
                 nodes,
                 by_remote,
                 next_ino: 2,
                 inflight_chunks: HashMap::new(),
-            }),
+            })),
+            delete_guard: DeleteGuard::new(DEFAULT_DELETE_LIMIT, DEFAULT_DELETE_WINDOW),
         })
     }
 
@@ -256,6 +656,27 @@ impl QxyncFs {
     /// 共享 pin 状态（daemon 场景：IPC 的 `pin` 与 xattr 要看到同一份）。
     pub fn with_pins(mut self, pins: PinMap) -> Self {
         self.pins = pins;
+        self
+    }
+
+    /// ★ M2c：共享节点表句柄 —— 必须在把实例交给 `mount2` **之前**取。
+    pub fn handle(&self) -> FsHandle {
+        FsHandle {
+            inner: self.inner.clone(),
+            cache_dir: self.cache_dir.clone(),
+            chunk_size: self.chunk_size,
+            remote_root: self.remote_root.clone(),
+            upload: self.upload.clone(),
+            delete_guard: self.delete_guard.clone(),
+            read_only: self.read_only,
+        }
+    }
+
+    /// 本地批量删除阈值（0 = 关闭熔断；默认 100 次/60 秒）。
+    pub fn with_delete_limit(mut self, limit: usize) -> Self {
+        if limit != DEFAULT_DELETE_LIMIT {
+            self.delete_guard = DeleteGuard::new(limit, DEFAULT_DELETE_WINDOW);
+        }
         self
     }
 
@@ -467,6 +888,15 @@ impl QxyncFs {
         let Some(name) = name.to_str() else {
             return reply.error(fuser::Errno::EINVAL);
         };
+        // ★ M2c：本地大批删除熔断。`rm -rf` 超过阈值后拒绝继续删，
+        //   避免「本地误删 → 立即同步清空远端」这种最危险的组合。
+        if !self.delete_guard.allow() {
+            tracing::warn!(
+                "本地删除被熔断（{}）: {name}",
+                self.delete_guard.reason().unwrap_or_default()
+            );
+            return reply.error(fuser::Errno::EACCES);
+        }
         let (parent_remote, _ino, dirty) = {
             let g = self.inner.lock().unwrap();
             let Some(p) = g.nodes.get(&parent) else {
@@ -536,6 +966,7 @@ impl QxyncFs {
             local: cache,
             mtime,
             attempts: 0,
+            ephemeral: false,
         };
         queue.enqueue(job).map_err(|e| {
             tracing::error!("入队上传失败: {e}");
@@ -698,6 +1129,13 @@ impl QxyncFs {
 /// 拼远端路径。
 fn join_path(dir: &str, name: &str) -> String {
     format!("{}/{}", dir.trim_end_matches('/'), name)
+}
+
+/// `SystemTime` → epoch 秒（负数/异常一律 0）。
+fn epoch_secs(t: SystemTime) -> i64 {
+    t.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// FNV-1a 64 位：实现简单、跨版本稳定（不像 `DefaultHasher` 那样无保证）。
@@ -1507,5 +1945,153 @@ mod tests {
             .collect();
         assert_eq!(safe, "_______.txt");
         assert!(!safe.contains('/'));
+    }
+
+    // ------------------------------------------------------------ M2c 单测
+
+    fn test_link() -> qxync_core::LinkConfig {
+        qxync_core::LinkConfig {
+            id: "test".into(),
+            host: "nas.invalid".into(),
+            port: 9834,
+            https: true,
+            insecure: true,
+            user: "test1".into(),
+            home_root: "/home".into(),
+            ipv4_only: false,
+        }
+    }
+
+    fn test_fs(dir: &Path, rw: bool) -> QxyncFs {
+        let client = Arc::new(Client::new(&test_link()).unwrap());
+        let fs = QxyncFs::new(client, "/home", dir).unwrap();
+        if rw {
+            fs.with_write_mode()
+        } else {
+            fs
+        }
+    }
+
+    #[test]
+    fn delete_guard_trips_and_resets() {
+        let g = DeleteGuard::new(3, Duration::from_secs(60));
+        assert!(g.allow());
+        assert!(g.allow());
+        assert!(g.allow());
+        assert!(!g.allow(), "第 4 次必须熔断");
+        assert!(g.blocked());
+        assert!(g.reason().unwrap().contains("熔断"));
+        g.reset();
+        assert!(!g.blocked());
+        assert!(g.allow());
+        // limit=0 → 完全关闭
+        let off = DeleteGuard::new(0, Duration::from_secs(60));
+        for _ in 0..1000 {
+            assert!(off.allow());
+        }
+        assert!(!off.blocked());
+    }
+
+    #[test]
+    fn fs_handle_refreshes_remote_meta_and_invalidates_cache() {
+        let dir = std::env::temp_dir().join(format!("qxync-fuse-m2c-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let fs = test_fs(&dir, false);
+        let entry = DirEntry::local("a.txt", false, 100, 111);
+        let node = fs.insert_node(INodeNo::ROOT, "a.txt", "/home/a.txt", &entry);
+        let cache = fs.cache_file_for(node.ino).unwrap();
+        assert!(cache.exists());
+        let h = fs.handle();
+        assert_eq!(h.remote_root(), "/home");
+        let n = h.node("/home/a.txt").unwrap();
+        assert_eq!(
+            (n.size, n.mtime, n.dirty, n.is_dir),
+            (100, 111, false, false)
+        );
+        assert!(h.known_dirs().iter().any(|d| d == "/home"));
+
+        // 远端改了大小 → 元数据更新 + 缓存失效（下次 read 重新水合）
+        assert!(h.apply_remote_meta("/home/a.txt", false, 200, 222));
+        let n = h.node("/home/a.txt").unwrap();
+        assert_eq!((n.size, n.mtime), (200, 222));
+        assert!(n.cache.is_none(), "内容过期必须丢弃缓存引用");
+        assert!(!cache.exists(), "内容过期必须删掉稀疏缓存文件");
+
+        // 未知路径 → 不动，返回 false（readdir/lookup 会自然发现）
+        assert!(!h.apply_remote_meta("/home/nope.txt", false, 1, 1));
+        assert_eq!(h.nodes().len(), 2); // root + a.txt
+
+        // 远端删除 → 节点消失
+        assert!(h.remove_remote("/home/a.txt"));
+        assert!(h.node("/home/a.txt").is_none());
+        assert!(!h.remove_remote("/home/a.txt"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fs_handle_dir_delete_removes_descendants() {
+        let dir = std::env::temp_dir().join(format!("qxync-fuse-m2c-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let fs = test_fs(&dir, false);
+        let d = DirEntry::local("d", true, 0, 1);
+        let dnode = fs.insert_node(INodeNo::ROOT, "d", "/home/d", &d);
+        let f = DirEntry::local("f.txt", false, 5, 2);
+        fs.insert_node(dnode.ino, "f.txt", "/home/d/f.txt", &f);
+        let h = fs.handle();
+        assert_eq!(h.nodes().len(), 3);
+        assert!(h.remove_remote("/home/d"));
+        assert!(h.nodes().iter().all(|n| !n.remote.starts_with("/home/d")));
+        assert_eq!(h.nodes().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fs_handle_mark_dirty_requires_upload_queue_and_cache() {
+        let dir = std::env::temp_dir().join(format!("qxync-fuse-m2c-dirty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // 只读：没有上传队列 → 报错
+        let ro = test_fs(&dir.join("ro"), false);
+        let e = DirEntry::local("a.txt", false, 4, 1);
+        ro.insert_node(INodeNo::ROOT, "a.txt", "/home/a.txt", &e);
+        ro.cache_file_for(INodeNo(2)).unwrap();
+        assert!(ro.handle().mark_dirty("/home/a.txt").is_err());
+
+        // 读写：入队后 has_pending 为真（内容源是稀疏缓存文件）
+        let rw_dir = dir.join("rw");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = Arc::new(Client::new(&test_link()).unwrap());
+        let q =
+            UploadQueue::new(client.clone(), rt.handle().clone(), rw_dir.join("queue")).unwrap();
+        let fs = QxyncFs::new(client, "/home", rw_dir.join("cache"))
+            .unwrap()
+            .with_write_mode()
+            .with_upload_queue(q.clone());
+        let e = DirEntry::local("a.txt", false, 4, 1);
+        let node = fs.insert_node(INodeNo::ROOT, "a.txt", "/home/a.txt", &e);
+        fs.cache_file_for(node.ino).unwrap();
+        let h = fs.handle();
+        assert!(!h.has_pending("/home/a.txt"));
+        h.mark_dirty("/home/a.txt").unwrap();
+        assert!(h.has_pending("/home/a.txt"));
+        assert!(h.node("/home/a.txt").unwrap().dirty);
+        // 冲突副本：把本地缓存复制到 stash
+        let stash = h
+            .stash_conflict("/home/a.txt", "a (conflicted copy from pc 2026-09-30).txt")
+            .unwrap();
+        assert!(stash.exists());
+        assert!(stash.to_string_lossy().contains("conflicts"));
+        // 直接入队一个冲突副本上传作业
+        h.enqueue_upload(
+            "/home",
+            "a (conflicted copy from pc 2026-09-30).txt",
+            stash,
+            9,
+        )
+        .unwrap();
+        assert!(h.has_pending("/home/a (conflicted copy from pc 2026-09-30).txt"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

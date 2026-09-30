@@ -14,8 +14,9 @@
 
 use futures_util::StreamExt;
 use qxync_core::{
-    build_query, encode_query_value, model::parse_listing, parse_max_log, parse_nas_uid, DirEntry,
-    Error, LinkConfig, Listing, MaxLog, NasUid, Result, ServerStatus,
+    build_query, encode_query_value, model::parse_listing, parse_max_log, parse_nas_uid,
+    parse_sync_log, DirEntry, Error, LinkConfig, Listing, MaxLog, NasUid, Result, ServerStatus,
+    SyncLogBatch,
 };
 use std::time::Duration;
 
@@ -203,6 +204,71 @@ impl Client {
             Err(Error::Status { .. }) | Err(Error::Auth(_)) => Ok(false),
             Err(e) => Err(e),
         }
+    }
+
+    // ---------------------------------------------------------- M2c 变更发现
+
+    /// `func=qbox_get_sync_log&lower=&number=`：拉一批文件变更事件。
+    ///
+    /// 真机要点：
+    /// * `lower` 是**闭区间下界**（`lower=30` 会包含 `log_id=30`）；
+    /// * 没有任何事件时回 `status:-17`（[`qxync_core::sync::is_log_missing`] 可判定），
+    ///   这不是错误，调用方**不要推进游标**、转而对账 baseline 即可。
+    pub async fn sync_log(
+        &self,
+        lower: i64,
+        number: usize,
+        sub_folder: Option<&str>,
+    ) -> Result<SyncLogBatch> {
+        let lower_s = lower.to_string();
+        let number_s = number.to_string();
+        let mut extra: Vec<(&str, &str)> = vec![
+            ("lower", lower_s.as_str()),
+            ("number", number_s.as_str()),
+            ("get_detail", "1"),
+        ];
+        if let Some(f) = sub_folder {
+            extra.push(("sub_folder", f));
+        }
+        let body = self.qsync_func("qbox_get_sync_log", &extra).await?;
+        parse_sync_log(&body)
+    }
+
+    /// `func=qbox_query_notify&lower=&upper=`：config log / global notify log 的区间查询。
+    ///
+    /// M2c 只用来**推进游标 + 统计**（共享邀请、团队文件夹等事件不在 M2c 范围内）。
+    pub async fn query_notify(&self, lower: u64, upper: u64) -> Result<NotifyBatch> {
+        let lower_s = lower.to_string();
+        let upper_s = upper.to_string();
+        let body = self
+            .qsync_func(
+                "qbox_query_notify",
+                &[("lower", lower_s.as_str()), ("upper", upper_s.as_str())],
+            )
+            .await?;
+        parse_notify(&body, "qbox_query_notify")
+    }
+
+    /// `func=qbox_get_device_config_list&user=&lower=&upper=`：设备/同步文件夹配置日志区间。
+    pub async fn device_config_list(
+        &self,
+        user: &str,
+        lower: u64,
+        upper: u64,
+    ) -> Result<NotifyBatch> {
+        let lower_s = lower.to_string();
+        let upper_s = upper.to_string();
+        let body = self
+            .qsync_func(
+                "qbox_get_device_config_list",
+                &[
+                    ("user", user),
+                    ("lower", lower_s.as_str()),
+                    ("upper", upper_s.as_str()),
+                ],
+            )
+            .await?;
+        parse_notify(&body, "qbox_get_device_config_list")
     }
 
     /// 调一个不带额外参数的 `qsyncsrv.cgi?func=…`。
@@ -637,6 +703,60 @@ pub fn parse_upload_result(body: &[u8], filename: &str) -> Result<()> {
     Ok(())
 }
 
+/// `qbox_query_notify` / `qbox_get_device_config_list` 的通用返回（M2c）。
+///
+/// 这两个端点的事件结构在报告里标为「△ 未确认」，M2c 只做「取到 + 计数 + 推进游标」，
+/// 因此这里保留原始 JSON，不强行反序列化成可能错的字段。
+#[derive(Debug, Clone, Default)]
+pub struct NotifyBatch {
+    pub items: Vec<serde_json::Value>,
+}
+
+impl NotifyBatch {
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+    /// 事件里出现过的 `device_uid`（去重），用于诊断「这些事件是哪台设备产生的」。
+    pub fn device_uids(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for it in &self.items {
+            for k in ["device_uid", "duid"] {
+                if let Some(s) = it.get(k).and_then(|v| v.as_str()) {
+                    if !s.is_empty() && !out.iter().any(|x| x == s) {
+                        out.push(s.to_string());
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+/// 解析 `qbox_query_notify` / `qbox_get_device_config_list` 的 JSON。
+/// `status:-17` 与 sync log 一样表示「区间内没有事件」。
+pub fn parse_notify(body: &[u8], context: &str) -> Result<NotifyBatch> {
+    let v: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| Error::Parse(format!("{context} 解析失败: {e}")))?;
+    if let Some(s) = v.get("status").and_then(|x| {
+        x.as_i64()
+            .or_else(|| x.as_str().and_then(|s| s.parse().ok()))
+    }) {
+        if s != 0 && s != 1 {
+            return Err(Error::status(s, context));
+        }
+    }
+    let items = v
+        .get("data")
+        .or_else(|| v.get("datas"))
+        .and_then(|d| d.as_array())
+        .cloned()
+        .unwrap_or_default();
+    Ok(NotifyBatch { items })
+}
+
 /// 极简 XML 取值（`authLogin.cgi` 的响应是 XML，只有登录需要它）。
 fn xml_text<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
     let open = format!("<{tag}>");
@@ -706,5 +826,16 @@ mod tests {
             join_nas_path("/home/qxync-test/", "a.txt"),
             "/home/qxync-test/a.txt"
         );
+    }
+
+    #[test]
+    fn notify_batch_parses_and_surfaces_minus_17() {
+        let ok = br#"{"status":0,"data":[{"device_uid":"abc","event":"config"},{"duid":"abc"}]}"#;
+        let b = parse_notify(ok, "qbox_query_notify").unwrap();
+        assert_eq!(b.len(), 2);
+        assert_eq!(b.device_uids(), vec!["abc".to_string()]);
+        let empty = br#"{"version":"","build":"","status":-17,"success":"true"}"#;
+        let e = parse_notify(empty, "qbox_query_notify").unwrap_err();
+        assert!(qxync_core::sync::is_log_missing(&e), "{e}");
     }
 }

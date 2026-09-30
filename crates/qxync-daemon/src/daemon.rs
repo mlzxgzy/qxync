@@ -7,10 +7,12 @@ use qxync_client::{Client, Session};
 use qxync_core::ipc::{
     decode_line, encode_line, mask_sid, CursorInfo, DaemonInfo, ErrorKind, GetData, HydroStats,
     IpcError, LinkInfo, LoginData, LsData, MountInfo, PingData, PutData, Request, RequestEnvelope,
-    Response, ServerInfo, SessionInfo, ShutdownData, StatusData, IPC_VERSION,
+    Response, ServerInfo, SessionInfo, ShutdownData, StatusData, SyncCursors, SyncInfo,
+    IPC_VERSION,
 };
 use qxync_core::{ConfigPaths, Credentials, Error as CoreError, LinkConfig, HOME_ROOT};
-use qxync_fuse::{HydroCounters, PinMap, QxyncFs};
+use qxync_fuse::upload::UploadQueue;
+use qxync_fuse::{FsHandle, HydroCounters, LocalView, PinMap, QxyncFs};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -18,6 +20,8 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, Mutex};
+
+use crate::sync::{self, MountView, SyncConfig, SyncState, SyncStats};
 
 pub struct Options {
     pub link_id: String,
@@ -31,7 +35,9 @@ struct MountEntry {
     done: std::sync::mpsc::Receiver<std::io::Result<()>>,
     counters: Arc<HydroCounters>,
     /// 读写挂载时的上传队列（卸载前要排空）。
-    upload: Option<Arc<qxync_fuse::upload::UploadQueue>>,
+    upload: Option<Arc<UploadQueue>>,
+    /// ★ M2c：共享节点表句柄（同步引擎在挂载线程外刷新远端变更）。
+    handle: FsHandle,
 }
 
 struct State {
@@ -44,6 +50,16 @@ struct State {
     /// 远端路径 → pin 状态（与 FUSE 实例共享，`getfattr -n user.qsync.pin` 能看到）。
     pins: PinMap,
     mounts: StdMutex<HashMap<PathBuf, MountEntry>>,
+    /// ★ M2c：引擎专用的 HTTP 客户端（不抢 `client` 的锁，长轮询不阻塞 IPC 命令）。
+    engine_client: Mutex<Option<Arc<Client>>>,
+    /// 游标 + baseline（原子落盘）。
+    sync_store: StdMutex<SyncState>,
+    /// 引擎计数器。
+    sync_stats: Arc<SyncStats>,
+    /// 引擎参数（`--force-deletes` / `--max-deletes` 临时改）。
+    sync_cfg: StdMutex<SyncConfig>,
+    /// 后台轮询间隔秒数（0 = 暂停）。
+    sync_interval: StdMutex<u64>,
 }
 
 // ---------------------------------------------------------------- 入口
@@ -76,6 +92,22 @@ pub async fn run(opts: Options) -> Result<()> {
     .ok();
 
     let client = Client::new(&link)?;
+    // ★ M2c：游标 + baseline 落在 <data>/sync/<host>/（不同 NAS 互不污染）
+    let sync_dir = qxync_core::sync::sync_state_dir(&paths.data_dir, &link.host);
+    let sync_store = SyncState::load(&sync_dir)
+        .with_context(|| format!("读取同步状态失败: {}", sync_dir.display()))?;
+    tracing::info!(
+        "同步状态: {}（游标 notify={} config={} global={}，baseline {} 项）",
+        sync_dir.display(),
+        sync_store.cursors.notify,
+        sync_store.cursors.config,
+        sync_store.cursors.global_notify,
+        sync_store.baseline.len()
+    );
+    let sync_interval: u64 = std::env::var("QSYNC_POLL_INTERVAL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(qxync_core::sync::DEFAULT_POLL_INTERVAL_SECS);
     let state = Arc::new(State {
         version: env!("CARGO_PKG_VERSION"),
         started: Instant::now(),
@@ -85,6 +117,11 @@ pub async fn run(opts: Options) -> Result<()> {
         session: Mutex::new(None),
         pins: Arc::new(StdMutex::new(HashMap::new())),
         mounts: StdMutex::new(HashMap::new()),
+        engine_client: Mutex::new(None),
+        sync_store: StdMutex::new(sync_store),
+        sync_stats: Arc::new(SyncStats::default()),
+        sync_cfg: StdMutex::new(SyncConfig::default()),
+        sync_interval: StdMutex::new(sync_interval),
     });
 
     tracing::info!(
@@ -99,6 +136,9 @@ pub async fn run(opts: Options) -> Result<()> {
             Err(e) => tracing::warn!("自动登录失败（可稍后 `qsync login`）: {}", e.message),
         }
     }
+
+    // ★ M2c：后台轮询（三游标 + baseline 对账）；QSYNC_POLL_INTERVAL=0 可暂停
+    spawn_poller(state.clone());
 
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
     loop {
@@ -214,6 +254,7 @@ async fn dispatch(state: &Arc<State>, req: Request, shutdown: &mpsc::Sender<()>)
             auto_unmount,
             hydrate_timeout_secs,
             read_write,
+            delete_limit,
         } => {
             mount(
                 state,
@@ -224,11 +265,28 @@ async fn dispatch(state: &Arc<State>, req: Request, shutdown: &mpsc::Sender<()>)
                 auto_unmount.unwrap_or(false),
                 Duration::from_secs(hydrate_timeout_secs.unwrap_or(60)),
                 read_write.unwrap_or(false),
+                delete_limit,
             )
             .await
         }
         Request::Umount { mountpoint } => umount(state, mountpoint).await,
         Request::Mounts => mounts(state),
+        Request::Sync {
+            once,
+            force_deletes,
+            max_deletes,
+            interval_secs,
+        } => {
+            sync_cmd(
+                state,
+                once.unwrap_or(false),
+                force_deletes.unwrap_or(false),
+                max_deletes,
+                interval_secs,
+            )
+            .await
+        }
+        Request::Rm { dir, name } => rm(state, dir, name).await,
         Request::Shutdown => {
             // 先回响应，再触发退出，避免对端拿不到回包
             let tx = shutdown.clone();
@@ -428,6 +486,7 @@ async fn status(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
         cursors,
         hydro,
         uploads,
+        sync: Some(sync_info(state)),
         mounts,
     })
 }
@@ -555,6 +614,7 @@ async fn mount(
     auto_unmount: bool,
     hydrate_timeout: Duration,
     read_write: bool,
+    delete_limit: Option<usize>,
 ) -> Result<serde_json::Value, IpcError> {
     ensure_session(state).await?;
     let sid = require_sid(state).await?;
@@ -603,12 +663,15 @@ async fn mount(
         .with_hydrate_timeout(hydrate_timeout)
         .with_counters(counters.clone())
         .with_pins(state.pins.clone());
+    if let Some(limit) = delete_limit {
+        fs = fs.with_delete_limit(limit);
+    }
     let mut upload_queue = None;
     if read_write {
         let marker_dir = ConfigPaths::discover()
             .map(|p| p.data_dir.join("upload-queue"))
             .unwrap_or_else(|_| cache.join("upload-queue"));
-        let q = qxync_fuse::upload::UploadQueue::new(
+        let q = UploadQueue::new(
             fuse_client.clone(),
             tokio::runtime::Handle::current(),
             marker_dir,
@@ -619,6 +682,8 @@ async fn mount(
         fs = fs.with_write_mode().with_upload_queue(q.clone());
         upload_queue = Some(q);
     }
+    // ★ M2c：必须在 fs 被移进挂载线程之前取句柄，同步引擎靠它刷新远端变更
+    let handle = fs.handle();
 
     let (tx, done) = std::sync::mpsc::channel();
     let mp_thread = mp.clone();
@@ -667,6 +732,7 @@ async fn mount(
             done,
             counters,
             upload: upload_queue,
+            handle,
         },
     );
     tracing::info!(
@@ -744,6 +810,7 @@ fn snapshot_mounts(
         bytes += b;
         if let Some(u) = m.upload.as_ref().map(|q| q.snapshot()) {
             let e = uploads.get_or_insert_with(Default::default);
+            e.active = e.active || u.active;
             e.pending += u.pending;
             e.done += u.done;
             e.failed += u.failed;
@@ -780,4 +847,218 @@ fn is_mounted(path: &Path) -> bool {
             None => false,
         }
     })
+}
+
+// ---------------------------------------------------------------- M2c 同步引擎
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 当前同步状态（`status` / `sync` 共用；计数器是**累计值**）。
+fn sync_info(state: &Arc<State>) -> SyncInfo {
+    let snap = state.sync_stats.snapshot();
+    let (cursors, baseline_entries, note) = {
+        let g = state.sync_store.lock().unwrap();
+        (g.cursors, g.baseline.len(), None::<String>)
+    };
+    let interval = *state.sync_interval.lock().unwrap();
+    SyncInfo {
+        enabled: interval > 0,
+        interval_secs: interval,
+        polls: snap.polls,
+        last_poll_age_secs: if snap.last_poll_unix == 0 {
+            0
+        } else {
+            now_secs().saturating_sub(snap.last_poll_unix)
+        },
+        cursors: SyncCursors {
+            config: cursors.config,
+            notify: cursors.notify,
+            global_notify: cursors.global_notify,
+            max_log_seen: cursors.max_log_seen,
+            log_missing_count: cursors.log_missing_count,
+        },
+        baseline_entries: baseline_entries as u64,
+        refreshed: snap.refreshed,
+        conflicts: snap.conflicts,
+        uploaded: snap.uploaded,
+        deleted: snap.deleted,
+        deletes_blocked: snap.deletes_blocked,
+        events: snap.events,
+        devices: snap.devices,
+        last_error: snap.last_error,
+        delete_block_reason: snap.delete_block_reason,
+        note: snap.last_note.or(note),
+    }
+}
+
+/// 引擎专用客户端（带当前 sid，不占 `state.client` 的锁）。
+async fn engine_client(state: &Arc<State>) -> Result<Arc<Client>, IpcError> {
+    ensure_session(state).await?;
+    let sid = require_sid(state).await?;
+    let mut g = state.engine_client.lock().await;
+    let stale = g
+        .as_ref()
+        .map(|c| c.sid() != Some(sid.as_str()))
+        .unwrap_or(true);
+    if stale {
+        let mut c = Client::new(&state.link).map_err(map_err)?;
+        c.set_sid(sid);
+        *g = Some(Arc::new(c));
+    }
+    Ok(g.clone().expect("刚填过"))
+}
+
+/// 当前挂载视图（同步引擎的操作对象）。
+fn build_views(state: &Arc<State>) -> Vec<MountView> {
+    let g = state.mounts.lock().unwrap();
+    g.values()
+        .map(|m| MountView {
+            mountpoint: m.info.mountpoint.clone(),
+            remote_root: m.info.remote.clone(),
+            view: Arc::new(m.handle.clone()) as Arc<dyn LocalView>,
+            upload: m.upload.clone(),
+            read_only: m.info.readonly,
+        })
+        .collect()
+}
+
+/// 跑一轮同步（拉事件 + baseline 对账）。
+async fn run_sync_once(state: &Arc<State>) -> Result<sync::SyncReport, IpcError> {
+    let client = engine_client(state).await?;
+    let views = build_views(state);
+    let cfg = state.sync_cfg.lock().unwrap().clone();
+    let user = state.link.user.clone();
+    let report = sync::poll_once(
+        &client,
+        &views,
+        &state.sync_store,
+        &cfg,
+        &state.sync_stats,
+        &user,
+    )
+    .await;
+    // `--force-deletes` 只放行一轮
+    {
+        let mut c = state.sync_cfg.lock().unwrap();
+        if c.force_deletes {
+            c.force_deletes = false;
+        }
+    }
+    Ok(report)
+}
+
+/// `qsync sync`：查看/触发/调参同步引擎。
+async fn sync_cmd(
+    state: &Arc<State>,
+    once: bool,
+    force_deletes: bool,
+    max_deletes: Option<usize>,
+    interval_secs: Option<u64>,
+) -> Result<serde_json::Value, IpcError> {
+    if let Some(secs) = interval_secs {
+        *state.sync_interval.lock().unwrap() = secs.min(86_400);
+    }
+    if let Some(m) = max_deletes {
+        state.sync_cfg.lock().unwrap().delete_protection.max_entries = m;
+        tracing::info!("删除保护阈值 = {m}");
+    }
+    if force_deletes {
+        // 只把 force_deletes 置位（决策处直接跳过检查），不动阈值 —— 否则 `--force-deletes`
+        // 会把后续所有轮次的绝对阈值永久放开。
+        state.sync_cfg.lock().unwrap().force_deletes = true;
+        // 同时解除 FUSE 侧的本地批量删除熔断
+        let guards: Vec<_> = state
+            .mounts
+            .lock()
+            .unwrap()
+            .values()
+            .map(|m| m.handle.delete_guard())
+            .collect();
+        for g in guards {
+            g.reset();
+        }
+        state.sync_stats.delete_block_reason.lock().unwrap().take();
+        tracing::warn!("删除保护已解除（--force-deletes，仅放行一轮）");
+    }
+    if once {
+        let report = run_sync_once(state).await?;
+        tracing::info!(
+            "sync --once: events={} refreshed={} uploaded={} conflicts={} deleted={} blocked={}",
+            report.events,
+            report.refreshed,
+            report.uploaded,
+            report.conflicts,
+            report.deleted,
+            report.deletes_blocked
+        );
+    }
+    to_value(sync_info(state))
+}
+
+/// 后台轮询：按 `sync_interval` 周期跑 `run_sync_once`；未登录时静默跳过。
+fn spawn_poller(state: Arc<State>) {
+    let interval = *state.sync_interval.lock().unwrap();
+    if interval == 0 {
+        tracing::info!("变更轮询已禁用（QSYNC_POLL_INTERVAL=0）");
+        return;
+    }
+    tracing::info!("变更轮询已启动：每 {interval}s 一轮（QSYNC_POLL_INTERVAL 可调）");
+    tokio::spawn(async move {
+        loop {
+            let secs = *state.sync_interval.lock().unwrap();
+            if secs == 0 {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+            tokio::time::sleep(Duration::from_secs(secs.clamp(1, 3600))).await;
+            if *state.sync_interval.lock().unwrap() == 0 {
+                continue;
+            }
+            if state.client.lock().await.sid().is_none() {
+                // 懒登录：没会话就不轮询（避免每次都发一个必然失败的请求）
+                match login_internal(&state, None, None).await {
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::debug!("轮询等待登录: {}", e.message);
+                        continue;
+                    }
+                }
+            }
+            match run_sync_once(&state).await {
+                Ok(r) => {
+                    if r.conflicts > 0 || r.deletes_blocked > 0 || !r.errors.is_empty() {
+                        tracing::warn!(
+                            "轮询有异常: conflicts={} blocked={} errors={:?}",
+                            r.conflicts,
+                            r.deletes_blocked,
+                            r.errors
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("轮询失败: {}", e.message);
+                    *state.sync_stats.last_error.lock().unwrap() = Some(e.message.clone());
+                }
+            }
+        }
+    });
+}
+
+/// `qsync rm <dir> <name>`：删远端条目（脚本/测试用；FUSE 的 unlink 走同一方法）。
+async fn rm(state: &Arc<State>, dir: String, name: String) -> Result<serde_json::Value, IpcError> {
+    ensure_session(state).await?;
+    let d = dir.clone();
+    let n = name.clone();
+    with_client!(state, |c| c.delete_entry(&d, &n))?;
+    let path = format!("{}/{}", dir.trim_end_matches('/'), name);
+    let p2 = path.clone();
+    // 记 write log（尽力而为，让其它设备看到）
+    let _ = with_client!(state, |c| c
+        .write_log(&p2, qxync_client::write_action::DELETE));
+    to_value(serde_json::json!({ "deleted": path }))
 }

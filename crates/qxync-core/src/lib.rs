@@ -19,12 +19,17 @@ pub mod error;
 pub mod ipc;
 pub mod model;
 pub mod status;
+pub mod sync;
 
 pub use config::{ConfigPaths, Credentials, LinkConfig};
 pub use encode::{build_query, encode_query_value};
 pub use error::{Error, Result};
 pub use model::{parse_listing, parse_max_log, parse_nas_uid, DirEntry, Listing, MaxLog, NasUid};
 pub use status::ServerStatus;
+pub use sync::{
+    parse_sync_log, Baseline, Cursors, Decision, DeleteProtection, LocalSig, Sig, SyncEvent,
+    SyncLogBatch,
+};
 
 /// 普通用户的 Qsync 家目录根（不是 `/home/<user>`）。
 pub const HOME_ROOT: &str = "/home";

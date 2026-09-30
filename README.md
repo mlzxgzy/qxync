@@ -16,7 +16,8 @@
 | **M1.5 daemon（`qxyncd`）+ 本地 IPC + CLI 完善 + 滚动日志** | ✅ **真机验收通过**（IPC 端到端测试 + 16/16 FUSE 矩阵在 daemon 持有挂载下复跑） |
 | **M2a 区间水合（128 KiB）** | ✅ **已实现并验收**：`head -c 100 big.bin` 只下载 1 个 128 KiB 区间（`chunks=1/1024`） |
 | **M2b 写路径**（FUSE 写操作 + 上传队列 + dirty 标记崩溃恢复） | ✅ **已实现并验收**（矩阵 30/30，其中写路径 10 项） |
-| M2c 变更发现（三游标轮询 + 冲突）/ M3 脱水 / M4 GUI | ⏳ 下一步 |
+| **M2c 变更发现**（三游标轮询 + baseline 三向对账 + 冲突副本 + 删除保护） | ✅ **已实现并真机验收**（矩阵 **46/46**，其中 M2c 16 项） |
+| M3 脱水 / M4 GUI | ⏳ 下一步 |
 
 真机验证对象：`TS-464C` / `QTS 5.2.9` / Qsync QPKG `5.0.0.7`（build `20260723`）。
 
@@ -29,6 +30,13 @@ M1 实现说明（`crates/qxync-fuse`）：
 `user.qsync.chunks` 显示 `已就绪/总数`。缓存文件名用**远端路径的稳定哈希**（不能用 ino，
 否则两次挂载里同一个 ino 可能对应不同文件 → 读到错的缓存）。
 
+**M2c 让「另一台设备改了 NAS」能被发现**（`crates/qxync-daemon/src/sync.rs`）：守护进程每 30s
+（`QSYNC_POLL_INTERVAL` 可调）跑一轮「三游标 + baseline 对账」——
+`qbox_get_max_log` / `qbox_get_sync_log` 拉事件（`lower` 是闭区间、无事件时 `status:-17` 不是错误），
+再按「已知目录列举 + baseline 差集」兜底。远端改动 → 刷新元数据并**失效本地缓存**（下次读按需水合新内容）；
+双方都改 → **冲突副本**（远端占原名，本地内容存 `xxx (conflicted copy from <设备> <日期>).txt` 并上传）；
+远端批量删除 → **熔断**（`qsync sync --force-deletes` 才放行）；本地批量删除也有滑动窗口熔断。
+
 ## 目录结构
 
 ```
@@ -36,7 +44,8 @@ crates/
 ├── qxync-core/        共享类型：状态码、错误、URL 编码规则、数据模型、配置布局（零运行时依赖）
 ├── qxync-client/      NAS HTTP API 封装（登录 / 元数据 / 上传下载）
 ├── qxync-fuse/        FUSE 只读 + on-demand 水合（M1：Filesystem 实现 + 挂载参数）
-├── qxync-daemon/      二进制 `qxyncd`（M1.5：常驻进程 + unix socket JSON IPC + 持有 FUSE）
+├── qxync-daemon/      二进制 `qxyncd`（M1.5：常驻进程 + unix socket JSON IPC + 持有 FUSE；
+│                       M2c：`sync.rs` 三游标轮询 + baseline 对账 + 冲突/删除保护）
 ├── qxync-cli/         二进制 `qsync`（login/status/ls/stat/get/put/mkdir/mount/umount/pin/state/daemon）
 └── qxync-proto-test/  真机集成测试（5 个协议测试 + 1 个 IPC 端到端，均 #[ignore] 手动跑）
 xtask/tests/
@@ -45,6 +54,7 @@ docs/
 ├── 开发规划.md             第一版（MVP）规划
 ├── M1.5-设计.md           daemon/IPC 契约、生命周期、pin 语义、验收标准
 ├── M2b-写路径.md          ★ 写路径：真机写接口契约、read-modify-write 铁则、上传队列、已知限制
+├── M2c-变更发现.md        ★ 变更发现：三游标/事件契约、三向决策表、冲突副本、删除保护、已知限制
 ├── 执行方案-M0M1.md        ★ 真机验证后的修正版：实测事实 + 修正项 + 执行顺序 + 风险门
 └── 测试环境.local.md       测试 NAS 与账号（已 gitignore，禁止提交）
 report/                 逆向报告 + probe 工具（qs_probe.py / qs_fixture.py）
@@ -79,7 +89,8 @@ cargo run -p qxync-cli -- umount ~/qsync-mnt
 ```
 
 `mount` 常用开关：`--threads N`（FUSE 事件循环线程，默认 4）、`--hydrate-timeout N`（秒，默认 60）、
-`--auto-unmount`（需 `/etc/fuse.conf` 里 `user_allow_other`）、`--ipv4`（对端 IPv6 路由不通时用）。
+`--auto-unmount`（需 `/etc/fuse.conf` 里 `user_allow_other`）、`--ipv4`（对端 IPv6 路由不通时用）、
+`--rw`（读写挂载）、`--delete-limit N`（M2c 本地批量删除熔断阈值，60 秒窗口，0 = 关闭，默认 100）。
 
 守护进程（M1.5）：
 
@@ -92,6 +103,9 @@ qsync pin /home/qxync-test/hello.txt pinned      # 设 pin（getfattr -n user.qs
 qsync state /home/qxync-test/hello.txt           # 占位符状态 + pin
 qsync mount ~/qsync-mnt --remote /home           # FUSE 由 daemon 持有（默认只读）
 qsync mount ~/qsync-mnt --remote /home --rw      # M2b：读写挂载（本地改动经队列推回 NAS）
+qsync sync                  # M2c：变更发现状态（三游标 / baseline / 冲突 / 删除保护）
+qsync sync --once           # 立刻跑一轮（拉事件 + 对账）；--force-deletes 放行批量删除
+qsync rm /home/qxync-test a.txt                  # 删远端条目（测试/脚本用；挂载点里 rm 走 FUSE）
 qsync umount ~/qsync-mnt
 qsync daemon stop           # 干净退出：卸载全部挂载 + 删 socket/pid
 ```
@@ -103,8 +117,16 @@ IPC 契约见 [`docs/M1.5-设计.md`](docs/M1.5-设计.md)：unix socket + **一
 M1 验收矩阵（挂载 → 16 项检查 → 卸载）：
 
 ```bash
-xtask/tests/fuse-matrix.sh          # 快测 30 项（M1 + M2a 区间水合 + M2b 写路径），~2min
+xtask/tests/fuse-matrix.sh          # 快测 46 项（M1 + M2a 区间水合 + M2b 写路径 + M2c 变更发现），~8min
 xtask/tests/fuse-matrix.sh --big    # 追加 128 MiB 全量读 + 并发去重（~5min，取决于带宽）
+```
+
+M2c 的真机引擎测试（冲突副本 / 删除保护 / 游标落盘，`#[ignore]` 手动跑）：
+
+```bash
+export QSYNC_TEST_HOST=... QSYNC_TEST_USER=... QSYNC_TEST_PASSWORD=...
+export QSYNC_TEST_FIXTURE=/home/qxync-test
+cargo test -p qxync-daemon -- --ignored --test-threads=1 --nocapture
 ```
 
 > **沙箱/受限环境注意**：若 `~/.cargo` / `~/.config` 不可写，用工作区内的路径：
@@ -160,6 +182,16 @@ cargo test -p qxync-proto-test -- --ignored --test-threads=1 --nocapture   # 协
     （blocking 线程带 runtime 上下文，再 `block_on` 另一个 runtime 会 panic）。
 17. 对端同时发布 AAAA 但 IPv6 路由不通时，会出现 `Network is unreachable` 或传输中途 body 解码失败 →
     用 `--ipv4`（客户端 `local_address` 绑 IPv4 源地址）规避。
+
+写变更发现时踩到的（M2c）：
+
+18. **`qbox_get_sync_log` 的 `lower` 是闭区间下界**（`lower=30` 会返回 `log_id=30`）→ 游标推进到
+    「最后一条 `log_id` + 1」；区间内没有事件时返回 **`status:-17`**，这不是协议错。
+19. **事件里 `isfolder` 是 `1`=目录 / `2`=文件 / `0`=删除项**（不是布尔）；`size` 是字符串。
+20. **删除事件的 `filepath` 实测为空**，而且**我们自己的 CGI 写操作（upload/rename/move/delete）
+    不产生 sync log 事件**（本机未做设备配对）→ 变更发现必须**以 baseline 对账为主路径**，事件只是快路径。
+21. `qbox_write_log` 会让 `max_log` 上涨但区间内取不到事件 → 游标**只按实际返回的事件推进**，
+    `-17` 时不推进、只记账，避免「推进了游标但事件丢了」。
 
 ## 两条铁则（整个项目不许违反）
 

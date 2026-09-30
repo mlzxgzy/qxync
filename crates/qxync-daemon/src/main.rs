@@ -9,6 +9,7 @@
 //! 契约见 [`qxync_core::ipc`] 与 `docs/M1.5-设计.md`。
 
 mod daemon;
+mod sync;
 
 use anyhow::{Context, Result};
 use clap::Parser;

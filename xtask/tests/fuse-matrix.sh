@@ -308,6 +308,158 @@ sys.exit(0 if got==bytes(exp) else 1)"; then
   unmount_retry "$MNTW"
 fi
 
+echo
+echo "=== M2c 变更发现（daemon 三游标轮询 + baseline 对账 + 冲突副本 + 删除保护）==="
+MNTC="$RUNDIR/mnt-m2c"; CACHEC="$RUNDIR/cache-m2c"
+mkdir -p "$MNTC"; rm -rf "$CACHEC"
+M2C="$FIXTURE/mx2"                       # 远端沙盒目录
+export QSYNC_POLL_INTERVAL=2             # 快轮询，验收更快
+"$QS" daemon stop >/dev/null 2>&1
+"$QS" daemon start >/dev/null 2>&1
+"$QS" --direct mkdir "$FIXTURE" mx2 >/dev/null 2>&1
+MC="$MNTC$(echo "$FIXTURE" | sed 's#^/home##')/mx2"
+
+xattr_state() {  # $1=挂载点内路径 → 打印 user.qsync.state
+  python3 -c "
+import os
+try: print(os.getxattr('$1','user.qsync.state').decode())
+except OSError as e: print('ERR%d'%e.errno)"
+}
+
+if ! "$QS" mount "$MNTC" --remote "${QSYNC_REMOTE_ROOT:-/home}" --cache-dir "$CACHEC" \
+        --threads 4 --rw >/dev/null 2>&1; then
+  bad "M2c：daemon 读写挂载失败（跳过 M2c 检查）"
+else
+  # ---- M2c-1 远端改动 → 元数据刷新 + 缓存失效（下一次读拿到新内容）
+  python3 -c "open('$RUNDIR/m2c-r1.bin','wb').write(b'R1-ORIGINAL\n')"
+  "$QS" --direct put "$RUNDIR/m2c-r1.bin" "$M2C" --name r.txt >/dev/null 2>&1
+  n1=$(wc -c <"$RUNDIR/m2c-r1.bin")
+  ok1=0
+  for _ in $(seq 1 30); do
+    [ "$(stat -c %s "$MC/r.txt" 2>/dev/null)" = "$n1" ] && { ok1=1; break; }
+    sleep 0.5
+  done
+  check "$([ "$ok1" = 1 ] && echo 0 || echo 1)" "M2c-1 远端新文件对挂载点可见（$n1 字节）"
+  cat "$MC/r.txt" >"$RUNDIR/m2c-r1.out" 2>/dev/null     # 先水合，制造本地缓存
+  python3 -c "open('$RUNDIR/m2c-r2.bin','wb').write(b'R2-REMOTE-CHANGED-0123456789\n')"
+  "$QS" --direct put "$RUNDIR/m2c-r2.bin" "$M2C" --name r.txt >/dev/null 2>&1
+  n2=$(wc -c <"$RUNDIR/m2c-r2.bin")
+  ok2=0
+  for _ in $(seq 1 30); do
+    [ "$(stat -c %s "$MC/r.txt" 2>/dev/null)" = "$n2" ] && { ok2=1; break; }
+    sleep 0.5
+  done
+  check "$([ "$ok2" = 1 ] && echo 0 || echo 1)" "M2c-1b 远端改动后挂载点元数据已刷新（$n1 → $n2）"
+  cat "$MC/r.txt" >"$RUNDIR/m2c-r2.out" 2>/dev/null
+  if cmp -s "$RUNDIR/m2c-r2.out" "$RUNDIR/m2c-r2.bin"; then
+    ok "M2c-1c 缓存已失效（读到的是远端新内容，不是本地旧缓存）"
+  else
+    bad "M2c-1c 读到的仍是旧缓存内容"
+  fi
+  st=$(xattr_state "$MC/r.txt")
+  check "$([ "$st" = "hydrated" ] && echo 0 || echo 1)" "M2c-1d 刷新后重新读 = hydrated（当前 $st）"
+
+  # ---- M2c-2 远端删除 → 本地节点消失（单条删除不触发保护）
+  "$QS" --direct rm "$M2C" r.txt >/dev/null 2>&1
+  ok3=0
+  for _ in $(seq 1 30); do
+    [ ! -e "$MC/r.txt" ] && { ok3=1; break; }
+    sleep 0.5
+  done
+  check "$([ "$ok3" = 1 ] && echo 0 || echo 1)" "M2c-2 远端删除后挂载点里节点消失"
+
+  # ---- M2c-3 删除保护：一次对账删 5 项 > 阈值 2 → 整批挡住；--force-deletes 才放行
+  "$QS" sync --interval 0 >/dev/null 2>&1        # 暂停自动轮询，手工控制节奏
+  for i in 1 2 3 4 5 6; do
+    printf 'keep%s\n' "$i" >"$RUNDIR/m2c-keep.bin"
+    "$QS" --direct put "$RUNDIR/m2c-keep.bin" "$M2C" --name "keep$i.txt" >/dev/null 2>&1
+  done
+  ls "$MC" >/dev/null 2>&1                       # 让挂载点建立本地节点
+  cat "$MC/keep1.txt" >/dev/null 2>&1            # keep1 水合（有本地缓存）
+  "$QS" sync --once >/dev/null 2>&1              # 采纳 baseline
+  for i in 1 2 3 4 5; do
+    "$QS" --direct rm "$M2C" "keep$i.txt" >/dev/null 2>&1
+  done
+  "$QS" sync --max-deletes 2 --once >"$RUNDIR/m2c-blocked.txt" 2>&1
+  echo "  删除保护：keep1 存在=$([ -e "$MC/keep1.txt" ] && echo yes || echo no) 状态=$(xattr_state "$MC/keep1.txt") 输出=$(grep -c '删除被挡' "$RUNDIR/m2c-blocked.txt")"
+  check "$([ -e "$MC/keep1.txt" ] && echo 0 || echo 1)" "M2c-3 批量删除被熔断（被删的本地节点保留）"
+  check "$([ "$(xattr_state "$MC/keep1.txt")" = "hydrated" ] && echo 0 || echo 1)" "M2c-3b 熔断期间本地缓存内容未被清掉"
+  check "$(grep -q '删除被挡 [1-9]' "$RUNDIR/m2c-blocked.txt" && echo 0 || echo 1)" "M2c-3c 状态显示「删除被挡」"
+  "$QS" sync --force-deletes --once >/dev/null 2>&1
+  ok4=0
+  for _ in $(seq 1 30); do
+    if [ ! -e "$MC/keep1.txt" ] && [ -e "$MC/keep6.txt" ]; then ok4=1; break; fi
+    sleep 0.5
+  done
+  check "$([ "$ok4" = 1 ] && echo 0 || echo 1)" "M2c-3d --force-deletes 放行后删掉 5 项、保留未删的 keep6"
+  "$QS" sync --max-deletes 50 >/dev/null 2>&1
+
+  # ---- M2c-4 冲突副本：远端/本地都改 → 远端占原名，本地内容另存副本并上传
+  printf 'BASE-CONTENT\n' >"$RUNDIR/m2c-cf-base.bin"
+  "$QS" --direct put "$RUNDIR/m2c-cf-base.bin" "$M2C" --name cf.txt >/dev/null 2>&1
+  "$QS" sync --interval 0 --once >/dev/null 2>&1     # baseline = BASE
+  cat "$MC/cf.txt" >/dev/null 2>&1                    # 水合（本地有节点）
+  head -c 4194304 /dev/zero | tr '\0' 'L' >"$RUNDIR/m2c-cf-local.bin"   # 4 MiB 本地改动
+  cp "$RUNDIR/m2c-cf-local.bin" "$MC/cf.txt"          # 脏 + 入队上传
+  wait_upload=0
+  for _ in $(seq 1 240); do
+    "$QS" status >"$RUNDIR/m2c-up.txt" 2>&1
+    if grep -q '上传队列.*待上传 0｜上传中 no｜完成 [1-9]' "$RUNDIR/m2c-up.txt"; then wait_upload=1; break; fi
+    sleep 0.5
+  done
+  printf 'REMOTE-AFTER\n' >"$RUNDIR/m2c-cf-remote.bin"
+  "$QS" --direct put "$RUNDIR/m2c-cf-remote.bin" "$M2C" --name cf.txt >/dev/null 2>&1
+  "$QS" sync --once >"$RUNDIR/m2c-conflict.txt" 2>&1
+  echo "  冲突：本地已上传=$wait_upload  $(grep -o '冲突 [1-9][0-9]*' "$RUNDIR/m2c-conflict.txt" | head -1)"
+  check "$([ "$wait_upload" = 1 ] && echo 0 || echo 1)" "M2c-4 本地 4 MiB 改动已上传（冲突前置）"
+  check "$(grep -qE '冲突 [1-9]' "$RUNDIR/m2c-conflict.txt" && echo 0 || echo 1)" "M2c-4b 引擎识别冲突并生成副本（冲突计数 ≥ 1）"
+  "$QS" --direct get "$M2C" cf.txt -o "$RUNDIR/m2c-cf-orig.out" >/dev/null 2>&1
+  if cmp -s "$RUNDIR/m2c-cf-orig.out" "$RUNDIR/m2c-cf-remote.bin"; then
+    ok "M2c-4c 原名保留远端内容"
+  else
+    bad "M2c-4c 原名内容不是远端版本"
+  fi
+  copy_ok=0; copy_name=""
+  for _ in $(seq 1 60); do
+    [ -n "$copy_name" ] || copy_name=$(ls "$MC" 2>/dev/null | grep 'conflicted copy' | head -1)
+    if [ -n "$copy_name" ] && cat "$MC/$copy_name" >"$RUNDIR/m2c-cf-copy.out" 2>/dev/null \
+       && cmp -s "$RUNDIR/m2c-cf-copy.out" "$RUNDIR/m2c-cf-local.bin"; then
+      copy_ok=1; break
+    fi
+    sleep 1
+  done
+  check "$([ "$copy_ok" = 1 ] && echo 0 || echo 1)" "M2c-4d 冲突副本内容 = 本地改动（$copy_name）"
+
+  # ---- M2c-5 三游标 + baseline 落盘可见
+  "$QS" status >"$RUNDIR/m2c-status.txt" 2>&1
+  check "$(grep -q '变更发现' "$RUNDIR/m2c-status.txt" && echo 0 || echo 1)" "M2c-5 status 显示变更发现状态"
+  check "$(grep -q '游标' "$RUNDIR/m2c-status.txt" && echo 0 || echo 1)" "M2c-5b status 显示三游标"
+  cfile=$(find "$RUNDIR/data" -name cursors.json 2>/dev/null | head -1)
+  bfile=$(find "$RUNDIR/data" -name baseline.json 2>/dev/null | head -1)
+  echo "  状态文件：$cfile / $bfile"
+  if [ -n "$cfile" ] && [ -n "$bfile" ]; then
+    if python3 -c "
+import json,sys
+c=json.load(open('$cfile')); b=json.load(open('$bfile'))
+assert c['max_log_seen'] >= 1, c
+assert len(b.get('entries',{})) >= 1, b
+"; then
+      ok "M2c-5c cursors.json / baseline.json 已原子落盘"
+    else
+      bad "M2c-5c 状态文件内容不对"
+    fi
+  else
+    bad "M2c-5c 找不到 cursors.json / baseline.json"
+  fi
+
+  # ---- M2c 收尾：恢复轮询 + 清远端沙盒 + 卸载
+  "$QS" sync --interval 2 >/dev/null 2>&1
+  for n in $(ls "$MC" 2>/dev/null); do "$QS" --direct rm "$M2C" "$n" >/dev/null 2>&1; done
+  "$QS" --direct rm "$FIXTURE" mx2 >/dev/null 2>&1
+  unmount_retry "$MNTC"
+fi
+"$QS" daemon stop >/dev/null 2>&1
+
 echo "=== 卸载干净（无残留）==="
 if [ "$KEEP" = "0" ]; then
   unmount_retry "$MNT"

@@ -241,3 +241,79 @@ async fn write_api_contract() {
         .unwrap()
         .is_none());
 }
+
+/// ★ M2c：变更发现三端点（`qbox_get_sync_log` / `qbox_query_notify` / `qbox_get_device_config_list`）。
+///
+/// 验收点（真机）：
+/// 1. `qbox_get_sync_log&lower=0&number=N` 要么返回**按 log_id 递增**的事件，要么回 `status:-17`
+///    （区间无事件）——两者都算通过，`-17` 不是协议错（旧谜团）。
+/// 2. 事件字段：`log_id/action/isfolder/filepath/device/device_uid/exist/mtime/size` 都能解析。
+/// 3. `lower` 是**闭区间下界**：用上一批最后一个 log_id 再拉一次，应能重新拿到它。
+/// 4. `qbox_query_notify` / `qbox_get_device_config_list` 不 panic、错误可判定。
+#[tokio::test]
+#[ignore = "需要真机 NAS"]
+async fn m2c_sync_log_and_notify_endpoints() {
+    use qxync_core::sync::is_log_missing;
+
+    let Some(client) = logged_in().await else {
+        return;
+    };
+    let max = client.max_log().await.expect("qbox_get_max_log");
+    println!(
+        "max_log={} global_notify={}",
+        max.max_log, max.global_notify
+    );
+
+    match client.sync_log(0, 20, None).await {
+        Ok(b) => {
+            println!(
+                "sync_log: {} 条（end={} number={}）",
+                b.events.len(),
+                b.end,
+                b.number
+            );
+            for e in b.events.iter().take(5) {
+                println!(
+                    "  log_id={} action={} isfolder={} exist={} size={} device={:?} path={}",
+                    e.log_id, e.action, e.isfolder, e.exist, e.size, e.device, e.filepath
+                );
+            }
+            for w in b.events.windows(2) {
+                assert!(
+                    w[0].log_id <= w[1].log_id,
+                    "事件必须按 log_id 递增: {} > {}",
+                    w[0].log_id,
+                    w[1].log_id
+                );
+            }
+            // `lower` 闭区间：拿最后一个 log_id 再拉，必须还能看到它
+            if let Some(last) = b.events.last().map(|e| e.log_id) {
+                match client.sync_log(last, 5, None).await {
+                    Ok(b2) => assert!(
+                        b2.events.iter().any(|e| e.log_id == last),
+                        "lower={last} 应包含 log_id={last}（闭区间）"
+                    ),
+                    Err(e) if is_log_missing(&e) => {
+                        println!("  lower={last} → -17（日志被滚动，符合预期）")
+                    }
+                    Err(e) => panic!("sync_log(lower={last}) 失败: {e}"),
+                }
+            }
+        }
+        Err(e) if is_log_missing(&e) => println!("sync_log lower=0 → status:-17（区间内没有事件）"),
+        Err(e) => panic!("qbox_get_sync_log 失败: {e}"),
+    }
+
+    // 另外两个游标端点：能判定即可（M2c 不消费它们的事件）
+    match client.query_notify(0, max.global_notify).await {
+        Ok(b) => println!("query_notify: {} 项 device={:?}", b.len(), b.device_uids()),
+        Err(e) if is_log_missing(&e) => println!("query_notify → -17"),
+        Err(e) => println!("query_notify 出错（可容忍）: {e}"),
+    }
+    let user = client.link().user.clone();
+    match client.device_config_list(&user, 0, max.max_log).await {
+        Ok(b) => println!("device_config_list: {} 项", b.len()),
+        Err(e) if is_log_missing(&e) => println!("device_config_list → -17"),
+        Err(e) => println!("device_config_list 出错（可容忍）: {e}"),
+    }
+}
