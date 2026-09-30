@@ -1,0 +1,29 @@
+# ===== 敏感信息（绝不提交）=====
+*.local.md
+docs/测试环境.local.md
+credentials*.json
+*.pem
+*.key
+.env
+.env.*
+
+# ===== probe 输出（含 sid / 响应原文）=====
+report/probe/probe-out/
+
+# ===== Rust =====
+target/
+**/*.rs.bk
+Cargo.lock
+# 注意：workspace 打包发布时 Cargo.lock 需要提交（bin 项目），
+# 目前纯本地开发阶段先忽略，第一次发布前移除此行。
+
+# ===== 本地杂项 =====
+.workbuddy/
+*.log
+.DS_Store
+
+# ===== Rust 本地构建 =====
+.cargo/
+.cargo-home/
+
+.local-run/
