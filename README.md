@@ -18,7 +18,8 @@
 | **M2b 写路径**（FUSE 写操作 + 上传队列 + dirty 标记崩溃恢复） | ✅ **已实现并验收**（矩阵 30/30，其中写路径 10 项） |
 | **M2c 变更发现**（三游标轮询 + baseline 三向对账 + 冲突副本 + 删除保护） | ✅ **已实现并真机验收**（矩阵 46/46，其中 M2c 16 项） |
 | **M3 脱水**（安全检查链 + 先 `inval_inode` 再清内容 + 闲置/限额 LRU + `--cache-mode`） | ✅ **已实现并真机验收**（矩阵 **67/67**，其中 M3 21 项） |
-| M4 GUI / M5 增量 delta + SQLite 元数据 | ⏳ 下一步 |
+| **M4 GUI**（Tauri 2：登录配置 / 挂载管理 / 状态与进度 / pin 管理） | ✅ **已实现并真机验收**（`gui-matrix.sh` **41/41**，5 个 tab 真窗口截图） |
+| M5 增量 delta + SQLite 元数据 | ⏳ 下一步 |
 
 真机验证对象：`TS-464C` / `QTS 5.2.9` / Qsync QPKG `5.0.0.7`（build `20260723`）。
 
@@ -56,15 +57,18 @@ crates/
 ├── qxync-daemon/      二进制 `qxyncd`（M1.5：常驻进程 + unix socket JSON IPC + 持有 FUSE；
 │                       M2c：`sync.rs` 三游标轮询 + baseline 对账 + 冲突/删除保护）
 ├── qxync-cli/         二进制 `qsync`（login/status/ls/stat/get/put/mkdir/mount/umount/pin/state/daemon）
+├── qxync-gui/         二进制 `qxync-gui`（M4：Tauri 2 桌面应用；`ui/` 是零依赖静态前端）
 └── qxync-proto-test/  真机集成测试（5 个协议测试 + 1 个 IPC 端到端，均 #[ignore] 手动跑）
 xtask/tests/
-└── fuse-matrix.sh     ★ M1 验收矩阵（挂载 → 16 项检查 → 卸载；--big 追加 128 MiB + 并发去重）
+├── fuse-matrix.sh     ★ M1–M3 验收矩阵（挂载 → 67 项检查 → 卸载；--big 追加 128 MiB + 并发去重）
+└── gui-matrix.sh      ★ M4 验收矩阵（自检 + 登录链 + 5 个 tab 真窗口截图，41 项）
 docs/
 ├── 开发规划.md             第一版（MVP）规划
 ├── M1.5-设计.md           daemon/IPC 契约、生命周期、pin 语义、验收标准
 ├── M2b-写路径.md          ★ 写路径：真机写接口契约、read-modify-write 铁则、上传队列、已知限制
 ├── M2c-变更发现.md        ★ 变更发现：三游标/事件契约、三向决策表、冲突副本、删除保护、已知限制
 ├── M3-脱水.md             ★ 脱水：安全检查链、inval_inode 顺序铁则、闲置/限额、cache-mode
+├── M4-GUI.md              ★ GUI：边界（GUI 是 daemon 客户端）、命令面、5 个 tab、验收与踩坑
 ├── 执行方案-M0M1.md        ★ 真机验证后的修正版：实测事实 + 修正项 + 执行顺序 + 风险门
 └── 测试环境.local.md       测试 NAS 与账号（已 gitignore，禁止提交）
 report/                 逆向报告 + probe 工具（qs_probe.py / qs_fixture.py）
@@ -127,6 +131,27 @@ qsync daemon stop           # 干净退出：卸载全部挂载 + 删 socket/pid
 IPC 契约见 [`docs/M1.5-设计.md`](docs/M1.5-设计.md)：unix socket + **一行一个 JSON**
 （`$XDG_RUNTIME_DIR/qxync/qxyncd.sock`，目录 0700 / socket 0600），手测可用
 `socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/qxync/qxyncd.sock`。日志在 `~/.local/state/qsync/log/qxyncd.log.YYYY-MM-DD`。
+
+### GUI（M4，Tauri 2）
+
+依赖：`libwebkit2gtk-4.1-dev` / `libgtk-3-dev`（本机 webkit2gtk 2.52 已装）。
+前端是 `crates/qxync-gui/ui/` 下的**零依赖静态三件套**（无 npm / 无打包器），
+由 `cargo build` 在编译期嵌进二进制；GUI 本身不发 HTTP，全部经 daemon 的 IPC。
+
+```bash
+cargo build -p qxync-gui
+qsync daemon start          # GUI 也会在「保存并登录 / 启动 daemon」时自己拉起
+./target/debug/qxync-gui    # 应用名 QSync；5 个 tab：状态/进度、连接/登录、挂载、文件/pin、同步/缓存
+
+# 无窗口自检（脚本/CI 用；daemon 在跑时退出码 0）
+./target/debug/qxync-gui --self-test
+./target/debug/qxync-gui --self-test-login   # 额外跑一遍「保存并登录」整条链（会重启 daemon）
+
+xtask/tests/gui-matrix.sh        # M4 验收矩阵 41 项（含 5 个 tab 真窗口截图）
+xtask/tests/gui-matrix.sh --no-window   # 无 DISPLAY 的机器只跑自检
+```
+
+细节（命令面 / 5 个 tab / 已知限制 / 踩坑）见 [`docs/M4-GUI.md`](docs/M4-GUI.md)。
 
 M1 验收矩阵（挂载 → 16 项检查 → 卸载）：
 
@@ -220,6 +245,19 @@ cargo test -p qxync-proto-test -- --ignored --test-threads=1 --nocapture   # 协
     「没有缓存内容」（实测：16 MiB 本地文件脱水被报「本来就是占位符」）。
 26. 稀疏缓存别用 `du -sb`（apparent size）量占用 —— 128 MiB 的稀疏文件会算成 128 MiB；
     要 `du -s --block-size=1`（allocated）。
+
+写 GUI（M4）时踩到的：
+
+27. **`hidden` 属性压不住作者样式里的 `display`**：`.env-banner { display: flex }` 让
+    `<div hidden>` 在 Tauri 里**永远可见**——表现是 IPC 全通却顶着一条「未在 Tauri 中运行」红条。
+    全局加 `[hidden] { display: none !important; }`（loading/空态/结果框同类元素一起受益）。
+28. **首轮 `status` 没回来就切 tab → 空态**：`requireLogin()` 依赖 `state.lastStatus`，
+    页面刚起来时它是 `null`，「文件 / pin」页的 `ls` 直接被跳过（操作日志里连 `ipc_call ls` 都没有）。
+    修法：首轮 status 回来后补一次当前 tab 的刷新。
+29. Tauri 2 的命令参数是 **camelCase**（Rust `link_id` → JS `{linkId}`），但传进去的**对象内部字段
+    仍是 snake_case**（`home_root`/`force_deletes`/`cache_mode`/`hydrate_timeout_secs`…）；
+    `frontendDist` 是**编译期**嵌入，改 `ui/` 必须重新 `cargo build`
+    （`--self-test` 里的 `ui_assets` 字节数就是「资源有没有真的进包」的判据）。
 
 ## 两条铁则（整个项目不许违反）
 

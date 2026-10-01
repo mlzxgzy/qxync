@@ -6,6 +6,7 @@ members = [
     "crates/qxync-cli",
     "crates/qxync-fuse",
     "crates/qxync-daemon",
+    "crates/qxync-gui",
     "crates/qxync-proto-test",
 ]
 

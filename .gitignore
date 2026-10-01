@@ -26,4 +26,7 @@ Cargo.lock
 .cargo/
 .cargo-home/
 
+# ===== Tauri（tauri-build 每次编译重新生成）=====
+crates/qxync-gui/gen/schemas/
+
 .local-run/

@@ -1,0 +1,30 @@
+[package]
+name = "qxync-gui"
+description = "QSync for Linux 桌面应用（Tauri 2：登录配置 / 挂载管理 / 状态面板 / pin 管理）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# Tauri 约定：GUI 二进制（应用名由 tauri.conf.json 的 productName=QSync 决定）。
+# CLI 的二进制已经叫 `qsync`，这里不抢名字，避免 `cargo build` 产物冲突。
+[[bin]]
+name = "qxync-gui"
+path = "src/main.rs"
+
+[lib]
+name = "qxync_gui"
+path = "src/lib.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+qxync-core = { path = "../qxync-core" }
+tauri = { version = "2", features = [] }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender = "0.2"

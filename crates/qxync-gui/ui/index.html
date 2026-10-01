@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QSync — QNAP 按需同步</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- 非 Tauri 环境横幅（app.js 负责显示） -->
+<div id="env-banner" class="env-banner" hidden>
+  <strong>未在 Tauri 中运行</strong>
+  <span>当前页面被当作普通网页打开，<code>window.__TAURI__</code> 不存在，所有操作均不可用。
+  请用 QSync 桌面程序（或 <code>qxync-gui</code>）打开本界面。</span>
+</div>
+
+<!-- ============================= 顶部常驻状态条 ============================= -->
+<header id="topbar" class="topbar">
+  <div class="topbar-row">
+    <div class="brand">QSync<span class="brand-sub">QNAP 按需同步</span></div>
+
+    <div class="status-chips">
+      <span id="chip-daemon" class="chip chip-unknown">qxyncd：检测中…</span>
+      <span id="chip-conn" class="chip chip-unknown">连接：—</span>
+      <span id="chip-login" class="chip chip-unknown">登录：—</span>
+    </div>
+
+    <div class="topbar-actions">
+      <button id="btn-daemon-start" type="button">启动 daemon</button>
+      <button id="btn-daemon-stop" type="button">停止 daemon</button>
+      <button id="btn-quick-login" type="button" class="primary">立即登录</button>
+    </div>
+  </div>
+
+  <div class="topbar-meta mono">
+    <span id="meta-daemon">daemon：—</span>
+    <span id="meta-conn">连接：—</span>
+    <span id="meta-session">session：—</span>
+  </div>
+</header>
+
+<!-- ============================= Tab 导航 ============================= -->
+<nav class="tabs" id="tabs">
+  <button type="button" class="tab active" data-tab="status">状态 / 进度</button>
+  <button type="button" class="tab" data-tab="connect">连接 / 登录</button>
+  <button type="button" class="tab" data-tab="mounts">挂载</button>
+  <button type="button" class="tab" data-tab="files">文件 / pin</button>
+  <button type="button" class="tab" data-tab="sync">同步 / 缓存</button>
+</nav>
+
+<main id="main">
+
+  <!-- ======================= Tab 1：状态 / 进度 ======================= -->
+  <section class="panel active" id="panel-status">
+    <div class="grid-2">
+      <div class="card">
+        <h2>服务端信息</h2>
+        <div id="srv-warn" class="warn" hidden></div>
+        <dl class="kv" id="srv-kv"></dl>
+      </div>
+
+      <div class="card">
+        <h2>本次会话</h2>
+        <dl class="kv" id="sess-kv"></dl>
+        <h3 class="sub">游标（config / notify / global_notify）</h3>
+        <dl class="kv mono" id="cursors-kv"></dl>
+      </div>
+    </div>
+
+    <div class="grid-3">
+      <div class="card">
+        <h2>水合统计</h2>
+        <dl class="kv" id="hydro-kv"></dl>
+      </div>
+
+      <div class="card">
+        <h2>上传队列 <span id="uploads-active" class="badge-live" hidden>进行中</span></h2>
+        <dl class="kv" id="uploads-kv"></dl>
+      </div>
+
+      <div class="card">
+        <h2>缓存 / 脱水</h2>
+        <dl class="kv" id="cache-kv"></dl>
+        <div class="bar-wrap" id="cache-bar-wrap">
+          <div class="bar"><div class="bar-fill" id="cache-bar-fill" style="width:0%"></div></div>
+          <div class="bar-label mono" id="cache-bar-label">—</div>
+        </div>
+        <dl class="kv" id="cache-blocked-kv"></dl>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>挂载点 <span class="count" id="mounts-status-count"></span>
+        <button type="button" class="mini" id="btn-status-mounts-refresh">刷新</button>
+      </h2>
+      <table class="tbl" id="tbl-status-mounts">
+        <thead><tr><th>挂载点</th><th>远端</th><th>模式</th><th class="col-act">操作</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <p class="empty-hint" id="status-mounts-empty" hidden>暂无挂载。</p>
+    </div>
+
+    <div class="card">
+      <h2>最近一次同步摘要</h2>
+      <div id="sync-alerts" class="alert-stack"></div>
+      <dl class="kv kv-inline" id="sync-summary-kv"></dl>
+      <p class="note" id="sync-note" hidden></p>
+      <p class="empty-hint" id="sync-missing" hidden>daemon 未上报 sync 状态。</p>
+    </div>
+  </section>
+
+  <!-- ======================= Tab 2：连接 / 登录 ======================= -->
+  <section class="panel" id="panel-connect">
+    <div class="grid-2">
+      <div class="card">
+        <h2>连接配置</h2>
+        <p class="hint" id="connect-hint">加载中…</p>
+        <p class="hint mono" id="cred-hint">凭据：—</p>
+
+        <form id="form-connect" class="form" autocomplete="off">
+          <label>主机 / NAS 地址
+            <input type="text" id="f-host" placeholder="nas.local 或 192.168.1.10" spellcheck="false">
+          </label>
+          <div class="row-2">
+            <label>端口
+              <input type="number" id="f-port" min="1" max="65535" step="1" placeholder="9834">
+            </label>
+            <label>登录用户
+              <input type="text" id="f-user" spellcheck="false" autocomplete="username">
+            </label>
+          </div>
+          <label>口令
+            <input type="password" id="f-password" autocomplete="current-password" placeholder="留空则不解写凭据">
+          </label>
+          <div class="row-checks">
+            <label class="check"><input type="checkbox" id="f-https" checked> 使用 HTTPS</label>
+            <label class="check"><input type="checkbox" id="f-insecure"> 自签证书：跳过 TLS 校验</label>
+            <label class="check"><input type="checkbox" id="f-ipv4-only"> 仅 IPv4</label>
+          </div>
+          <label>home_root（远端家目录根）
+            <input type="text" id="f-home-root" placeholder="/home" spellcheck="false" class="mono">
+          </label>
+          <div class="btn-row">
+            <button type="submit" id="btn-link-save">保存连接配置</button>
+            <button type="button" id="btn-login" class="primary">保存并登录</button>
+            <button type="button" id="btn-connect-start">启动 daemon</button>
+            <button type="button" id="btn-connect-stop">停止 daemon</button>
+          </div>
+        </form>
+
+        <div id="login-result" class="result" hidden></div>
+      </div>
+
+      <div class="card">
+        <h2>本机路径 / 运行环境</h2>
+        <dl class="kv mono" id="paths-kv"></dl>
+        <button type="button" class="mini" id="btn-app-info-refresh">刷新</button>
+        <p class="hint" id="link-path-hint">—</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= Tab 3：挂载 ======================= -->
+  <section class="panel" id="panel-mounts">
+    <div class="card">
+      <h2>当前挂载 <span class="count" id="mounts-count"></span>
+        <button type="button" class="mini" id="btn-mounts-refresh">刷新</button>
+      </h2>
+      <table class="tbl" id="tbl-mounts">
+        <thead><tr><th>挂载点</th><th>远端</th><th>模式</th><th class="col-act">操作</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <p class="empty-hint" id="mounts-empty" hidden>暂无挂载。</p>
+    </div>
+
+    <div class="card">
+      <h2>新建挂载</h2>
+      <form id="form-mount" class="form" autocomplete="off">
+        <label>挂载点（本地目录，会被创建）
+          <input type="text" id="m-mountpoint" spellcheck="false" class="mono">
+        </label>
+        <label>远端路径
+          <input type="text" id="m-remote" value="/home" spellcheck="false" class="mono">
+        </label>
+        <div class="row-2">
+          <label>缓存模式
+            <select id="m-cache-mode">
+              <option value="pagecache">pagecache（默认）</option>
+              <option value="direct">direct（绕过 page cache，不可 mmap）</option>
+            </select>
+          </label>
+          <label>并发线程数 threads
+            <input type="number" id="m-threads" min="1" max="64" step="1" value="4">
+          </label>
+        </div>
+        <div class="row-3">
+          <label>水合超时（秒）
+            <input type="number" id="m-hydrate-timeout" min="1" step="1" value="600">
+          </label>
+          <label>删除熔断阈值 delete_limit
+            <input type="number" id="m-delete-limit" min="0" step="1" value="100">
+          </label>
+          <label class="check"><input type="checkbox" id="m-read-write"> 读写挂载（否则只读）</label>
+        </div>
+        <label class="check"><input type="checkbox" id="m-auto-unmount" checked> 异常退出时自动卸载 auto_unmount</label>
+        <div class="btn-row">
+          <button type="submit" id="btn-mount" class="primary">挂载</button>
+          <span class="busy" id="mount-busy" hidden>进行中…</span>
+        </div>
+      </form>
+      <div id="mount-result" class="result" hidden></div>
+    </div>
+  </section>
+
+  <!-- ======================= Tab 4：文件 / pin ======================= -->
+  <section class="panel" id="panel-files">
+    <div class="card">
+      <h2>远端目录</h2>
+      <form id="form-path" class="pathbar" autocomplete="off">
+        <input type="text" id="fp-path" value="/home" spellcheck="false" class="mono">
+        <button type="submit" id="btn-path-go">打开</button>
+        <button type="button" id="btn-path-up">上级目录</button>
+        <button type="button" id="btn-path-refresh">刷新</button>
+        <label class="check"><input type="checkbox" id="fp-hide-excluded"> 隐藏 excluded</label>
+      </form>
+      <div class="toolbar">
+        <button type="button" id="btn-mkdir">新建目录</button>
+        <button type="button" id="btn-rm" class="danger">删除选中</button>
+        <span class="toolbar-info" id="files-info">—</span>
+        <span class="busy" id="files-busy" hidden>进行中…</span>
+      </div>
+      <table class="tbl tbl-files">
+        <thead>
+          <tr>
+            <th class="col-sel">选</th>
+            <th class="col-type">类型</th>
+            <th>文件名</th>
+            <th class="col-size">大小</th>
+            <th class="col-time">修改时间</th>
+            <th class="col-child">have_child</th>
+            <th class="col-pin">pin 状态 / 操作</th>
+          </tr>
+        </thead>
+        <tbody id="files-tbody"></tbody>
+      </table>
+      <p class="empty-hint" id="files-empty" hidden>目录为空，或尚未加载。</p>
+    </div>
+  </section>
+
+  <!-- ======================= Tab 5：同步 / 缓存 ======================= -->
+  <section class="panel" id="panel-sync">
+    <div class="card">
+      <h2>同步状态（SyncInfo）</h2>
+      <div class="btn-row">
+        <button type="button" id="btn-sync-once" class="primary">立即同步</button>
+        <button type="button" id="btn-sync-force" class="danger">强制放行删除</button>
+        <button type="button" id="btn-sync-pause">暂停轮询</button>
+        <label class="inline-num">间隔秒数 <input type="number" id="sy-interval" min="1" step="1" value="60"></label>
+        <button type="button" id="btn-sync-interval">设置轮询间隔</button>
+        <span class="busy" id="sync-busy" hidden>进行中…</span>
+      </div>
+      <div id="sync2-alerts" class="alert-stack"></div>
+      <dl class="kv kv-inline" id="sync-full-kv"></dl>
+      <h3 class="sub">游标</h3>
+      <dl class="kv kv-inline mono" id="sync-cursors-kv"></dl>
+      <h3 class="sub">事件设备（uid:次数）</h3>
+      <ul class="plain-list mono" id="sync-devices"></ul>
+    </div>
+
+    <div class="card">
+      <h2>缓存 / 脱水（CacheInfo）</h2>
+      <div class="btn-row">
+        <button type="button" id="btn-dehy-dry">脱水（预演）</button>
+        <button type="button" id="btn-dehy-all">全部脱水</button>
+        <label class="inline-num">限额 <input type="text" id="dehy-limit" placeholder="512M / 2G / 25%" class="mono" size="8"></label>
+        <button type="button" id="btn-dehy-limit">按限额脱水</button>
+        <label class="inline-num">闲置秒 <input type="number" id="dehy-idle" min="0" step="1" value="3600"></label>
+        <button type="button" id="btn-dehy-idle">释放闲置</button>
+        <span class="busy" id="dehy-busy" hidden>进行中…</span>
+      </div>
+      <dl class="kv kv-inline" id="cache-full-kv"></dl>
+      <div class="bar-wrap">
+        <div class="bar"><div class="bar-fill" id="cache2-bar-fill" style="width:0%"></div></div>
+        <div class="bar-label mono" id="cache2-bar-label">—</div>
+      </div>
+      <div id="dehy-result" class="result" hidden></div>
+    </div>
+  </section>
+
+</main>
+
+<!-- ============================= 底部操作日志 ============================= -->
+<footer id="logbox" class="logbox">
+  <div class="logbox-head" id="logbox-head">
+    <span class="logbox-title">操作日志</span>
+    <span class="logbox-count" id="log-count">0</span>
+    <span class="logbox-toggle" id="log-toggle">收起</span>
+    <button type="button" class="mini" id="btn-log-clear">清空</button>
+  </div>
+  <div class="logbox-body" id="log-body"></div>
+</footer>
+
+<!-- ============================= 通用输入弹窗 ============================= -->
+<div id="modal" class="modal" hidden>
+  <div class="modal-card">
+    <h3 id="modal-title">输入</h3>
+    <p id="modal-message" class="hint"></p>
+    <input type="text" id="modal-input" class="mono" spellcheck="false">
+    <div class="btn-row">
+      <button type="button" id="modal-ok" class="primary">确定</button>
+      <button type="button" id="modal-cancel">取消</button>
+    </div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
