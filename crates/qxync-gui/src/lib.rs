@@ -73,12 +73,18 @@ pub fn run() {
                 return;
             }
             let want_tray = close_to_tray_now();
-            // 托盘没建起来（缺 appindicator / 当时没有 StatusNotifierHost）时必须**真的关闭**：
-            // 窗口一隐藏就再也没人能把它叫回来，进程会变成用户够不着的僵尸 ——
-            // 那不叫「降级为普通窗口」，叫挖坑。这里正好落回普通窗口的语义。
-            if want_tray && !tray::created() {
+            // ⚠ 判据是「托盘**可见**」，不是「托盘对象建起来了」：
+            //   有 watcher 但没有 StatusNotifierHost（裸 GNOME / 没渲染托盘的面板）、
+            //   或者纯 XEmbed 桌面（IceWM/Fluxbox）时，名字能注册成功但**没人画图标** ——
+            //   那种情况下隐藏窗口 = 用户再也找不回窗口，进程变僵尸。
+            //   探测没跑完时 `visible()` 也是 false，宁可真的关掉（见 tray.rs 的探测说明）。
+            if want_tray && !tray::visible() {
+                let st = tray::state_snapshot();
                 tracing::warn!(
-                    "★ M8.4：close_to_tray=true 但托盘未创建成功，直接关闭窗口（藏起来就找不回来了）"
+                    "★ M8.4：close_to_tray=true 但托盘不可见（created={}, probed={}，{}）→ 直接关闭窗口",
+                    st.created,
+                    st.probed,
+                    st.reason
                 );
                 return;
             }
@@ -89,7 +95,10 @@ pub fn run() {
                 if let Err(e) = window.hide() {
                     tracing::warn!("★ M8.4：隐藏主窗口失败（按关闭处理）: {e}");
                 } else {
-                    tracing::info!("★ M8.4：主窗口已收进托盘（close_to_tray=true）");
+                    tracing::info!(
+                        "★ M8.4：主窗口已收进托盘（close_to_tray=true，托盘可见：{}）",
+                        tray::state_snapshot().reason
+                    );
                 }
             } else {
                 tracing::info!("★ M8.4：close_to_tray=false，主窗口正常关闭并退出");
@@ -438,6 +447,9 @@ async fn self_test_inner() -> Value {
         "m84": {
             "plugins": m84["plugins"],
             "tray_code": true,
+            // 无窗口自检既不建托盘也不探测：如实写清楚，别让脚本以为「可见性=false」是环境坏
+            "tray_probed": false,
+            "tray_visible": false,
             "tray_created": false,
             "note": "无窗口自检不建托盘",
             "app_exe": m84["app_exe"],

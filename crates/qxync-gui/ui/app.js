@@ -3158,11 +3158,22 @@
       '运行中', '未运行');
     var note = $('about-m84');
     if (note) {
-      note.textContent = state.m84Info
-        ? ('托盘：' + (state.m84Info.tray_created ? '已创建' : '未创建') +
-           ' · 插件：' + ((state.m84Info.plugins || []).join(' / ') || '—') +
-           ' · 托盘事件：' + (state.trayAction ? state.trayAction : '（还没触发过）'))
-        : '托盘/通知/选择器（M8.4）：GUI 侧命令未就绪时这里显示 —';
+      if (!state.m84Info) {
+        note.textContent = '托盘/通知/选择器（M8.4）：GUI 侧命令未就绪时这里显示 —';
+      } else {
+        // ★ 「建起来」≠「有人画」：这里如实区分三态，别让用户以为托盘一定可见
+        var m = state.m84Info;
+        var tray;
+        if (m.tray_visible === true) { tray = '可见（面板会画）'; }
+        else if (m.tray_probed !== true) { tray = '探测中…'; }
+        else if (m.tray_created === true) { tray = '不可见（名字注册了但没有面板宿主）'; }
+        else { tray = '不可用（没有 StatusNotifierWatcher）'; }
+        note.textContent = '托盘：' + tray +
+          (m.tray_reason ? '　' + str(m.tray_reason) : '') +
+          '　| 插件：' + ((m.plugins || []).join(' / ') || '—') +
+          '　| 关窗：' + (m.close_to_tray ? '收进托盘' : '直接关闭') +
+          '　| 托盘事件：' + (state.trayAction ? state.trayAction : '（还没触发过）');
+      }
     }
   }
 

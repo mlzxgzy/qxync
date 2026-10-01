@@ -475,6 +475,13 @@
                 </label>
               </div>
               <label class="check"><input type="checkbox" id="s-close-tray"> 关闭主窗口时最小化到托盘</label>
+              <p class="hint">
+                ⚠ **托盘不可见时这个开关不会生效**：如果系统里没有
+                <code>org.kde.StatusNotifierWatcher</code>（纯 XEmbed 桌面如 IceWM/Fluxbox，
+                或装了 GNOME 但没启用 AppIndicator 扩展），图标根本不会被画出来 ——
+                此时关闭窗口会**真的关闭**，免得窗口藏起来之后找不回。
+                这种桌面可以装 <code>snixembed</code> 把 SNI 图标桥进老式托盘。
+              </p>
               <div class="btn-row">
                 <button type="button" id="btn-personal-save" class="primary">保存个人设置</button>
               </div>

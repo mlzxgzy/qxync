@@ -22,7 +22,7 @@
 | **M8.1 GUI 外壳**（左侧图标栏 + 主页 + 诊断收纳 + 9 个目的地 + 旧 `QSYNC_GUI_TAB` 值兼容） | ✅ **已实现并真机验收**（`gui-matrix.sh` **86/86**；同步回归 `fuse-matrix.sh` 68/68 等全绿） |
 | **M8.2 同步任务**（`tasks/<id>.json` 持久化 + 每任务暂停/继续 + `--restore-tasks` 重启恢复 + 自定义缓存目录 + GUI 任务页） | ✅ **已实现并真机验收**（`m82-matrix.sh` **37/37**；`fuse-matrix.sh` 68/68 回归） |
 | **M8.3 同步日志**（`sync.db` schema v2 加 `journal` 表 + 后台批量落库与轮转 + GUI 文件更新中心/错误列表） | ✅ **已实现并真机验收**（`m83-matrix.sh` **27/27**；`m5-matrix.sh` 扩到 30/30） |
-| **M8.4 设置中心 + 托盘/通知 + 自动释放空间 + M7 面板补课**（`settings.json` + 代理三模式接 reqwest + ksni 托盘 + 桌面通知 + 开机自启 + `statvfs` 自动释放空间（复用脱水安全链）+ 筛选器/LAN/冲突策略面板 + 文件页三态与右键菜单 + 文件选择器/opener/关于页） | ✅ **已实现并真机验收**（`m84-matrix.sh` **88/88**；全量回归见下方「M8.4 验收结论」） |
+| **M8.4 设置中心 + 托盘/通知 + 自动释放空间 + M7 面板补课**（`settings.json` + 代理三模式接 reqwest + ksni 托盘（含「真可见」探测）+ 桌面通知 + 开机自启 + `statvfs` 自动释放空间（复用脱水安全链）+ 筛选器/LAN/冲突策略面板 + 文件页三态与右键菜单 + 文件选择器/opener/关于页） | ✅ **已实现并真机验收**（`m84-matrix.sh` **92/92**；全量回归见下方「M8.4 验收结论」） |
 | **M5 SQLite 元数据 + delta**（`sync.db` 承载游标/baseline/pin/队列 + librsync 兼容编解码 + 能力门控） | ✅ **已实现并真机验收**（`m5-matrix.sh` **28/28**；服务端无历史版本 → 增量走门控，见 [`M5-SQLite与delta.md`](docs/M5-SQLite与delta.md)） |
 | **M6 多根 / 共享文件夹**（link `roots` + 同步文件夹发现 + FUSE 多根视图 + 非家目录根只读保护） | ✅ **已实现并真机验收**（`m6-matrix.sh` **29/29**，含多根真挂载：两根都能按需水合、共享根写回 `EROFS`、家目录能写、共享根可脱水） |
 | **M7 选择性同步 + 设备配对 / LAN 直连**（`exclude` 规则引擎贯通 FUSE/同步/脱水 + 内置临时文件过滤；qxync↔qxync 自研对等协议：配对、事件快路径、LAN 直传） | ✅ **已实现并真机验收**（`m7-matrix.sh` **60/60** 含真挂载段；回归 `fuse-matrix.sh` 68/68，见 [`docs/M7-选择性同步与LAN直连.md`](docs/M7-选择性同步与LAN直连.md)） |
@@ -33,7 +33,7 @@
 
 | 矩阵 | 结果 |
 |---|---|
-| `m84-matrix.sh`（本里程碑新增） | **88/88** |
+| `m84-matrix.sh`（本里程碑新增） | **92/92** |
 | `gui-matrix.sh` | **131/131**（比 M8.1 的 86 多出 7 个设置分区截图与 4 条 M8.4 数据源断言） |
 | `fuse-matrix.sh` | **68/68**（回归；M8.4 动过上传队列的取消语义，必须复跑） |
 | `m5 / m6 / m7 / m82 / m83` | **30 / 29 / 60 / 37 / 27** 全过（`m5`/`m83` 的 schema 断言随 v3 改动） |
@@ -128,7 +128,7 @@ xtask/tests/
 ├── m6-matrix.sh       ★ M6 验收矩阵（共享文件夹读写事实/roots 判定/布局单测/多根真挂载，29 项）
 ├── m82-matrix.sh      ★ M8.2 验收矩阵（任务登记/兼容/重启恢复/暂停隔离/安全/缓存目录，37 项）
 ├── m83-matrix.sh      ★ M8.3 验收矩阵（schema 迁移/日志过滤/clear 隔离/轮转，27 项）
-└── m84-matrix.sh      ★ M8.4 验收矩阵（设置/代理三模式+假代理看 CONNECT/托盘+通知/自动释放空间+安全链/筛选器/冲突策略五选/三态+铁则 2，88 项）
+└── m84-matrix.sh      ★ M8.4 验收矩阵（设置/代理三模式+假代理看 CONNECT/托盘可见性+通知/自动释放空间+安全链/筛选器/冲突策略五选/三态+铁则 2，92 项）
 docs/
 ├── 开发规划.md             第一版（MVP）规划
 ├── M1.5-设计.md           daemon/IPC 契约、生命周期、pin 语义、验收标准
@@ -288,6 +288,20 @@ export QSYNC_TEST_HOST=... QSYNC_TEST_PORT=9834 QSYNC_TEST_USER=... QSYNC_TEST_P
 export QSYNC_TEST_FIXTURE=/home/qxync-test
 cargo test -p qxync-proto-test -- --ignored --test-threads=1 --nocapture   # 协议 5 项 + IPC 端到端 1 项
 ```
+
+## 已知限制
+
+* **托盘（M8.4）需要 SNI 宿主**：qxync 走的是 `org.kde.StatusNotifierItem`（ksni 实现，
+  不是 libappindicator —— `ldd` 里没有 `libayatana-appindicator`）。它覆盖
+  Plasma / waybar / polybar / XFCE（`statusnotifier` 插件）/ LXQt / Cinnamon /
+  GNOME + AppIndicator 扩展；但 **IceWM / Fluxbox / Openbox+tray / 老式 XFCE·MATE 面板只有
+  XEmbed**、**裸 GNOME 两个协议都不支持** —— 这两类环境里托盘图标不会出现（可装
+  [`snixembed`](https://sr.ht/~steef/snixembed/) 把 SNI 桥进老式托盘）。
+  程序会**探测**自己是否真的可见（watcher 有 host + 本进程 item 已登记），
+  **不可见时关闭窗口会真的关闭**，不会把窗口藏进一个没人画的托盘里；状态在「设置 → 关于」如实显示。
+* **「按频率」自动释放空间**的「上次触发时间」只在内存里，daemon 重启会重新计时
+  （「当空间少于 X%」不受影响）。
+* 直连（`--direct`）模式下改 `settings.json` 只写文件，**跑着的 daemon 要重启才读到**新代理/释放空间设置。
 
 ## 已实测的协议要点（踩过的坑）
 

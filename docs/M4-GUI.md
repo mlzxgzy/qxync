@@ -155,7 +155,14 @@ cargo run -p qxync-gui -- --self-test-login
 
 **托盘**：ksni（纯 Rust StatusNotifierItem）→ D-Bus 名字 `org.kde.StatusNotifierItem-<pid>-1`，
 菜单 4 项（打开主窗口 / 立即与 NAS 同步 / 暂停 / 退出）；前三项 emit `tray://action`，动作由前端执行。
-关闭主窗口按 `close_to_tray` 隐藏进托盘；**托盘不可用时照常关闭**。
+
+★ **「建起来」≠「有人画」**：创建后会探测
+① watcher 在不在 ② `IsStatusNotifierHostRegistered` ③ 本进程 item 是否已在
+`RegisteredStatusNotifierItems` 里（最多 8×250ms 重试），三条都过才算**托盘可见**，
+结果在 `m84_info` 的 `tray_visible` / `tray_reason` 与「设置 → 关于」里如实显示。
+关闭主窗口按 `close_to_tray` 隐藏进托盘 —— 但**托盘不可见时照常关闭**，
+否则窗口会藏进一个没人渲染的托盘、用户再也找不回来。
+XEmbed-only 桌面（IceWM/Fluxbox 等）与裸 GNOME 属于「不可见」，可装 `snixembed` 桥接。
 
 # 完整验收矩阵（M4 自检/登录链 + M8.1 的 9 个目的地 + 旧 tab 值落点等价性 + M8.4 的 7 个设置分区）
 xtask/tests/gui-matrix.sh              # 自检 + 登录链 + 9 个目的地真窗口截图

@@ -496,12 +496,19 @@ pub async fn m84_info() -> Result<Value, String> {
         }
         Err(_) => (String::new(), false, Settings::default().close_to_tray),
     };
+    let tray = crate::tray::state_snapshot();
     Ok(json!({
         "ok": true,
         // 三个插件都是进程启动时注册的；列出来是给验收脚本对答案用的。
         "plugins": ["notification", "dialog", "opener"],
         // 如实上报：`--self-test`（无窗口）模式下永远是 false。
         "tray_created": crate::tray::created(),
+        // ★ M8.4：「建起来」≠「有人画」。可见性 = watcher 有 host 且本进程已登记，
+        //   探测（带重试）跑完前 `probed=false`，前端要如实显示「探测中」，不要猜。
+        "tray_probed": tray.probed,
+        "tray_visible": tray.visible,
+        "tray_reason": tray.reason,
+        "tray_watcher": tray.watcher,
         "app_exe": std::env::current_exe()
             .map(|p| p.display().to_string())
             .unwrap_or_default(),

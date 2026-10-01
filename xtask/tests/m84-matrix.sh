@@ -232,7 +232,8 @@ if [ "$NO_GUI" = "1" ] || [ ! -x "$GUI" ]; then
 else
   start_daemon "" ""; login
   pkill -x qxync-gui 2>/dev/null; sleep 0.5
-  "$GUI" >"$RUNDIR/gui-tray.log" 2>&1 &
+  # 矩阵全局 RUST_LOG=warn 会吞掉 info 级的「托盘可用」判据 → 这里单独放开 qxync_gui 模块
+  RUST_LOG="qxync_gui=info,warn" "$GUI" >"$RUNDIR/gui-tray.log" 2>&1 &
   GUI_PID=$!
   WID=""
   for _ in $(seq 1 40); do
@@ -245,6 +246,14 @@ else
   ITEM=$(dbus-send --session --dest=org.freedesktop.DBus --type=method_call --print-reply \
     /org/freedesktop/DBus org.freedesktop.DBus.ListNames 2>/dev/null | grep -c "StatusNotifierItem-${GUI_PID}-")
   check "$([ "${ITEM:-0}" -ge 1 ] && echo 0 || echo 1)" "★ D-Bus 上出现本进程的 StatusNotifierItem（托盘图标注册成功）"
+  # ★ M8.4：「注册成功」≠「有人画」。GUI 会探测 watcher 的 IsStatusNotifierHostRegistered
+  #   并确认自己的 item 在 RegisteredStatusNotifierItems 里，才认定「托盘可见」。
+  check "$([ "$(grep -c '托盘可用' "$RUNDIR/gui-tray.log" 2>/dev/null)" -ge 1 ] && echo 0 || echo 1)" \
+    "★ 托盘**可见性**探测通过（$(grep -oE '托盘可用（[^）]*）' "$RUNDIR/gui-tray.log" | head -1)）"
+  WHOST=$(dbus-send --session --print-reply --dest=org.kde.StatusNotifierWatcher /StatusNotifierWatcher \
+    org.freedesktop.DBus.Properties.Get string:org.kde.StatusNotifierWatcher \
+    string:IsStatusNotifierHostRegistered 2>/dev/null | grep -c "boolean true")
+  check "$([ "${WHOST:-0}" -ge 1 ] && echo 0 || echo 1)" "watcher 自报 IsStatusNotifierHostRegistered=true（与上面的探测互相印证）"
   # 中文菜单项不是 ASCII，`strings` 默认抓不到 → 直接在二进制里 grep（-a）
   check "$([ "$(grep -ac '立即与 NAS 同步' "$GUI" 2>/dev/null)" -ge 1 ] && echo 0 || echo 1)" "托盘菜单 4 项文案编进二进制（打开主窗口/立即与 NAS 同步/暂停/退出）"
 
@@ -267,6 +276,29 @@ else
   fi
   kill "$GUI_PID" 2>/dev/null; GUI_PID=""
 
+  # 负向对照：私有一根 D-Bus 会话（**没有** watcher）→ 托盘不可用 → 关窗必须真的退出。
+  #   判据不是「日志好看」，而是进程真的没了（这正是「别把窗口藏起来找不回」的护栏）。
+  if command -v dbus-run-session >/dev/null; then
+    NEG_LOG="$RUNDIR/gui-notray.log"
+    : > "$NEG_LOG"
+    GUI="$GUI" NEG_LOG="$NEG_LOG" timeout 60 dbus-run-session -- bash -c '
+      export GDK_BACKEND=x11
+      "$GUI" >"$NEG_LOG" 2>&1 &
+      GP=$!
+      sleep 6
+      wmctrl -c "QSync" 2>/dev/null
+      sleep 2
+      if kill -0 "$GP" 2>/dev/null; then kill "$GP" 2>/dev/null; echo ALIVE; else echo EXITED; fi
+    ' > "$RUNDIR/gui-notray.result" 2>&1
+    NEG_RES=$(grep -oE "ALIVE|EXITED" "$RUNDIR/gui-notray.result" 2>/dev/null | tail -1)
+    check "$([ "$NEG_RES" = "EXITED" ] && echo 0 || echo 1)" \
+      "★ 没有 watcher 的会话里：托盘不可用 → 关窗**真的退出**（$NEG_RES）"
+    NEG_WHY=$(grep -oE '托盘不可见[^）]*|系统托盘创建失败[^:：]*' "$NEG_LOG" 2>/dev/null | head -1)
+    check "$([ -n "$NEG_WHY" ] && echo 0 || echo 1)" "负向会话的日志如实说明托盘为何不可用（${NEG_WHY:-无}）"
+  else
+    skip "无 watcher 负向对照（没有 dbus-run-session）"
+  fi
+
   # 通知：dbus-monitor 抓 org.freedesktop.Notifications
   #   第 1 节把「桌面通知」关过（验设置往返），这里先打开再验正路径
   Q settings --set notifications=true >/dev/null 2>&1
@@ -275,7 +307,9 @@ else
   timeout 12 dbus-monitor --session "interface='org.freedesktop.Notifications'" >"$NOTIF_LOG" 2>&1 &
   MON_PID=$!
   sleep 1
-  "$GUI" --self-test-notify >"$RUNDIR/gui-notify.json" 2>&1
+  # ⚠ stdout 是 JSON、stderr 是 GTK/dbind 警告：**必须分开重定向**，
+  #   否则 jq 会读到一行 "(qxync-gui:1234): dbind-WARNING ..." 而解析失败（踩过）。
+  "$GUI" --self-test-notify >"$RUNDIR/gui-notify.json" 2>"$RUNDIR/gui-notify.err"
   NRC=$?
   sleep 2
   kill "$MON_PID" 2>/dev/null
@@ -288,7 +322,7 @@ else
   timeout 10 dbus-monitor --session "interface='org.freedesktop.Notifications'" >"$NOTIF_LOG2" 2>&1 &
   MON2=$!
   sleep 1
-  "$GUI" --self-test-notify >"$RUNDIR/gui-notify-off.json" 2>&1
+  "$GUI" --self-test-notify >"$RUNDIR/gui-notify-off.json" 2>"$RUNDIR/gui-notify-off.err"
   sleep 2
   kill "$MON2" 2>/dev/null
   check "$([ "$(jq -r '.shown' "$RUNDIR/gui-notify-off.json" 2>/dev/null)" = "false" ] && echo 0 || echo 1)" "★ 关掉桌面通知后 shown=false（如实上报，不是假装发了）"

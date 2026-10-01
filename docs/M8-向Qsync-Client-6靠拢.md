@@ -754,8 +754,21 @@ tauri 将来升到 0.26 时这行要跟着升，否则依赖图里会出现两�
 * 托盘用 **ksni**（纯 Rust StatusNotifierItem，不是 libappindicator）：名字是规范的
   `org.kde.StatusNotifierItem-<pid>-1`，D-Bus 上可被验收脚本直接断言；菜单 4 项
   （打开主窗口 / 立即与 NAS 同步 / 暂停 / 退出），前三项 emit `tray://action` 给前端做。
-* `CloseRequested` → 读设置里的 `close_to_tray`：为真则隐藏进托盘；
-  **托盘没建起来时照常关闭**（否则进程会变成用户够不着的僵尸）。
+  `ldd target/debug/qxync-gui` 里**没有** `libayatana-appindicator` —— 走 ksni 后
+  这条系统库依赖真的没有了（tray-icon 的 libappindicator 后端仍在依赖图里但被 cfg 排除）。
+* ★ **「建起来」≠「用户看得见」**：SNI 的宿主是 `org.kde.StatusNotifierWatcher`，
+  但「有 watcher」不等于「有 host」。创建后做一次探测（最多 8×250ms 重试）：
+  ① watcher 在总线上；② `IsStatusNotifierHostRegistered == true`；
+  ③ 本进程的 item 出现在 `RegisteredStatusNotifierItems` 里。三条都过才认定**托盘可见**，
+  并写进 `m84_info` 的 `tray_visible` / `tray_reason`（GUI「关于」页如实显示三态：
+  可见 / 不可见 / 探测中）。
+* `CloseRequested` → 读设置里的 `close_to_tray`：为真**且托盘可见**才隐藏；
+  否则照常关闭 —— 免得窗口藏进一个「没人画图标」的托盘后用户再也找不回来。
+* 兼容性事实（写进 README 已知限制）：SNI 覆盖 Plasma / waybar / polybar / XFCE(statusnotifier) /
+  LXQt / Cinnamon / GNOME+AppIndicator 扩展；**IceWM / Fluxbox / Openbox+tray / 老面板只有 XEmbed**，
+  裸 GNOME 两个协议都不支持 —— 这两类环境下托盘不出现（可装
+  [`snixembed`](https://sr.ht/~steef/snixembed/) 把 SNI 桥进 XEmbed 托盘），
+  但 qxync 的窗口、通知、同步全都照常工作。
 * 桌面通知尊重 `desktop_notifications`：关掉时 `notify_show` 与 `--self-test-notify` 都如实回 `shown=false`。
 * 前端在轮询里每 ~6s 看一次 journal 的 `error` 视图，有新错误才发通知（成功项不发，避免噪声）。
 
@@ -808,7 +821,7 @@ LAN 面板显示身份/监听/配对码/已配对设备/事件计数，并支持
 | 验收项（计划里的 ①–⑦） | 实测 |
 |---|---|
 | ① 代理三模式 | ✅ **假代理（`nc -l`）真的看到了 `CONNECT nas.example.com:9834`**（Auto-detect 走环境变量、Manual 走配置）；`No proxy` 时环境变量还在也**一个字节都没经过代理**且登录成功；**代理停掉后 Manual 登录失败（退出码 3）**，切回 `No proxy` 立刻恢复 |
-| ② 托盘 | ✅ 真窗口起来后 D-Bus 上出现 `org.kde.StatusNotifierItem-<pid>-1` 且 watcher 已登记；dbusmenu 的 4 项文案与二进制一致；`wmctrl -c` 关窗后**窗口不可见、进程仍在**（进了托盘）；`close_to_tray=false` 时关窗即退出 |
+| ② 托盘 | ✅ 真窗口起来后 D-Bus 上出现 `org.kde.StatusNotifierItem-<pid>-1` 且 watcher 已登记；**可见性探测通过**（watcher + `IsStatusNotifierHostRegistered=true` + 本进程 item 已在列表里，日志与 `m84_info` 一致）；dbusmenu 的 4 项文案与二进制一致；`wmctrl -c` 关窗后**窗口不可见、进程仍在**（进了托盘）；`close_to_tray=false` 时关窗即退出；**负向对照**：用 `dbus-run-session` 起一根没有 watcher 的私有会话 → 托盘创建失败 → 关窗**真的退出**（不会把窗口藏起来） |
 | ③ 通知 | ✅ `dbus-monitor` 抓到 `member=Notify`（正路径）；**关掉设置后 `shown=false` 且 dbus 上一个 Notify 都没有**（负向对照） |
 | ④ 自动释放空间 | ✅ `QSYNC_TEST_FAKE_STATVFS=avail_pct=5` → 判定触发 → 普通文件自动回到**仅在线**；**`pin` 住的文件仍是始终可用且 131072 字节内容原样**（安全链挡下，没被绕过）；journal 有「自动释放空间」记录；非法注入值**报错**不静默 |
 | ⑤ 筛选器 | ✅ 加 `*.iso` → `rules --match` 判 `excluded`，且**真挂载点里看不到** hidden.iso、看得到 visible.txt |
@@ -871,7 +884,7 @@ LAN 面板显示身份/监听/配对码/已配对设备/事件计数，并支持
 | `xtask/tests/m7-matrix.sh` | 60/60 | ✅ **保持 60/60**（后端规则一行未改；GUI 侧的规则编辑面板复用同一批命令） |
 | `xtask/tests/m82-matrix.sh` | — | ✅ **新增 37/37**（M8.2：登记/兼容/重启恢复/暂停隔离/安全/缓存目录） |
 | `xtask/tests/m83-matrix.sh` | — | ✅ **新增 27/27**（M8.3：schema 迁移/过滤/clear 隔离/轮转；M8.4 把 schema 断言改到 v3） |
-| `xtask/tests/m84-matrix.sh` | — | ✅ **新增 88/88**（M8.4：设置/代理三模式+假代理/托盘+通知/自动释放空间+安全链/筛选器/冲突策略五选/三态+铁则 2） |
+| `xtask/tests/m84-matrix.sh` | — | ✅ **新增 92/92**（M8.4：设置/代理三模式+假代理/托盘可见性+通知/自动释放空间+安全链/筛选器/冲突策略五选/三态+铁则 2） |
 
 **门（Gate）**：每个里程碑的 PR 必须在**同一 PR 内**同时更新受影响的矩阵脚本；只改产品代码不改矩阵 = 不允许合并。
 
@@ -912,7 +925,7 @@ LAN 面板显示身份/监听/配对码/已配对设备/事件计数，并支持
 | **M8.1 外壳** | ✅ **已完成**（2026-10-01，含矩阵改造与数据安全比对） | — | — |
 | **M8.2 任务模型** | ✅ **已完成**（2026-10-01，`m82-matrix.sh` 37/37；fuse 回归 68/68） | — | — |
 | **M8.3 同步日志** | ✅ **已完成**（2026-10-01，`m83-matrix.sh` 27/27；`m5-matrix` 扩到 30/30） | — | — |
-| **M8.4 设置/托盘/释放空间/冲突策略** | ✅ **已完成**（2026-10-01，`m84-matrix.sh` 88/88；全量回归见 §7/§12） | — | — |
+| **M8.4 设置/托盘/释放空间/冲突策略** | ✅ **已完成**（2026-10-01，`m84-matrix.sh` 92/92；全量回归见 §7/§12） | — | — |
 | **M8 剩余（M8.6 打磨与收口）** | 2 | M8.1–M8.4 已完成 | 见各里程碑 |
 
 ---
@@ -1076,7 +1089,7 @@ M8.1 的写域是 `crates/qxync-gui/ui/**` + `xtask/tests/gui-matrix.sh`：
 
 | 项 | 结果 |
 |---|---|
-| 期间跑过的验收 | `fuse-matrix` 68 + `m5` 30 + `m6` 29 + `m7` 60 + `m82` 37 + `m83` 27 + `gui-matrix` 131 + `m84-matrix` 88 = **470 项**（全部通过），外加 `cargo test --workspace` |
+| 期间跑过的验收 | `fuse-matrix` 68 + `m5` 30 + `m6` 29 + `m7` 60 + `m82` 37 + `m83` 27 + `gui-matrix` 131 + `m84-matrix` **92** = **474 项**（全部通过），外加 `cargo test --workspace` |
 | **added** | **0** |
 | **removed** | **0** ← 最关键的一条 |
 | **resized** | **1**：`/home/.recent`（106496 → 110592 字节）—— **NAS 自己的「最近访问」索引**（QTS 维护，不是用户数据）；M8.4 第一次**大量真读写** NAS（上传/下载/水合/脱水夹具），索引随之增长属于预期。**复跑一次（基线改为第一次 manifest）：`resized 0`**，说明那只是索引一次性补齐、不是持续增长 |

@@ -33,6 +33,11 @@ tauri = { version = "2", features = ["tray-icon", "image-png"] }
 # （`default-features = false` 只表示「不额外加默认 feature」，tauri 想要的
 # `libappindicator`/`serde` 仍然由 tauri 自己声明，不影响）。
 tray-icon = { version = "0.25", default-features = false, features = ["ksni"] }
+# ★ M8.4：「托盘**真的**会被画出来吗」的探测要用 D-Bus 读 watcher 的属性。
+# zbus 5 本来就在依赖图里（ksni 的传递依赖），这里直接依赖它不会多编一个 crate。
+# 只用来**读**两个属性（IsStatusNotifierHostRegistered / RegisteredStatusNotifierItems），
+# 不注册任何服务、不写总线。
+zbus = "5"
 # ★ M8.4：三个官方插件都只从 **Rust 命令**里调用（JS 侧不碰插件 API），
 # 因此 capabilities 里不需要给它们加权限；插件在这里的价值是提供跨平台的
 # 通知/文件选择器/opener 实现，而不是它的 IPC 命令面。
