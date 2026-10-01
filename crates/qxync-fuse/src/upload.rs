@@ -73,6 +73,9 @@ pub struct UploadSnapshot {
     pub bytes: u64,
 }
 
+/// 上传成功回调（M3：让 FUSE 节点清掉 `dirty`，否则脱水永远被 dirty 挡住）。
+pub type SuccessHook = Arc<dyn Fn(&str) + Send + Sync>;
+
 pub struct UploadQueue {
     client: Arc<Client>,
     rt: tokio::runtime::Handle,
@@ -82,6 +85,7 @@ pub struct UploadQueue {
     cv: Condvar,
     shutdown: AtomicBool,
     stats: UploadStats,
+    success_hook: Mutex<Option<SuccessHook>>,
 }
 
 struct State {
@@ -129,11 +133,17 @@ impl UploadQueue {
             }),
             cv: Condvar::new(),
             shutdown: AtomicBool::new(false),
+            success_hook: Mutex::new(None),
             stats: UploadStats {
                 pending: AtomicU64::new(n),
                 ..Default::default()
             },
         }))
+    }
+
+    /// 注册「上传成功」回调（按远端路径调用）。daemon 用它把节点 `dirty` 清掉。
+    pub fn set_success_hook(&self, hook: SuccessHook) {
+        *self.success_hook.lock().unwrap() = Some(hook);
     }
 
     /// 入队：**先写盘标记，再改内存队列**（崩溃安全）。
@@ -272,6 +282,9 @@ impl UploadQueue {
                     if job.ephemeral {
                         // 冲突副本的 stash 是一次性的：传完就删
                         let _ = std::fs::remove_file(&job.local);
+                    }
+                    if let Some(hook) = self.success_hook.lock().unwrap().clone() {
+                        hook(&job.remote_path());
                     }
                     let n = std::fs::metadata(&job.local).map(|m| m.len()).unwrap_or(0);
                     self.stats.done.fetch_add(1, Ordering::Relaxed);

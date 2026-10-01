@@ -16,8 +16,9 @@
 | **M1.5 daemon（`qxyncd`）+ 本地 IPC + CLI 完善 + 滚动日志** | ✅ **真机验收通过**（IPC 端到端测试 + 16/16 FUSE 矩阵在 daemon 持有挂载下复跑） |
 | **M2a 区间水合（128 KiB）** | ✅ **已实现并验收**：`head -c 100 big.bin` 只下载 1 个 128 KiB 区间（`chunks=1/1024`） |
 | **M2b 写路径**（FUSE 写操作 + 上传队列 + dirty 标记崩溃恢复） | ✅ **已实现并验收**（矩阵 30/30，其中写路径 10 项） |
-| **M2c 变更发现**（三游标轮询 + baseline 三向对账 + 冲突副本 + 删除保护） | ✅ **已实现并真机验收**（矩阵 **46/46**，其中 M2c 16 项） |
-| M3 脱水 / M4 GUI | ⏳ 下一步 |
+| **M2c 变更发现**（三游标轮询 + baseline 三向对账 + 冲突副本 + 删除保护） | ✅ **已实现并真机验收**（矩阵 46/46，其中 M2c 16 项） |
+| **M3 脱水**（安全检查链 + 先 `inval_inode` 再清内容 + 闲置/限额 LRU + `--cache-mode`） | ✅ **已实现并真机验收**（矩阵 **67/67**，其中 M3 21 项） |
+| M4 GUI / M5 增量 delta + SQLite 元数据 | ⏳ 下一步 |
 
 真机验证对象：`TS-464C` / `QTS 5.2.9` / Qsync QPKG `5.0.0.7`（build `20260723`）。
 
@@ -29,6 +30,14 @@ M1 实现说明（`crates/qxync-fuse`）：
 只把读到的区间 `pwrite` 进去；`user.qsync.state` 会显示 `placeholder`/`partial`/`hydrated`，
 `user.qsync.chunks` 显示 `已就绪/总数`。缓存文件名用**远端路径的稳定哈希**（不能用 ino，
 否则两次挂载里同一个 ino 可能对应不同文件 → 读到错的缓存）。
+
+**M3 让磁盘占用可控**（`crates/qxync-core/src/dehydrate.rs` + `qxync-fuse`/`qxyncd`）：
+脱水前先过**完整安全检查链**（pin=pinned/excluded、未上传改动/队列在途、打开的 fd、
+被 mmap（扫 `/proc/*/maps`）、正在水合、刚访问过），再按**铁则 2** 执行
+`inval_inode(0,0)` → 清缓存内容 → 更新占位符状态；`inval_inode` 失败就**什么都不清**。
+默认**不**自动脱水：`QSYNC_DEHYDRATE_IDLE=600`（闲置）/ `QSYNC_CACHE_LIMIT=2G|25%`（限额，LRU）
+或手动 `qsync dehydrate --path | --all | --cache-limit`；`--cache-mode direct` 用
+`FOPEN_DIRECT_IO` 绕过 page cache（脱水天然安全，代价是没 readahead、mmap 不可用）。
 
 **M2c 让「另一台设备改了 NAS」能被发现**（`crates/qxync-daemon/src/sync.rs`）：守护进程每 30s
 （`QSYNC_POLL_INTERVAL` 可调）跑一轮「三游标 + baseline 对账」——
@@ -55,6 +64,7 @@ docs/
 ├── M1.5-设计.md           daemon/IPC 契约、生命周期、pin 语义、验收标准
 ├── M2b-写路径.md          ★ 写路径：真机写接口契约、read-modify-write 铁则、上传队列、已知限制
 ├── M2c-变更发现.md        ★ 变更发现：三游标/事件契约、三向决策表、冲突副本、删除保护、已知限制
+├── M3-脱水.md             ★ 脱水：安全检查链、inval_inode 顺序铁则、闲置/限额、cache-mode
 ├── 执行方案-M0M1.md        ★ 真机验证后的修正版：实测事实 + 修正项 + 执行顺序 + 风险门
 └── 测试环境.local.md       测试 NAS 与账号（已 gitignore，禁止提交）
 report/                 逆向报告 + probe 工具（qs_probe.py / qs_fixture.py）
@@ -90,7 +100,9 @@ cargo run -p qxync-cli -- umount ~/qsync-mnt
 
 `mount` 常用开关：`--threads N`（FUSE 事件循环线程，默认 4）、`--hydrate-timeout N`（秒，默认 60）、
 `--auto-unmount`（需 `/etc/fuse.conf` 里 `user_allow_other`）、`--ipv4`（对端 IPv6 路由不通时用）、
-`--rw`（读写挂载）、`--delete-limit N`（M2c 本地批量删除熔断阈值，60 秒窗口，0 = 关闭，默认 100）。
+`--rw`（读写挂载）、`--delete-limit N`（M2c 本地批量删除熔断阈值，60 秒窗口，0 = 关闭，默认 100）、
+`--cache-mode pagecache|direct`（M3：默认走内核 page cache；`direct` 用 `FOPEN_DIRECT_IO` 绕过它，
+脱水天然安全但没有 readahead、mmap 不可用）。
 
 守护进程（M1.5）：
 
@@ -105,6 +117,8 @@ qsync mount ~/qsync-mnt --remote /home           # FUSE 由 daemon 持有（默�
 qsync mount ~/qsync-mnt --remote /home --rw      # M2b：读写挂载（本地改动经队列推回 NAS）
 qsync sync                  # M2c：变更发现状态（三游标 / baseline / 冲突 / 删除保护）
 qsync sync --once           # 立刻跑一轮（拉事件 + 对账）；--force-deletes 放行批量删除
+qsync dehydrate --path /home/qxync-test/big.bin   # M3：脱水（只留占位符，释放本地缓存）
+qsync dehydrate --cache-limit 2G --dry-run        # 按限额预演（LRU 该清哪些）；去掉 --dry-run 真清
 qsync rm /home/qxync-test a.txt                  # 删远端条目（测试/脚本用；挂载点里 rm 走 FUSE）
 qsync umount ~/qsync-mnt
 qsync daemon stop           # 干净退出：卸载全部挂载 + 删 socket/pid
@@ -117,7 +131,7 @@ IPC 契约见 [`docs/M1.5-设计.md`](docs/M1.5-设计.md)：unix socket + **一
 M1 验收矩阵（挂载 → 16 项检查 → 卸载）：
 
 ```bash
-xtask/tests/fuse-matrix.sh          # 快测 46 项（M1 + M2a 区间水合 + M2b 写路径 + M2c 变更发现），~8min
+xtask/tests/fuse-matrix.sh          # 快测 67 项（M1 + M2a 区间水合 + M2b 写路径 + M2c 变更发现 + M3 脱水），~12min
 xtask/tests/fuse-matrix.sh --big    # 追加 128 MiB 全量读 + 并发去重（~5min，取决于带宽）
 ```
 
@@ -192,6 +206,20 @@ cargo test -p qxync-proto-test -- --ignored --test-threads=1 --nocapture   # 协
     不产生 sync log 事件**（本机未做设备配对）→ 变更发现必须**以 baseline 对账为主路径**，事件只是快路径。
 21. `qbox_write_log` 会让 `max_log` 上涨但区间内取不到事件 → 游标**只按实际返回的事件推进**，
     `-17` 时不推进、只记账，避免「推进了游标但事件丢了」。
+
+脱水时踩到的（M3）：
+
+22. ★ **顺序铁则**：`Notifier::inval_inode(ino, 0, 0)` 必须在清内容**之前** —— 否则内核 page cache
+    里的旧页会让应用读到旧数据。验收方式：脱水后把远端改成**同长度不同内容**再 `cat`，必须拿到新内容。
+23. `fuser` 的 `mount2()` **拿不到 `Notifier`** → 改用 `fuser::spawn_mount2()`（daemon 侧），
+    拿到 `BackgroundSession`（join/卸载）+ `Notifier`（`inval_inode`）。
+24. **mmap 挡不住**：Linux 的 `flock` 不阻止 mmap → 只能自己扫 `/proc/*/maps`。
+    实测补充：mmap 会给映射保留 `struct file`，进程 `close(fd)` 后 FUSE `release` 也不触发，
+    所以「打开的 fd」计数本身就是第一道防线（`/proc` 扫描是兜底）。
+25. 本地写入的区间必须记进区间表（`chunks_done`），否则本地新建/改过的文件会被判成
+    「没有缓存内容」（实测：16 MiB 本地文件脱水被报「本来就是占位符」）。
+26. 稀疏缓存别用 `du -sb`（apparent size）量占用 —— 128 MiB 的稀疏文件会算成 128 MiB；
+    要 `du -s --block-size=1`（allocated）。
 
 ## 两条铁则（整个项目不许违反）
 

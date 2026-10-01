@@ -4,17 +4,19 @@
 
 use anyhow::{bail, Context, Result};
 use qxync_client::{Client, Session};
+use qxync_core::dehydrate::{Block, CacheLimit, Policy};
 use qxync_core::ipc::{
-    decode_line, encode_line, mask_sid, CursorInfo, DaemonInfo, ErrorKind, GetData, HydroStats,
-    IpcError, LinkInfo, LoginData, LsData, MountInfo, PingData, PutData, Request, RequestEnvelope,
-    Response, ServerInfo, SessionInfo, ShutdownData, StatusData, SyncCursors, SyncInfo,
-    IPC_VERSION,
+    decode_line, encode_line, mask_sid, CacheInfo, CursorInfo, DaemonInfo, DehydrateData,
+    ErrorKind, GetData, HydroStats, IpcError, LinkInfo, LoginData, LsData, MountInfo, PingData,
+    PutData, Request, RequestEnvelope, Response, ServerInfo, SessionInfo, ShutdownData, StatusData,
+    SyncCursors, SyncInfo, IPC_VERSION,
 };
 use qxync_core::{ConfigPaths, Credentials, Error as CoreError, LinkConfig, HOME_ROOT};
 use qxync_fuse::upload::UploadQueue;
-use qxync_fuse::{FsHandle, HydroCounters, LocalView, PinMap, QxyncFs};
+use qxync_fuse::{CacheMode, FsHandle, HydroCounters, LocalView, MountHandle, PinMap, QxyncFs};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -31,13 +33,17 @@ pub struct Options {
 
 struct MountEntry {
     info: MountInfo,
-    /// 挂载线程结束时回传结果，用于 `umount` 时确认线程真的退出了。
-    done: std::sync::mpsc::Receiver<std::io::Result<()>>,
+    /// ★ M3：fuser 的后台会话（`umount` 时 join）。
+    session: Option<qxync_fuse::BackgroundSession>,
+    /// ★ M3：脱水要用的内核通知句柄（`inval_inode`）。
+    notifier: qxync_fuse::Notifier,
     counters: Arc<HydroCounters>,
     /// 读写挂载时的上传队列（卸载前要排空）。
     upload: Option<Arc<UploadQueue>>,
     /// ★ M2c：共享节点表句柄（同步引擎在挂载线程外刷新远端变更）。
     handle: FsHandle,
+    /// ★ M3：缓存模式（pagecache / direct）。
+    cache_mode: CacheMode,
 }
 
 struct State {
@@ -60,6 +66,9 @@ struct State {
     sync_cfg: StdMutex<SyncConfig>,
     /// 后台轮询间隔秒数（0 = 暂停）。
     sync_interval: StdMutex<u64>,
+    /// ★ M3：脱水配置 + 计数。
+    dehydrate_cfg: StdMutex<DehydrateCfg>,
+    dehydrate_stats: Arc<DehydrateStats>,
 }
 
 // ---------------------------------------------------------------- 入口
@@ -122,6 +131,8 @@ pub async fn run(opts: Options) -> Result<()> {
         sync_stats: Arc::new(SyncStats::default()),
         sync_cfg: StdMutex::new(SyncConfig::default()),
         sync_interval: StdMutex::new(sync_interval),
+        dehydrate_cfg: StdMutex::new(DehydrateCfg::from_env()),
+        dehydrate_stats: Arc::new(DehydrateStats::default()),
     });
 
     tracing::info!(
@@ -139,6 +150,8 @@ pub async fn run(opts: Options) -> Result<()> {
 
     // ★ M2c：后台轮询（三游标 + baseline 对账）；QSYNC_POLL_INTERVAL=0 可暂停
     spawn_poller(state.clone());
+    // ★ M3：后台脱水（闲置 + 缓存限额）；QSYNC_DEHYDRATE_IDLE / QSYNC_CACHE_LIMIT 开启
+    spawn_dehydrator(state.clone());
 
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
     loop {
@@ -255,6 +268,7 @@ async fn dispatch(state: &Arc<State>, req: Request, shutdown: &mpsc::Sender<()>)
             hydrate_timeout_secs,
             read_write,
             delete_limit,
+            cache_mode,
         } => {
             mount(
                 state,
@@ -266,6 +280,7 @@ async fn dispatch(state: &Arc<State>, req: Request, shutdown: &mpsc::Sender<()>)
                 Duration::from_secs(hydrate_timeout_secs.unwrap_or(60)),
                 read_write.unwrap_or(false),
                 delete_limit,
+                cache_mode,
             )
             .await
         }
@@ -287,6 +302,29 @@ async fn dispatch(state: &Arc<State>, req: Request, shutdown: &mpsc::Sender<()>)
             .await
         }
         Request::Rm { dir, name } => rm(state, dir, name).await,
+        Request::Dehydrate {
+            path,
+            all,
+            idle_secs,
+            cache_limit,
+            force,
+            dry_run,
+            mountpoint,
+        } => {
+            dehydrate_cmd(
+                state,
+                DehydrateOpts {
+                    path,
+                    all: all.unwrap_or(false),
+                    idle_secs,
+                    cache_limit,
+                    force: force.unwrap_or(false),
+                    dry_run: dry_run.unwrap_or(false),
+                    mountpoint,
+                },
+            )
+            .await
+        }
         Request::Shutdown => {
             // 先回响应，再触发退出，避免对端拿不到回包
             let tx = shutdown.clone();
@@ -487,6 +525,7 @@ async fn status(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
         hydro,
         uploads,
         sync: Some(sync_info(state)),
+        cache: Some(cache_info(state)),
         mounts,
     })
 }
@@ -615,6 +654,7 @@ async fn mount(
     hydrate_timeout: Duration,
     read_write: bool,
     delete_limit: Option<usize>,
+    cache_mode: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
     ensure_session(state).await?;
     let sid = require_sid(state).await?;
@@ -666,6 +706,17 @@ async fn mount(
     if let Some(limit) = delete_limit {
         fs = fs.with_delete_limit(limit);
     }
+    // ★ M3：缓存模式（pagecache 默认 / direct 绕过 page cache）
+    let mode = match cache_mode.as_deref() {
+        None => CacheMode::PageCache,
+        Some(s) => CacheMode::parse(s).ok_or_else(|| {
+            IpcError::new(
+                ErrorKind::BadRequest,
+                format!("cache_mode 只能是 pagecache/direct，收到 {s:?}"),
+            )
+        })?,
+    };
+    fs = fs.with_cache_mode(mode);
     let mut upload_queue = None;
     if read_write {
         let marker_dir = ConfigPaths::discover()
@@ -682,41 +733,36 @@ async fn mount(
         fs = fs.with_write_mode().with_upload_queue(q.clone());
         upload_queue = Some(q);
     }
-    // ★ M2c：必须在 fs 被移进挂载线程之前取句柄，同步引擎靠它刷新远端变更
+    // ★ M2c/M3：必须在 fs 被交给 fuser 之前取句柄，同步引擎与脱水都靠它
     let handle = fs.handle();
+    // ★ M3：上传成功后清掉节点 dirty（否则脱水永远被 dirty 挡住）
+    if let Some(q) = &upload_queue {
+        let h = handle.clone();
+        q.set_success_hook(Arc::new(move |remote: &str| h.clear_dirty(remote)));
+    }
 
-    let (tx, done) = std::sync::mpsc::channel();
-    let mp_thread = mp.clone();
-    std::thread::Builder::new()
-        .name("qxync-fuse".into())
-        .spawn(move || {
-            let r = qxync_fuse::mount(fs, &mp_thread, threads, auto_unmount, !read_write);
-            let _ = tx.send(r);
-        })
-        .map_err(|e| IpcError::new(ErrorKind::Io, format!("创建 FUSE 线程失败: {e}")))?;
+    // ★ M3：用 spawn（而不是阻塞的 mount2）—— 拿到 Notifier 才能发 inval_inode
+    let MountHandle { session, notifier } =
+        qxync_fuse::spawn(fs, &mp, threads, auto_unmount, !read_write)
+            .map_err(|e| IpcError::new(ErrorKind::Io, format!("挂载失败: {e}")))?;
 
-    // 等挂载生效（或线程提前报错）
+    // 等挂载生效（Session::new 已同步挂上，这里只是兜底）
     let mut mounted = false;
-    for _ in 0..60 {
+    for _ in 0..40 {
         if is_mounted(&mp) {
             mounted = true;
             break;
         }
-        if let Ok(res) = done.try_recv() {
-            return Err(IpcError::new(
-                ErrorKind::Io,
-                format!(
-                    "挂载失败: {}",
-                    res.err().map(|e| e.to_string()).unwrap_or_default()
-                ),
-            ));
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     if !mounted {
+        let _ = std::process::Command::new("fusermount3")
+            .arg("-u")
+            .arg(&mp)
+            .output();
         return Err(IpcError::new(
             ErrorKind::Io,
-            format!("挂载 {} 超时（15s）", mp.display()),
+            format!("挂载 {} 未生效", mp.display()),
         ));
     }
 
@@ -729,23 +775,26 @@ async fn mount(
         mp.clone(),
         MountEntry {
             info: info.clone(),
-            done,
+            session: Some(session),
+            notifier,
             counters,
             upload: upload_queue,
             handle,
+            cache_mode: mode,
         },
     );
     tracing::info!(
-        "已挂载 {}（{} 线程，auto_unmount={auto_unmount}）",
+        "已挂载 {}（{} 线程，auto_unmount={auto_unmount}，cache_mode={}）",
         mp.display(),
-        threads
+        threads,
+        mode.as_str()
     );
     to_value(info)
 }
 
 async fn umount(state: &Arc<State>, mountpoint: PathBuf) -> Result<serde_json::Value, IpcError> {
     let mp = std::fs::canonicalize(&mountpoint).unwrap_or(mountpoint);
-    let entry = state.mounts.lock().unwrap().remove(&mp).ok_or_else(|| {
+    let mut entry = state.mounts.lock().unwrap().remove(&mp).ok_or_else(|| {
         IpcError::new(
             ErrorKind::BadRequest,
             format!("{} 不在挂载表里", mp.display()),
@@ -780,10 +829,20 @@ async fn umount(state: &Arc<State>, mountpoint: PathBuf) -> Result<serde_json::V
         state.mounts.lock().unwrap().insert(mp.clone(), entry);
         return Err(IpcError::new(ErrorKind::Io, msg));
     }
-    // 等挂载线程真正退出
-    match entry.done.recv_timeout(Duration::from_secs(5)) {
-        Ok(_) => tracing::info!("已卸载 {}", mp.display()),
-        Err(e) => tracing::warn!("等待挂载线程退出超时: {e}"),
+    // 等挂载线程真正退出（fuser 的后台会话）
+    match entry.session.take() {
+        Some(s) => {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(s.join());
+            });
+            match rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(Ok(())) => tracing::info!("已卸载 {}", mp.display()),
+                Ok(Err(e)) => tracing::warn!("挂载会话退出报错: {e}"),
+                Err(e) => tracing::warn!("等待挂载线程退出超时: {e}"),
+            }
+        }
+        None => tracing::info!("已卸载 {}", mp.display()),
     }
     to_value(serde_json::json!({}))
 }
@@ -1061,4 +1120,400 @@ async fn rm(state: &Arc<State>, dir: String, name: String) -> Result<serde_json:
     let _ = with_client!(state, |c| c
         .write_log(&p2, qxync_client::write_action::DELETE));
     to_value(serde_json::json!({ "deleted": path }))
+}
+
+// ---------------------------------------------------------------- M3 脱水
+
+/// 脱水配置（环境变量初始化，IPC 可临时覆盖）。
+#[derive(Debug, Clone)]
+struct DehydrateCfg {
+    /// 定时脱水：只清闲置 ≥ N 秒的文件（0 = 关闭定时脱水）。
+    idle_secs: u64,
+    /// 缓存限额（`512M` / `2G` / `25%`）。
+    limit: Option<CacheLimit>,
+    /// 扫描间隔（秒）。
+    interval_secs: u64,
+}
+
+impl DehydrateCfg {
+    fn from_env() -> Self {
+        let idle = std::env::var("QSYNC_DEHYDRATE_IDLE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0u64);
+        let limit = std::env::var("QSYNC_CACHE_LIMIT")
+            .ok()
+            .and_then(|v| CacheLimit::parse(&v));
+        let interval = std::env::var("QSYNC_DEHYDRATE_INTERVAL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60u64);
+        Self {
+            idle_secs: idle,
+            limit,
+            interval_secs: interval.max(1),
+        }
+    }
+    fn enabled(&self) -> bool {
+        self.idle_secs > 0 || self.limit.is_some()
+    }
+}
+
+#[derive(Default)]
+struct DehydrateStats {
+    runs: AtomicU64,
+    dehydrated: AtomicU64,
+    freed: AtomicU64,
+    blocked_dirty: AtomicU64,
+    blocked_pinned: AtomicU64,
+    blocked_open: AtomicU64,
+    blocked_mapped: AtomicU64,
+    blocked_inflight: AtomicU64,
+    last_run_unix: AtomicU64,
+    last_error: StdMutex<Option<String>>,
+}
+
+/// `qsync dehydrate` 的参数。
+struct DehydrateOpts {
+    path: Option<String>,
+    all: bool,
+    idle_secs: Option<u64>,
+    cache_limit: Option<String>,
+    force: bool,
+    dry_run: bool,
+    mountpoint: Option<PathBuf>,
+}
+
+/// 缓存/脱水状态快照（`status` 用）。
+fn cache_info(state: &Arc<State>) -> CacheInfo {
+    let cfg = state.dehydrate_cfg.lock().unwrap().clone();
+    let st = &state.dehydrate_stats;
+    let g = state.mounts.lock().unwrap();
+    let mut used = 0u64;
+    let mut files = 0u64;
+    let mut hydrated = 0u64;
+    let mut mode = "pagecache".to_string();
+    for m in g.values() {
+        let s = m.handle.cache_stats();
+        used += s.used_bytes;
+        files += s.total_files;
+        hydrated += s.hydrated_files;
+        if m.cache_mode == CacheMode::Direct {
+            mode = "direct".to_string();
+        }
+    }
+    let last = st.last_run_unix.load(Ordering::Relaxed);
+    CacheInfo {
+        mode,
+        used_bytes: used,
+        total_files: files,
+        hydrated_files: hydrated,
+        limit_bytes: cfg
+            .limit
+            .map(|l| resolve_limit(Some(l), &first_cache_dir(state)).unwrap_or(0)),
+        idle_secs: cfg.idle_secs,
+        dehydrated_total: st.dehydrated.load(Ordering::Relaxed),
+        freed_total_bytes: st.freed.load(Ordering::Relaxed),
+        last_sweep_age_secs: if last == 0 {
+            0
+        } else {
+            now_secs().saturating_sub(last)
+        },
+        blocked_dirty: st.blocked_dirty.load(Ordering::Relaxed),
+        blocked_pinned: st.blocked_pinned.load(Ordering::Relaxed),
+        blocked_open: st.blocked_open.load(Ordering::Relaxed),
+        blocked_mapped: st.blocked_mapped.load(Ordering::Relaxed),
+        blocked_inflight: st.blocked_inflight.load(Ordering::Relaxed),
+        last_error: st.last_error.lock().unwrap().clone(),
+    }
+}
+
+fn first_cache_dir(state: &Arc<State>) -> PathBuf {
+    state
+        .mounts
+        .lock()
+        .unwrap()
+        .values()
+        .next()
+        .map(|m| m.handle.cache_dir().to_path_buf())
+        .or_else(|| {
+            ConfigPaths::discover()
+                .ok()
+                .map(|p| p.data_dir.join("cache"))
+        })
+        .unwrap_or_else(|| PathBuf::from("/tmp/qxync/cache"))
+}
+
+/// 百分比限额 → 字节（用缓存所在文件系统的总容量）。
+fn resolve_limit(limit: Option<CacheLimit>, cache_dir: &std::path::Path) -> Option<u64> {
+    limit.map(|l| match l {
+        CacheLimit::Bytes(b) => b,
+        CacheLimit::Percent(_) => {
+            let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+            let c = std::ffi::CString::new(cache_dir.to_string_lossy().as_bytes()).ok();
+            let total = match c {
+                Some(c) => {
+                    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } == 0 {
+                        st.f_blocks as u64 * st.f_frsize as u64
+                    } else {
+                        0
+                    }
+                }
+                None => 0,
+            };
+            l.bytes(total)
+        }
+    })
+}
+
+/// 扫描 `/proc/*/maps`，找出挂载点下被 mmap 的远端路径（脱水必须避开它们）。
+fn mmap_remotes(
+    mountpoint: &std::path::Path,
+    remote_root: &str,
+) -> std::collections::BTreeSet<String> {
+    use std::collections::BTreeSet;
+    let mut out = BTreeSet::new();
+    let mp = mountpoint.to_string_lossy().to_string();
+    let Ok(procs) = std::fs::read_dir("/proc") else {
+        return out;
+    };
+    for p in procs.flatten() {
+        let name = p.file_name();
+        let name = name.to_string_lossy();
+        if !name.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(maps) = std::fs::read_to_string(p.path().join("maps")) else {
+            continue;
+        };
+        for line in maps.lines() {
+            if let Some(i) = line.find(&mp) {
+                let mapped = &line[i..];
+                let mapped = mapped.trim_end();
+                if mapped == mp {
+                    continue;
+                }
+                let rest = &mapped[mp.len()..];
+                if rest.starts_with('/') {
+                    out.insert(format!("{}{}", remote_root.trim_end_matches('/'), rest));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 执行一次脱水（`qsync dehydrate` 与后台扫描共用）。
+async fn run_dehydrate(state: &Arc<State>, opts: DehydrateOpts) -> DehydrateData {
+    let recent = if opts.force { 0 } else { 300 };
+    run_dehydrate_with_recent(state, opts, recent).await
+}
+
+async fn run_dehydrate_with_recent(
+    state: &Arc<State>,
+    opts: DehydrateOpts,
+    recent_secs: u64,
+) -> DehydrateData {
+    let now = now_secs();
+    let cfg = state.dehydrate_cfg.lock().unwrap().clone();
+    let idle_secs = opts.idle_secs.unwrap_or(cfg.idle_secs);
+    let limit_spec = match &opts.cache_limit {
+        Some(s) => CacheLimit::parse(s),
+        None => cfg.limit,
+    };
+    if opts.cache_limit.is_some() && limit_spec.is_none() {
+        let mut d = DehydrateData::default();
+        d.dry_run = opts.dry_run;
+        return d;
+    }
+
+    // 选定挂载点
+    let targets: Vec<(PathBuf, String, FsHandle, qxync_fuse::Notifier, CacheMode)> = {
+        let g = state.mounts.lock().unwrap();
+        g.values()
+            .filter(|m| {
+                opts.mountpoint
+                    .as_ref()
+                    .map(|mp| m.info.mountpoint == *mp)
+                    .unwrap_or(true)
+            })
+            .map(|m| {
+                (
+                    m.info.mountpoint.clone(),
+                    m.info.remote.clone(),
+                    m.handle.clone(),
+                    m.notifier.clone(),
+                    m.cache_mode,
+                )
+            })
+            .collect()
+    };
+
+    let mut out = DehydrateData {
+        dry_run: opts.dry_run,
+        ..Default::default()
+    };
+    let manual_path = opts.path.clone();
+    for (mp, remote_root, handle, notifier, _mode) in &targets {
+        if let Some(p) = &manual_path {
+            if !(p == remote_root
+                || p.starts_with(&format!("{}/", remote_root.trim_end_matches('/'))))
+            {
+                continue;
+            }
+        }
+        let cache_dir = handle.cache_dir().to_path_buf();
+        let limit = resolve_limit(limit_spec, &cache_dir);
+        out.limit_bytes = limit;
+        let mapped = mmap_remotes(mp, remote_root);
+        let policy = Policy {
+            idle_secs,
+            cache_limit: limit,
+            recent_secs,
+            now,
+        };
+        let cands = if let Some(p) = &manual_path {
+            handle.candidate(p).into_iter().collect::<Vec<_>>()
+        } else {
+            handle.dehydrate_candidates()
+        };
+        let plan = qxync_core::dehydrate::plan(&cands, &policy, &mapped);
+        if manual_path.is_some() && plan.targets.is_empty() && plan.blocked.is_empty() {
+            continue;
+        }
+        for (path, why) in &plan.blocked {
+            out.blocked.push((path.clone(), why.reason().to_string()));
+            record_block(&state.dehydrate_stats, *why);
+        }
+        for c in &plan.targets {
+            out.targets.push(c.remote.clone());
+            if opts.dry_run {
+                out.freed_bytes += c.hydrated_bytes;
+                out.dehydrated += 1;
+                continue;
+            }
+            let n = notifier.clone();
+            match handle.dehydrate_now(&c.remote, &policy, mapped.contains(&c.remote), move |ino| {
+                n.inval_inode(ino, 0, 0)
+            }) {
+                qxync_fuse::DehydrateOutcome::Freed(bytes) => {
+                    out.dehydrated += 1;
+                    out.freed_bytes += bytes;
+                }
+                qxync_fuse::DehydrateOutcome::Blocked(b) => {
+                    out.blocked.push((c.remote.clone(), b.reason().to_string()));
+                    record_block(&state.dehydrate_stats, b);
+                }
+                qxync_fuse::DehydrateOutcome::Failed(e) => {
+                    out.blocked.push((c.remote.clone(), format!("失败: {e}")));
+                    *state.dehydrate_stats.last_error.lock().unwrap() = Some(e);
+                }
+            }
+        }
+    }
+    out.used_bytes = cache_info(state).used_bytes;
+    // 累计统计（手动与后台共用；dry-run 不计数）
+    let st = &state.dehydrate_stats;
+    st.runs.fetch_add(1, Ordering::Relaxed);
+    st.last_run_unix.store(now, Ordering::Relaxed);
+    if !opts.dry_run {
+        st.dehydrated.fetch_add(out.dehydrated, Ordering::Relaxed);
+        st.freed.fetch_add(out.freed_bytes, Ordering::Relaxed);
+    }
+    out
+}
+
+fn record_block(stats: &Arc<DehydrateStats>, b: Block) {
+    let c = match b {
+        Block::Dirty => &stats.blocked_dirty,
+        Block::PendingUpload => &stats.blocked_dirty,
+        Block::Pinned | Block::Excluded => &stats.blocked_pinned,
+        Block::Open => &stats.blocked_open,
+        Block::Mapped => &stats.blocked_mapped,
+        Block::InFlight => &stats.blocked_inflight,
+        // 其它（不是文件/没内容/刚访问过）不单独计数
+        _ => return,
+    };
+    c.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `qsync dehydrate`：IPC 入口。
+async fn dehydrate_cmd(
+    state: &Arc<State>,
+    mut opts: DehydrateOpts,
+) -> Result<serde_json::Value, IpcError> {
+    if opts.cache_limit.is_some()
+        && CacheLimit::parse(opts.cache_limit.as_deref().unwrap()).is_none()
+    {
+        return Err(IpcError::new(
+            ErrorKind::BadRequest,
+            format!(
+                "cache_limit 写法无效: {:?}（例：512M / 2G / 25%）",
+                opts.cache_limit
+            ),
+        ));
+    }
+    // IPC 传进来的闲置/限额临时覆盖（下次后台扫描继续用环境变量的值）
+    if let Some(idle) = opts.idle_secs {
+        state.dehydrate_cfg.lock().unwrap().idle_secs = idle;
+    }
+    if !opts.all && opts.path.is_none() && opts.cache_limit.is_none() && opts.idle_secs.is_none() {
+        // 没给范围：按当前配置扫一遍
+        opts.all = true;
+    }
+    let out = run_dehydrate(state, opts).await;
+    to_value(out)
+}
+
+/// 后台脱水：按 `QSYNC_DEHYDRATE_INTERVAL` 周期扫「闲置 + 限额」。
+fn spawn_dehydrator(state: Arc<State>) {
+    let cfg = state.dehydrate_cfg.lock().unwrap().clone();
+    if cfg.enabled() {
+        tracing::info!(
+            "自动脱水已启动：每 {}s 扫一次，闲置 ≥ {}s，限额 {:?}",
+            cfg.interval_secs,
+            cfg.idle_secs,
+            cfg.limit
+        );
+    } else {
+        tracing::info!(
+            "自动脱水未启用（QSYNC_DEHYDRATE_IDLE=0 且未设 QSYNC_CACHE_LIMIT）；\
+             手动 `qsync dehydrate` 可用，`qsync dehydrate --idle-secs N` 可动态开启"
+        );
+    }
+    tokio::spawn(async move {
+        loop {
+            let interval = state.dehydrate_cfg.lock().unwrap().interval_secs.max(1);
+            tokio::time::sleep(Duration::from_secs(interval.clamp(5, 3600))).await;
+            let cfg = state.dehydrate_cfg.lock().unwrap().clone();
+            if !cfg.enabled() {
+                continue;
+            }
+            // 闲置阈值本身就是「耐心值」：设了 idle 就不再叠加 300s 保护窗口
+            // （没设 idle 时按限额清，才需要「刚访问过」的保护）。
+            let recent = if cfg.idle_secs > 0 { 0 } else { 300 };
+            let out = run_dehydrate_with_recent(
+                &state,
+                DehydrateOpts {
+                    path: None,
+                    all: true,
+                    idle_secs: Some(cfg.idle_secs),
+                    cache_limit: None,
+                    force: false,
+                    dry_run: false,
+                    mountpoint: None,
+                },
+                recent,
+            )
+            .await;
+            if out.dehydrated > 0 {
+                tracing::info!(
+                    "自动脱水：清理 {} 个文件 / 释放 {} 字节（缓存现 {} 字节）",
+                    out.dehydrated,
+                    out.freed_bytes,
+                    out.used_bytes
+                );
+            }
+        }
+    });
 }

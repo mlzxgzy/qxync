@@ -105,6 +105,9 @@ pub enum Request {
         /// ★ M2c：本地大批删除熔断阈值（60 秒窗口内的删除次数；0 = 关闭）。
         #[serde(default)]
         delete_limit: Option<usize>,
+        /// ★ M3：缓存模式 `pagecache`（默认）/ `direct`（绕过 page cache，mmap 不可用）。
+        #[serde(default)]
+        cache_mode: Option<String>,
     },
     Umount {
         mountpoint: PathBuf,
@@ -132,6 +135,29 @@ pub enum Request {
         dir: String,
         name: String,
     },
+    /// ★ M3：脱水（丢掉本地缓存内容、只留占位符）。
+    ///
+    /// * `path` 指定单个远端路径（不给就看 `all`/限额/闲置）；
+    /// * `idle_secs` 只清闲置 ≥ N 秒的（0 = 不限制）；
+    /// * `cache_limit` 形如 `512M` / `2G` / `25%`，按 LRU 清到不超限；
+    /// * `force=true` 跳过「刚访问过」保护窗口；
+    /// * `dry_run=true` 只算不删。
+    Dehydrate {
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        all: Option<bool>,
+        #[serde(default)]
+        idle_secs: Option<u64>,
+        #[serde(default)]
+        cache_limit: Option<String>,
+        #[serde(default)]
+        force: Option<bool>,
+        #[serde(default)]
+        dry_run: Option<bool>,
+        #[serde(default)]
+        mountpoint: Option<PathBuf>,
+    },
     /// 干净退出：卸载所有挂载点、删 socket/pid。
     Shutdown,
 }
@@ -154,6 +180,7 @@ impl Request {
             Request::Mounts => "mounts",
             Request::Sync { .. } => "sync",
             Request::Rm { .. } => "rm",
+            Request::Dehydrate { .. } => "dehydrate",
             Request::Shutdown => "shutdown",
         }
     }
@@ -166,6 +193,7 @@ impl Request {
                 | Request::Put { .. }
                 | Request::Mount { .. }
                 | Request::Sync { .. }
+                | Request::Dehydrate { .. }
         )
     }
 }
@@ -389,6 +417,49 @@ pub struct SyncInfo {
     pub note: Option<String>,
 }
 
+/// ★ M3：本地缓存 / 脱水状态。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CacheInfo {
+    /// `pagecache` / `direct`。
+    pub mode: String,
+    /// 本地已缓存字节数（各挂载求和）。
+    pub used_bytes: u64,
+    pub total_files: u64,
+    pub hydrated_files: u64,
+    /// 当前限额（字节；未设 = None）。
+    pub limit_bytes: Option<u64>,
+    /// 后台扫描的闲置阈值（秒；0 = 关闭定时脱水）。
+    pub idle_secs: u64,
+    /// 累计脱水次数 / 释放字节。
+    pub dehydrated_total: u64,
+    pub freed_total_bytes: u64,
+    /// 上次扫描距今秒数（没扫过 = 0）。
+    pub last_sweep_age_secs: u64,
+    /// 被安全检查挡下的分类计数（最近一次扫描）。
+    pub blocked_dirty: u64,
+    pub blocked_pinned: u64,
+    pub blocked_open: u64,
+    pub blocked_mapped: u64,
+    pub blocked_inflight: u64,
+    pub last_error: Option<String>,
+}
+
+/// ★ M3：`dehydrate` 的返回。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DehydrateData {
+    pub dehydrated: u64,
+    pub freed_bytes: u64,
+    /// 执行后的本地缓存字节（全部挂载）。
+    pub used_bytes: u64,
+    pub limit_bytes: Option<u64>,
+    pub dry_run: bool,
+    pub targets: Vec<String>,
+    /// 被挡下的（路径 → 原因）。
+    pub blocked: Vec<(String, String)>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusData {
     pub daemon: DaemonInfo,
@@ -402,6 +473,9 @@ pub struct StatusData {
     pub uploads: Option<UploadInfo>,
     #[serde(default)]
     pub sync: Option<SyncInfo>,
+    /// ★ M3：缓存/脱水状态。
+    #[serde(default)]
+    pub cache: Option<CacheInfo>,
     pub mounts: Vec<MountInfo>,
 }
 
@@ -496,6 +570,7 @@ mod tests {
             hydrate_timeout_secs: Some(600),
             read_write: Some(false),
             delete_limit: Some(0),
+            cache_mode: Some("direct".into()),
         });
         let line = encode_line(&e).unwrap();
         let back: RequestEnvelope = decode_line(&line).unwrap();
@@ -505,12 +580,14 @@ mod tests {
                 hydrate_timeout_secs,
                 remote,
                 delete_limit,
+                cache_mode,
                 ..
             } => {
                 assert_eq!(threads, Some(4));
                 assert_eq!(hydrate_timeout_secs, Some(600));
                 assert_eq!(remote.as_deref(), Some("/home"));
                 assert_eq!(delete_limit, Some(0));
+                assert_eq!(cache_mode.as_deref(), Some("direct"));
             }
             other => panic!("解成了 {other:?}"),
         }
@@ -543,6 +620,42 @@ mod tests {
             .method(),
             "rm"
         );
+    }
+
+    #[test]
+    fn dehydrate_request_round_trip() {
+        let e = RequestEnvelope::new(Request::Dehydrate {
+            path: Some("/home/a.bin".into()),
+            all: Some(false),
+            idle_secs: Some(600),
+            cache_limit: Some("512M".into()),
+            force: Some(true),
+            dry_run: Some(true),
+            mountpoint: None,
+        });
+        let back: RequestEnvelope = decode_line(&encode_line(&e).unwrap()).unwrap();
+        match back.req {
+            Request::Dehydrate {
+                path,
+                idle_secs,
+                cache_limit,
+                dry_run,
+                ..
+            } => {
+                assert_eq!(path.as_deref(), Some("/home/a.bin"));
+                assert_eq!(idle_secs, Some(600));
+                assert_eq!(cache_limit.as_deref(), Some("512M"));
+                assert_eq!(dry_run, Some(true));
+            }
+            other => panic!("解成了 {other:?}"),
+        }
+        assert_eq!(e.req.method(), "dehydrate");
+        assert!(e.req.is_long_running());
+        // CacheInfo / DehydrateData 的序列化默认值要能解析（向前兼容）
+        let info: CacheInfo = serde_json::from_str("{}").unwrap();
+        assert_eq!(info.used_bytes, 0);
+        let d: DehydrateData = serde_json::from_str("{}").unwrap();
+        assert_eq!(d.dehydrated, 0);
     }
 
     #[test]

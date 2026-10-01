@@ -43,16 +43,45 @@ export RUST_LOG="${RUST_LOG:-info}"
 LOG="$RUNDIR/fuse-matrix.log"
 
 if ! [ -x "$QS" ]; then echo "缺少 $QS，先 cargo build"; exit 1; fi
+cleanup_stale
+
+# ★ 精确判断挂载点：`grep -F "$MNT"` 会把 mnt-rw / mnt-m3 也算进来（踩过：
+#   上一次跑留下的挂载会让这一次的检查全跑在旧挂载上，而且旧挂载的缓存目录刚被 rm 掉）。
+is_mounted() {
+  awk -v mp="$1" '$2==mp { found=1 } END { exit !found }' /proc/mounts
+}
+
+# 上一次跑崩了可能留下挂载点/进程：开跑前先清干净（只碰本仓库 $RUNDIR 下的挂载点）
+cleanup_stale() {
+  local mp
+  for mp in "$RUNDIR"/mnt*; do
+    [ -d "$mp" ] || continue
+    if is_mounted "$mp"; then
+      echo "  ⚠️  清理上次残留的挂载: $mp"
+      fusermount3 -u "$mp" >/dev/null 2>&1 || "$QS" umount "$mp" >/dev/null 2>&1
+    fi
+  done
+  pkill -f "$REPO/target/debug/qsync mount" 2>/dev/null
+  sleep 1
+}
 
 # 卸载带退避重试：FUSE 会话可能正卡在一次慢下载上，fusermount 偶尔会忙
 unmount_retry() {
   local mp="$1" i
   for i in 1 2 3 4 5; do
-    grep -qF "$mp" /proc/mounts || return 0
+    is_mounted "$mp" || return 0
     "$QS" umount "$mp" >/dev/null 2>&1 || fusermount3 -u "$mp" >/dev/null 2>&1
     sleep 1
   done
-  ! grep -qF "$mp" /proc/mounts
+  if is_mounted "$mp"; then
+    # 最后手段：杀掉本仓库里持有这个挂载点的 mount 进程（只匹配本仓库路径）
+    echo "  ⚠️  $mp 卸载不掉，杀掉对应 mount 进程"
+    pkill -f "$REPO/target/debug/qsync mount $mp" 2>/dev/null
+    sleep 1
+    fusermount3 -u "$mp" >/dev/null 2>&1
+    sleep 1
+  fi
+  ! is_mounted "$mp"
 }
 
 cleanup() {
@@ -65,9 +94,9 @@ rm -f "$CACHE"/*
 "$QS" mount "$MNT" --remote "${QSYNC_REMOTE_ROOT:-/home}" --cache-dir "$CACHE" \
       --threads 4 --auto-unmount ${QSYNC_MOUNT_EXTRA:-} >"$LOG" 2>&1 &
 MOUNT_PID=$!
-for _ in $(seq 1 30); do grep -q "$MNT" /proc/mounts && break; sleep 0.5; done
-grep -q "$MNT" /proc/mounts || { echo "挂载失败，日志："; cat "$LOG"; exit 1; }
-echo "  mounted: $(grep "$MNT" /proc/mounts | head -1)"
+for _ in $(seq 1 30); do is_mounted "$MNT" && break; sleep 0.5; done
+is_mounted "$MNT" || { echo "挂载失败，日志："; cat "$LOG"; exit 1; }
+echo "  mounted: $(awk -v mp="$MNT" '$2==mp' /proc/mounts | head -1)"
 
 M="$MNT$( echo "$FIXTURE" | sed 's#^/home##' )"   # /home -> 挂载点根
 
@@ -148,7 +177,7 @@ mkdir -p "$MNT2"
 rm -f "$CACHE"/*          # 别让上一个挂载的缓存把这步短路
 "$QS" mount "$MNT2" --remote "${QSYNC_REMOTE_ROOT:-/home}" --cache-dir "$CACHE" \
       --threads 2 --auto-unmount --hydrate-timeout 0 >>"$LOG" 2>&1 &
-for _ in $(seq 1 30); do grep -q "$MNT2" /proc/mounts && break; sleep 0.5; done
+for _ in $(seq 1 30); do is_mounted "$MNT2" && break; sleep 0.5; done
 M2="$MNT2$( echo "$FIXTURE" | sed 's#^/home##' )"
 timeout 30 cat "$M2/big.bin" >"$RUNDIR/eio.out" 2>"$RUNDIR/eio.err"
 rc=$?
@@ -167,7 +196,7 @@ if [ "$BIG" = "1" ]; then
   rm -f "$CACHE"/*; : >"$LOG"
   RUST_LOG=debug "$QS" mount "$MNT" --remote "${QSYNC_REMOTE_ROOT:-/home}" --cache-dir "$CACHE" \
         --threads 4 --auto-unmount --hydrate-timeout "$HYD" >>"$LOG" 2>&1 &
-  for _ in $(seq 1 30); do grep -q "$MNT" /proc/mounts && break; sleep 0.5; done
+  for _ in $(seq 1 30); do is_mounted "$MNT" && break; sleep 0.5; done
   read_big() {  # 输出 "字节数 md5"；失败输出 "0 -"
     local n h
     n=$(cat "$M/big.bin" | wc -c 2>/dev/null)
@@ -196,7 +225,7 @@ if [ "$BIG" = "1" ]; then
   : >"$LOG"
   RUST_LOG=debug "$QS" mount "$MNT" --remote "${QSYNC_REMOTE_ROOT:-/home}" --cache-dir "$CACHE" \
         --threads 4 --auto-unmount --hydrate-timeout "$HYD" >>"$LOG" 2>&1 &
-  for _ in $(seq 1 30); do grep -q "$MNT" /proc/mounts && break; sleep 0.5; done
+  for _ in $(seq 1 30); do is_mounted "$MNT" && break; sleep 0.5; done
   # 注意：不能裸用 wait —— 后台还挂着 FUSE 挂载进程，wait 会一直等它。
   pids=()
   for i in 1 2 3 4; do (md5sum "$M/big.bin" >"$RUNDIR/dedup-$i.txt" 2>&1) & pids+=($!); done
@@ -218,8 +247,8 @@ MNTW="$RUNDIR/mnt-rw"; CACHEW="$RUNDIR/cache-rw"
 mkdir -p "$MNTW"; rm -rf "$CACHEW"
 "$QS" mount "$MNTW" --remote "${QSYNC_REMOTE_ROOT:-/home}" --cache-dir "$CACHEW" \
       --threads 4 --rw >>"$LOG" 2>&1 &
-for _ in $(seq 1 40); do grep -qF "$MNTW" /proc/mounts && break; sleep 0.5; done
-if ! grep -qF "$MNTW" /proc/mounts; then
+for _ in $(seq 1 40); do is_mounted "$MNTW" && break; sleep 0.5; done
+if ! is_mounted "$MNTW"; then
   bad "读写挂载失败（跳过写路径检查）"
 else
   MW="$MNTW$(echo "$FIXTURE" | sed 's#^/home##')"
@@ -460,10 +489,151 @@ assert len(b.get('entries',{})) >= 1, b
 fi
 "$QS" daemon stop >/dev/null 2>&1
 
+echo
+echo "=== M3 脱水（先 inval_inode 再清内容 + 安全检查链 + 闲置/限额 + direct 模式）==="
+MNT3="$RUNDIR/mnt-m3"; CACHE3="$RUNDIR/cache-m3"
+mkdir -p "$MNT3"; rm -rf "$CACHE3"
+unset QSYNC_CACHE_LIMIT
+export QSYNC_DEHYDRATE_IDLE=0            # 先关掉自动扫描，测试要可控
+export QSYNC_DEHYDRATE_INTERVAL=5
+"$QS" daemon stop >/dev/null 2>&1
+"$QS" daemon start >/dev/null 2>&1
+M3="$MNT3$(echo "$FIXTURE" | sed 's#^/home##')"
+DAEMONLOG=$(ls -t "$XDG_STATE_HOME"/qsync/log/qxyncd.log.* 2>/dev/null | head -1)
+
+# 注意：缓存是稀疏文件，`du -sb`（apparent size）会把 128 MiB 的稀疏缓存算成 128 MiB；
+# 这里要的是**真实磁盘占用**，所以用 --block-size=1 的默认（allocated）口径。
+cache_bytes() { du -s --block-size=1 "$1" 2>/dev/null | cut -f1; }
+
+if "$QS" mount "$MNT3" --remote "${QSYNC_REMOTE_ROOT:-/home}" --cache-dir "$CACHE3" \
+        --threads 4 --rw >/dev/null 2>&1; then
+
+  # ---- M3-1 水合 → 脱水 → 占位符仍显示真实大小 → 再读数据正确
+  cat "$M3/hello.txt" >"$RUNDIR/m3-hello.out" 2>/dev/null
+  check "$(cmp -s "$RUNDIR/m3-hello.out" "$LOCAL_FIXTURE/hello.txt" && echo 0 || echo 1)" "M3-1 读之前状态正常（水合内容一致）"
+  st_before=$(xattr_state "$M3/hello.txt")
+  c_before=$(cache_bytes "$CACHE3")
+  "$QS" dehydrate --path "$FIXTURE/hello.txt" --force >"$RUNDIR/m3-d1.txt" 2>&1
+  st_after=$(xattr_state "$M3/hello.txt")
+  c_after=$(cache_bytes "$CACHE3")
+  echo "  $st_before → $st_after，缓存 ${c_before}B → ${c_after}B"
+  check "$([ "$st_before" = "hydrated" ] && [ "$st_after" = "placeholder" ] && echo 0 || echo 1)" "M3-1b 脱水后状态 = placeholder"
+  check "$([ "$(stat -c %s "$M3/hello.txt")" = "24" ] && echo 0 || echo 1)" "M3-1c 占位符仍显示真实大小 24"
+  check "$([ "${c_after:-0}" -lt "${c_before:-0}" ] && echo 0 || echo 1)" "M3-1d 本地缓存字节数下降（$c_before → $c_after）"
+  cat "$M3/hello.txt" >"$RUNDIR/m3-hello2.out" 2>/dev/null
+  check "$(cmp -s "$RUNDIR/m3-hello2.out" "$LOCAL_FIXTURE/hello.txt" && echo 0 || echo 1)" "M3-1e 脱水后重新读数据正确（按需水合回来了）"
+
+  # ---- M3-2 ★ inval_inode 隔离验证：脱水后远端改成「同样长度、不同内容」，
+  #          cat 必须拿到新内容 —— 若内核 page cache 没被失效，就会读到旧内容
+  cat "$M3/hello.txt" >/dev/null 2>&1                     # 先水合，让 page cache 里有旧内容
+  "$QS" dehydrate --path "$FIXTURE/hello.txt" --force >/dev/null 2>&1
+  python3 -c "open('$RUNDIR/m3-z.bin','wb').write(b'Z'*24)"
+  "$QS" --direct put "$RUNDIR/m3-z.bin" "$FIXTURE" --name hello.txt >/dev/null 2>&1
+  got=$(cat "$M3/hello.txt" 2>/dev/null | tr -d '\n')
+  check "$([ "$got" = "ZZZZZZZZZZZZZZZZZZZZZZZZ" ] && echo 0 || echo 1)" "M3-2 脱水让内核失效了 page cache（读到远端新内容，不是旧缓存）"
+  "$QS" --direct put "$LOCAL_FIXTURE/hello.txt" "$FIXTURE" --name hello.txt >/dev/null 2>&1  # 还原 fixture
+  cat "$M3/hello.txt" >/dev/null 2>&1
+
+  # ---- M3-3 安全检查链：打开的 fd / mmap / pin
+  cat "$M3/1k.bin" >/dev/null 2>&1                        # 水合
+  python3 -c "import time; f=open('$M3/1k.bin','rb'); time.sleep(10)" &
+  FDPID=$!
+  sleep 1
+  "$QS" dehydrate --path "$FIXTURE/1k.bin" --force >"$RUNDIR/m3-fd.txt" 2>&1
+  kill "$FDPID" 2>/dev/null
+  check "$(grep -q '打开的 fd' "$RUNDIR/m3-fd.txt" && echo 0 || echo 1)" "M3-3 有打开的 fd → 跳过脱水"
+  # ★ mmap 保护：Linux 下 mmap 会给映射保留 struct file，就算进程 close(fd)，
+  #   FUSE 的 release 也不会触发 → 我们的 open 计数仍然 >0（这层已经拦住了）；
+  #   /proc/*/maps 扫描是第二道防线。这里验收「结果」：绝不能把 mmap 中的文件脱水。
+  python3 -c "
+import mmap,time
+f=open('$M3/1k.bin','rb'); m=mmap.mmap(f.fileno(),0,prot=mmap.PROT_READ); f.close(); time.sleep(10)" &
+MPID=$!
+  sleep 1
+  "$QS" dehydrate --path "$FIXTURE/1k.bin" --force >"$RUNDIR/m3-mmap.txt" 2>&1
+  st_mmap=$(xattr_state "$M3/1k.bin")
+  kill "$MPID" 2>/dev/null
+  echo "  mmap 中脱水结果: $st_mmap｜$(grep -oE '(还有打开的 fd|有进程 mmap 了它)' "$RUNDIR/m3-mmap.txt" | head -1)"
+  check "$([ "$st_mmap" = "hydrated" ] && echo 0 || echo 1)" "M3-3b 被 mmap 的文件不会被脱水（fd 计数 / /proc 扫描兜底）"
+  "$QS" pin "$FIXTURE/1k.bin" pinned >/dev/null 2>&1
+  "$QS" dehydrate --path "$FIXTURE/1k.bin" --force >"$RUNDIR/m3-pin.txt" 2>&1
+  check "$(grep -q 'pinned' "$RUNDIR/m3-pin.txt" && echo 0 || echo 1)" "M3-3c pin=pinned → 跳过脱水"
+  "$QS" pin "$FIXTURE/1k.bin" unpinned >/dev/null 2>&1
+  "$QS" dehydrate --path "$FIXTURE/1k.bin" --force >"$RUNDIR/m3-pin2.txt" 2>&1
+  check "$(grep -qE '脱水 1 个|脱水 [1-9]' "$RUNDIR/m3-pin2.txt" && echo 0 || echo 1)" "M3-3d unpin 后可以脱水"
+
+  # ---- M3-4 dirty / 在途上传 → 跳过；上传落地（success hook 清 dirty）后可以脱水
+  head -c 16777216 /dev/zero | tr '\0' 'D' >"$RUNDIR/m3-16m.bin"
+  cp "$RUNDIR/m3-16m.bin" "$M3/m3-big.bin"                   # 16 MiB 本地新文件 → 入队上传
+  "$QS" dehydrate --path "$FIXTURE/m3-big.bin" --force >"$RUNDIR/m3-dirty.txt" 2>&1
+  echo "  立即脱水（上传在途）: $(grep -oE '跳过 [0-9]+ 个' "$RUNDIR/m3-dirty.txt" | head -1) $(grep -oE '(有未上传的本地改动|上传队列里还有该文件的作业)' "$RUNDIR/m3-dirty.txt" | head -1)"
+  check "$(grep -qE '未上传的本地改动|上传队列里还有该文件的作业' "$RUNDIR/m3-dirty.txt" && echo 0 || echo 1)" "M3-4 有未上传改动/在途上传 → 跳过脱水"
+  upok=0
+  for _ in $(seq 1 240); do
+    if "$QS" status 2>/dev/null | grep -q '上传队列.*待上传 0｜上传中 no'; then upok=1; break; fi
+    sleep 0.5
+  done
+  check "$([ "$upok" = 1 ] && echo 0 || echo 1)" "M3-4b 16 MiB 上传完成（上传队列排空）"
+  "$QS" dehydrate --path "$FIXTURE/m3-big.bin" --force >"$RUNDIR/m3-dirty2.txt" 2>&1
+  check "$(grep -qE '脱水 [1-9]' "$RUNDIR/m3-dirty2.txt" && echo 0 || echo 1)" "M3-4c 上传成功后 dirty 已清 → 可以脱水（success hook 生效）"
+  "$QS" --direct rm "$FIXTURE" m3-big.bin >/dev/null 2>&1
+
+  # ---- M3-5 限额：按 LRU 清到不超限
+  head -c 1048576 "$M3/big.bin" >/dev/null 2>&1              # 水合 1 MiB（8 个区间）
+  cat "$M3/1k.bin" >/dev/null 2>&1
+  cat "$M3/hello.txt" >/dev/null 2>&1
+  sleep 2   # 让刚读完的 readahead / 内核 file 引用落定（真实场景不会毫秒级紧接着脱水）
+  c_before=$(cache_bytes "$CACHE3")
+  "$QS" dehydrate --cache-limit 256K --force >"$RUNDIR/m3-limit.txt" 2>&1
+  c_after=$(cache_bytes "$CACHE3")
+  echo "  限额 256K：缓存 ${c_before}B → ${c_after}B｜$(grep -oE '释放 [^；]*' "$RUNDIR/m3-limit.txt" | head -1)"
+  check "$([ "${c_after:-0}" -lt "${c_before:-0}" ] && echo 0 || echo 1)" "M3-5 限额触发批量脱水（$c_before → $c_after）"
+  check "$([ "${c_after:-0}" -le 400000 ] && echo 0 || echo 1)" "M3-5b 清到了限额附近（≤ 400 KiB 含开销）"
+
+  # ---- M3-6 后台自动扫描（动态开启 idle 脱水）
+  cat "$M3/hello.txt" >/dev/null 2>&1                        # 重新水合
+  "$QS" dehydrate --idle-secs 1 >/dev/null 2>&1              # 动态开启后台扫描（闲置 ≥1s）
+  sleep 9
+  st_auto=$(xattr_state "$M3/hello.txt")
+  check "$([ "$st_auto" = "placeholder" ] && echo 0 || echo 1)" "M3-6 后台定时脱水生效（闲置 ≥1s 后被自动清成占位符）"
+  check "$(grep -qh '自动脱水：' "$XDG_STATE_HOME"/qsync/log/qxyncd.log.* && echo 0 || echo 1)" "M3-6b daemon 日志有自动脱水记录"
+  "$QS" dehydrate --idle-secs 0 >/dev/null 2>&1              # 关掉，别影响 Direct 模式测试
+
+  # ---- M3-7 status 可观测
+  "$QS" status >"$RUNDIR/m3-status.txt" 2>&1
+  check "$(grep -q '本地缓存' "$RUNDIR/m3-status.txt" && echo 0 || echo 1)" "M3-7 status 显示本地缓存/脱水信息"
+  check "$(grep -qE '累计脱水 [1-9]' "$RUNDIR/m3-status.txt" && echo 0 || echo 1)" "M3-7b status 显示累计脱水次数"
+  unmount_retry "$MNT3"
+else
+  bad "M3：daemon 读写挂载失败（跳过脱水检查）"
+fi
+
+# ---- M3-8 direct 模式（绕过 page cache）：数据正确 + mmap 不可用
+MNT3D="$RUNDIR/mnt-m3-direct"; CACHE3D="$RUNDIR/cache-m3-direct"
+mkdir -p "$MNT3D"; rm -rf "$CACHE3D"
+if "$QS" mount "$MNT3D" --remote "${QSYNC_REMOTE_ROOT:-/home}" --cache-dir "$CACHE3D" \
+        --threads 2 --cache-mode direct >/dev/null 2>&1; then
+  M3D="$MNT3D$(echo "$FIXTURE" | sed 's#^/home##')"
+  check "$(cmp -s <(cat "$M3D/1k.bin" 2>/dev/null) "$LOCAL_FIXTURE/1k.bin" && echo 0 || echo 1)" "M3-8 direct 模式读取正确"
+  check "$(python3 -c "
+import mmap,sys
+f=open('$M3D/1k.bin','rb')
+try:
+    mmap.mmap(f.fileno(),0,prot=mmap.PROT_READ); sys.exit(1)
+except OSError:
+    sys.exit(0)
+" && echo 0 || echo 1)" "M3-8b direct 模式 mmap 不可用（FOPEN_DIRECT_IO 生效）"
+  unmount_retry "$MNT3D"
+else
+  bad "M3：direct 模式挂载失败"
+fi
+
+"$QS" daemon stop >/dev/null 2>&1
+
 echo "=== 卸载干净（无残留）==="
 if [ "$KEEP" = "0" ]; then
   unmount_retry "$MNT"
-  check "$(grep -qF "$MNT" /proc/mounts && echo 1 || echo 0)" "卸载后无残留挂载"
+  check "$(is_mounted "$MNT" && echo 1 || echo 0)" "卸载后无残留挂载"
   grep -E "unmount: 水合" "$LOG" | tail -1 | sed 's/^/  /'
 fi
 

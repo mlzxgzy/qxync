@@ -9,11 +9,11 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use qxync_client::Client;
 use qxync_core::ipc::{
-    default_socket_path, CursorInfo, ErrorKind, GetData, LsData, MountInfo, PingData, PutData,
-    Request, StatusData, SyncInfo,
+    default_socket_path, CacheInfo, CursorInfo, DehydrateData, ErrorKind, GetData, LsData,
+    MountInfo, PingData, PutData, Request, StatusData, SyncInfo,
 };
 use qxync_core::{ConfigPaths, Credentials, DirEntry, LinkConfig, HOME_ROOT};
-use qxync_fuse::QxyncFs;
+use qxync_fuse::{CacheMode, QxyncFs};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -131,6 +131,9 @@ enum Cmd {
         /// ★ M2c：本地大批删除熔断阈值（60 秒窗口内最多删多少项；0 = 关闭，默认 100）
         #[arg(long)]
         delete_limit: Option<usize>,
+        /// ★ M3：缓存模式 `pagecache`（默认，脱水需先 inval_inode）/ `direct`（绕过 page cache，mmap 不可用）
+        #[arg(long, value_name = "MODE")]
+        cache_mode: Option<String>,
     },
     /// 卸载 FUSE 挂载点
     Umount { mountpoint: PathBuf },
@@ -153,6 +156,35 @@ enum Cmd {
 
     /// 删除远端文件/目录（M2c 脚本/测试用；挂在挂载点上 rm 走 FUSE）
     Rm { dir: String, name: String },
+
+    /// ★ M3：脱水（丢掉本地缓存内容、只留占位符；远端数据不动）
+    ///
+    /// 安全检查（报告 12 §8.1）：pin=pinned/excluded、有未上传改动、有打开的 fd、
+    /// 被 mmap、正在水合、刚访问过 —— 任一命中就跳过。
+    /// 执行顺序铁则：先 inval_inode 让内核失效，再清内容，最后更新占位符状态。
+    Dehydrate {
+        /// 只处理这个远端路径（如 /home/qxync-test/big.bin）
+        #[arg(long)]
+        path: Option<String>,
+        /// 处理所有挂载点里所有可脱水的文件（默认：按闲置/限额配置扫）
+        #[arg(long)]
+        all: bool,
+        /// 只清闲置 ≥ N 秒的文件（0 = 不限制；给这个值也会覆盖后台配置）
+        #[arg(long)]
+        idle_secs: Option<u64>,
+        /// 缓存限额，如 512M / 2G / 25%（按 LRU 清到不超限）
+        #[arg(long)]
+        cache_limit: Option<String>,
+        /// 跳过「刚访问过」保护窗口（默认 300s）
+        #[arg(long)]
+        force: bool,
+        /// 只算不删
+        #[arg(long)]
+        dry_run: bool,
+        /// 只处理这个挂载点
+        #[arg(long)]
+        mount: Option<PathBuf>,
+    },
 
     /// 查看/设置 pin：`qsync pin <远端路径> [pinned|unpinned|unspecified|excluded]`
     Pin { path: String, state: Option<String> },
@@ -439,8 +471,8 @@ async fn main() -> Result<()> {
             client.mkdir(parent, name).await?;
             println!("✅ 已建目录 {parent}/{name}");
         }
-        Cmd::Pin { .. } | Cmd::State { .. } | Cmd::Sync { .. } => {
-            bail!("`pin`/`state`/`sync` 需要 daemon：先 `qsync daemon start`（或用 --socket 指向运行中的 daemon）");
+        Cmd::Pin { .. } | Cmd::State { .. } | Cmd::Sync { .. } | Cmd::Dehydrate { .. } => {
+            bail!("`pin`/`state`/`sync`/`dehydrate` 需要 daemon：先 `qsync daemon start`（或用 --socket 指向运行中的 daemon）");
         }
         Cmd::Rm { dir, name } => {
             let (client, _) = connect(&cli, true).await?;
@@ -463,6 +495,7 @@ async fn main() -> Result<()> {
             hydrate_timeout,
             rw,
             delete_limit,
+            cache_mode,
         } => {
             let (client, link) = connect(&cli, true).await?;
             let cache = cache_dir.clone().unwrap_or_else(|| {
@@ -476,6 +509,11 @@ async fn main() -> Result<()> {
                 .with_hydrate_timeout(std::time::Duration::from_secs(*hydrate_timeout));
             if let Some(limit) = delete_limit {
                 fs = fs.with_delete_limit(*limit);
+            }
+            if let Some(m) = cache_mode {
+                let mode = CacheMode::parse(m)
+                    .with_context(|| format!("cache_mode 只能是 pagecache/direct，收到 {m:?}"))?;
+                fs = fs.with_cache_mode(mode);
             }
             let mut queue = None;
             if *rw {
@@ -609,6 +647,7 @@ fn to_request(cli: &Cli) -> Option<Request> {
             hydrate_timeout,
             rw,
             delete_limit,
+            cache_mode,
         } => Request::Mount {
             mountpoint: mountpoint.clone(),
             remote: Some(remote.clone()),
@@ -618,6 +657,7 @@ fn to_request(cli: &Cli) -> Option<Request> {
             hydrate_timeout_secs: Some(*hydrate_timeout),
             read_write: Some(*rw),
             delete_limit: *delete_limit,
+            cache_mode: cache_mode.clone(),
         },
         Cmd::Umount { mountpoint } => Request::Umount {
             mountpoint: mountpoint.clone(),
@@ -640,6 +680,23 @@ fn to_request(cli: &Cli) -> Option<Request> {
         Cmd::Rm { dir, name } => Request::Rm {
             dir: dir.clone(),
             name: name.clone(),
+        },
+        Cmd::Dehydrate {
+            path,
+            all,
+            idle_secs,
+            cache_limit,
+            force,
+            dry_run,
+            mount,
+        } => Request::Dehydrate {
+            path: path.clone(),
+            all: Some(*all),
+            idle_secs: *idle_secs,
+            cache_limit: cache_limit.clone(),
+            force: Some(*force),
+            dry_run: Some(*dry_run),
+            mountpoint: mount.clone(),
         },
         Cmd::State { .. } | Cmd::Daemon { .. } => return None,
     })
@@ -775,6 +832,10 @@ async fn route_via_daemon(
             ipc_client::call_ok(&socket, req).await?;
             println!("✅ 已删除 {dir}/{name}（经 daemon）");
         }
+        Cmd::Dehydrate { dry_run, .. } => {
+            let d: DehydrateData = ipc_client::call(&socket, req).await?;
+            print_dehydrate(&d, *dry_run);
+        }
         Cmd::Umount { mountpoint } => {
             ipc_client::call_ok(&socket, req).await?;
             println!("✅ 已卸载 {}", mountpoint.display());
@@ -799,6 +860,72 @@ async fn route_via_daemon(
         Cmd::State { .. } | Cmd::Daemon { .. } => unreachable!(),
     }
     Ok(())
+}
+
+/// ★ M3：缓存/脱水状态。
+fn print_cache(c: &CacheInfo) {
+    let limit = c
+        .limit_bytes
+        .map(|b| human_size(b))
+        .unwrap_or_else(|| "未设".into());
+    println!(
+        "本地缓存  : {}（{}），已缓存 {} / 限额 {}｜水合文件 {} / 共 {}｜累计脱水 {} 次 / 释放 {}",
+        c.mode,
+        if c.idle_secs > 0 {
+            format!("闲置 ≥ {}s 自动脱水", c.idle_secs)
+        } else {
+            "仅手动脱水".to_string()
+        },
+        human_size(c.used_bytes),
+        limit,
+        c.hydrated_files,
+        c.total_files,
+        c.dehydrated_total,
+        human_size(c.freed_total_bytes)
+    );
+    if c.last_sweep_age_secs > 0 {
+        println!(
+            "            上次扫描 {}s 前｜被挡：dirty={} pinned={} open={} mmap={} 在途={}",
+            c.last_sweep_age_secs,
+            c.blocked_dirty,
+            c.blocked_pinned,
+            c.blocked_open,
+            c.blocked_mapped,
+            c.blocked_inflight
+        );
+    }
+    if let Some(e) = &c.last_error {
+        println!("            ⚠️  最近错误: {e}");
+    }
+}
+
+/// ★ M3：`qsync dehydrate` 的结果。
+fn print_dehydrate(d: &DehydrateData, dry_run: bool) {
+    println!(
+        "{}脱水 {} 个文件，释放 {}；本地缓存现 {} / 限额 {}",
+        if dry_run { "[dry-run] " } else { "" },
+        d.dehydrated,
+        human_size(d.freed_bytes),
+        human_size(d.used_bytes),
+        d.limit_bytes
+            .map(human_size)
+            .unwrap_or_else(|| "未设".into())
+    );
+    for t in d.targets.iter().take(20) {
+        println!("  - {t}");
+    }
+    if d.targets.len() > 20 {
+        println!("  …（共 {} 个）", d.targets.len());
+    }
+    if !d.blocked.is_empty() {
+        println!("  跳过 {} 个：", d.blocked.len());
+        for (p, why) in d.blocked.iter().take(10) {
+            println!("  · {p} —— {why}");
+        }
+        if d.blocked.len() > 10 {
+            println!("  …（共 {} 个）", d.blocked.len());
+        }
+    }
 }
 
 /// 变更发现状态（`qsync sync` / `status` 共用）。
@@ -890,6 +1017,9 @@ fn print_status(st: &StatusData) {
             "游标      : max_log={} global_notify={} sync_signal={}",
             c.max_log, c.global_notify, c.sync_signal
         );
+    }
+    if let Some(c) = &st.cache {
+        print_cache(c);
     }
     if let Some(u) = &st.uploads {
         println!(

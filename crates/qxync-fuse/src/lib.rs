@@ -21,7 +21,11 @@ use fuser::{
 
 pub mod upload;
 
+// 脱水需要 daemon 持有 fuser 的会话/通知句柄；这里转出，避免 daemon 直接依赖 fuser。
+pub use fuser::{BackgroundSession, Notifier};
+
 use qxync_client::Client;
+use qxync_core::dehydrate::{Block, Candidate, Policy};
 use qxync_core::DirEntry;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
@@ -58,6 +62,13 @@ struct Node {
     chunks_done: Vec<bool>,
     /// 本地有未上传的改动。
     dirty: bool,
+    /// ★ M3：打开的 fd 数（>0 时禁止脱水，报告 12 §8.1）。
+    open_count: u32,
+    /// ★ M3：最后一次读/写时间（LRU 脱水排序、闲置判定）。
+    last_access: SystemTime,
+    /// ★ M3：节点级操作锁 —— `read`/`write`/`setattr` 持锁；脱水用 `try_lock`，
+    /// 拿不到就说明「正在水合/读写」，本轮跳过（报告 12 §8.1 的 in_progress）。
+    op_lock: Arc<Mutex<()>>,
 }
 
 impl Node {
@@ -76,6 +87,23 @@ impl Node {
 
     fn is_partially_hydrated(&self) -> bool {
         self.chunks_done.iter().any(|d| *d)
+    }
+
+    /// 本地已缓存的字节数（已就绪区间之和；末块按文件大小截断）。
+    fn hydrated_bytes(&self, chunk_size: u64) -> u64 {
+        let mut sum = 0u64;
+        for (i, done) in self.chunks_done.iter().enumerate() {
+            if !*done {
+                continue;
+            }
+            let start = i as u64 * chunk_size;
+            if start >= self.attr.size {
+                continue;
+            }
+            let end = (start + chunk_size).min(self.attr.size);
+            sum += end - start;
+        }
+        sum
     }
 
     /// 给 xattr 用的状态串。
@@ -185,6 +213,31 @@ pub struct FsHandle {
     upload: Option<Arc<UploadQueue>>,
     delete_guard: Arc<DeleteGuard>,
     read_only: bool,
+    /// ★ M3：pin 状态（脱水拦截条件）。
+    pins: PinMap,
+    cache_mode: CacheMode,
+}
+
+/// 缓存占用统计（`status` / 限额判定用）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheStats {
+    /// 本地已缓存字节数（已就绪区间之和）。
+    pub used_bytes: u64,
+    /// 文件节点数（不含目录/根）。
+    pub total_files: u64,
+    /// 有缓存内容的文件数（含部分水合）。
+    pub hydrated_files: u64,
+}
+
+/// 脱水结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DehydrateOutcome {
+    /// 成功，释放了 N 字节。
+    Freed(u64),
+    /// 安全检查未通过（原因见 [`Block`]）。
+    Blocked(Block),
+    /// 执行失败（例如 `inval_inode` 被内核拒绝）——此时**没有**清内容。
+    Failed(String),
 }
 
 impl FsHandle {
@@ -196,6 +249,176 @@ impl FsHandle {
     }
     pub fn is_read_only(&self) -> bool {
         self.read_only
+    }
+
+    pub fn cache_mode(&self) -> CacheMode {
+        self.cache_mode
+    }
+
+    /// 导出所有可脱水候选（fuse 侧事实，策略判定在 `qxync_core::dehydrate`）。
+    pub fn dehydrate_candidates(&self) -> Vec<Candidate> {
+        let g = self.inner.lock().unwrap();
+        g.nodes
+            .values()
+            .filter(|n| n.attr.kind == FileType::RegularFile)
+            .map(|n| self.candidate_of(&g, n, true))
+            .collect()
+    }
+
+    pub fn candidate(&self, remote: &str) -> Option<Candidate> {
+        self.candidate_locked(remote, true)
+    }
+
+    /// `check_op_lock=false` 用在「调用方已经持有该节点操作锁」的场景
+    /// （脱水复查）——否则会把自己的锁当成「在途」而误判。
+    fn candidate_locked(&self, remote: &str, check_op_lock: bool) -> Option<Candidate> {
+        let g = self.inner.lock().unwrap();
+        let ino = *g.by_remote.get(remote)?;
+        let n = g.nodes.get(&ino)?;
+        Some(self.candidate_of(&g, n, check_op_lock))
+    }
+
+    fn candidate_of(&self, g: &Inner, n: &Node, check_op_lock: bool) -> Candidate {
+        let in_flight = g
+            .inflight_chunks
+            .keys()
+            .any(|(i, _)| *i == u64::from(n.ino))
+            || (check_op_lock && n.op_lock.try_lock().is_err());
+        Candidate {
+            remote: n.remote.clone(),
+            is_dir: n.attr.kind == FileType::Directory,
+            size: n.attr.size,
+            hydrated_bytes: n.hydrated_bytes(self.chunk_size),
+            dirty: n.dirty,
+            pending_upload: self
+                .upload
+                .as_ref()
+                .map(|q| q.has_pending(&n.remote))
+                .unwrap_or(false),
+            open_count: n.open_count,
+            in_flight,
+            pin: self
+                .pins
+                .lock()
+                .unwrap()
+                .get(&n.remote)
+                .cloned()
+                .unwrap_or_else(|| "unspecified".to_string()),
+            last_access: epoch_secs(n.last_access).max(0) as u64,
+        }
+    }
+
+    /// 缓存占用统计。
+    pub fn cache_stats(&self) -> CacheStats {
+        let g = self.inner.lock().unwrap();
+        let mut out = CacheStats::default();
+        for n in g.nodes.values() {
+            if n.attr.kind != FileType::RegularFile {
+                continue;
+            }
+            out.total_files += 1;
+            let used = n.hydrated_bytes(self.chunk_size);
+            if used > 0 {
+                out.hydrated_files += 1;
+                out.used_bytes += used;
+            }
+        }
+        out
+    }
+
+    /// 上传成功后清掉 `dirty`（有 hook 时由上传队列回调）。
+    pub fn clear_dirty(&self, remote: &str) {
+        if self.has_pending(remote) {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap();
+        if let Some(ino) = g.by_remote.get(remote).copied() {
+            if let Some(n) = g.nodes.get_mut(&ino) {
+                n.dirty = false;
+            }
+        }
+    }
+
+    /// ★★ M3 铁则 2：**先 `inval_inode`（让内核失效 page cache）→ 再清内容 → 再更新状态**。
+    ///
+    /// `invalidate` 由调用方注入（daemon 传 `Notifier::inval_inode(ino, 0, 0)`；
+    /// 单测传空实现）—— 顺序由这里的代码固定，任何实现都绕不过「先失效」。
+    ///
+    /// 安全检查不通过时**什么都不做**；`inval_inode` 失败时也**不清内容**（宁可占着磁盘，
+    /// 也不能让应用读到 0）。
+    pub fn dehydrate_now<F>(
+        &self,
+        remote: &str,
+        policy: &Policy,
+        mapped: bool,
+        invalidate: F,
+    ) -> DehydrateOutcome
+    where
+        F: FnOnce(INodeNo) -> std::io::Result<()>,
+    {
+        let Some(cand) = self.candidate(remote) else {
+            return DehydrateOutcome::Blocked(Block::NoContent);
+        };
+        if let Err(b) = qxync_core::dehydrate::eligible(&cand, policy, mapped) {
+            log_dehydrate_block(remote, &cand, b, "预检");
+            return DehydrateOutcome::Blocked(b);
+        }
+        // 节点操作锁：拿不到 = 正在水合/读写 → 本轮跳过（报告 12 §8.1 in_progress）
+        let (ino, lock) = {
+            let g = self.inner.lock().unwrap();
+            match g
+                .by_remote
+                .get(remote)
+                .copied()
+                .and_then(|i| g.nodes.get(&i))
+            {
+                Some(n) => (n.ino, n.op_lock.clone()),
+                None => return DehydrateOutcome::Blocked(Block::NoContent),
+            }
+        };
+        let _guard = match lock.try_lock() {
+            Ok(g) => g,
+            Err(_) => return DehydrateOutcome::Blocked(Block::InFlight),
+        };
+        // 持锁后复查（open/dirty/pending 可能刚变了；此时不再看自己的 op_lock）
+        let fresh = match self.candidate_locked(remote, false) {
+            Some(c) => c,
+            None => return DehydrateOutcome::Blocked(Block::NoContent),
+        };
+        if let Err(b) = qxync_core::dehydrate::eligible(&fresh, policy, mapped) {
+            log_dehydrate_block(remote, &fresh, b, "持锁复查");
+            return DehydrateOutcome::Blocked(b);
+        }
+        let freed = fresh.hydrated_bytes;
+
+        // ① 先让内核失效（失败 → 绝不继续）
+        if let Err(e) = invalidate(ino) {
+            tracing::error!("脱水中止：inval_inode {remote} 失败: {e}");
+            return DehydrateOutcome::Failed(format!("inval_inode 失败: {e}"));
+        }
+        // ② 再清内容（删稀疏缓存）
+        let cache_path = {
+            let mut g = self.inner.lock().unwrap();
+            g.nodes.get_mut(&ino).and_then(|n| n.cache.take())
+        };
+        if let Some(p) = cache_path {
+            if let Err(e) = std::fs::remove_file(&p) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!("删除缓存文件失败 {}: {e}", p.display());
+                }
+            }
+        }
+        // ③ 再更新占位符状态
+        {
+            let mut g = self.inner.lock().unwrap();
+            let chunk_size = self.chunk_size;
+            if let Some(n) = g.nodes.get_mut(&ino) {
+                n.chunks_done = vec![false; n.chunk_count(chunk_size)];
+                n.dirty = false;
+            }
+        }
+        tracing::info!("已脱水 {remote}（释放 {freed} 字节，先 inval_inode 再清内容）");
+        DehydrateOutcome::Freed(freed)
     }
 }
 
@@ -501,6 +724,21 @@ impl DeleteGuard {
     }
 }
 
+/// 脱水被安全检查挡下时打一条可诊断的日志（含各检查项的实际取值）。
+fn log_dehydrate_block(remote: &str, c: &Candidate, b: Block, phase: &str) {
+    tracing::info!(
+        "脱水跳过 {remote}（{phase}）: {}｜open={} dirty={} pending={} in_flight={} hydrated={} pin={} last_access={}",
+        b.reason(),
+        c.open_count,
+        c.dirty,
+        c.pending_upload,
+        c.in_flight,
+        c.hydrated_bytes,
+        c.pin,
+        c.last_access
+    );
+}
+
 /// 文件名安全化（冲突副本的 stash 文件名用）。
 fn sanitize_filename(name: &str) -> String {
     name.chars()
@@ -512,6 +750,33 @@ fn sanitize_filename(name: &str) -> String {
             }
         })
         .collect()
+}
+
+/// ★ M3：缓存模式（报告 12 §8.3）。
+///
+/// * `PageCache`（默认）：走内核 page cache（性能好，脱水必须严格按「先 inval_inode 再清内容」）；
+/// * `Direct`：`open()` 回 `FOPEN_DIRECT_IO`，完全绕过 page cache —— 脱水绝对安全，
+///   但**没有 readahead、mmap 不可用**（保守模式，排障/低速链路用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheMode {
+    PageCache,
+    Direct,
+}
+
+impl CacheMode {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "pagecache" | "page-cache" | "cached" | "cache" => Some(CacheMode::PageCache),
+            "direct" | "direct_io" | "direct-io" => Some(CacheMode::Direct),
+            _ => None,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CacheMode::PageCache => "pagecache",
+            CacheMode::Direct => "direct",
+        }
+    }
 }
 
 pub struct QxyncFs {
@@ -537,6 +802,8 @@ pub struct QxyncFs {
     inner: Arc<Mutex<Inner>>,
     /// ★ M2c：本地大批删除熔断（`rm -rf` 保护）。
     delete_guard: Arc<DeleteGuard>,
+    /// ★ M3：缓存模式（pagecache / direct）。
+    cache_mode: CacheMode,
 }
 
 impl QxyncFs {
@@ -580,6 +847,9 @@ impl QxyncFs {
             cache: None,
             chunks_done: Vec::new(),
             dirty: false,
+            open_count: 0,
+            last_access: UNIX_EPOCH,
+            op_lock: Arc::new(Mutex::new(())),
         };
         let mut nodes = HashMap::new();
         let mut by_remote = HashMap::new();
@@ -606,6 +876,7 @@ impl QxyncFs {
                 inflight_chunks: HashMap::new(),
             })),
             delete_guard: DeleteGuard::new(DEFAULT_DELETE_LIMIT, DEFAULT_DELETE_WINDOW),
+            cache_mode: CacheMode::PageCache,
         })
     }
 
@@ -669,7 +940,19 @@ impl QxyncFs {
             upload: self.upload.clone(),
             delete_guard: self.delete_guard.clone(),
             read_only: self.read_only,
+            pins: self.pins.clone(),
+            cache_mode: self.cache_mode,
         }
+    }
+
+    /// ★ M3：缓存模式（`pagecache` 默认 / `direct` 绕过 page cache）。
+    pub fn with_cache_mode(mut self, mode: CacheMode) -> Self {
+        self.cache_mode = mode;
+        self
+    }
+
+    pub fn cache_mode(&self) -> CacheMode {
+        self.cache_mode
     }
 
     /// 本地批量删除阈值（0 = 关闭熔断；默认 100 次/60 秒）。
@@ -790,6 +1073,9 @@ impl QxyncFs {
             cache: None,
             chunks_done: Vec::new(),
             dirty: false,
+            open_count: 0,
+            last_access: SystemTime::now(),
+            op_lock: Arc::new(Mutex::new(())),
         };
         g.nodes.insert(ino, node.clone());
         g.by_remote.insert(remote.to_string(), ino);
@@ -974,6 +1260,61 @@ impl QxyncFs {
         })?;
         tracing::debug!("已入队上传: {remote} (mtime={mtime})");
         Ok(())
+    }
+
+    /// 测试用：读某个 ino 的状态串（placeholder/partial/hydrated）。
+    #[cfg(test)]
+    fn node_state_for_test(&self, ino: INodeNo) -> &'static str {
+        let g = self.inner.lock().unwrap();
+        g.nodes
+            .get(&ino)
+            .map(|n| n.state_str())
+            .unwrap_or("missing")
+    }
+
+    /// ★ M3：刷新节点的「最后访问时间」（LRU 脱水用）。
+    fn touch(&self, ino: INodeNo) {
+        let mut g = self.inner.lock().unwrap();
+        if let Some(n) = g.nodes.get_mut(&ino) {
+            n.last_access = SystemTime::now();
+        }
+    }
+
+    /// ★ M3：把被**完整覆盖**的区间记成「已就绪」。
+    ///
+    /// 本地写入的数据同样在缓存文件里，不记的话本地新建/改过的文件永远被当成
+    /// 「没有缓存内容」：既不能脱水、xattr 的 chunks 也不准
+    /// （实测踩过：16 MiB 本地文件脱水被判成「本来就是占位符」）。
+    /// 只有整块区间都被这次写覆盖才算完整（部分覆盖的块里还有别的字节）。
+    fn mark_written_chunks(&self, ino: INodeNo, offset: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        let chunk_size = self.chunk_size;
+        let mut g = self.inner.lock().unwrap();
+        if let Some(n) = g.nodes.get_mut(&ino) {
+            let want = n.chunk_count(chunk_size);
+            if n.chunks_done.len() < want {
+                n.chunks_done.resize(want, false);
+            }
+            let end = offset + len;
+            let (first, last) = chunk_indices(offset, len, chunk_size);
+            for idx in first..=last {
+                let c_start = idx * chunk_size;
+                let c_end = ((idx + 1) * chunk_size).min(n.attr.size);
+                if c_start >= offset && c_end <= end {
+                    if let Some(slot) = n.chunks_done.get_mut(idx as usize) {
+                        *slot = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// 节点操作锁（read/write/setattr 持锁；脱水 try_lock）。
+    fn op_lock(&self, ino: INodeNo) -> Option<Arc<Mutex<()>>> {
+        let g = self.inner.lock().unwrap();
+        g.nodes.get(&ino).map(|n| n.op_lock.clone())
     }
 
     /// 缓存文件（懒创建）：**apparent size = 文件大小**，用 `set_len` 造稀疏文件。
@@ -1235,15 +1576,22 @@ impl Filesystem for QxyncFs {
         if self.read_only && flags.acc_mode() != OpenAccMode::O_RDONLY {
             return reply.error(fuser::Errno::EACCES);
         }
-        let exists = { self.inner.lock().unwrap().nodes.contains_key(&ino) };
-        if exists {
-            reply.opened(
-                fuser::FileHandle(u64::from(ino)),
-                FopenFlags::FOPEN_KEEP_CACHE,
-            );
-        } else {
-            reply.error(fuser::Errno::ENOENT);
+        // ★ M3：缓存模式决定是否绕过内核 page cache
+        let fopen = match self.cache_mode {
+            CacheMode::PageCache => FopenFlags::FOPEN_KEEP_CACHE,
+            CacheMode::Direct => FopenFlags::FOPEN_DIRECT_IO,
+        };
+        {
+            let mut g = self.inner.lock().unwrap();
+            match g.nodes.get_mut(&ino) {
+                Some(n) => {
+                    n.open_count = n.open_count.saturating_add(1);
+                    n.last_access = SystemTime::now();
+                }
+                None => return reply.error(fuser::Errno::ENOENT),
+            }
         }
+        reply.opened(fuser::FileHandle(u64::from(ino)), fopen);
     }
 
     fn read(
@@ -1267,6 +1615,13 @@ impl Filesystem for QxyncFs {
         if offset >= file_size {
             return reply.data(&[]); // 正常 EOF
         }
+        // ★ M3：拿节点操作锁 —— 脱水用 try_lock，因此在途读不会被清内容
+        let lock = match self.op_lock(ino) {
+            Some(l) => l,
+            None => return reply.error(fuser::Errno::ENOENT),
+        };
+        let _guard = lock.lock().unwrap();
+        self.touch(ino);
         // 请求范围若越过文件尾，只需返回实际存在的部分（这是 EOF，不是短读）
         let want = (size as u64).min(file_size - offset);
         // ★ M2：只取这段需要的 128 KiB 区间（single-flight + 超时）
@@ -1298,6 +1653,13 @@ impl Filesystem for QxyncFs {
         if self.read_only {
             return reply.error(fuser::Errno::EROFS);
         }
+        // ★ M3：与脱水互斥（不然可能「写完被清掉、还没入队」）
+        let lock = match self.op_lock(ino) {
+            Some(l) => l,
+            None => return reply.error(fuser::Errno::ENOENT),
+        };
+        let _guard = lock.lock().unwrap();
+        self.touch(ino);
         // ★ read-modify-write：先把会被整块覆盖之外的区间补齐，
         //   否则未取回的区间是 0，整文件上传会把远端内容清零。
         if let Err(e) = self.hydrate_all(ino, Some((offset, data.len() as u64))) {
@@ -1332,6 +1694,8 @@ impl Filesystem for QxyncFs {
         if f.write_all_at(data, offset).is_err() {
             return reply.error(fuser::Errno::EIO);
         }
+        // ★ M3：本地写入的数据也是「已经有内容」
+        self.mark_written_chunks(ino, offset, data.len() as u64);
         let now = SystemTime::now();
         {
             let mut g = self.inner.lock().unwrap();
@@ -1367,6 +1731,9 @@ impl Filesystem for QxyncFs {
         if self.read_only && (size.is_some() || mtime.is_some()) {
             return reply.error(fuser::Errno::EROFS);
         }
+        // ★ M3：截断/改 mtime 与脱水互斥
+        let lock = self.op_lock(ino);
+        let _guard = lock.as_ref().map(|l| l.lock().unwrap());
         let mut size_changed = false;
 
         if let Some(new_size) = size {
@@ -1757,13 +2124,20 @@ impl Filesystem for QxyncFs {
     fn release(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         _fh: fuser::FileHandle,
         _flags: fuser::OpenFlags,
         _lock_owner: Option<fuser::LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        {
+            let mut g = self.inner.lock().unwrap();
+            if let Some(n) = g.nodes.get_mut(&ino) {
+                n.open_count = n.open_count.saturating_sub(1);
+                n.last_access = SystemTime::now();
+            }
+        }
         reply.ok();
     }
 
@@ -1846,6 +2220,42 @@ pub fn mount_config(n_threads: usize, auto_unmount: bool, read_only: bool) -> Co
     cfg
 }
 
+/// ★ M3：可通知内核的挂载句柄。
+///
+/// `qsync_fuse::mount()` 用 `fuser::mount2`（拿不到 Notifier）；脱水必须能发
+/// `inval_inode`，所以 daemon 用 [`spawn`] —— 它返回 `BackgroundSession`（可 join/卸载）
+/// 和 `Notifier`（`inval_inode(ino, 0, 0)`）。
+pub struct MountHandle {
+    pub session: fuser::BackgroundSession,
+    pub notifier: fuser::Notifier,
+}
+
+impl MountHandle {
+    /// 让内核对某个 inode 失效（page cache + attr）。
+    pub fn invalidate_inode(&self, ino: INodeNo) -> std::io::Result<()> {
+        self.notifier.inval_inode(ino, 0, 0)
+    }
+
+    /// 卸载并 join 挂载线程（外部 `fusermount3 -u` 之后调用）。
+    pub fn join(self) -> std::io::Result<()> {
+        self.session.join()
+    }
+}
+
+/// ★ M3：后台挂载（daemon 用；返回可发通知的句柄）。
+pub fn spawn(
+    fs: QxyncFs,
+    mountpoint: &Path,
+    n_threads: usize,
+    auto_unmount: bool,
+    read_only: bool,
+) -> std::io::Result<MountHandle> {
+    let cfg = mount_config(n_threads, auto_unmount, read_only);
+    let session = fuser::spawn_mount2(fs, mountpoint, &cfg)?;
+    let notifier = session.notifier();
+    Ok(MountHandle { session, notifier })
+}
+
 /// 便捷入口：前台挂载（阻塞）。
 pub fn mount(
     fs: QxyncFs,
@@ -1907,6 +2317,9 @@ mod tests {
             cache: None,
             chunks_done: vec![false; 3],
             dirty: false,
+            open_count: 0,
+            last_access: UNIX_EPOCH,
+            op_lock: Arc::new(Mutex::new(())),
         };
         assert_eq!(n.state_str(), "placeholder");
         n.chunks_done[0] = true;
@@ -1948,6 +2361,13 @@ mod tests {
     }
 
     // ------------------------------------------------------------ M2c 单测
+
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
 
     fn test_link() -> qxync_core::LinkConfig {
         qxync_core::LinkConfig {
@@ -2093,5 +2513,352 @@ mod tests {
         .unwrap();
         assert!(h.has_pending("/home/a (conflicted copy from pc 2026-09-30).txt"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------------------ M3 脱水单测
+
+    /// 造一个「已水合」的节点（缓存文件存在 + 所有区间就绪）。
+    fn hydrated_fs(dir: &Path, pins: PinMap) -> (QxyncFs, INodeNo, PathBuf) {
+        let client = Arc::new(Client::new(&test_link()).unwrap());
+        let fs = QxyncFs::new(client, "/home", dir.join("cache"))
+            .unwrap()
+            .with_pins(pins);
+        let entry = DirEntry::local("a.bin", false, 300 * 1024, 111);
+        let node = fs.insert_node(INodeNo::ROOT, "a.bin", "/home/a.bin", &entry);
+        let cache = fs.cache_file_for(node.ino).unwrap();
+        {
+            let mut g = fs.inner.lock().unwrap();
+            let n = g.nodes.get_mut(&node.ino).unwrap();
+            n.chunks_done = vec![true; n.chunk_count(DEFAULT_CHUNK_SIZE)];
+            // 真的写点字节，验证「删缓存文件」确实发生
+            std::fs::write(&cache, vec![7u8; 300 * 1024]).unwrap();
+        }
+        (fs, node.ino, cache)
+    }
+
+    #[test]
+    fn dehydrate_invalidates_before_clearing_and_frees_cache() {
+        let dir = std::env::temp_dir().join(format!("qxync-fuse-m3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (fs, ino, cache) = hydrated_fs(&dir, Arc::new(Mutex::new(HashMap::new())));
+        let h = fs.handle();
+        assert_eq!(h.cache_stats().used_bytes, 300 * 1024);
+        assert_eq!(h.cache_stats().hydrated_files, 1);
+
+        // 记录 inval_inode 回调被调用时缓存文件是否还在（铁则 2：必须先失效再清）
+        let seen = Arc::new(Mutex::new(None::<bool>));
+        let seen2 = seen.clone();
+        let cache_for_cb = cache.clone();
+        let out = h.dehydrate_now(
+            "/home/a.bin",
+            &Policy::manual(now_secs()),
+            false,
+            move |got_ino| {
+                assert_eq!(u64::from(got_ino), u64::from(ino));
+                *seen2.lock().unwrap() = Some(cache_for_cb.exists());
+                Ok(())
+            },
+        );
+        assert_eq!(out, DehydrateOutcome::Freed(300 * 1024));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(true),
+            "inval_inode 必须发生在清内容之前"
+        );
+        assert!(!cache.exists(), "缓存文件必须被清掉");
+        assert_eq!(h.cache_stats().used_bytes, 0);
+        let n = h.node("/home/a.bin").unwrap();
+        assert_eq!(n.size, 300 * 1024, "占位符仍显示真实大小");
+        assert_eq!(fs.node_state_for_test(ino), "placeholder");
+        // 再脱水一次 → 没内容可清
+        assert_eq!(
+            h.dehydrate_now(
+                "/home/a.bin",
+                &Policy::manual(now_secs()),
+                false,
+                |_| Ok(())
+            ),
+            DehydrateOutcome::Blocked(Block::NoContent)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dehydrate_aborts_when_invalidate_fails() {
+        let dir = std::env::temp_dir().join(format!("qxync-fuse-m3b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (fs, _ino, cache) = hydrated_fs(&dir, Arc::new(Mutex::new(HashMap::new())));
+        let h = fs.handle();
+        let out = h.dehydrate_now("/home/a.bin", &Policy::manual(now_secs()), false, |_| {
+            Err(std::io::Error::other("内核拒绝"))
+        });
+        assert!(matches!(out, DehydrateOutcome::Failed(_)), "{out:?}");
+        assert!(cache.exists(), "inval 失败绝不能清内容");
+        assert_eq!(h.cache_stats().used_bytes, 300 * 1024);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dehydrate_safety_chain_in_fuse() {
+        let dir = std::env::temp_dir().join(format!("qxync-fuse-m3c-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pins: PinMap = Arc::new(Mutex::new(HashMap::new()));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = Arc::new(Client::new(&test_link()).unwrap());
+        let q = UploadQueue::new(client.clone(), rt.handle().clone(), dir.join("queue")).unwrap();
+        let fs = QxyncFs::new(client, "/home", dir.join("cache"))
+            .unwrap()
+            .with_write_mode()
+            .with_upload_queue(q.clone())
+            .with_pins(pins.clone());
+        let entry = DirEntry::local("a.bin", false, 300 * 1024, 111);
+        let node = fs.insert_node(INodeNo::ROOT, "a.bin", "/home/a.bin", &entry);
+        let cache = fs.cache_file_for(node.ino).unwrap();
+        {
+            let mut g = fs.inner.lock().unwrap();
+            let n = g.nodes.get_mut(&node.ino).unwrap();
+            n.chunks_done = vec![true; n.chunk_count(DEFAULT_CHUNK_SIZE)];
+        }
+        std::fs::write(&cache, vec![7u8; 300 * 1024]).unwrap();
+        let h = fs.handle();
+        let manual = Policy::manual(now_secs());
+
+        // dirty → 拒绝
+        {
+            let mut g = fs.inner.lock().unwrap();
+            g.nodes.get_mut(&node.ino).unwrap().dirty = true;
+        }
+        assert_eq!(
+            h.dehydrate_now("/home/a.bin", &manual, false, |_| Ok(())),
+            DehydrateOutcome::Blocked(Block::Dirty)
+        );
+        // dirty 清了但上传队列里还有作业 → 拒绝
+        {
+            let mut g = fs.inner.lock().unwrap();
+            g.nodes.get_mut(&node.ino).unwrap().dirty = false;
+        }
+        // 直接入队（不置 dirty）→ 只触发「队列里还有作业」这条
+        q.enqueue(UploadJob {
+            remote_dir: "/home".into(),
+            remote_name: "a.bin".into(),
+            local: cache.clone(),
+            mtime: 111,
+            attempts: 0,
+            ephemeral: false,
+        })
+        .unwrap();
+        assert_eq!(
+            h.dehydrate_now("/home/a.bin", &manual, false, |_| Ok(())),
+            DehydrateOutcome::Blocked(Block::PendingUpload)
+        );
+        assert!(cache.exists(), "被挡下时不能动内容");
+        // 队列清空后放行
+        q.cancel("/home/a.bin");
+        {
+            let mut g = fs.inner.lock().unwrap();
+            g.nodes.get_mut(&node.ino).unwrap().dirty = false;
+        }
+        assert!(matches!(
+            h.dehydrate_now("/home/a.bin", &manual, false, |_| Ok(())),
+            DehydrateOutcome::Freed(_)
+        ));
+        assert!(!cache.exists());
+
+        // ---- 重新水合（模拟），继续测 fd / mmap / pin
+        let cache2 = fs.cache_file_for(node.ino).unwrap();
+        {
+            let mut g = fs.inner.lock().unwrap();
+            let n = g.nodes.get_mut(&node.ino).unwrap();
+            n.chunks_done = vec![true; n.chunk_count(DEFAULT_CHUNK_SIZE)];
+        }
+        std::fs::write(&cache2, vec![7u8; 300 * 1024]).unwrap();
+        // 有打开的 fd → 拒绝
+        {
+            let mut g = fs.inner.lock().unwrap();
+            g.nodes.get_mut(&node.ino).unwrap().open_count = 1;
+        }
+        assert_eq!(
+            h.dehydrate_now("/home/a.bin", &manual, false, |_| Ok(())),
+            DehydrateOutcome::Blocked(Block::Open)
+        );
+        {
+            let mut g = fs.inner.lock().unwrap();
+            g.nodes.get_mut(&node.ino).unwrap().open_count = 0;
+        }
+        // 被 mmap → 拒绝
+        assert_eq!(
+            h.dehydrate_now("/home/a.bin", &manual, true, |_| Ok(())),
+            DehydrateOutcome::Blocked(Block::Mapped)
+        );
+        // pin=pinned / excluded → 拒绝；unpinned 放行
+        pins.lock()
+            .unwrap()
+            .insert("/home/a.bin".into(), "pinned".into());
+        assert_eq!(
+            h.dehydrate_now("/home/a.bin", &manual, false, |_| Ok(())),
+            DehydrateOutcome::Blocked(Block::Pinned)
+        );
+        pins.lock()
+            .unwrap()
+            .insert("/home/a.bin".into(), "excluded".into());
+        assert_eq!(
+            h.dehydrate_now("/home/a.bin", &manual, false, |_| Ok(())),
+            DehydrateOutcome::Blocked(Block::Excluded)
+        );
+        pins.lock()
+            .unwrap()
+            .insert("/home/a.bin".into(), "unpinned".into());
+        assert!(matches!(
+            h.dehydrate_now("/home/a.bin", &manual, false, |_| Ok(())),
+            DehydrateOutcome::Freed(_)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dehydrate_skips_in_flight_and_recent() {
+        let dir = std::env::temp_dir().join(format!("qxync-fuse-m3d-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (fs, ino, _cache) = hydrated_fs(&dir, Arc::new(Mutex::new(HashMap::new())));
+        let h = fs.handle();
+        // 在途（持有节点操作锁）→ Blocked(InFlight)
+        let lock = fs
+            .inner
+            .lock()
+            .unwrap()
+            .nodes
+            .get(&ino)
+            .unwrap()
+            .op_lock
+            .clone();
+        let guard = lock.lock().unwrap();
+        assert_eq!(
+            h.dehydrate_now(
+                "/home/a.bin",
+                &Policy::manual(now_secs()),
+                false,
+                |_| Ok(())
+            ),
+            DehydrateOutcome::Blocked(Block::InFlight)
+        );
+        drop(guard);
+        // 保护窗口内（刚访问过）→ Blocked(Recent)
+        let policy = Policy {
+            idle_secs: 600,
+            cache_limit: None,
+            recent_secs: 300,
+            now: now_secs(),
+        };
+        assert_eq!(
+            h.dehydrate_now("/home/a.bin", &policy, false, |_| Ok(())),
+            DehydrateOutcome::Blocked(Block::Recent)
+        );
+        // 闲置 600s 的人工时间点 → 放行
+        let old = Policy {
+            idle_secs: 600,
+            recent_secs: 300,
+            now: now_secs() + 1000,
+            cache_limit: None,
+        };
+        assert!(matches!(
+            h.dehydrate_now("/home/a.bin", &old, false, |_| Ok(())),
+            DehydrateOutcome::Freed(_)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upload_success_hook_clears_dirty() {
+        let dir = std::env::temp_dir().join(format!("qxync-fuse-m3e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = Arc::new(Client::new(&test_link()).unwrap());
+        let q = UploadQueue::new(client.clone(), rt.handle().clone(), dir.join("queue")).unwrap();
+        let fs = QxyncFs::new(client, "/home", dir.join("cache"))
+            .unwrap()
+            .with_write_mode()
+            .with_upload_queue(q.clone());
+        let entry = DirEntry::local("a.bin", false, 10, 1);
+        let node = fs.insert_node(INodeNo::ROOT, "a.bin", "/home/a.bin", &entry);
+        fs.cache_file_for(node.ino).unwrap();
+        let h = fs.handle();
+        h.mark_dirty("/home/a.bin").unwrap();
+        assert!(h.node("/home/a.bin").unwrap().dirty);
+        // 队列里还有作业 → 不清（这就是脱水被挡的第二种情况）
+        h.clear_dirty("/home/a.bin");
+        assert!(h.node("/home/a.bin").unwrap().dirty);
+        // 作业做完了（把队列清掉）→ hook 才能清
+        q.cancel("/home/a.bin");
+        h.clear_dirty("/home/a.bin");
+        assert!(!h.node("/home/a.bin").unwrap().dirty);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_writes_mark_chunks_so_files_can_be_dehydrated() {
+        let dir = std::env::temp_dir().join(format!("qxync-fuse-m3f-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (fs, ino, cache) = {
+            let client = Arc::new(Client::new(&test_link()).unwrap());
+            let fs = QxyncFs::new(client, "/home", dir.join("cache")).unwrap();
+            let entry = DirEntry::local("new.bin", false, 0, 1);
+            let node = fs.insert_node(INodeNo::ROOT, "new.bin", "/home/new.bin", &entry);
+            let cache = fs.cache_file_for(node.ino).unwrap();
+            (fs, node.ino, cache)
+        };
+        // 模拟「本地新建 300 KiB」：先扩大小，再逐块写入
+        {
+            let mut g = fs.inner.lock().unwrap();
+            let n = g.nodes.get_mut(&ino).unwrap();
+            n.attr.size = 300 * 1024;
+        }
+        std::fs::write(&cache, vec![1u8; 300 * 1024]).unwrap();
+        fs.mark_written_chunks(ino, 0, 300 * 1024);
+        assert_eq!(fs.node_state_for_test(ino), "hydrated");
+        let h = fs.handle();
+        assert_eq!(h.cache_stats().used_bytes, 300 * 1024);
+        // 有内容 → 可以脱水
+        assert!(matches!(
+            h.dehydrate_now("/home/new.bin", &Policy::manual(now_secs()), false, |_| Ok(
+                ()
+            )),
+            DehydrateOutcome::Freed(_)
+        ));
+
+        // 部分覆盖的块不算「有内容」：只写前 100 字节（第一章区间没被完整覆盖）
+        let entry = DirEntry::local("part.bin", false, 0, 1);
+        let node = fs.insert_node(INodeNo::ROOT, "part.bin", "/home/part.bin", &entry);
+        fs.cache_file_for(node.ino).unwrap();
+        {
+            let mut g = fs.inner.lock().unwrap();
+            g.nodes.get_mut(&node.ino).unwrap().attr.size = 300 * 1024;
+        }
+        fs.mark_written_chunks(node.ino, 0, 100);
+        assert_eq!(h.cache_stats().used_bytes, 0, "部分覆盖不能算内容完整");
+        assert_eq!(
+            h.dehydrate_now(
+                "/home/part.bin",
+                &Policy::manual(now_secs()),
+                false,
+                |_| Ok(())
+            ),
+            DehydrateOutcome::Blocked(Block::NoContent)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_mode_parse_and_direct_io_flag() {
+        assert_eq!(CacheMode::parse("pagecache"), Some(CacheMode::PageCache));
+        assert_eq!(CacheMode::parse("direct"), Some(CacheMode::Direct));
+        assert_eq!(CacheMode::parse("DIRECT_IO"), Some(CacheMode::Direct));
+        assert_eq!(CacheMode::parse("nope"), None);
+        assert_eq!(CacheMode::Direct.as_str(), "direct");
     }
 }

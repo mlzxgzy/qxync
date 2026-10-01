@@ -14,6 +14,7 @@
 //! * 普通用户的家目录根是 `/home`（对应真实路径 `/share/homes/<user>`）。
 
 pub mod config;
+pub mod dehydrate;
 pub mod encode;
 pub mod error;
 pub mod ipc;
@@ -22,6 +23,7 @@ pub mod status;
 pub mod sync;
 
 pub use config::{ConfigPaths, Credentials, LinkConfig};
+pub use dehydrate::{Block, CacheLimit, Candidate, Policy};
 pub use encode::{build_query, encode_query_value};
 pub use error::{Error, Result};
 pub use model::{parse_listing, parse_max_log, parse_nas_uid, DirEntry, Listing, MaxLog, NasUid};
