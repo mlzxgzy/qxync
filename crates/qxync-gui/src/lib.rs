@@ -22,6 +22,8 @@ pub fn ui_assets() -> Value {
         "index_html": include_str!("../ui/index.html").len(),
         "app_js": include_str!("../ui/app.js").len(),
         "style_css": include_str!("../ui/style.css").len(),
+        // ★ M8.6：文案表也是前端资源的一部分，漏打包 = 界面全是 key
+        "i18n_js": include_str!("../ui/i18n.js").len(),
     })
 }
 
@@ -364,11 +366,218 @@ pub fn self_test_notify() -> bool {
     payload["ok"].as_bool().unwrap_or(false)
 }
 
+/// ★ M8.6：前端资源的**静态事实**自检（不开窗口、不碰 NAS）。
+///
+/// M8.6 的交付物大多是「资源里有没有」这类事实：文案表键是否齐全、键盘焦点环在不在、
+/// 空/错/加载四态有没有实现、有没有拼 `innerHTML`。这些用 grep 也能查，但 grep 查的是
+/// 工作区里的文件；这里扫的是 `include_str!` 进来的**这一份**，于是「自检绿」等价于
+/// 「打进包的那份 UI 合规」。零依赖解析（注释/字符串感知的极简扫描），够用就行。
+pub fn ui_spec() -> Value {
+    let index = strip_comments(include_str!("../ui/index.html"));
+    let app = strip_comments(include_str!("../ui/app.js"));
+    let css = strip_comments(include_str!("../ui/style.css"));
+    let i18n = strip_comments(include_str!("../ui/i18n.js"));
+
+    // 1) M4 的安全约定：外部字符串只走 textContent，绝不拼 HTML
+    let mut sinks: Vec<&str> = Vec::new();
+    for needle in ["innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"] {
+        if app.contains(needle) || index.contains(needle) || i18n.contains(needle) {
+            sinks.push(needle);
+        }
+    }
+
+    // 2) i18n：`T('key')` 与 `data-i18n*` 用到的 key 必须都在 zh-CN 表里；en 预留（空表）
+    let zh = table_keys(&i18n, "var ZH = {");
+    let en = table_keys(&i18n, "var EN = {");
+    let used = quoted_keys(&app, "T('", '\'');
+    let mut dom: Vec<String> = Vec::new();
+    for attr in ["data-i18n", "data-i18n-title", "data-i18n-placeholder", "data-i18n-aria-label"] {
+        dom.extend(quoted_keys(&index, &format!("{attr}=\""), '"'));
+    }
+    let missing_used: Vec<String> = used.iter().filter(|k| !zh.contains(k)).cloned().collect();
+    let missing_dom: Vec<String> = dom.iter().filter(|k| !zh.contains(k)).cloned().collect();
+
+    // 3) 键盘可达性 / 视觉规范（token 必须在浅色与深色两份里都定义）
+    let a11y = json!({
+        "focus_visible": css.contains(":focus-visible"),
+        "hidden_rule": css.contains("[hidden]") && css.contains("display: none !important"),
+        "skip_link": index.contains("skip-link") && css.contains(".skip-link"),
+        "aria_current": index.contains("aria-current") && app.contains("aria-current"),
+        "tablist": index.contains("role=\"tablist\"") && index.contains("role=\"tabpanel\""),
+        "dialog": index.contains("role=\"dialog\"") && index.contains("aria-modal=\"true\""),
+        "aria_busy": app.contains("aria-busy"),
+        "reduced_motion": css.contains("prefers-reduced-motion"),
+        "dark_tokens": css.matches("--focus:").count() >= 2
+            && css.matches("--overlay:").count() >= 2
+            && css.matches("--shadow-lg:").count() >= 2,
+    });
+    let a11y_ok = a11y.as_object().map(|m| m.values().all(|v| v.as_bool() == Some(true))).unwrap_or(false);
+
+    // 4) 空/错/加载四态：统一入口 + 页面上的 data-state 标记
+    let states = json!({
+        "helper": app.contains("function setListState"),
+        "markers": index.matches("data-state=").count(),
+        "screens": app.matches("setListState(").count(),
+        "phases": app.contains("'loading'") && app.contains("'error'") && app.contains("'empty'"),
+    });
+    let states_ok = states["helper"].as_bool().unwrap_or(false)
+        && states["phases"].as_bool().unwrap_or(false)
+        && states["markers"].as_u64().unwrap_or(0) >= 8
+        && states["screens"].as_u64().unwrap_or(0) >= 8;
+
+    let en_reserved = i18n.contains("var EN = {");
+    let i18n_ok = missing_used.is_empty() && missing_dom.is_empty() && zh.len() >= 100 && en_reserved;
+
+    json!({
+        "ok": sinks.is_empty() && i18n_ok && a11y_ok && states_ok,
+        "html_sinks": sinks,
+        "i18n": {
+            "ok": i18n_ok,
+            "zh_keys": zh.len(),
+            "en_keys": en.len(),
+            "en_reserved": en_reserved,
+            "used_keys": used.len(),
+            "dom_keys": dom.len(),
+            "missing_used": missing_used,
+            "missing_dom": missing_dom,
+        },
+        "a11y": a11y,
+        "states": states,
+    })
+}
+
+/// 去掉 `//`、`/* */`、HTML `<!-- -->` 注释（保留字符串内容）—— 免得注释里提到
+/// `innerHTML` 就被当成真的用了它。够用即可：本项目前端无模板字符串、无正则字面量。
+fn strip_comments(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut it = src.chars().peekable();
+    let mut in_line = false;
+    let mut in_block = false;
+    let mut in_html = false;
+    let mut quote: Option<char> = None;
+    while let Some(c) = it.next() {
+        if in_line {
+            if c == '\n' {
+                in_line = false;
+                out.push(c);
+            }
+            continue;
+        }
+        if in_block {
+            if c == '*' && it.peek() == Some(&'/') {
+                it.next();
+                in_block = false;
+            }
+            continue;
+        }
+        if in_html {
+            if c == '-' && it.peek() == Some(&'-') {
+                let mut probe = it.clone();
+                probe.next();
+                if probe.peek() == Some(&'>') {
+                    it.next();
+                    it.next();
+                    in_html = false;
+                }
+            }
+            continue;
+        }
+        if let Some(q) = quote {
+            out.push(c);
+            if c == '\\' {
+                if let Some(n) = it.next() {
+                    out.push(n);
+                }
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        if c == '<' && it.peek() == Some(&'!') {
+            let mut probe = it.clone();
+            probe.next();
+            if probe.peek() == Some(&'-') {
+                probe.next();
+                if probe.peek() == Some(&'-') {
+                    it.next();
+                    it.next();
+                    in_html = true;
+                    continue;
+                }
+            }
+        }
+        if c == '/' {
+            match it.peek() {
+                Some('/') => {
+                    it.next();
+                    in_line = true;
+                    continue;
+                }
+                Some('*') => {
+                    it.next();
+                    in_block = true;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        if c == '\'' || c == '"' {
+            quote = Some(c);
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// 扫 `'key':` 形式的文案表键（从 `marker` 到表结束的 `\n  };`）。
+fn table_keys(src: &str, marker: &str) -> Vec<String> {
+    let start = match src.find(marker) {
+        Some(i) => i + marker.len(),
+        None => return Vec::new(),
+    };
+    let end = src[start..].find("\n  };").map(|i| start + i).unwrap_or(src.len());
+    let mut out = Vec::new();
+    for line in src[start..end].lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix('\'') {
+            if let Some(i) = rest.find("':") {
+                out.push(rest[..i].to_string());
+            }
+        }
+    }
+    out
+}
+
+/// 扫 `needle`（自带开引号）后面的字符串内容，例如 `T('` → `key`、`data-i18n="` → `key`。
+fn quoted_keys(src: &str, needle: &str, quote: char) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut rest = src;
+    while let Some(i) = rest.find(needle) {
+        let after = &rest[i + needle.len()..];
+        match after.find(quote) {
+            Some(j) => {
+                let key = &after[..j];
+                if !key.is_empty() && !out.iter().any(|k| k == key) {
+                    out.push(key.to_string());
+                }
+                rest = &after[j + 1..];
+            }
+            None => break,
+        }
+    }
+    out
+}
+
 async fn self_test_inner() -> Value {
     let assets = ui_assets();
     let assets_ok = assets["index_html"].as_u64().unwrap_or(0) > 64
         && assets["app_js"].as_u64().unwrap_or(0) > 256
-        && assets["style_css"].as_u64().unwrap_or(0) > 64;
+        && assets["style_css"].as_u64().unwrap_or(0) > 64
+        && assets["i18n_js"].as_u64().unwrap_or(0) > 256;
+
+    // ★ M8.6：UI 的静态合规性（文案表 / 焦点环 / 四态 / 无 innerHTML）也进自检
+    let spec = ui_spec();
+    let spec_ok = spec["ok"].as_bool().unwrap_or(false);
 
     let info = commands::app_info().await.unwrap_or(Value::Null);
     let sock = ipc::socket_path();
@@ -427,9 +636,12 @@ async fn self_test_inner() -> Value {
     }
 
     json!({
-        "ok": assets_ok && running && status_ok && ls_ok && mounts_ok && sync_ok,
+        "ok": assets_ok && spec_ok && running && status_ok && ls_ok && mounts_ok && sync_ok,
         "ui_assets": assets,
         "ui_assets_ok": assets_ok,
+        // ★ M8.6：UI 静态合规性（文案表键齐全 / 焦点环 / 四态 / 无 innerHTML / 深色 token）
+        "ui_spec": spec,
+        "ui_spec_ok": spec_ok,
         "app_info": info,
         "daemon_running": running,
         "socket": sock.display().to_string(),

@@ -1,6 +1,7 @@
 # M8 —— 界面与功能向 Qsync Client 6 靠拢（研究与执行方案）
 
-> 状态：**研究 + 方案**（本文不含任何代码改动）。
+> 状态：**方案已全部落地**（M8.0–M8.4 + **M8.6 打磨与收口** 已完成；M8.5 备份任务决策不做）。
+> 本文保留原始研究与决策记录，逐条实测结论见各里程碑小节与 §12。
 > 基准：QNAP 官方教程 [如何使用 Qsync Client 6？](https://www.qnap.com.cn/zh-cn/how-to/tutorial/article/%e5%a6%82%e4%bd%95%e4%bd%bf%e7%94%a8-qsync-client-6)
 > （最后修订 2025-07-22，适用 Windows / macOS 的 Qsync Client 6.0.0+）。
 > 现状基线：M0–M7 全部完成，`fuse-matrix.sh` 68/68、`gui-matrix.sh` 41/41。
@@ -863,13 +864,39 @@ LAN 面板显示身份/监听/配对码/已配对设备/事件计数，并支持
 * **保留的动作只有一个**：首次运行向导里 **Backup Task 卡片保持可见但不可用**，
   点击给出「本客户端暂不支持备份任务」的说明 —— 让 Qsync 用户一眼看懂缺什么。
 
-### M8.6 —— 打磨与验收收口（2 人日）
+### M8.6 —— 打磨与验收收口（2 人日）✅ **已完成（2026-10-01）**
 
 | 项 | 内容 |
 |---|---|
 | 交付物 | ① 视觉规范落地（浅色卡片 + 状态色 + 徽章 + 图标；深色模式同步维护）；② 键盘可达性与焦点环；③ 空态/错误态/加载态逐页检查（M4 踩坑 #1 `[hidden]` 与 #2 首轮 status 的同类问题全库复查）；④ **i18n（可选）**：抽出 zh-CN 文案表，预留 en；⑤ `gui-matrix.sh` 覆盖全部新页面；⑥ `README.md` / `docs/开发规划.md` 同步 |
 | 写域 | `crates/qxync-gui/ui/**`、`xtask/tests/gui-matrix.sh`、`README.md`、`docs/` |
 | 验收 | ① 全矩阵绿：`fuse-matrix.sh` 68/68、`gui-matrix.sh`（新项全绿）、`m5/m6/m7-matrix.sh`；② 每个新页面都有真窗口截图 + 非空白 + 两两 AE 差异；③ 无 `innerHTML` 拼接外部字符串（沿用 M4 的安全约定） |
+
+#### 实到了什么（逐条对照上面的交付物）
+
+| 交付物 | 落地 |
+|---|---|
+| ① 视觉规范 | `style.css` 顶部一组 token（层次 `--bg/--bg-sunken/--bg-elev/--bg-head`、文字三档、状态四色 + `-soft`、`--accent`、形状 `--radius/--radius-lg/--radius-pill`、浮层 `--shadow/--shadow-lg/--overlay`）；**新增 `--focus` / `--focus-halo` / `--overlay` / `--shadow-lg` / `--code-bg` 全部同时给了深色值**（`ui_spec.a11y.dark_tokens` 断言「浅色与深色两份都有」）；任务卡角标改用语义类 `badge-sync` / `badge-backup`；补 `prefers-reduced-motion` |
+| ② 键盘可达性 | 「跳到主内容」skip-link（`:focus-visible` 才显形）；全局 `:focus-visible` 焦点环（按钮/tab/图标栏/菜单项/表格行 `:focus-within` 都有）；图标栏 ↑↓←→ + Home/End；设置分区 / 诊断子页 `role=tablist` + `aria-selected` + ←→ 跟随焦点；弹窗 `role=dialog aria-modal` + **Tab 焦点陷阱** + 关闭时**焦点归还**；文件行右键菜单键盘化（Shift+F10 / 菜单键打开、↑↓/Home/End、Escape/Tab 关闭并把焦点还给触发行）；日志面板头 `role=button tabindex=0 aria-expanded` + Enter/Space 折叠；`aria-current="page"` 标当前页 |
+| ③ 空/错/加载四态 | 新增 `setListState()`（`loading`/`error`/`empty`/`ready`，写 `data-state` 供断言）+ `setBusyState()`（容器 `aria-busy`），**10 个列表全部接入**：主页任务、任务页、待裁决、文件、更新中心、错误列表、挂载（诊断 + 状态页两张表）、远端根、LAN 设备/事件、释放空间、设置读取失败。**修掉的就是 M4 踩坑 #2 的同类**：首轮数据没回来时不再写「不可用（daemon 未运行？）」，而是「正在读取…」；读取失败给出失败原因；文件页另外区分「daemon 没跑 / 没登录 / ls 真失败」三种情况 |
+| ④ i18n | 新增 `ui/i18n.js`：**zh-CN 文案表 163 条**、`en` 预留（空表 = 整条回落到 zh-CN）、`{name}` 具名插值、`data-i18n` / `data-i18n-title` / `-placeholder` / `-aria-label` 四种静态挂钩 + 启动时 `apply()`；JS 侧动态文案走 `T(key)`。**不引入 i18n 框架**（方案 §8 风险 10 的口径）。范围划清：`logErr/logInfo` 的诊断日志与 `index.html` 里带内联 `<code>` 的混合标记段落**不进表**（写进 `i18n.js` 头注释） |
+| ⑤ 矩阵覆盖 | `gui-matrix.sh`：新增 2c（`ui_spec` 静态合规性 14 条 + 文案表运行时回落 1 条）+ 3c（真窗口 Tab 焦点断言 2 条）→ **148/148**；9 个目的地 + 8 个设置分区 + 5 个旧 tab 值的截图与 AE 断言全部保留 |
+| ⑥ 文档 | `README.md`（现状表 + M8.6 验收结论）、`docs/开发规划.md`（M8 进度块）、本文（§7 矩阵表、§9 排期、§12.7 数据安全） |
+
+#### 验收结果
+
+| 项 | 实测 |
+|---|---|
+| `gui-matrix.sh` | ✅ **148/148**（0 失败，含 2c 的 15 条静态断言与 3c 的 Tab 焦点 AE 2918 px） |
+| `ui_spec`（随 `--self-test`，不开窗口） | ✅ 无 HTML 拼接（`innerHTML`/`outerHTML`/`insertAdjacentHTML`/`document.write` 全 0）；文案表 163 条、`T()` 用到 124 条、DOM 挂 58 条，**两边缺词都是 0**；焦点环/skip-link/tablist+tabpanel/dialog/aria-busy/aria-current/reduced-motion/深色 token 全绿；四态入口 + 13 个 `data-state` 标记 |
+| 键盘可达性（真窗口） | ✅ 窗口起来后发一次 Tab → 画面变化 **AE 2918 px**（skip-link 显形 + 焦点环），截图 `.local-run/gui-shots/kbd-{before,after}.png` |
+| 回归矩阵 | 见 §12.7 与 `README.md`「M8.6 验收结论」 |
+| 负向对照 | ✅ daemon 停掉后 `--self-test` 仍**非 0 退出**（自检没被新增的静态断言稀释成橡皮图章） |
+
+> ⚠️ 环境限制（如实记录）：本次验收所在沙箱**没有 `/dev/fuse`**（`nodev fuse` 在 `/proc/filesystems` 里，但设备节点缺失且无 `CAP_MKNOD`/`sudo`），
+> 所以 `fuse-matrix.sh` 与各矩阵的**真挂载段**这次跑不了 —— 它们是「跳过」而不是「通过」。
+> 这与 M6/M7/M8.4 当年「拿到 `/dev/fuse` 后补跑」的情况一样，属于环境而非代码；有 `/dev/fuse` 的机器上重跑即可。
+> **M8.6 的写域只有前端资源 + 矩阵 + 文档，零后端/协议/FUSE 改动**，因此不动铁则 1（`read()` 不短读）与铁则 2（脱水先 `inval_inode`）。
 
 ---
 
@@ -878,7 +905,7 @@ LAN 面板显示身份/监听/配对码/已配对设备/事件计数，并支持
 | 矩阵 | 现在 | M8 后 |
 |---|---|---|
 | `xtask/tests/fuse-matrix.sh` | 68/68 | ✅ **保持 68/68**（M8.2–M8.4 每次都复跑；M8.4 触碰了上传队列的取消语义，也在此回归里） |
-| `xtask/tests/gui-matrix.sh` | 41/41（5 tab 截图） | ✅ **M8.1 后 86/86**（9 个目的地 + 旧 tab 落点等价）；**M8.4 后 131/131**（+7 个设置分区截图、两两 AE 差异 + 4 条 M8.4 数据源断言） |
+| `xtask/tests/gui-matrix.sh` | 41/41（5 tab 截图） | ✅ **M8.1 后 86/86**（9 个目的地 + 旧 tab 落点等价）；**M8.4 后 131/131**（+7 个设置分区截图、两两 AE 差异 + 4 条 M8.4 数据源断言）；**M8.6 后 148/148**（+15 条 2c 静态合规性断言（`ui_spec` + 文案表运行时回落）、+2 条 3c 真窗口键盘断言；截图项一条未减） |
 | `xtask/tests/m5-matrix.sh` | 28/28 | ✅ **30/30**（+schema 补表断言，M8.4 起断言 v3） |
 | `xtask/tests/m6-matrix.sh` | 29/29 | 不变（多根语义不动） |
 | `xtask/tests/m7-matrix.sh` | 60/60 | ✅ **保持 60/60**（后端规则一行未改；GUI 侧的规则编辑面板复用同一批命令） |
@@ -887,6 +914,10 @@ LAN 面板显示身份/监听/配对码/已配对设备/事件计数，并支持
 | `xtask/tests/m84-matrix.sh` | — | ✅ **新增 92/92**（M8.4：设置/代理三模式+假代理/托盘可见性+通知/自动释放空间+安全链/筛选器/冲突策略五选/三态+铁则 2） |
 
 **门（Gate）**：每个里程碑的 PR 必须在**同一 PR 内**同时更新受影响的矩阵脚本；只改产品代码不改矩阵 = 不允许合并。
+
+> ★ M8.6 追加的判据不是截图而是 **`ui_spec`**：它随 `qxync-gui --self-test` 一起产出，
+> 扫的是 `include_str!` **打进二进制的那份 UI**（不是工作区文件），因此「自检绿」= 交付物合规。
+> 这一条同时守住了 M4 的安全约定（无 `innerHTML` 类拼接）——**新增界面代码时如果拼了 HTML，自检直接红**。
 
 ---
 
@@ -919,14 +950,14 @@ LAN 面板显示身份/监听/配对码/已配对设备/事件计数，并支持
 | M8.2 任务模型 + 持久化 | 3 | M8.1 | 与 M8.3 部分并行（后端/前端可拆） |
 | M8.3 journal + 更新中心 + 错误列表 | 3 | M8.2 | 同上 |
 | M8.4 设置中心 + 托盘/通知 + 自动释放 + M7 面板 | 4 | M8.1（⑥⑦ 还需 M8.2） | 内部可拆 4 条并行 |
-| M8.6 打磨与收口 | 2 | 全部 | — |
+| M8.6 打磨与收口 | 2 | 全部 | ✅ **已完成**（2026-10-01，`gui-matrix` 148/148 + `ui_spec` 全绿；见 §M8.6 与 §12.7） |
 | **M8 合计** | **14.5** | | |
 | **P0 探针线**（§11，与 M8 解耦） | ✅ **已完成**（只读阶段，0.5 人日） | — | 已关闭，无后续 |
 | **M8.1 外壳** | ✅ **已完成**（2026-10-01，含矩阵改造与数据安全比对） | — | — |
 | **M8.2 任务模型** | ✅ **已完成**（2026-10-01，`m82-matrix.sh` 37/37；fuse 回归 68/68） | — | — |
 | **M8.3 同步日志** | ✅ **已完成**（2026-10-01，`m83-matrix.sh` 27/27；`m5-matrix` 扩到 30/30） | — | — |
 | **M8.4 设置/托盘/释放空间/冲突策略** | ✅ **已完成**（2026-10-01，`m84-matrix.sh` 92/92；全量回归见 §7/§12） | — | — |
-| **M8 剩余（M8.6 打磨与收口）** | 2 | M8.1–M8.4 已完成 | 见各里程碑 |
+| **M8 剩余** | **0** | M8.0–M8.4 + M8.6 全部完成 | M8.5 已决策不做 |
 
 ---
 
@@ -1105,6 +1136,35 @@ M8.1 的写域是 `crates/qxync-gui/ui/**` + `xtask/tests/gui-matrix.sh`：
 
 > ⚠️ 与 M8.1–M8.3 的差别要如实写明：那三次的 `resized` 是 0；这次是 1，且那 1 项是
 > NAS 内部索引 `.recent`。**没有第二个文件被写过。**
+
+### 12.7 M8.6 的实测结果
+
+**采集范围与基线**：基线 = **M8.6 改动落地之后、回归矩阵开跑之前**的 `.local-run/nas-baseline-m86.json`；
+事后 = `.local-run/nas-after-m86.json`（两者都是 `/home` 全树 16 项）。
+
+| 项 | 结果 |
+|---|---|
+| 期间跑过的验收 | `gui-matrix` **148** + `m5` 30 + `m82` 18 + `m83` 24 + `m84` 48 + `m6` 21 + `m7` 42 = **331 项通过**；另 `cargo test --workspace` 全绿（6 个测试二进制，0 failed）；`fuse-matrix` 因无 `/dev/fuse` **未运行** |
+| **added** | **0** |
+| **removed** | **0** ← 最关键的一条 |
+| **resized** | **0** ← 没有任何已有文件的内容被改（这一次连 `.recent` 都只动了 mtime） |
+| retimed | **2**：`/home/.recent`、`/home/qxync-test` —— M8.1–M8.4 记录里的老面孔（NAS 自维护索引 + 夹具目录），属预期 |
+
+**为什么这次改动本身不可能伤到 NAS**：M8.6 的写域只有
+`crates/qxync-gui/ui/**`、`crates/qxync-gui/src/lib.rs`（新增 `ui_spec` 静态自检）、
+`xtask/tests/gui-matrix.sh` 与文档 —— **零 daemon 改动、零协议改动、零 FUSE 改动**，
+两条铁则（`read()` 不短读、脱水先 `inval_inode`）的实现代码**一行未动**。
+
+**环境限制（如实记录）**：本沙箱**没有 `/dev/fuse`**（`/proc/filesystems` 里有 `nodev fuse`，
+但没有设备节点，也没有 `CAP_MKNOD` / 可用 `sudo`）。`fuse-matrix.sh` 直接停在
+`fusermount3: fuse device /dev/fuse not found. Kernel module not loaded?`；
+`m6`/`m7`/`m82`/`m83`/`m84` 的**真挂载段按设计整段跳过** —— 它们是**「跳过」而不是「通过」**。
+有 `/dev/fuse` 的机器上重跑这些矩阵即可（M6/M7/M8.4 当年也是这么补的）。
+
+**顺带发现的既有问题（不在 M8.6 写域，未修）**：无 `/dev/fuse` 时 `qsync task add` / `task resume`
+（默认要挂载）会让 daemon 的 worker panic 断连（`Cannot drop a runtime in a context where blocking is not allowed`）。
+这解释了 `m82-matrix.sh` 在 `--no-fuse` 模式下的 2 条失败 —— 它们都要求真挂载，而 M8.6 没碰
+`qsync`/`qxyncd` 一行。建议修法：把挂载失败包成 `Result` 经 IPC 返回，而不是在 blocking 任务里让运行时析构。
 
 ---
 

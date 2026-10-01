@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gui-matrix.sh —— M4 + M8.1（GUI：Tauri 2 桌面应用 + Qsync 风格外壳）验收矩阵
+# gui-matrix.sh —— M4 + M8.1/M8.4 + M8.6（GUI：Tauri 2 桌面应用 + Qsync 风格外壳）验收矩阵
 #
 # 用法:
 #   xtask/tests/gui-matrix.sh                 # 全量：无窗口自检 + 9 个目的地真实截图（~2min）
@@ -22,7 +22,14 @@
 #      也能用 `settings:<分区>` 直达并逐个出图（`QSYNC_GUI_TAB=settings:proxy`）；
 #   5. ★ M8.1：**旧 `QSYNC_GUI_TAB` 取值必须继续可用且落点不变** ——
 #      status/mounts/sync/connect/files 五个旧值各起一次，用截图 AE 证明它们
-#      落在与对应的新目的地**完全相同**的页面上（AE 很小 = 同页，落错页会极大）。
+#      落在与对应的新目的地**完全相同**的页面上（AE 很小 = 同页，落错页会极大）；
+#   6. ★ M8.6：**UI 静态合规性**（`ui_spec`，随 `--self-test` 一起产出，不用开窗口）：
+#      文案表键齐全（T() 与 data-i18n 用到的 key 都在 zh-CN 表里、en 预留）、
+#      无 innerHTML 类拼接、键盘焦点环 / skip-link / tablist / dialog / aria-busy /
+#      深色 token / reduced-motion 齐全、空错加载四态统一入口 + data-state 标记；
+#      另加一条**运行时**断言：把 locale 切到预留的 en（空表）必须整条回落到 zh-CN；
+#   7. ★ M8.6：**真窗口键盘可达性** —— 窗口起来后发一次 Tab，画面必须有变化
+#      （第一个落点是「跳到主内容」skip-link，焦点环同时显形）。
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -139,6 +146,45 @@ CF4=$("$QS" --socket "$SOCK" conflicts --json 2>/dev/null)
 check "$([ "$(echo "$CF4" | jq -r '.pending' 2>/dev/null)" != "null" ] && echo 0 || echo 1)" "M8.4 数据源：conflicts（待裁决 $(echo "$CF4" | jq -r '.pending' 2>/dev/null)）"
 cp -f "$ST" "$SHOTS/self-test.json"
 
+# ---------------------------------------------------------------- 2c. ★ M8.6 UI 静态合规性
+# 判据来源：`ui_spec` —— Rust 侧扫 include_str! 进来的**这一份** UI 资源（不是 grep 工作区），
+# 所以这里绿 = 「打进二进制的那份界面」合规。见 crates/qxync-gui/src/lib.rs::ui_spec。
+echo "== 2c. M8.6 UI 静态合规性（ui_spec） =="
+jqs() { jq -r "$1" "$ST" 2>/dev/null; }
+check "$([ "$(jqs .ui_spec_ok)" = "true" ] && echo 0 || echo 1)" "ui_spec.ok（UI 静态合规性总闸）"
+check "$([ "$(jqs .ui_assets.i18n_js)" -gt 256 ] && echo 0 || echo 1)" "文案表已嵌入（i18n.js $(jqs .ui_assets.i18n_js) B）"
+check "$([ "$(jqs .ui_spec.i18n.ok)" = "true" ] && echo 0 || echo 1)" \
+  "文案表：zh-CN $(jqs .ui_spec.i18n.zh_keys) 条 / en 预留 $(jqs .ui_spec.i18n.en_keys) 条 / T() 用 $(jqs .ui_spec.i18n.used_keys) 条 / DOM 挂 $(jqs .ui_spec.i18n.dom_keys) 条；缺词 T=$(jqs '.ui_spec.i18n.missing_used|length') DOM=$(jqs '.ui_spec.i18n.missing_dom|length')"
+check "$([ "$(jqs '.ui_spec.html_sinks|length')" = "0" ] && echo 0 || echo 1)" \
+  "无 HTML 拼接（innerHTML/outerHTML/insertAdjacentHTML/document.write）"
+for kv in focus_visible hidden_rule skip_link aria_current tablist dialog aria_busy reduced_motion dark_tokens; do
+  check "$([ "$(jqs ".ui_spec.a11y.$kv")" = "true" ] && echo 0 || echo 1)" "无障碍/视觉规范：$kv"
+done
+check "$([ "$(jqs .ui_spec.states.helper)" = "true" ] && [ "$(jqs .ui_spec.states.markers)" -ge 8 ] && [ "$(jqs .ui_spec.states.screens)" -ge 8 ] && echo 0 || echo 1)" \
+  "空/错/加载四态：setListState $(jqs .ui_spec.states.screens) 处调用，页面 data-state 标记 $(jqs .ui_spec.states.markers) 个"
+
+# 2c-2. ★ M8.6：文案表的**运行时**回落语义（ui_spec 只能查键齐不齐，查不了行为）
+#   判据：zh-CN 取到中文；切到预留的 en（空表）必须整条回落到 zh-CN（不是空白、不是 key）；
+#   未知 key 返回 key 本身（便于在界面上看出漏配）。node 不在就如实跳过。
+if command -v node >/dev/null; then
+  I18N_OUT=$(node -e '
+    const fs = require("fs");
+    global.window = global;
+    eval(fs.readFileSync(process.argv[1], "utf8"));
+    const I = global.QSYNC_I18N;
+    const zh = I.t("nav.home");
+    I.setLocale("en");
+    const en = I.t("nav.home");
+    const missing = I.t("no.such.key.at.all");
+    I.setLocale("zh-CN");
+    process.stdout.write(JSON.stringify({ zh: zh, en: en, missing: missing }));
+  ' "$REPO/crates/qxync-gui/ui/i18n.js" 2>/dev/null)
+  check "$([ "$(echo "$I18N_OUT" | jq -r '.zh' 2>/dev/null)" = "主页" ] && [ "$(echo "$I18N_OUT" | jq -r '.en' 2>/dev/null)" = "主页" ] && [ "$(echo "$I18N_OUT" | jq -r '.missing' 2>/dev/null)" = "no.such.key.at.all" ] && echo 0 || echo 1)" \
+    "i18n 回落：en（预留空表）→ zh-CN（zh=$(echo "$I18N_OUT" | jq -r '.zh' 2>/dev/null) / en=$(echo "$I18N_OUT" | jq -r '.en' 2>/dev/null)）；未知 key 原样返回"
+else
+  skip "i18n 回落语义（没有 node，跳过）"
+fi
+
 # 负向对照：daemon 停了必须以非 0 退出（否则自检没有意义）
 kill "$DAEMON_PID" 2>/dev/null; DAEMON_PID=""; rm -f "$SOCK"; sleep 0.8
 "$GUI" --self-test >/dev/null 2>&1
@@ -233,6 +279,38 @@ else
     prev_sec="$SHOT"
   done
 
+  # 3c. ★ M8.6：键盘可达性 —— Tab 一次，skip-link/焦点环必须显形（画面有变化）
+  echo "== 3c. M8.6 键盘可达性（真窗口 Tab） =="
+  pkill -x qxync-gui 2>/dev/null; sleep 0.6
+  QSYNC_GUI_TAB=home "$GUI" >"$RUNDIR/gui-window-kbd.log" 2>&1 &
+  GUI_PID=$!
+  KWID=""
+  for _ in $(seq 1 40); do
+    KWID=$(xdotool search --name "QSync" 2>/dev/null | head -1)
+    [ -n "$KWID" ] && break
+    sleep 0.5
+  done
+  if [ -z "$KWID" ]; then
+    bad "kbd：20s 内没找到 QSync 窗口"
+  else
+    sleep 5
+    import -window "$KWID" "$SHOTS/kbd-before.png" 2>/dev/null
+    check "$([ -s "$SHOTS/kbd-before.png" ] && echo 0 || echo 1)" "kbd：Tab 前截图产出"
+    # 把窗口激活再发键（XTEST 只送到有输入焦点的窗口）；拿不到输入焦点就如实跳过，不假装通过
+    if xdotool windowactivate --sync "$KWID" 2>/dev/null; then
+      sleep 0.5
+      xdotool key --clearmodifiers Tab 2>/dev/null
+      sleep 1
+      import -window "$KWID" "$SHOTS/kbd-after.png" 2>/dev/null
+      KAE=$(ae_of "$SHOTS/kbd-before.png" "$SHOTS/kbd-after.png")
+      check "$([ "${KAE:-0}" -gt 100 ] && echo 0 || echo 1)" \
+        "kbd：Tab 后 skip-link/焦点环显形（AE $KAE px > 100）"
+    else
+      skip "kbd：拿不到窗口输入焦点（无 WM / Wayland 转发）→ 只保留 Tab 前截图"
+    fi
+    kill "$GUI_PID" 2>/dev/null; wait "$GUI_PID" 2>/dev/null; GUI_PID=""
+  fi
+
   # 3b. ★ M8.1：旧的 QSYNC_GUI_TAB 取值必须继续可用，而且落到**同一个目的地**
   #     判据 = 截图 AE 很小（同一目的地）而不是极大（落错页）。
   echo "== 3b. 旧 QSYNC_GUI_TAB 值兼容（落点等价性） =="
@@ -253,7 +331,7 @@ echo
 echo "== 汇总 =="
 echo "  通过 $PASS / 失败 $FAIL"
 if [ "$FAIL" = "0" ]; then
-  echo "  🎉 M4 GUI 验收矩阵全过"
+  echo "  🎉 GUI 验收矩阵全过（M4 自检/登录链 + M8.1 目的地 + M8.4 设置分区 + M8.6 打磨收口）"
 else
   echo "  ❌ 有失败项，见上面输出；截图在 $SHOTS"
 fi

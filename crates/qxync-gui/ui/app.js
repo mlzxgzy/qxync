@@ -9,6 +9,15 @@
 (function () {
   'use strict';
 
+  // --------------------------------------------------------------- i18n（★ M8.6）
+  // 文案表在 ui/i18n.js：zh-CN 是真值，en 预留、查不到就整条回落到 zh-CN。
+  // 表没加载（旧包 / 被单测直接 eval）时退化成「返回 key」，界面不至于抛错。
+  var I18N = (typeof window !== 'undefined' && window.QSYNC_I18N) ? window.QSYNC_I18N : null;
+  function T(key, vars) {
+    if (I18N && typeof I18N.t === 'function') { return I18N.t(key, vars); }
+    return String(key);
+  }
+
   // --------------------------------------------------------------- 常量
   var LOG_MAX = 200;              // 操作日志最多保留条数
   var POLL_MS = 2000;             // daemon_status 轮询间隔
@@ -23,27 +32,27 @@
   // ★ M8.1：一级目的地（左侧图标栏）。顺序 = 界面顺序。
   var PAGES = ['home', 'tasks', 'files', 'journal', 'errors', 'settings', 'diag'];
   var PAGE_TITLE = {
-    home: '主页',
-    tasks: '任务',
-    files: '文件',
-    journal: '文件更新中心',
-    errors: '错误列表',
-    settings: '设置',
-    diag: '诊断'
+    home: T('page.home'),
+    tasks: T('page.tasks'),
+    files: T('page.files'),
+    journal: T('page.journal'),
+    errors: T('page.errors'),
+    settings: T('page.settings'),
+    diag: T('page.diag')
   };
   // 诊断页内的子 tab
   var DIAG_PANELS = ['status', 'mounts', 'sync'];
   // ★ M8.4：设置页内的分区（对齐 Qsync 的四个 tab + 连接/筛选/LAN/关于）
   var SETTINGS_SECS = ['connect', 'proxy', 'sync', 'personal', 'advanced', 'free', 'lan', 'about'];
   var SEC_TITLE = {
-    connect: '连接',
-    proxy: '代理',
-    sync: '同步与筛选',
-    personal: '个人',
-    advanced: '高级',
-    free: '释放空间',
-    lan: 'LAN 加速',
-    about: '关于'
+    connect: T('sec.connect'),
+    proxy: T('sec.proxy'),
+    sync: T('sec.sync'),
+    personal: T('sec.personal'),
+    advanced: T('sec.advanced'),
+    free: T('sec.free'),
+    lan: T('sec.lan'),
+    about: T('sec.about')
   };
   // ★ 兼容：M8.1 之前 QSYNC_GUI_TAB 用的是这 5 个值，必须继续可用
   var LEGACY_TABS = {
@@ -67,7 +76,8 @@
       dir: '/home',
       entries: [],
       selected: null,
-      loading: false
+      loading: false,
+      error: ''          // ★ M8.6：读取失败时的可见原因
     },
     mounts: [],
     tasks: null,        // ★ M8.2：tasks 请求的最近一次结果
@@ -87,6 +97,17 @@
     fileStates: {},       // 文件名 → 三态（file_states 请求）
     fsSummary: null,      // file_states 的汇总（online/local/always）
     m84Info: null,        // GUI 侧 M8.4 能力（托盘/插件）
+    // ★ M8.6：各列表的四态（loading / error）—— 首轮不再冒充「不可用」
+    journalLoading: false, journalError: '',
+    errorsLoading: false, errorsError: '',
+    tasksLoading: false, tasksError: '',
+    decisionsLoading: false, decisionsError: '',
+    mountsLoading: false, mountsError: '',
+    rootsLoaded: false,
+    lanLoading: false,
+    spaceLoading: false,
+    settingsError: '',
+    rowMenuTrigger: null, // 右键菜单的焦点来处（关闭时还回去）
     lastErrorKey: '',     // 已通知过的错误条目（去重）
     errorTick: 0,         // 轮询计数器（每 3 次查一遍错误列表）
     rowMenu: null,        // 右键菜单当前作用的条目
@@ -120,6 +141,39 @@
   function show(id, visible) {
     var n = $(id);
     if (n) { n.hidden = !visible; }
+  }
+
+  /**
+   * ★ M8.6：列表四态的统一入口 —— loading / error / empty / ready。
+   *
+   * 为什么要它：M4 踩坑 #2 的同类问题在 M8 的新页面上又冒出来过一次 ——
+   * 首轮数据还没回来时，界面写的是「不可用（daemon 未运行？）」，
+   * 明明只是**还没加载完**，却长得像错误。现在四态各有各的文案，
+   * 并把相位写到 `data-state` 上（`ready` 时移除），验收矩阵可据此断言。
+   */
+  function setListState(hintId, phase, text) {
+    var n = $(hintId);
+    if (!n) { return; }
+    if (phase === 'ready') {
+      n.hidden = true;
+      n.removeAttribute('data-state');
+      n.classList.remove('empty-err');
+      return;
+    }
+    n.hidden = false;
+    n.setAttribute('data-state', phase);
+    if (phase === 'error') { n.classList.add('empty-err'); }
+    else { n.classList.remove('empty-err'); }
+    if (text !== undefined && text !== null) { n.textContent = String(text); }
+  }
+
+  /** 容器在读取中的 aria-busy（读屏能播报，验收也能断言）。 */
+  function setBusyState(id, on) {
+    var n = $(id);
+    if (n) {
+      if (on) { n.setAttribute('aria-busy', 'true'); }
+      else { n.setAttribute('aria-busy', 'false'); }
+    }
   }
 
   function isFn(v) { return typeof v === 'function'; }
@@ -317,7 +371,7 @@
     while (body.childNodes.length > LOG_MAX) {
       body.removeChild(body.lastChild);
     }
-    setText('log-count', state.logCount + ' 条');
+    setText('log-count', T('log.count', { n: state.logCount }));
   }
 
   function logOk(text) { logLine('ok', text); }
@@ -431,6 +485,7 @@
 
   // ============================================================ 弹窗
   var modalResolve = null;
+  var modalLastFocus = null;   // ★ M8.6：打开前的焦点，关闭时还回去
 
   function openModal(title, message, initial) {
     var box = $('modal');
@@ -439,6 +494,7 @@
     setText('modal-message', message || '');
     var input = $('modal-input');
     input.value = initial === undefined ? '' : String(initial);
+    modalLastFocus = document.activeElement;
     box.hidden = false;
     input.focus();
     input.select();
@@ -450,6 +506,8 @@
   function closeModal(value) {
     var box = $('modal');
     if (box) { box.hidden = true; }
+    if (modalLastFocus && isFn(modalLastFocus.focus)) { modalLastFocus.focus(); }
+    modalLastFocus = null;
     var r = modalResolve;
     modalResolve = null;
     if (isFn(r)) { r(value); }
@@ -471,6 +529,17 @@
     if (box) {
       box.addEventListener('click', function (ev) {
         if (ev.target === box) { closeModal(null); }
+      });
+      // ★ M8.6：aria-modal 的弹窗必须把 Tab 关在里面（焦点陷阱），Escape 关闭。
+      box.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Escape') { ev.preventDefault(); closeModal(null); return; }
+        if (ev.key !== 'Tab') { return; }
+        var f = box.querySelectorAll('input, select, textarea, button, [href], [tabindex]:not([tabindex="-1"])');
+        if (!f.length) { return; }
+        var first = f[0];
+        var last = f[f.length - 1];
+        if (ev.shiftKey && document.activeElement === first) { ev.preventDefault(); last.focus(); }
+        else if (!ev.shiftKey && document.activeElement === last) { ev.preventDefault(); first.focus(); }
       });
     }
   }
@@ -511,53 +580,63 @@
     chipL.className = 'chip chip-unknown';
 
     if (!st) {
-      chipD.textContent = 'qxyncd：检测中…';
+      chipD.textContent = T('top.daemon_checking');
       return;
     }
     if (!st.running) {
-      chipD.textContent = 'qxyncd 未运行';
+      chipD.textContent = T('top.daemon_down');
       chipD.className = 'chip chip-err';
-      chipC.textContent = '连接：—';
-      chipL.textContent = '登录：—';
-      setText('meta-daemon', 'daemon：未运行（socket ' + str(st.socket) + '）');
-      setText('meta-conn', '连接：—');
-      setText('meta-session', 'session：—');
+      chipC.textContent = T('top.conn_dash');
+      chipL.textContent = T('top.login_dash');
+      setText('meta-daemon', T('top.daemon_meta_down', { socket: str(st.socket) }));
+      setText('meta-conn', T('top.meta_dash'));
+      setText('meta-session', T('top.session_dash'));
       return;
     }
 
     var ping = isObj(st.ping) ? st.ping : null;
-    chipD.textContent = 'qxyncd 运行中' + (ping ? ' v' + str(ping.daemon_version) : '');
+    chipD.textContent = T('top.daemon_up') + (ping ? ' v' + str(ping.daemon_version) : '');
     chipD.className = 'chip chip-ok';
 
     var s = isObj(st.status) ? st.status : null;
     var link = (s && isObj(s.link)) ? s.link : null;
     if (link) {
-      chipC.textContent = '连接：' + str(link.host) + ':' + str(link.port) + (link.https ? ' (https)' : ' (http)');
+      chipC.textContent = T('top.conn', {
+        value: str(link.host) + ':' + str(link.port) + (link.https ? ' (https)' : ' (http)')
+      });
       chipC.className = 'chip chip-ok';
     } else {
-      chipC.textContent = '连接：无 link 信息';
+      chipC.textContent = T('top.conn_none');
       chipC.className = 'chip chip-warn';
     }
 
     var logged = !!(s && s.logged_in);
     var sess = (s && isObj(s.session)) ? s.session : null;
     if (logged) {
-      chipL.textContent = '登录：' + str(sess ? sess.sid_masked : '已登录') + (sess && !sess.alive ? '（失活）' : '');
+      chipL.textContent = T('top.login', {
+        value: str(sess ? sess.sid_masked : T('top.login_ok')) + (sess && !sess.alive ? T('top.login_alive_dead') : '')
+      });
       chipL.className = 'chip ' + (sess && !sess.alive ? 'chip-warn' : 'chip-ok');
     } else {
-      chipL.textContent = '登录：未登录';
+      chipL.textContent = T('top.login_none');
       chipL.className = 'chip chip-warn';
     }
 
-    setText('meta-daemon', 'daemon：pid ' + str(ping ? ping.pid : '—') + ' · v' + str(ping ? ping.daemon_version : '—') +
-      ' · uptime ' + humanDuration(ping ? ping.uptime_secs : 0) + ' · socket ' + str(st.socket));
-    setText('meta-conn', '连接：' + (link ? (str(link.user) + '@' + str(link.host) + ':' + str(link.port) +
-      (link.ipv4_only ? ' · 仅 IPv4' : '')) : '—'));
-    setText('meta-session', 'session：' + (sess ? (str(sess.sid_masked) + ' · ' + (sess.alive ? 'alive' : 'dead')) : '—'));
+    setText('meta-daemon', T('top.daemon_meta', {
+      pid: str(ping ? ping.pid : '—'), version: str(ping ? ping.daemon_version : '—'),
+      uptime: humanDuration(ping ? ping.uptime_secs : 0), socket: str(st.socket)
+    }));
+    setText('meta-conn', link
+      ? T('top.conn_meta', { user: str(link.user), host: str(link.host), port: str(link.port) }) +
+        (link.ipv4_only ? T('top.conn_ipv4') : '')
+      : T('top.meta_dash'));
+    setText('meta-session', sess
+      ? T('top.session_meta', { sid: str(sess.sid_masked), state: (sess.alive ? 'alive' : 'dead') })
+      : T('top.session_dash'));
 
     if (st.error) {
       chipD.className = 'chip chip-warn';
-      chipD.textContent = 'qxyncd 运行中（状态读取有错）';
+      chipD.textContent = T('top.daemon_up_err');
     }
   }
 
@@ -569,33 +648,33 @@
    */
   function taskState(st, sy, hasMounts) {
     if (!st || !st.running) {
-      return { mark: '⏸', tone: 'warn', text: 'qxyncd 未运行' };
+      return { mark: '⏸', tone: 'warn', text: T('task.state_no_daemon') };
     }
     var s = isObj(st.status) ? st.status : null;
     if (!s || !s.logged_in) {
-      return { mark: '⚠️', tone: 'warn', text: '未登录 NAS' };
+      return { mark: '⚠️', tone: 'warn', text: T('task.state_not_logged_in') };
     }
     if (!hasMounts) {
-      return { mark: '⏸', tone: 'warn', text: '还没有同步任务' };
+      return { mark: '⏸', tone: 'warn', text: T('task.state_no_task') };
     }
     if (sy) {
       if (sy.last_error) {
-        return { mark: '⚠️', tone: 'err', text: '同步出错：' + String(sy.last_error) };
+        return { mark: '⚠️', tone: 'err', text: T('task.state_sync_error', { msg: String(sy.last_error) }) };
       }
       if (sy.delete_block_reason) {
-        return { mark: '⚠️', tone: 'warn', text: '有删除被熔断挡住（待确认）' };
+        return { mark: '⚠️', tone: 'warn', text: T('task.state_delete_blocked') };
       }
       if (!sy.enabled) {
-        return { mark: '⏸', tone: 'warn', text: '已暂停轮询' };
+        return { mark: '⏸', tone: 'warn', text: T('task.state_paused') };
       }
       if (!num(sy.polls, 0)) {
-        return { mark: '⏳', tone: 'warn', text: '尚未跑过同步轮次' };
+        return { mark: '⏳', tone: 'warn', text: T('task.state_no_poll') };
       }
       if (num(sy.conflicts, 0) > 0) {
-        return { mark: '⚠️', tone: 'warn', text: '最近一轮有 ' + num(sy.conflicts, 0) + ' 个冲突副本' };
+        return { mark: '⚠️', tone: 'warn', text: T('task.state_conflicts', { n: num(sy.conflicts, 0) }) };
       }
     }
-    return { mark: '✅', tone: 'ok', text: '所有文件均处于最新状态' };
+    return { mark: '✅', tone: 'ok', text: T('task.state_all_synced') };
   }
 
   function renderHome(st) {
@@ -609,18 +688,19 @@
     if (dot) { dot.className = 'conn-dot'; }
     if (!st || !st.running) {
       if (dot) { dot.className = 'conn-dot err'; }
-      if (txt) { txt.textContent = 'qxyncd 未运行 —— 点顶部「启动 daemon」'; }
+      if (txt) { txt.textContent = T('home.conn_down'); }
     } else if (!link) {
       if (dot) { dot.className = 'conn-dot warn'; }
-      if (txt) { txt.textContent = 'daemon 在跑，但没有连接配置'; }
+      if (txt) { txt.textContent = T('home.conn_no_link'); }
     } else {
       var logged = !!(s && s.logged_in);
       if (dot) { dot.className = 'conn-dot ' + (logged ? 'ok' : 'warn'); }
       if (txt) {
-        txt.textContent = str(link.user) + '@' + str(link.host) + ':' + str(link.port) +
-          (link.https ? ' (https)' : ' (http)') + ' · ' +
-          (logged ? '已连接' : '未登录') +
-          (s && s.server && s.server.qsync_version ? ' · Qsync ' + str(s.server.qsync_version) : '');
+        txt.textContent = T('home.conn_ok', {
+          user: str(link.user), host: str(link.host), port: str(link.port),
+          state: (logged ? T('home.conn_connected') : T('home.conn_disconnected'))
+        }) + (s && s.server && s.server.qsync_version
+          ? T('home.conn_qsync', { version: str(s.server.qsync_version) }) : '');
       }
     }
 
@@ -662,8 +742,8 @@
     if (!box) { return; }
     clear(box);
     var views = taskViews(mounts, taskInfos);
-    setText('home-task-count', views.length ? '（' + views.length + '）' : '');
-    show('home-tasks-empty', views.length === 0);
+    setText('home-task-count', views.length ? T('home.task_count', { n: views.length }) : '');
+    setListState('home-tasks-empty', views.length ? 'ready' : 'empty', T('home.tasks_empty'));
 
     var ts = taskState(st, sy, views.length > 0);
     for (var i = 0; i < views.length; i++) {
@@ -687,47 +767,49 @@
     var body = el('div', 'task-body');
     var stateText = ts.text;
     if (t) {
-      if (!t.enabled) { stateText = '已暂停（登记停用，挂载点已卸载）'; }
-      else if (!v.mounted) { stateText = '已启用，但当前未挂载'; }
+      if (!t.enabled) { stateText = T('task.state_paused_task'); }
+      else if (!v.mounted) { stateText = T('task.state_not_mounted'); }
     }
     body.appendChild(el('div', 'task-state', stateText));
 
     var roots = taskRoots(v);
     var mp = t ? str(t.mountpoint) : str(m.mountpoint);
-    body.appendChild(el('div', 'task-meta',
-      '本地 ' + (mp || '（未设）') + '  ⇄  NAS ' + (roots.length ? roots.join(', ') : '（由 link home_root 决定）')));
+    body.appendChild(el('div', 'task-meta', T('task.pair', {
+      local: mp || T('task.not_set'),
+      remote: roots.length ? roots.join(', ') : T('task.roots_by_link')
+    })));
 
     var sub = [];
     if (t) {
-      sub.push(t.read_write ? '读写' : '只读');
-      sub.push('缓存 ' + str(t.cache_mode));
-      if (t.direction && t.direction !== '2way') { sub.push('方向 ' + str(t.direction)); }
-      if (t.space_saving) { sub.push('节省空间模式'); }
-      if (t.smart_delete) { sub.push('智能删除'); }
-      if ((t.exclude || []).length) { sub.push('排除规则 ' + t.exclude.length); }
+      sub.push(t.read_write ? T('task.meta_read_write') : T('task.meta_read_only'));
+      sub.push(T('task.meta_cache', { mode: str(t.cache_mode) }));
+      if (t.direction && t.direction !== '2way') { sub.push(T('task.meta_direction', { dir: str(t.direction) })); }
+      if (t.space_saving) { sub.push(T('task.meta_space_saving')); }
+      if (t.smart_delete) { sub.push(T('task.meta_smart_delete')); }
+      if ((t.exclude || []).length) { sub.push(T('task.meta_exclude', { n: t.exclude.length })); }
       // ★ M8.4：冲突策略一眼可见（ask 的要显眼 —— 会攒待裁决队列）
-      sub.push('冲突 ' + conflictLabel(str(t.conflict) || 'rename_local'));
+      sub.push(T('task.meta_conflict', { policy: conflictLabel(str(t.conflict) || 'rename_local') }));
     } else {
-      sub.push(m.readonly ? '只读' : '读写');
+      sub.push(m.readonly ? T('task.meta_read_only') : T('task.meta_read_write'));
     }
     if (sy && num(sy.last_poll_age_secs, 0) > 0) {
-      sub.push('上次轮询 ' + humanDuration(sy.last_poll_age_secs) + '前');
+      sub.push(T('task.meta_last_poll', { dur: humanDuration(sy.last_poll_age_secs) }));
     }
     body.appendChild(el('div', 'task-meta', sub.join(' · ')));
 
     var badgeRow = el('div', 'task-meta');
-    badgeRow.appendChild(el('span', 'badge badge-on', 'Sync'));
+    badgeRow.appendChild(el('span', 'badge badge-sync', T('task.badge_sync')));
     badgeRow.appendChild(document.createTextNode(' '));
     if (t && !t.enabled) {
-      badgeRow.appendChild(el('span', 'badge badge-off', '已暂停'));
+      badgeRow.appendChild(el('span', 'badge badge-off', T('task.badge_paused')));
     } else if (t && !v.mounted) {
-      badgeRow.appendChild(el('span', 'badge badge-warn', '未挂载'));
+      badgeRow.appendChild(el('span', 'badge badge-warn', T('task.badge_unmounted')));
     } else {
-      badgeRow.appendChild(el('span', 'badge badge-on', '已挂载'));
+      badgeRow.appendChild(el('span', 'badge badge-on', T('task.badge_mounted')));
     }
     if (roots.length > 1) {
       badgeRow.appendChild(document.createTextNode(' '));
-      badgeRow.appendChild(el('span', 'badge', '多根'));
+      badgeRow.appendChild(el('span', 'badge', T('task.badge_multi_root')));
     }
     body.appendChild(badgeRow);
     card.appendChild(body);
@@ -736,17 +818,17 @@
 
     if (full && t) {
       if (!t.enabled) {
-        var bResume = el('button', 'mini primary', '继续');
+        var bResume = el('button', 'mini primary', T('task.act_resume'));
         bResume.type = 'button';
         bResume.addEventListener('click', function () { doTaskAction('resume', t.id, '继续', bResume); });
         act.appendChild(bResume);
       } else if (v.mounted) {
-        var bPause = el('button', 'mini', '暂停');
+        var bPause = el('button', 'mini', T('task.act_pause'));
         bPause.type = 'button';
         bPause.addEventListener('click', function () { doTaskAction('pause', t.id, '暂停', bPause); });
         act.appendChild(bPause);
       } else {
-        var bMount = el('button', 'mini primary', '挂载');
+        var bMount = el('button', 'mini primary', T('task.act_mount'));
         bMount.type = 'button';
         bMount.addEventListener('click', function () { doTaskAction('mount', t.id, '挂载', bMount); });
         act.appendChild(bMount);
@@ -754,24 +836,24 @@
     }
 
     if (full && t) {
-      var bEdit = el('button', 'mini', '设置');
+      var bEdit = el('button', 'mini', T('task.act_settings'));
       bEdit.type = 'button';
       bEdit.addEventListener('click', function () { editTask(t); });
       act.appendChild(bEdit);
     }
 
-    var bOpen = el('button', 'mini', '管理');
+    var bOpen = el('button', 'mini', T('task.act_manage'));
     bOpen.type = 'button';
     bOpen.addEventListener('click', function () { switchPage('diag', 'mounts'); });
     act.appendChild(bOpen);
 
-    var bSync = el('button', 'mini primary', '立即同步');
+    var bSync = el('button', 'mini primary', T('task.act_sync_now'));
     bSync.type = 'button';
     bSync.addEventListener('click', function () { doSync({ once: true }, [], '立即同步'); });
     act.appendChild(bSync);
 
     if (full && t) {
-      var bDel = el('button', 'mini danger', '删除登记');
+      var bDel = el('button', 'mini danger', T('task.act_delete'));
       bDel.type = 'button';
       bDel.addEventListener('click', function () {
         if (!window.confirm('删除任务登记？\n' + t.id + '\n\n只删 ~/.config/qsync/tasks/' + t.id +
@@ -824,11 +906,17 @@
   }
 
   function refreshJournal(extra) {
+    state.journalLoading = true;
+    state.journalError = '';
+    renderJournalPage();
     return withBusy({ buttons: ['btn-journal-refresh'] }, function () {
       return ipc(journalQuery(extra));
     }).then(function (r) {
+      state.journalLoading = false;
       if (!r.ok) {
         logErr('journal 查询失败：' + str(r.error));
+        state.journalError = str(r.error);
+        renderJournalPage();
         return r;
       }
       state.journal = isObj(r.data) ? r.data : null;
@@ -841,24 +929,30 @@
     var tb = $('journal-tbody');
     if (!tb) { return; }
     clear(tb);
+    setBusyState('journal-tbody', state.journalLoading === true);
     var d = state.journal;
+    if (state.journalError) {
+      setText('journal-count', '');
+      setListState('journal-empty', 'error', T('list.error', { msg: state.journalError }));
+      show('journal-note', false);
+      return;
+    }
     if (!d) {
       setText('journal-count', '');
-      show('journal-empty', true);
-      setText('journal-empty', '日志不可用（daemon 未运行？）');
+      setListState('journal-empty', 'loading', T('journal.loading'));
       show('journal-note', false);
       return;
     }
     var list = (d.entries || []).filter(isObj);
     var counts = isObj(d.counts) ? d.counts : {};
-    setText('journal-count',
-      '共 ' + num(d.total, 0) + ' 条 · ok ' + num(counts.ok, 0) +
-      ' / error ' + num(counts.error, 0) + ' / blocked ' + num(counts.blocked, 0));
-    show('journal-empty', list.length === 0);
+    setText('journal-count', T('journal.counts', {
+      total: num(d.total, 0), ok: num(counts.ok, 0),
+      error: num(counts.error, 0), blocked: num(counts.blocked, 0)
+    }));
     if (list.length === 0) {
-      setText('journal-empty', d.cleared
-        ? '日志已清空。'
-        : '没有符合条件的日志。挂载一个同步任务后点「立即同步」，或有实际同步活动时就会出现记录。');
+      setListState('journal-empty', 'empty', d.cleared ? T('journal.cleared') : T('journal.empty_filtered'));
+    } else {
+      setListState('journal-empty', 'ready');
     }
 
     for (var i = 0; i < list.length; i++) {
@@ -885,9 +979,15 @@
 
   /** 错误列表 = journal 里 status=error 的视图（复用同一份数据）。 */
   function refreshErrors() {
+    state.errorsLoading = true;
+    state.errorsError = '';
+    renderErrorsPage();
     return ipc({ method: 'journal', level: 'error', limit: 500 }).then(function (r) {
+      state.errorsLoading = false;
       if (!r.ok) {
         logErr('错误列表读取失败：' + str(r.error));
+        state.errorsError = str(r.error);
+        renderErrorsPage();
         return r;
       }
       state.errors = isObj(r.data) ? r.data : null;
@@ -900,16 +1000,21 @@
     var box = $('errors-list');
     if (!box) { return; }
     clear(box);
+    setBusyState('errors-list', state.errorsLoading === true);
     var d = state.errors;
+    if (state.errorsError) {
+      setText('errors-count', '');
+      setListState('errors-empty', 'error', T('list.error', { msg: state.errorsError }));
+      return;
+    }
     if (!d) {
       setText('errors-count', '');
-      show('errors-empty', true);
-      setText('errors-empty', '错误列表不可用（daemon 未运行？）');
+      setListState('errors-empty', 'loading', T('errors.loading'));
       return;
     }
     var list = (d.entries || []).filter(isObj);
     setText('errors-count', list.length ? '（' + list.length + '）' : '');
-    show('errors-empty', list.length === 0);
+    setListState('errors-empty', list.length ? 'ready' : 'empty', T('errors.empty'));
 
     for (var i = 0; i < list.length; i++) {
       (function (e) {
@@ -952,12 +1057,18 @@
 
   // ============================================================ 任务页（M8.2）
   function refreshTasks() {
+    state.tasksLoading = true;
+    state.tasksError = '';
+    renderTasksPage();
     return ipc({ method: 'tasks', action: 'list' }).then(function (r) {
+      state.tasksLoading = false;
       // 任务列表回来后顺手刷一下冲突策略汇总与待裁决队列（M8.4）
       window.setTimeout(function () { renderConflictKv(); }, 0);
       refreshDecisions();
       if (!r.ok) {
         logErr('tasks list 失败：' + str(r.error));
+        state.tasksError = str(r.error);
+        renderTasksPage();
         return r;
       }
       state.tasks = isObj(r.data) ? r.data : null;
@@ -971,11 +1082,17 @@
     if (!box) { return; }
     clear(box);
     clear($('tasks-bad'));
+    setBusyState('tasks-list', state.tasksLoading === true);
     var d = state.tasks;
+    if (state.tasksError) {
+      setText('tasks-count', '');
+      setListState('tasks-empty', 'error', T('list.error', { msg: state.tasksError }));
+      show('tasks-note', false);
+      return;
+    }
     if (!d) {
       setText('tasks-count', '');
-      show('tasks-empty', true);
-      setText('tasks-empty', '任务信息不可用（daemon 未运行？）');
+      setListState('tasks-empty', 'loading', T('tasks.loading'));
       show('tasks-note', false);
       return;
     }
@@ -984,11 +1101,10 @@
     var ts = taskState(state.lastStatus, sy, infos.length > 0);
 
     setText('tasks-count', infos.length ? '（' + infos.length + '）' : '');
-    show('tasks-empty', infos.length === 0);
     if (infos.length === 0) {
-      setText('tasks-empty', d.empty
-        ? '还没有登记过任务。点右上「＋ 添加配对文件夹」建一个。'
-        : '任务目录里没有可用的任务文件。');
+      setListState('tasks-empty', 'empty', d.empty ? T('tasks.empty_never') : T('tasks.empty_files'));
+    } else {
+      setListState('tasks-empty', 'ready');
     }
     for (var i = 0; i < infos.length; i++) {
       box.appendChild(buildTaskCard(
@@ -1008,7 +1124,7 @@
     for (var k = 0; k < bad.length; k++) {
       var pair = bad[k];
       badBox.appendChild(el('li', null,
-        '⚠️ 任务文件解析失败（已跳过）：' + str(pair[0]) + ' —— ' + str(pair[1])));
+        T('tasks.bad_file', { file: str(pair[0]), err: str(pair[1]) })));
     }
   }
 
@@ -1376,7 +1492,18 @@
     clear(tb);
     var list = (mounts || []).filter(isObj);
     if (countId) { setText(countId, list.length ? '（' + list.length + '）' : ''); }
-    if (emptyId) { show(emptyId, list.length === 0); }
+    if (emptyId) {
+      if (state.mountsError) {
+        setListState(emptyId, 'error', T('list.error', { msg: state.mountsError }));
+      } else if (state.mountsLoading && !list.length) {
+        setListState(emptyId, 'loading', T('mounts.loading'));
+      } else if (list.length) {
+        setListState(emptyId, 'ready');
+      } else {
+        setListState(emptyId, 'empty', T('mounts.empty'));
+      }
+    }
+    setBusyState(tbodyTableId, state.mountsLoading === true);
 
     for (var i = 0; i < list.length; i++) {
       (function (m) {
@@ -1435,11 +1562,11 @@
     clear($('roots-summary-kv'));
 
     var roots = (data.roots || []).filter(isObj);
+    state.rootsLoaded = true;
+    setBusyState('roots-list', false);
     setText('roots-count', roots.length ? '（' + roots.length + '）' : '');
-    show('roots-empty', roots.length === 0);
-    if (!roots.length) {
-      setText('roots-empty', '未读取到远端根（未登录时 daemon 不做可读性探测）。');
-    }
+    if (roots.length) { setListState('roots-empty', 'ready'); }
+    else { setListState('roots-empty', 'empty', T('roots.unreadable')); }
 
     var kv = $('roots-summary-kv');
     kvText(kv, 'home_root', optText(data.home_root) || '—');
@@ -1470,7 +1597,8 @@
     }
 
     var sf = (data.syncing_folders || []).filter(isObj);
-    show('roots-folders-empty', sf.length === 0);
+    if (sf.length) { setListState('roots-folders-empty', 'ready'); }
+    else { setListState('roots-folders-empty', 'empty', T('roots.folders_empty')); }
     for (var j = 0; j < sf.length; j++) {
       var f = sf[j];
       var txt = str(f.folder) + ' · permission=' + str(f.permission) +
@@ -1483,6 +1611,11 @@
     if (rootsInflight) { return rootsInflight; }
     var btn = $('btn-roots-refresh');
     if (btn) { btn.disabled = true; }
+    // ★ M8.6：首轮还没有数据时先给「读取中」，别让空态冒充结论
+    if (!state.rootsLoaded) {
+      setListState('roots-empty', 'loading', T('roots.loading'));
+      setBusyState('roots-list', true);
+    }
     rootsInflight = ipc({ method: 'roots' }).then(function (r) {
       rootsInflight = null;
       if (btn) { btn.disabled = false; }
@@ -1494,9 +1627,9 @@
         clear($('roots-folders'));
         clear($('roots-summary-kv'));
         setText('roots-count', '');
-        show('roots-empty', true);
-        setText('roots-empty', '读取远端根失败：' + str(r.error));
-        show('roots-folders-empty', true);
+        setListState('roots-empty', 'error', T('list.error', { msg: str(r.error) }));
+        setListState('roots-folders-empty', 'ready');
+        setBusyState('roots-list', false);
         var nt = $('roots-note');
         if (nt) { nt.hidden = true; nt.textContent = ''; }
       }
@@ -1504,6 +1637,7 @@
     }, function (e) {
       rootsInflight = null;
       if (btn) { btn.disabled = false; }
+      setBusyState('roots-list', false);
       throw e;
     });
     return rootsInflight;
@@ -1518,11 +1652,11 @@
     var hint = $('connect-hint');
     if (hint) {
       if (!info) {
-        hint.textContent = '无法读取连接配置。';
+        hint.textContent = T('connect.failed');
       } else if (info.exists && isObj(info.link)) {
-        hint.textContent = '已加载连接配置：' + str(info.path);
+        hint.textContent = T('connect.loaded', { path: str(info.path) });
       } else {
-        hint.textContent = '尚无连接配置（' + str(info.path) + '），填好后点「保存并登录」。';
+        hint.textContent = T('connect.none', { path: str(info.path) });
       }
     }
     setText('link-path-hint', info ? ('link 文件：' + str(info.path)) : '—');
@@ -1778,10 +1912,15 @@
 
   // ============================================================ Tab 3 挂载
   function refreshMounts() {
+    state.mountsLoading = true;
     return call('daemon_status', {}).then(function (r) {
+      state.mountsLoading = false;
       if (r.ok && isObj(r.data)) {
+        state.mountsError = '';
         var s = isObj(r.data.status) ? r.data.status : null;
         state.mounts = (s && s.mounts) ? s.mounts : [];
+      } else {
+        state.mountsError = str(r.error) || T('list.error_daemon');
       }
       renderMountTable('tbl-mounts', 'mounts-empty', 'mounts-count', state.mounts);
       renderMountTable('tbl-status-mounts', 'status-mounts-empty', 'mounts-status-count', state.mounts);
@@ -1862,25 +2001,43 @@
   }
 
   function refreshFiles(path) {
-    if (!requireLogin()) { return Promise.resolve(null); }
     var target = pathNormalize(path === undefined ? state.files.path : path);
+    // ★ M8.6：先区分「daemon 没跑」/「没登录」/「真的读失败」，别把三种情况揉成一句空态。
+    // 但**首轮 status 还没回来**不算错误 —— 那是「读取中」，不是「不可用」（M4 踩坑 #2 的同类）。
+    if (!requireDaemon() || !requireLogin()) {
+      state.files.loading = false;
+      state.files.error = '';
+      if (state.lastStatus && !state.lastStatus.running) {
+        state.files.error = T('list.error_daemon');
+      } else if (state.lastStatus && state.lastStatus.running) {
+        state.files.error = T('files.not_logged_in');
+      } else {
+        state.files.loading = true;   // 状态未到：如实显示「读取中」
+      }
+      renderFiles();
+      return Promise.resolve(null);
+    }
     var fpb = $('btn-path-refresh');
     var busy = $('files-busy');
     if (busy) { busy.hidden = false; }
+    state.files.loading = true;
+    state.files.error = '';
+    if (!state.files.entries.length) { renderFiles(); }
     return ipc({ method: 'ls', path: target }).then(function (r) {
       if (busy) { busy.hidden = true; }
+      state.files.loading = false;
       if (!r.ok) {
         logErr('ls 失败：' + str(r.error));
         state.files.entries = [];
         state.files.selected = null;
-        renderFiles();
-        setText('files-info', 'ls ' + target + ' 失败：' + str(r.error));
-        show('files-empty', true);
+        state.files.error = str(r.error);
         var fpErr = $('fp-path');
         if (fpErr) { fpErr.value = target; }
+        renderFiles();
         return r;
       }
       var d = isObj(r.data) ? r.data : {};
+      state.files.error = '';
       state.files.dir = str(d.path || target);
       state.files.path = state.files.dir;
       state.files.entries = sortEntries(d.entries);
@@ -1934,20 +2091,33 @@
     var menu = $('row-menu');
     if (!menu) { return; }
     state.rowMenu = { entry: e, path: full };
+    // ★ M8.6：键盘（Shift+F10 / 菜单键）也能开；关闭时把焦点还给来处
+    state.rowMenuTrigger = document.activeElement;
     setText('row-menu-title', full);
     menu.hidden = false;
     var w = menu.offsetWidth || 300;
     var h = menu.offsetHeight || 250;
-    var x = Math.min(ev.clientX, Math.max(4, window.innerWidth - w - 8));
-    var y = Math.min(ev.clientY, Math.max(4, window.innerHeight - h - 8));
+    var cx = num(ev && ev.clientX, 0);
+    var cy = num(ev && ev.clientY, 0);
+    var rect = (ev && ev.target && ev.target.getBoundingClientRect) ? ev.target.getBoundingClientRect() : null;
+    if (!cx && !cy && rect) { cx = rect.left + 8; cy = rect.bottom + 2; }
+    var x = Math.min(cx, Math.max(4, window.innerWidth - w - 8));
+    var y = Math.min(cy, Math.max(4, window.innerHeight - h - 8));
     menu.style.left = Math.max(4, x) + 'px';
     menu.style.top = Math.max(4, y) + 'px';
+    var first = menu.querySelector('.ctx-item');
+    if (first && isFn(first.focus)) { first.focus(); }
   }
 
-  function closeRowMenu() {
+  /** `restoreFocus=true`（键盘路径）时把焦点还给触发元素；鼠标点空白处关就不还，免得抢焦点。 */
+  function closeRowMenu(restoreFocus) {
     var m = $('row-menu');
     if (m) { m.hidden = true; }
     state.rowMenu = null;
+    if (restoreFocus === true && state.rowMenuTrigger && isFn(state.rowMenuTrigger.focus)) {
+      state.rowMenuTrigger.focus();
+    }
+    state.rowMenuTrigger = null;
   }
 
   function wireRowMenu() {
@@ -1961,14 +2131,32 @@
         });
       })(items[i]);
     }
+    // ★ M8.6：菜单内部的方向键导航（↑↓/Home/End），Escape/Tab 关闭并把焦点还给来处
+    menu.addEventListener('keydown', function (ev) {
+      var items = menu.querySelectorAll('.ctx-item');
+      var cur = -1;
+      for (var i = 0; i < items.length; i++) {
+        if (items[i] === document.activeElement) { cur = i; }
+      }
+      var next = -1;
+      if (ev.key === 'ArrowDown') { next = cur < 0 ? 0 : (cur + 1) % items.length; }
+      else if (ev.key === 'ArrowUp') { next = cur < 0 ? items.length - 1 : (cur - 1 + items.length) % items.length; }
+      else if (ev.key === 'Home') { next = 0; }
+      else if (ev.key === 'End') { next = items.length - 1; }
+      else if (ev.key === 'Escape' || ev.key === 'Tab') { ev.preventDefault(); closeRowMenu(true); return; }
+      if (next < 0) { return; }
+      ev.preventDefault();
+      items[next].focus();
+    });
     document.addEventListener('click', function (ev) {
       var m = $('row-menu');
-      if (m && !m.hidden && !m.contains(ev.target)) { closeRowMenu(); }
+      if (m && !m.hidden && !m.contains(ev.target)) { closeRowMenu(false); }
     });
     document.addEventListener('keydown', function (ev) {
-      if (ev.key === 'Escape') { closeRowMenu(); }
+      var m = $('row-menu');
+      if (ev.key === 'Escape' && m && !m.hidden) { closeRowMenu(true); }
     });
-    window.addEventListener('blur', function () { closeRowMenu(); });
+    window.addEventListener('blur', function () { closeRowMenu(false); });
   }
 
   function doRowAction(act) {
@@ -1976,7 +2164,7 @@
     if (!cur) { return; }
     var e = cur.entry;
     var full = cur.path;
-    closeRowMenu();
+    closeRowMenu(false);
     if (act === 'pin') {
       setPinState(full, 'pinned', null, null);
       refreshFileStatesSoon();
@@ -2016,24 +2204,39 @@
     clear(tb);
     var hideExcluded = isOn('fp-hide-excluded', false);
     var entries = state.files.entries || [];
-    var shown = 0;
+    setBusyState('files-tbody', state.files.loading === true);
 
     for (var i = 0; i < entries.length; i++) {
       var e = entries[i];
       if (!isObj(e)) { continue; }
-      shown++;
       tb.appendChild(buildFileRow(e, hideExcluded));
     }
-    var info = '共 ' + entries.length + ' 项' + (state.files.dir ? ' · ' + state.files.dir : '');
+    // ★ M8.6：读取失败 → 明确报错；读取中 → 不把「共 0 项」当结论
+    if (state.files.error) {
+      setText('files-info', T('list.error', { msg: state.files.error }));
+      setListState('files-empty', 'error', T('list.error', { msg: state.files.error }));
+      return;
+    }
+    if (state.files.loading && !entries.length) {
+      setText('files-info', T('files.loading'));
+      setListState('files-empty', 'loading', T('files.loading'));
+      return;
+    }
+    var info = state.files.dir
+      ? T('files.info_dir', { n: entries.length, dir: state.files.dir })
+      : T('files.info', { n: entries.length });
     if (state.fsSummary) {
-      info += ' · 仅在线 ' + num(state.fsSummary.online, 0) +
-        ' / 本地可用 ' + num(state.fsSummary.local, 0) +
-        ' / 始终可用 ' + num(state.fsSummary.always, 0);
+      info += T('files.summary_states', {
+        online: num(state.fsSummary.online, 0),
+        local: num(state.fsSummary.local, 0),
+        always: num(state.fsSummary.always, 0)
+      });
     } else if (state.files.dir) {
-      info += ' · 三态需挂载后才能算（daemon 侧没有该目录的挂载视图）';
+      info += T('files.summary_no_mount');
     }
     setText('files-info', info);
-    show('files-empty', entries.length === 0);
+    if (entries.length) { setListState('files-empty', 'ready'); }
+    else { setListState('files-empty', 'empty', T('files.empty')); }
   }
 
   function buildFileRow(e, hideExcluded) {
@@ -2092,13 +2295,13 @@
     var fs = state.fileStates[str(e.filename)];
     var tdState = el('td', 'col-state');
     if (isDir) {
-      tdState.appendChild(el('span', 'badge', '目录'));
+      tdState.appendChild(el('span', 'badge', T('state.dir')));
     } else if (fs && str(fs.state) === 'always') {
-      tdState.appendChild(el('span', 'badge badge-always', '始终可用'));
+      tdState.appendChild(el('span', 'badge badge-always', T('state.always')));
     } else if (fs && str(fs.state) === 'local') {
-      tdState.appendChild(el('span', 'badge badge-local', '本地可用'));
+      tdState.appendChild(el('span', 'badge badge-local', T('state.local')));
     } else if (fs && str(fs.state) === 'online') {
-      tdState.appendChild(el('span', 'badge badge-online', '仅在线'));
+      tdState.appendChild(el('span', 'badge badge-online', T('state.online')));
     } else {
       tdState.appendChild(el('span', 'badge', '—'));
     }
@@ -2108,7 +2311,7 @@
     }
     if (fs && fs.dirty === true) {
       tdState.appendChild(document.createTextNode(' '));
-      tdState.appendChild(el('span', 'badge badge-warn', '未上传'));
+      tdState.appendChild(el('span', 'badge badge-warn', T('state.dirty')));
     }
     tr.appendChild(tdState);
 
@@ -2116,6 +2319,13 @@
     tr.addEventListener('contextmenu', function (ev) {
       ev.preventDefault();
       openRowMenu(ev, e, full);
+    });
+    // ★ M8.6：键盘打开同一份菜单（Shift+F10 或菜单键）—— 事件从行内的 checkbox/按钮冒泡上来
+    tr.addEventListener('keydown', function (ev) {
+      if (ev.key === 'ContextMenu' || (ev.shiftKey && ev.key === 'F10')) {
+        ev.preventDefault();
+        openRowMenu(ev, e, full);
+      }
     });
 
     // pin 操作
@@ -2539,8 +2749,10 @@
     return ipc({ method: 'settings' }).then(function (r) {
       if (r.ok) {
         state.settings = isObj(r.data) ? r.data : null;
+        state.settingsError = '';
       } else {
         logErr('读取设置失败：' + str(r.error));
+        state.settingsError = str(r.error);
       }
       renderSettings();
       return r;
@@ -2579,9 +2791,11 @@
       }
       kvText(envDl, '实际代理 URL', (d && d.proxy_url) ? str(d.proxy_url) : '（不走手动代理）');
     }
-    setText('proxy-hint', d
-      ? ('设置文件：' + str(d.path) + (d.saved ? '（已保存）' : '') + (d.note ? ' · ' + str(d.note) : ''))
-      : '设置文件：—');
+    setText('proxy-hint', state.settingsError
+      ? T('settings.error', { msg: state.settingsError })
+      : (d
+        ? ('设置文件：' + str(d.path) + (d.saved ? '（已保存）' : '') + (d.note ? ' · ' + str(d.note) : ''))
+        : T('settings.loading')));
 
     // ---- 个人
     var su = $('s-startup'); if (su) { su.checked = s.launch_at_startup === true; }
@@ -2717,7 +2931,9 @@
   // ------------------------------------------------------------ 释放空间
 
   function refreshSpace() {
+    state.spaceLoading = true;
     return ipc({ method: 'space' }).then(function (r) {
+      state.spaceLoading = false;
       if (!r.ok) {
         logErr('读取释放空间状态失败：' + str(r.error));
         setText('space-reason', '读取失败：' + str(r.error));
@@ -2735,7 +2951,7 @@
     if (!dl) { return; }
     clear(dl);
     if (!d) {
-      kvText(dl, '状态', '尚未读取');
+      kvText(dl, '状态', state.spaceLoading ? T('space.loading') : T('space.not_read'));
       return;
     }
     var total = num(d.fs_total, 0);
@@ -2940,9 +3156,15 @@
   }
 
   function refreshDecisions() {
+    state.decisionsLoading = true;
+    state.decisionsError = '';
+    renderDecisions();
     return ipc({ method: 'decisions', action: 'list' }).then(function (r) {
+      state.decisionsLoading = false;
       if (!r.ok) {
         logErr('读取冲突待裁决队列失败：' + str(r.error));
+        state.decisionsError = str(r.error);
+        renderDecisions();
         return r;
       }
       state.decisions = isObj(r.data) ? r.data : null;
@@ -2957,8 +3179,17 @@
     var d = state.decisions;
     var items = (d && d.decisions) ? d.decisions : [];
     clear(box);
+    setBusyState('decisions-list', state.decisionsLoading === true);
     setText('decisions-count', items.length ? (items.length + ' 条（待裁决 ' + num(d.pending, 0) + '）') : '');
-    show('decisions-empty', items.length === 0);
+    if (state.decisionsError) {
+      setListState('decisions-empty', 'error', T('list.error', { msg: state.decisionsError }));
+    } else if (!d) {
+      setListState('decisions-empty', 'loading', T('decisions.loading'));
+    } else if (items.length === 0) {
+      setListState('decisions-empty', 'empty', T('decisions.empty'));
+    } else {
+      setListState('decisions-empty', 'ready');
+    }
     var note = $('decisions-note');
     if (note) {
       note.hidden = !(d && d.note);
@@ -3010,8 +3241,10 @@
   // ------------------------------------------------------------ LAN 加速
 
   function refreshLan() {
+    state.lanLoading = true;
     return ipc({ method: 'peer', action: 'status' }).then(function (r) {
       if (!r.ok) {
+        state.lanLoading = false;
         logErr('读取 LAN 状态失败：' + str(r.error));
         return r;
       }
@@ -3020,6 +3253,7 @@
         ipc({ method: 'peer', action: 'list' }),
         ipc({ method: 'peer', action: 'events', limit: 10 })
       ]).then(function (rs) {
+        state.lanLoading = false;
         renderLanDevices(rs[0].ok ? rs[0].data : null);
         renderLanEvents(rs[1].ok ? rs[1].data : null);
         return r;
@@ -3055,7 +3289,9 @@
     if (!ul) { return; }
     clear(ul);
     var devs = (d && d.devices) ? d.devices : [];
-    show('lan-devices-empty', devs.length === 0);
+    if (devs.length) { setListState('lan-devices-empty', 'ready'); }
+    else if (state.lanLoading) { setListState('lan-devices-empty', 'loading', T('lan.devices_loading')); }
+    else { setListState('lan-devices-empty', 'empty', T('lan.devices_empty')); }
     for (var i = 0; i < devs.length; i++) {
       ul.appendChild(el('li', null, str(devs[i].name) + '  ' + str(devs[i].addr) + '  ' + str(devs[i].token_masked)));
     }
@@ -3066,7 +3302,9 @@
     if (!ul) { return; }
     clear(ul);
     var evs = (d && d.events) ? d.events : [];
-    show('lan-events-empty', evs.length === 0);
+    if (evs.length) { setListState('lan-events-empty', 'ready'); }
+    else if (state.lanLoading) { setListState('lan-events-empty', 'loading', T('lan.events_loading')); }
+    else { setListState('lan-events-empty', 'empty', T('lan.events_empty')); }
     for (var i = 0; i < evs.length; i++) {
       ul.appendChild(el('li', null, clock(num(evs[i].ts, 0) * 1000) + '  ' + str(evs[i].kind) + '  ' + str(evs[i].path)));
     }
@@ -3272,8 +3510,13 @@
     var items = document.querySelectorAll('.rail-item');
     for (var i = 0; i < items.length; i++) {
       var it = items[i];
-      if (it.getAttribute('data-page') === name) { it.classList.add('active'); }
-      else { it.classList.remove('active'); }
+      if (it.getAttribute('data-page') === name) {
+        it.classList.add('active');
+        it.setAttribute('aria-current', 'page');     // ★ M8.6：读屏能播报「当前页」
+      } else {
+        it.classList.remove('active');
+        it.removeAttribute('aria-current');
+      }
     }
 
     var pages = document.querySelectorAll('.page');
@@ -3316,8 +3559,13 @@
     var tabs = document.querySelectorAll('#settings-tabs .tab');
     for (var i = 0; i < tabs.length; i++) {
       var t = tabs[i];
-      if (t.getAttribute('data-sec') === name) { t.classList.add('active'); }
-      else { t.classList.remove('active'); }
+      if (t.getAttribute('data-sec') === name) {
+        t.classList.add('active');
+        t.setAttribute('aria-selected', 'true');     // ★ M8.6
+      } else {
+        t.classList.remove('active');
+        t.setAttribute('aria-selected', 'false');
+      }
     }
     var secs = document.querySelectorAll('#page-settings .settings-sec');
     for (var j = 0; j < secs.length; j++) {
@@ -3325,7 +3573,7 @@
       if (s.id === 'sec-' + name) { s.classList.add('active'); }
       else { s.classList.remove('active'); }
     }
-    setText('page-title', '设置 · ' + (SEC_TITLE[name] || name));
+    setText('page-title', T('page.settings_sec', { sec: SEC_TITLE[name] || name }));
     if (name === 'free') { refreshSpace(); }
     if (name === 'lan') { refreshLan(); }
     if (name === 'about') { renderAbout(); }
@@ -3341,8 +3589,13 @@
     var tabs = document.querySelectorAll('#diag-tabs .tab');
     for (var i = 0; i < tabs.length; i++) {
       var t = tabs[i];
-      if (t.getAttribute('data-panel') === name) { t.classList.add('active'); }
-      else { t.classList.remove('active'); }
+      if (t.getAttribute('data-panel') === name) {
+        t.classList.add('active');
+        t.setAttribute('aria-selected', 'true');     // ★ M8.6
+      } else {
+        t.classList.remove('active');
+        t.setAttribute('aria-selected', 'false');
+      }
     }
 
     var panels = document.querySelectorAll('#page-diag .panel');
@@ -3366,10 +3619,24 @@
     var box = $('logbox');
     var toggle = $('log-toggle');
     if (head && box) {
+      var flip = function () {
+        box.classList.toggle('collapsed');
+        var collapsed = box.classList.contains('collapsed');
+        if (toggle) { toggle.textContent = collapsed ? T('log.expand') : T('log.collapse'); }
+        // ★ M8.6：折叠头是 div，补上 role=button 的展开状态
+        head.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+      };
       head.addEventListener('click', function (ev) {
         if (ev.target && ev.target.id === 'btn-log-clear') { return; }
-        box.classList.toggle('collapsed');
-        if (toggle) { toggle.textContent = box.classList.contains('collapsed') ? '展开' : '收起'; }
+        flip();
+      });
+      // ★ M8.6：Enter / Space 也能折叠（鼠标之外的第二条路）
+      head.addEventListener('keydown', function (ev) {
+        if (ev.target !== head) { return; }
+        if (ev.key === 'Enter' || ev.key === ' ' || ev.key === 'Spacebar') {
+          ev.preventDefault();
+          flip();
+        }
       });
     }
     var clearBtn = $('btn-log-clear');
@@ -3386,13 +3653,26 @@
   // ============================================================ 事件绑定
   function bindEvents() {
     // 左侧图标栏（一级目的地）
+    // ★ M8.6：图标栏除了可点，还要能用键盘走 —— ↑↓/←→ 移焦点，Home/End 到首尾，
+    //   Enter/Space 由 button 原生触发（不需要手写）。
     var rail = document.querySelectorAll('.rail-item');
     for (var i = 0; i < rail.length; i++) {
-      (function (b) {
+      (function (b, idx) {
         b.addEventListener('click', function () {
           switchPage(str(b.getAttribute('data-page')));
         });
-      })(rail[i]);
+        b.addEventListener('keydown', function (ev) {
+          var list = document.querySelectorAll('.rail-item');
+          var next = -1;
+          if (ev.key === 'ArrowDown' || ev.key === 'ArrowRight') { next = (idx + 1) % list.length; }
+          else if (ev.key === 'ArrowUp' || ev.key === 'ArrowLeft') { next = (idx - 1 + list.length) % list.length; }
+          else if (ev.key === 'Home') { next = 0; }
+          else if (ev.key === 'End') { next = list.length - 1; }
+          if (next < 0) { return; }
+          ev.preventDefault();
+          if (list[next] && isFn(list[next].focus)) { list[next].focus(); }
+        });
+      })(rail[i], i);
     }
 
     // 诊断页内的子 tab
@@ -3404,6 +3684,10 @@
         });
       })(dtabs[k]);
     }
+
+    // ★ M8.6：设置分区 / 诊断子页的 tablist 支持 ←→（Home/End）切换
+    wireTabKeys('#settings-tabs', function (t) { switchSettingsSec(str(t.getAttribute('data-sec'))); });
+    wireTabKeys('#diag-tabs', function (t) { switchDiag(str(t.getAttribute('data-panel'))); });
 
     // ★ M8.3 更新中心 / 错误列表
     on('btn-journal-refresh', 'click', function () { refreshJournal(); });
@@ -3614,8 +3898,39 @@
     if (n) { n.addEventListener(evt, fn); }
   }
 
+  /**
+   * ★ M8.6：给 `role="tablist"` 的分段控件接方向键。
+   * 只移动焦点 + 立即切换（跟随焦点），符合 APG 的 tabs 键盘交互；Tab 键仍可离开控件。
+   */
+  function wireTabKeys(containerSel, onPick) {
+    var box = document.querySelector(containerSel);
+    if (!box) { return; }
+    box.addEventListener('keydown', function (ev) {
+      var tabs = box.querySelectorAll('.tab');
+      var cur = -1;
+      for (var i = 0; i < tabs.length; i++) {
+        if (tabs[i] === document.activeElement) { cur = i; }
+      }
+      if (cur < 0) { return; }
+      var next = -1;
+      if (ev.key === 'ArrowRight' || ev.key === 'ArrowDown') { next = (cur + 1) % tabs.length; }
+      else if (ev.key === 'ArrowLeft' || ev.key === 'ArrowUp') { next = (cur - 1 + tabs.length) % tabs.length; }
+      else if (ev.key === 'Home') { next = 0; }
+      else if (ev.key === 'End') { next = tabs.length - 1; }
+      if (next < 0) { return; }
+      ev.preventDefault();
+      if (isFn(tabs[next].focus)) { tabs[next].focus(); }
+      if (isFn(onPick)) { onPick(tabs[next]); }
+    });
+  }
+
   // ============================================================ 启动
   function boot() {
+    // ★ M8.6：先把静态文案套一遍（表在 i18n.js；DOM 里挂错 key 会在下面报出来）
+    if (I18N && isFn(I18N.apply)) {
+      I18N.apply(document);
+      document.title = T('app.title');
+    }
     wireModal();
     wireLogBox();
     wireRowMenu();
@@ -3628,6 +3943,16 @@
       logErr('未在 Tauri 中运行：window.__TAURI__.core.invoke 不存在，界面只做静态展示');
     } else {
       logInfo('QSync GUI 已启动，开始轮询 daemon_status（每 2s）');
+    }
+
+    // ★ M8.6：i18n 一致性 —— DOM 里挂了 data-i18n 但表里没有的 key 直接报出来（拼错立刻可见）
+    if (I18N && isFn(I18N.missingInDOM)) {
+      var miss = I18N.missingInDOM(document);
+      if (miss.length) {
+        logErr('i18n：DOM 里有 ' + miss.length + ' 个 key 不在文案表里 —— ' + miss.join(', '));
+      } else if (isFn(I18N.stats)) {
+        logInfo('i18n：' + I18N.locale() + ' 文案表已应用（' + I18N.stats().zh_keys + ' 条，en 预留）');
+      }
     }
 
     // 先拿 app_info（挂载点默认值 / 路径面板 / HOME）

@@ -188,6 +188,16 @@ xtask/tests/gui-matrix.sh --keep-open  # 结束时保留窗口，手动玩
 已知环境限制：矩阵里窗口/截图项会 `export GDK_BACKEND=x11`——`xdotool`/`import`
 看不见原生 Wayland 窗口。**只影响验收脚本**，用户正常启动仍走 Wayland。
 
+> ★ **M8.6（打磨与收口）在本文基础上又加了两段**：**2c** —— `ui_spec` 静态合规性
+> （随 `qxync-gui --self-test` 一起产出，扫的是**编译期嵌进二进制的那份 UI**：无 `innerHTML`
+> 类拼接、文案表键齐全、焦点环 / `aria-*` / 深色 token / reduced-motion、四态入口与标记）
+> 外加一条**文案表运行时回落**断言（预留的 `en` 空表必须回落到 zh-CN，未知 key 原样返回）；
+> **3c** —— 真窗口按一次 Tab，断言「跳到主内容」skip-link 与焦点环真的显形（AE > 100 px）。
+> 矩阵合计 **148 项**。同时 §6 的踩坑 #1（`[hidden]` 压不住 `display`）与 #2（首轮 status 未到
+> 就渲染空态）在 M8 新页面上**复查过一遍**：现在统一走 `setListState()`
+> （loading / error / empty / ready + `data-state` 标记），不再把「还没加载完」写成
+> 「不可用（daemon 未运行？）」。详见 [`M8-向Qsync-Client-6靠拢.md`](M8-向Qsync-Client-6靠拢.md) §M8.6。
+
 ## 6. 实现时踩到的坑（都是实测）
 
 1. ★ **`hidden` 属性压不住作者样式里的 `display`**：`.env-banner { display: flex }` 让

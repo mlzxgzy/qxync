@@ -8,6 +8,9 @@
 </head>
 <body>
 
+<!-- ★ M8.6：键盘用户的第一个落点（平时隐藏，:focus-visible 才显形） -->
+<a class="skip-link" href="#main" data-i18n="app.skip">跳到主内容</a>
+
 <!-- 非 Tauri 环境横幅（app.js 负责显示） -->
 <div id="env-banner" class="env-banner" hidden>
   <strong>未在 Tauri 中运行</strong>
@@ -23,39 +26,49 @@
   <aside class="rail">
     <div class="rail-logo" title="QSync — QNAP 按需同步">Q</div>
 
-    <nav class="rail-nav" id="rail-nav">
-      <button type="button" class="rail-item active" data-page="home" title="主页（任务状态）">
+    <!-- ★ M8.6：图标栏是一组按钮（键盘可达）—— 方向键在条目间移动、Home/End 到首尾，
+         aria-current="page" 标出当前页；图标本身 aria-hidden，可读名来自 span 文本。
+         这里用「导航按钮 + aria-current」而不是 tab/tablist：它换的是整页，不是页内面板。 -->
+    <nav class="rail-nav" id="rail-nav" aria-label="主导航" data-i18n-aria-label="nav.aria">
+      <button type="button" class="rail-item active" data-page="home" aria-current="page"
+              title="主页（任务状态）" data-i18n-title="nav.home_title">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/></svg>
-        <span>主页</span>
+        <span data-i18n="nav.home">主页</span>
       </button>
-      <button type="button" class="rail-item" data-page="tasks" title="任务（同步任务列表）">
+      <button type="button" class="rail-item" data-page="tasks"
+              title="任务（同步任务列表）" data-i18n-title="nav.tasks_title">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16"/><path d="M4 12h16"/><path d="M4 18h10"/></svg>
-        <span>任务</span>
+        <span data-i18n="nav.tasks">任务</span>
       </button>
-      <button type="button" class="rail-item" data-page="files" title="文件（远端浏览 / 节省空间模式）">
+      <button type="button" class="rail-item" data-page="files"
+              title="文件（远端浏览 / 节省空间模式）" data-i18n-title="nav.files_title">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
-        <span>文件</span>
+        <span data-i18n="nav.files">文件</span>
       </button>
-      <button type="button" class="rail-item" data-page="journal" title="文件更新中心（同步日志）">
+      <button type="button" class="rail-item" data-page="journal"
+              title="文件更新中心（同步日志）" data-i18n-title="nav.journal_title">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 8v4l3 2"/></svg>
-        <span>更新</span>
+        <span data-i18n="nav.journal">更新</span>
       </button>
-      <button type="button" class="rail-item" data-page="errors" title="错误列表（失败项）">
+      <button type="button" class="rail-item" data-page="errors"
+              title="错误列表（失败项）" data-i18n-title="nav.errors_title">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4 2.5 20h19z"/><path d="M12 10v4"/><path d="M12 17.2v.1"/></svg>
-        <span>错误</span>
+        <span data-i18n="nav.errors">错误</span>
       </button>
-      <button type="button" class="rail-item" data-page="settings" title="设置（连接 / 同步 / 缓存 / 网络 / 通知）">
+      <button type="button" class="rail-item" data-page="settings"
+              title="设置（连接 / 同步 / 缓存 / 网络 / 通知）" data-i18n-title="nav.settings_title">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M19 5l-2 2M7 17l-2 2"/></svg>
-        <span>设置</span>
+        <span data-i18n="nav.settings">设置</span>
       </button>
     </nav>
 
     <div class="rail-spacer"></div>
 
     <!-- 专家模式：现有排障页（状态/挂载/同步缓存）收纳在这里，字段与 id 全部保留 -->
-    <button type="button" class="rail-item rail-expert" data-page="diag" title="诊断（专家模式：游标 / baseline / 水合 / 脱水）">
+    <button type="button" class="rail-item rail-expert" data-page="diag"
+            title="诊断（专家模式：游标 / baseline / 水合 / 脱水）" data-i18n-title="nav.diag_title">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 4.5a4 4 0 0 0 5 5L21 8v3l-8 8-1.5-1.5"/><path d="M3 21l6-6"/><path d="M10.5 6.5 6 11l3 3 4.5-4.5z"/></svg>
-      <span>诊断</span>
+      <span data-i18n="nav.diag">诊断</span>
     </button>
   </aside>
 
@@ -67,7 +80,7 @@
         <h1 class="pagetitle" id="page-title">主页</h1>
 
         <div class="status-chips">
-          <span id="chip-daemon" class="chip chip-unknown">qxyncd：检测中…</span>
+          <span id="chip-daemon" class="chip chip-unknown" role="status" data-i18n="top.daemon_checking">qxyncd：检测中…</span>
           <span id="chip-conn" class="chip chip-unknown">连接：—</span>
           <span id="chip-login" class="chip chip-unknown">登录：—</span>
         </div>
@@ -86,7 +99,7 @@
       </div>
     </header>
 
-    <main id="main">
+    <main id="main" tabindex="-1">
 
       <!-- ======================= 页面 1：主页 ======================= -->
       <section class="page active" id="page-home">
@@ -98,7 +111,7 @@
             <span class="home-conn-actions">
               <button type="button" class="mini" id="btn-home-settings">连接设置</button>
               <button type="button" class="mini" id="btn-home-sync-now">立即同步</button>
-              <button type="button" class="mini primary" id="btn-home-add-task">＋ 添加任务</button>
+              <button type="button" class="mini primary" id="btn-home-add-task" data-i18n="task.act_add">＋ 添加任务</button>
             </span>
           </div>
         </div>
@@ -108,7 +121,7 @@
             <button type="button" class="mini" id="btn-home-refresh">刷新</button>
           </h2>
           <div id="home-tasks" class="task-list"></div>
-          <p class="empty-hint" id="home-tasks-empty" hidden>
+          <p class="empty-hint" id="home-tasks-empty" hidden data-state="ready" data-i18n="home.tasks_empty">
             还没有同步任务。点右上「＋ 添加任务」把本地文件夹与 NAS 文件夹配成一对。
           </p>
         </div>
@@ -132,17 +145,17 @@
             待裁决期间**两边都不动**（谁的改动都不会被覆盖）；裁决后由下一轮同步执行。
           </p>
           <div id="decisions-list" class="task-list"></div>
-          <p class="empty-hint" id="decisions-empty" hidden>没有待裁决的冲突。</p>
+          <p class="empty-hint" id="decisions-empty" hidden data-state="ready" data-i18n="decisions.empty">没有待裁决的冲突。</p>
           <p class="note" id="decisions-note" hidden></p>
         </div>
 
         <div class="card">
           <h2>同步任务 <span class="count" id="tasks-count"></span>
             <button type="button" class="mini" id="btn-tasks-refresh">刷新</button>
-            <button type="button" class="mini primary" id="btn-tasks-add">＋ 添加配对文件夹</button>
+            <button type="button" class="mini primary" id="btn-tasks-add" data-i18n="task.act_add_pair">＋ 添加配对文件夹</button>
           </h2>
           <div id="tasks-list" class="task-list"></div>
-          <p class="empty-hint" id="tasks-empty" hidden>
+          <p class="empty-hint" id="tasks-empty" hidden data-state="ready" data-i18n="tasks.empty">
             还没有同步任务。点右上「＋ 添加配对文件夹」把本地文件夹与 NAS 文件夹配成一对。
           </p>
           <p class="note" id="tasks-note" hidden></p>
@@ -207,7 +220,7 @@
             <div class="btn-row">
               <button type="submit" id="btn-task-save" class="primary">保存任务</button>
               <button type="button" id="btn-task-cancel">取消</button>
-              <span class="busy" id="task-busy" hidden>进行中…</span>
+              <span class="busy" id="task-busy" hidden data-i18n="busy.text">进行中…</span>
             </div>
           </form>
           <div id="task-result" class="result" hidden></div>
@@ -229,7 +242,7 @@
             <button type="button" id="btn-mkdir">新建目录</button>
             <button type="button" id="btn-rm" class="danger">删除选中</button>
             <span class="toolbar-info" id="files-info">—</span>
-            <span class="busy" id="files-busy" hidden>进行中…</span>
+            <span class="busy" id="files-busy" hidden data-i18n="busy.text">进行中…</span>
           </div>
           <table class="tbl tbl-files">
             <thead>
@@ -246,7 +259,7 @@
             </thead>
             <tbody id="files-tbody"></tbody>
           </table>
-          <p class="empty-hint" id="files-empty" hidden>目录为空，或尚未加载。</p>
+          <p class="empty-hint" id="files-empty" hidden data-state="ready" data-i18n="files.empty">目录为空，或尚未加载。</p>
           <p class="note">
             <strong>状态</strong>列就是 Qsync 的「节省空间模式」三态：
             <span class="badge badge-online">仅在线</span>（占位符，没有本地内容）·
@@ -272,7 +285,7 @@
             <label class="inline-num">条数 <input type="number" id="j-limit" min="1" max="10000" step="50" value="200"></label>
             <button type="button" id="btn-journal-refresh">查询</button>
             <button type="button" id="btn-journal-clear" class="danger">清空日志</button>
-            <span class="busy" id="journal-busy" hidden>进行中…</span>
+            <span class="busy" id="journal-busy" hidden data-i18n="busy.text">进行中…</span>
           </div>
           <table class="tbl tbl-journal">
             <thead>
@@ -286,7 +299,7 @@
             </thead>
             <tbody id="journal-tbody"></tbody>
           </table>
-          <p class="empty-hint" id="journal-empty" hidden>
+          <p class="empty-hint" id="journal-empty" hidden data-state="ready" data-i18n="journal.empty">
             没有日志。挂载一个同步任务后点「立即同步」，或有实际同步活动时就会出现记录。
           </p>
           <p class="note" id="journal-note" hidden></p>
@@ -300,7 +313,7 @@
             <button type="button" class="mini" id="btn-errors-refresh">刷新</button>
           </h2>
           <div id="errors-list" class="alert-stack"></div>
-          <p class="empty-hint" id="errors-empty" hidden>没有失败项 —— 同步、上传、脱水目前都正常。</p>
+          <p class="empty-hint" id="errors-empty" hidden data-state="ready" data-i18n="errors.empty">没有失败项 —— 同步、上传、脱水目前都正常。</p>
         </div>
       </section>
 
@@ -308,19 +321,20 @@
       <section class="page" id="page-settings">
         <!-- ★ M8.4：设置内分区（对齐 Qsync 的四个 tab + 连接/筛选/LAN/关于）
              直达写法：QSYNC_GUI_TAB=settings:proxy（验收矩阵逐个分区出图） -->
-        <nav class="tabs settings-tabs" id="settings-tabs">
-          <button type="button" class="tab active" data-sec="connect">连接</button>
-          <button type="button" class="tab" data-sec="proxy">代理</button>
-          <button type="button" class="tab" data-sec="sync">同步与筛选</button>
-          <button type="button" class="tab" data-sec="personal">个人</button>
-          <button type="button" class="tab" data-sec="advanced">高级</button>
-          <button type="button" class="tab" data-sec="free">释放空间</button>
-          <button type="button" class="tab" data-sec="lan">LAN 加速</button>
-          <button type="button" class="tab" data-sec="about">关于</button>
+        <nav class="tabs settings-tabs" id="settings-tabs" role="tablist"
+             aria-label="设置分区" data-i18n-aria-label="sec.tabs_aria">
+          <button type="button" class="tab active" id="sec-tab-connect" data-sec="connect" role="tab" aria-selected="true"  aria-controls="sec-connect" data-i18n="sec.connect">连接</button>
+          <button type="button" class="tab" id="sec-tab-proxy" data-sec="proxy" role="tab" aria-selected="false" aria-controls="sec-proxy" data-i18n="sec.proxy">代理</button>
+          <button type="button" class="tab" id="sec-tab-sync" data-sec="sync" role="tab" aria-selected="false" aria-controls="sec-sync" data-i18n="sec.sync">同步与筛选</button>
+          <button type="button" class="tab" id="sec-tab-personal" data-sec="personal" role="tab" aria-selected="false" aria-controls="sec-personal" data-i18n="sec.personal">个人</button>
+          <button type="button" class="tab" id="sec-tab-advanced" data-sec="advanced" role="tab" aria-selected="false" aria-controls="sec-advanced" data-i18n="sec.advanced">高级</button>
+          <button type="button" class="tab" id="sec-tab-free" data-sec="free" role="tab" aria-selected="false" aria-controls="sec-free" data-i18n="sec.free">释放空间</button>
+          <button type="button" class="tab" id="sec-tab-lan" data-sec="lan" role="tab" aria-selected="false" aria-controls="sec-lan" data-i18n="sec.lan">LAN 加速</button>
+          <button type="button" class="tab" id="sec-tab-about" data-sec="about" role="tab" aria-selected="false" aria-controls="sec-about" data-i18n="sec.about">关于</button>
         </nav>
 
         <!-- ---------------- 设置 1：连接 ---------------- -->
-        <div class="settings-sec active" id="sec-connect">
+        <div class="settings-sec active" id="sec-connect" role="tabpanel" aria-labelledby="sec-tab-connect">
           <div class="grid-2">
             <div class="card">
               <h2>连接配置</h2>
@@ -375,7 +389,7 @@
         </div>
 
         <!-- ---------------- 设置 2：代理（Qsync「代理」tab） ---------------- -->
-        <div class="settings-sec" id="sec-proxy">
+        <div class="settings-sec" id="sec-proxy" role="tabpanel" aria-labelledby="sec-tab-proxy">
           <div class="card">
             <h2>代理 <span class="badge" id="proxy-mode-badge"></span></h2>
             <p class="hint">
@@ -418,7 +432,7 @@
         </div>
 
         <!-- ---------------- 设置 3：同步与筛选（Qsync「筛选器设置」） ---------------- -->
-        <div class="settings-sec" id="sec-sync">
+        <div class="settings-sec" id="sec-sync" role="tabpanel" aria-labelledby="sec-tab-sync">
           <div class="card">
             <h2>筛选器设置（Filter settings）</h2>
             <p class="hint">
@@ -460,7 +474,7 @@
         </div>
 
         <!-- ---------------- 设置 4：个人（Qsync「个人」tab） ---------------- -->
-        <div class="settings-sec" id="sec-personal">
+        <div class="settings-sec" id="sec-personal" role="tabpanel" aria-labelledby="sec-tab-personal">
           <div class="card">
             <h2>个人</h2>
             <div class="form">
@@ -491,7 +505,7 @@
         </div>
 
         <!-- ---------------- 设置 5：高级（Qsync「高级」tab） ---------------- -->
-        <div class="settings-sec" id="sec-advanced">
+        <div class="settings-sec" id="sec-advanced" role="tabpanel" aria-labelledby="sec-tab-advanced">
           <div class="card">
             <h2>高级</h2>
             <div class="form">
@@ -519,7 +533,7 @@
         </div>
 
         <!-- ---------------- 设置 6：释放空间（Qsync「释放空间」tab） ---------------- -->
-        <div class="settings-sec" id="sec-free">
+        <div class="settings-sec" id="sec-free" role="tabpanel" aria-labelledby="sec-tab-free">
           <div class="card">
             <h2>释放空间 <span class="count" id="space-used-label"></span></h2>
             <div class="form">
@@ -552,7 +566,7 @@
         </div>
 
         <!-- ---------------- 设置 7：LAN 加速（Qsync「Enable LAN sync」，qxync 是自研协议） ---------------- -->
-        <div class="settings-sec" id="sec-lan">
+        <div class="settings-sec" id="sec-lan" role="tabpanel" aria-labelledby="sec-tab-lan">
           <div class="card">
             <h2>LAN 加速（LAN sync）</h2>
             <p class="hint">
@@ -583,17 +597,17 @@
               </div>
               <h3 class="sub">已配对设备</h3>
               <ul class="plain-list mono" id="lan-devices"></ul>
-              <p class="empty-hint" id="lan-devices-empty" hidden>还没有配对的设备。</p>
+              <p class="empty-hint" id="lan-devices-empty" hidden data-state="ready" data-i18n="lan.devices_empty">还没有配对的设备。</p>
               <h3 class="sub">最近收到的对端事件</h3>
               <ul class="plain-list mono" id="lan-events"></ul>
-              <p class="empty-hint" id="lan-events-empty" hidden>还没有收到对端事件。</p>
+              <p class="empty-hint" id="lan-events-empty" hidden data-state="ready" data-i18n="lan.events_empty">还没有收到对端事件。</p>
               <div id="lan-result" class="result" hidden></div>
             </div>
           </div>
         </div>
 
         <!-- ---------------- 设置 8：关于 ---------------- -->
-        <div class="settings-sec" id="sec-about">
+        <div class="settings-sec" id="sec-about" role="tabpanel" aria-labelledby="sec-tab-about">
           <div class="card">
             <h2>关于 / 快捷出口</h2>
             <dl class="kv" id="about-kv"></dl>
@@ -619,14 +633,15 @@
 
       <!-- ======================= 页面 7：诊断（专家模式） ======================= -->
       <section class="page" id="page-diag">
-        <nav class="tabs diag-tabs" id="diag-tabs">
-          <button type="button" class="tab active" data-panel="status">状态 / 进度</button>
-          <button type="button" class="tab" data-panel="mounts">挂载</button>
-          <button type="button" class="tab" data-panel="sync">同步 / 缓存</button>
+        <nav class="tabs diag-tabs" id="diag-tabs" role="tablist"
+             aria-label="诊断子页" data-i18n-aria-label="diag.tabs_aria">
+          <button type="button" class="tab active" id="diag-tab-status" data-panel="status" role="tab" aria-selected="true"  aria-controls="panel-status" data-i18n="diag.status">状态 / 进度</button>
+          <button type="button" class="tab" id="diag-tab-mounts" data-panel="mounts" role="tab" aria-selected="false" aria-controls="panel-mounts" data-i18n="diag.mounts">挂载</button>
+          <button type="button" class="tab" id="diag-tab-sync" data-panel="sync" role="tab" aria-selected="false" aria-controls="panel-sync" data-i18n="diag.sync">同步 / 缓存</button>
         </nav>
 
         <!-- ---------------- 诊断子页 1：状态 / 进度（id 与字段全部保留） ---------------- -->
-        <section class="panel active" id="panel-status">
+        <section class="panel active" id="panel-status" role="tabpanel" aria-labelledby="diag-tab-status">
           <div class="grid-2">
             <div class="card">
               <h2>服务端信息</h2>
@@ -672,7 +687,7 @@
               <thead><tr><th>挂载点</th><th>远端</th><th>模式</th><th class="col-act">操作</th></tr></thead>
               <tbody></tbody>
             </table>
-            <p class="empty-hint" id="status-mounts-empty" hidden>暂无挂载。</p>
+            <p class="empty-hint" id="status-mounts-empty" hidden data-state="ready" data-i18n="mounts.empty">暂无挂载。</p>
           </div>
 
           <div class="card">
@@ -681,11 +696,11 @@
             </h2>
             <dl class="kv mono" id="roots-summary-kv"></dl>
             <ul class="root-list" id="roots-list"></ul>
-            <p class="empty-hint" id="roots-empty" hidden>尚未读取远端根（点右上「刷新」）。</p>
+            <p class="empty-hint" id="roots-empty" hidden data-state="ready" data-i18n="roots.empty">尚未读取远端根（点右上「刷新」）。</p>
             <p class="note" id="roots-note" hidden></p>
             <h3 class="sub">NAS 同步文件夹</h3>
             <ul class="root-list mono" id="roots-folders"></ul>
-            <p class="empty-hint" id="roots-folders-empty" hidden>NAS 未登记 Qsync 同步文件夹</p>
+            <p class="empty-hint" id="roots-folders-empty" hidden data-state="ready" data-i18n="roots.folders_empty">NAS 未登记 Qsync 同步文件夹</p>
           </div>
 
           <div class="card">
@@ -693,12 +708,12 @@
             <div id="sync-alerts" class="alert-stack"></div>
             <dl class="kv kv-inline" id="sync-summary-kv"></dl>
             <p class="note" id="sync-note" hidden></p>
-            <p class="empty-hint" id="sync-missing" hidden>daemon 未上报 sync 状态。</p>
+            <p class="empty-hint" id="sync-missing" hidden data-state="ready" data-i18n="sync.missing">daemon 未上报 sync 状态。</p>
           </div>
         </section>
 
         <!-- ---------------- 诊断子页 2：挂载 ---------------- -->
-        <section class="panel" id="panel-mounts">
+        <section class="panel" id="panel-mounts" role="tabpanel" aria-labelledby="diag-tab-mounts">
           <div class="card">
             <h2>当前挂载 <span class="count" id="mounts-count"></span>
               <button type="button" class="mini" id="btn-mounts-refresh">刷新</button>
@@ -707,7 +722,7 @@
               <thead><tr><th>挂载点</th><th>远端</th><th>模式</th><th class="col-act">操作</th></tr></thead>
               <tbody></tbody>
             </table>
-            <p class="empty-hint" id="mounts-empty" hidden>暂无挂载。</p>
+            <p class="empty-hint" id="mounts-empty" hidden data-state="ready" data-i18n="mounts.empty">暂无挂载。</p>
           </div>
 
           <div class="card">
@@ -742,7 +757,7 @@
               <label class="check"><input type="checkbox" id="m-auto-unmount" checked> 异常退出时自动卸载 auto_unmount</label>
               <div class="btn-row">
                 <button type="submit" id="btn-mount" class="primary">挂载</button>
-                <span class="busy" id="mount-busy" hidden>进行中…</span>
+                <span class="busy" id="mount-busy" hidden data-i18n="busy.text">进行中…</span>
               </div>
             </form>
             <div id="mount-result" class="result" hidden></div>
@@ -750,7 +765,7 @@
         </section>
 
         <!-- ---------------- 诊断子页 3：同步 / 缓存 ---------------- -->
-        <section class="panel" id="panel-sync">
+        <section class="panel" id="panel-sync" role="tabpanel" aria-labelledby="diag-tab-sync">
           <div class="card">
             <h2>同步状态（SyncInfo）</h2>
             <div class="btn-row">
@@ -759,7 +774,7 @@
               <button type="button" id="btn-sync-pause">暂停轮询</button>
               <label class="inline-num">间隔秒数 <input type="number" id="sy-interval" min="1" step="1" value="60"></label>
               <button type="button" id="btn-sync-interval">设置轮询间隔</button>
-              <span class="busy" id="sync-busy" hidden>进行中…</span>
+              <span class="busy" id="sync-busy" hidden data-i18n="busy.text">进行中…</span>
             </div>
             <div id="sync2-alerts" class="alert-stack"></div>
             <dl class="kv kv-inline" id="sync-full-kv"></dl>
@@ -778,7 +793,7 @@
               <button type="button" id="btn-dehy-limit">按限额脱水</button>
               <label class="inline-num">闲置秒 <input type="number" id="dehy-idle" min="0" step="1" value="3600"></label>
               <button type="button" id="btn-dehy-idle">释放闲置</button>
-              <span class="busy" id="dehy-busy" hidden>进行中…</span>
+              <span class="busy" id="dehy-busy" hidden data-i18n="busy.text">进行中…</span>
             </div>
             <dl class="kv kv-inline" id="cache-full-kv"></dl>
             <div class="bar-wrap">
@@ -795,43 +810,47 @@
 </div>
 
 <!-- ============================= 底部操作日志 ============================= -->
-<footer id="logbox" class="logbox">
-  <div class="logbox-head" id="logbox-head">
-    <span class="logbox-title">操作日志</span>
+<footer id="logbox" class="logbox" aria-label="操作日志" data-i18n-aria-label="log.title">
+  <!-- ★ M8.6：可折叠区域的头是 div（视觉上是整条），因此显式补上键盘语义：
+       role=button + tabindex=0 + aria-expanded + Enter/Space（见 app.js wireLogBox） -->
+  <div class="logbox-head" id="logbox-head" role="button" tabindex="0"
+       aria-expanded="true" aria-controls="log-body">
+    <span class="logbox-title" data-i18n="log.title">操作日志</span>
     <span class="logbox-count" id="log-count">0</span>
-    <span class="logbox-toggle" id="log-toggle">收起</span>
-    <button type="button" class="mini" id="btn-log-clear">清空</button>
+    <span class="logbox-toggle" id="log-toggle" data-i18n="log.collapse">收起</span>
+    <button type="button" class="mini" id="btn-log-clear" data-i18n="log.clear">清空</button>
   </div>
-  <div class="logbox-body" id="log-body"></div>
+  <div class="logbox-body" id="log-body" role="log" aria-live="polite" aria-relevant="additions"></div>
 </footer>
 
 <!-- ============================= 文件页行右键菜单（M8.4） =============================
      对齐 Qsync 的「节省空间模式 ▸ 始终保留在此设备 / 释放空间」。用自绘菜单而不是
      系统菜单：前端零依赖、验收矩阵能直接断言条目；所有字符串来自 daemon，绝不拼 innerHTML。 -->
-<div id="row-menu" class="ctx-menu" hidden>
+<div id="row-menu" class="ctx-menu" role="menu" aria-label="文件操作" hidden>
   <div class="ctx-title" id="row-menu-title">—</div>
-  <button type="button" class="ctx-item" data-act="pin">☑ 始终保留在此设备（Always keep on this device）</button>
-  <button type="button" class="ctx-item" data-act="unpin">☐ 取消固定</button>
-  <button type="button" class="ctx-item" data-act="free">⤓ 释放空间（Free up space）</button>
-  <div class="ctx-sep"></div>
-  <button type="button" class="ctx-item" data-act="get">下载到本地…</button>
-  <button type="button" class="ctx-item" data-act="copy">复制远端路径</button>
-  <button type="button" class="ctx-item danger" data-act="rm">删除（远端）</button>
+  <button type="button" class="ctx-item" role="menuitem" data-act="pin" data-i18n="menu.pin">☑ 始终保留在此设备（Always keep on this device）</button>
+  <button type="button" class="ctx-item" role="menuitem" data-act="unpin" data-i18n="menu.unpin">☐ 取消固定</button>
+  <button type="button" class="ctx-item" role="menuitem" data-act="free" data-i18n="menu.free">⤓ 释放空间（Free up space）</button>
+  <div class="ctx-sep" role="separator"></div>
+  <button type="button" class="ctx-item" role="menuitem" data-act="get" data-i18n="menu.get">下载到本地…</button>
+  <button type="button" class="ctx-item" role="menuitem" data-act="copy" data-i18n="menu.copy">复制远端路径</button>
+  <button type="button" class="ctx-item danger" role="menuitem" data-act="rm" data-i18n="menu.rm">删除（远端）</button>
 </div>
 
 <!-- ============================= 通用输入弹窗 ============================= -->
 <div id="modal" class="modal" hidden>
-  <div class="modal-card">
-    <h3 id="modal-title">输入</h3>
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <h3 id="modal-title" data-i18n="modal.title">输入</h3>
     <p id="modal-message" class="hint"></p>
     <input type="text" id="modal-input" class="mono" spellcheck="false">
     <div class="btn-row">
-      <button type="button" id="modal-ok" class="primary">确定</button>
-      <button type="button" id="modal-cancel">取消</button>
+      <button type="button" id="modal-ok" class="primary" data-i18n="modal.ok">确定</button>
+      <button type="button" id="modal-cancel" data-i18n="modal.cancel">取消</button>
     </div>
   </div>
 </div>
 
+<script src="i18n.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
