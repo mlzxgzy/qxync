@@ -6,6 +6,7 @@
 use crate::config::ConfigPaths;
 use crate::model::DirEntry;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// 协议版本：请求/响应都带，用于向前兼容。
@@ -130,6 +131,12 @@ pub enum Request {
         #[serde(default)]
         interval_secs: Option<u64>,
     },
+    /// ★ M5：本地状态库（SQLite）自检 —— 路径 / schema 版本 / 游标 / baseline / pin / 队列。
+    Store {
+        /// 顺带跑 `PRAGMA integrity_check`（慢一点点，给验收脚本用）。
+        #[serde(default)]
+        integrity: Option<bool>,
+    },
     /// 删除远端条目（M2c 测试/脚本用；FUSE 的 unlink 走同一客户端方法）。
     Rm {
         dir: String,
@@ -179,6 +186,7 @@ impl Request {
             Request::Umount { .. } => "umount",
             Request::Mounts => "mounts",
             Request::Sync { .. } => "sync",
+            Request::Store { .. } => "store",
             Request::Rm { .. } => "rm",
             Request::Dehydrate { .. } => "dehydrate",
             Request::Shutdown => "shutdown",
@@ -460,6 +468,23 @@ pub struct DehydrateData {
     pub blocked: Vec<(String, String)>,
 }
 
+/// ★ M5：本地状态库快照（`store` 请求的返回）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StoreData {
+    /// 状态库路径（`<data>/sync/<host>/sync.db`）。
+    pub path: String,
+    pub schema_version: i64,
+    /// `PRAGMA integrity_check` 的结果（只在 `integrity=true` 时有值），正常是 `"ok"`。
+    pub integrity: Option<String>,
+    pub cursors: SyncCursors,
+    pub baseline_entries: u64,
+    /// 路径 → pin 状态（M5 起持久化）。
+    pub pins: BTreeMap<String, String>,
+    /// 未完成的上传作业数。
+    pub uploads: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusData {
     pub daemon: DaemonInfo,
@@ -656,6 +681,26 @@ mod tests {
         assert_eq!(info.used_bytes, 0);
         let d: DehydrateData = serde_json::from_str("{}").unwrap();
         assert_eq!(d.dehydrated, 0);
+    }
+
+    #[test]
+    fn store_request_round_trip() {
+        let e = RequestEnvelope::new(Request::Store {
+            integrity: Some(true),
+        });
+        let back: RequestEnvelope = decode_line(&encode_line(&e).unwrap()).unwrap();
+        match back.req {
+            Request::Store { integrity } => assert_eq!(integrity, Some(true)),
+            other => panic!("解成了 {other:?}"),
+        }
+        assert_eq!(e.req.method(), "store");
+        assert!(!e.req.is_long_running());
+        // 空对象也要能解析（向前兼容）
+        let d: StoreData = serde_json::from_str("{}").unwrap();
+        assert_eq!(d.baseline_entries, 0);
+        assert_eq!(d.schema_version, 0);
+        assert!(d.pins.is_empty());
+        assert!(d.integrity.is_none());
     }
 
     #[test]

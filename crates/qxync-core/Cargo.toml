@@ -10,3 +10,5 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 percent-encoding.workspace = true
+# M5 状态库（游标/baseline/pin）。`bundled` = 自带 SQLite 源码，不依赖系统 libsqlite3。
+rusqlite = { version = "0.40", features = ["bundled"] }

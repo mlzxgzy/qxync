@@ -9,7 +9,7 @@ use qxync_core::ipc::{
     decode_line, encode_line, mask_sid, CacheInfo, CursorInfo, DaemonInfo, DehydrateData,
     ErrorKind, GetData, HydroStats, IpcError, LinkInfo, LoginData, LsData, MountInfo, PingData,
     PutData, Request, RequestEnvelope, Response, ServerInfo, SessionInfo, ShutdownData, StatusData,
-    SyncCursors, SyncInfo, IPC_VERSION,
+    StoreData, SyncCursors, SyncInfo, IPC_VERSION,
 };
 use qxync_core::{ConfigPaths, Credentials, Error as CoreError, LinkConfig, HOME_ROOT};
 use qxync_fuse::upload::UploadQueue;
@@ -113,6 +113,12 @@ pub async fn run(opts: Options) -> Result<()> {
         sync_store.cursors.global_notify,
         sync_store.baseline.len()
     );
+    // ★ M5：pin 以前只在内存里 —— daemon 一重启就全丢，M3 的脱水安全检查
+    //   （pinned/excluded 不脱水）会静默失守。现在从状态库加载、写穿回去。
+    let pins_seed: HashMap<String, String> = sync_store.store.pins().unwrap_or_default().into_iter().collect();
+    if !pins_seed.is_empty() {
+        tracing::info!("从状态库恢复 {} 条 pin", pins_seed.len());
+    }
     let sync_interval: u64 = std::env::var("QSYNC_POLL_INTERVAL")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -124,7 +130,7 @@ pub async fn run(opts: Options) -> Result<()> {
         link,
         client: Mutex::new(client),
         session: Mutex::new(None),
-        pins: Arc::new(StdMutex::new(HashMap::new())),
+        pins: Arc::new(StdMutex::new(pins_seed)),
         mounts: StdMutex::new(HashMap::new()),
         engine_client: Mutex::new(None),
         sync_store: StdMutex::new(sync_store),
@@ -302,6 +308,7 @@ async fn dispatch(state: &Arc<State>, req: Request, shutdown: &mpsc::Sender<()>)
             .await
         }
         Request::Rm { dir, name } => rm(state, dir, name).await,
+        Request::Store { integrity } => store_info(state, integrity.unwrap_or(false)),
         Request::Dehydrate {
             path,
             all,
@@ -355,6 +362,7 @@ fn map_err(e: CoreError) -> IpcError {
         CoreError::Status { .. } => ErrorKind::Status,
         CoreError::Parse(_) => ErrorKind::Parse,
         CoreError::Io(_) => ErrorKind::Io,
+        CoreError::Db(_) => ErrorKind::Io,
         CoreError::Unsupported(_) => ErrorKind::Unsupported,
     };
     IpcError::new(kind, e.to_string())
@@ -625,8 +633,12 @@ fn pin_cmd(
                     format!("pin 只能是 {VALID:?} 之一，收到 {pin:?}"),
                 ));
             }
-            // M1.5：只登记；M2/M5 的 Dehydrator 与 read() 再消费它
+            // M1.5 只登记；M2/M5 的 Dehydrator 与 read() 消费它。
+            // ★ M5：同时写穿到状态库 —— 重启后 pin 还在，脱水安全检查不会静默失守。
             state.pins.lock().unwrap().insert(path.clone(), pin.clone());
+            if let Err(e) = state.sync_store.lock().unwrap().store.set_pin(&path, &pin) {
+                tracing::warn!("pin 落库失败（{path} = {pin}）: {e}");
+            }
             tracing::info!("pin {path} = {pin}");
             to_value(serde_json::json!({ "path": path, "pin": pin }))
         }
@@ -641,6 +653,48 @@ fn pin_cmd(
             to_value(serde_json::json!({ "path": path, "pin": cur }))
         }
     }
+}
+
+/// ★ M5：本地状态库快照（`qsync store [--integrity]`）。
+///
+/// 一次性把「同步正确性的核心状态」摊开给脚本看：游标、baseline 行数、pin、未完成上传。
+fn store_info(state: &Arc<State>, integrity: bool) -> Result<serde_json::Value, IpcError> {
+    let g = state.sync_store.lock().unwrap();
+    let ic = if integrity {
+        Some(
+            g.store
+                .integrity_check()
+                .map_err(|e| IpcError::new(ErrorKind::Io, e.to_string()))?,
+        )
+    } else {
+        None
+    };
+    let store = &g.store;
+    let data = StoreData {
+        path: g.db_path().display().to_string(),
+        schema_version: store
+            .schema_version()
+            .map_err(|e| IpcError::new(ErrorKind::Io, e.to_string()))?,
+        integrity: ic,
+        cursors: SyncCursors {
+            config: g.cursors.config,
+            notify: g.cursors.notify,
+            global_notify: g.cursors.global_notify,
+            max_log_seen: g.cursors.max_log_seen,
+            log_missing_count: g.cursors.log_missing_count,
+        },
+        baseline_entries: store
+            .baseline_len()
+            .map_err(|e| IpcError::new(ErrorKind::Io, e.to_string()))?,
+        pins: store
+            .pins()
+            .map_err(|e| IpcError::new(ErrorKind::Io, e.to_string()))?,
+        uploads: store
+            .uploads()
+            .map_err(|e| IpcError::new(ErrorKind::Io, e.to_string()))?
+            .len() as u64,
+    };
+    to_value(data)
 }
 
 #[allow(clippy::too_many_arguments)]

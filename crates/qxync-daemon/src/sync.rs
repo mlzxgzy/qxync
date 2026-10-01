@@ -14,10 +14,10 @@
 
 use anyhow::Result;
 use qxync_client::{write_action, Client};
+use qxync_core::store::{Store, DB_FILE};
 use qxync_core::sync::{
     conflict_name, conflict_name_with_seq, decide, is_log_missing, map_event_path, Baseline,
-    Cursors, Decision, DeleteProtection, LocalSig, Sig, BASELINE_FILE, CURSORS_FILE,
-    DEFAULT_LOG_BATCH,
+    Cursors, Decision, DeleteProtection, LocalSig, Sig, DEFAULT_LOG_BATCH,
 };
 use qxync_core::{Error as CoreError, MaxLog};
 use qxync_fuse::upload::UploadQueue;
@@ -168,8 +168,10 @@ impl SyncStats {
 }
 
 /// `<data>/sync/<host>/` 下的持久状态（游标 + baseline）。
+/// 同步状态：**内存工作副本**（游标 + baseline）+ **SQLite 持久层**（M5）。
 pub struct SyncState {
     pub dir: PathBuf,
+    pub store: Store,
     pub cursors: Cursors,
     pub baseline: Baseline,
 }
@@ -178,25 +180,41 @@ impl SyncState {
     pub fn load(dir: impl Into<PathBuf>) -> Result<Self> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)?;
+        // ★ M5：状态落在 <dir>/sync.db。M2c 的 baseline.json / cursors.json 会在首次打开时
+        //   迁进库里并归档成 *.json.migrated（保留备份），之后 JSON 不再参与读写。
+        let store = Store::open(dir.join(DB_FILE))?;
+        let rep = store.migrate_legacy(&dir)?;
+        if rep.did_something() {
+            tracing::info!(
+                "M5 状态迁移：游标={} baseline={} 条；旧 JSON 已归档：{}",
+                rep.cursors,
+                rep.baseline,
+                rep.archived
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        let cursors = store.cursors()?;
+        let baseline = store.baseline()?;
         Ok(Self {
-            cursors: Cursors::load(&dir.join(CURSORS_FILE)).unwrap_or_default(),
-            baseline: Baseline::load(&dir.join(BASELINE_FILE)).unwrap_or_default(),
             dir,
+            store,
+            cursors,
+            baseline,
         })
     }
 
-    pub fn cursors_path(&self) -> PathBuf {
-        self.dir.join(CURSORS_FILE)
+    /// 状态库路径（诊断 / 验收用）。
+    pub fn db_path(&self) -> PathBuf {
+        self.dir.join(DB_FILE)
     }
-    pub fn baseline_path(&self) -> PathBuf {
-        self.dir.join(BASELINE_FILE)
-    }
-    pub fn save_cursors(&self) -> Result<()> {
-        self.cursors.save(&self.cursors_path())?;
-        Ok(())
-    }
-    pub fn save_baseline(&self) -> Result<()> {
-        self.baseline.save(&self.baseline_path())?;
+
+    /// ★ M5 的核心：游标 + baseline **同一个事务**落盘（崩在中间也不会出现
+    /// 「游标推了、baseline 没推」这种半新半旧的状态）。
+    pub fn save_all(&self) -> Result<()> {
+        self.store.save_state(&self.cursors, &self.baseline)?;
         Ok(())
     }
 }
@@ -385,16 +403,13 @@ pub async fn poll_once(
     report
 }
 
-/// 把内存状态写回 store（原子落盘；失败只记录不 panic）。
+/// 把内存状态写回 store（**游标 + baseline 同一个事务**；失败只记录不 panic）。
 fn persist(store: &Mutex<SyncState>, cursors: &Cursors, baseline: &Baseline) {
     let mut g = store.lock().unwrap();
     g.cursors = *cursors;
     g.baseline = baseline.clone();
-    if let Err(e) = g.save_cursors() {
-        tracing::warn!("游标落盘失败: {e}");
-    }
-    if let Err(e) = g.save_baseline() {
-        tracing::warn!("baseline 落盘失败: {e}");
+    if let Err(e) = g.save_all() {
+        tracing::warn!("状态落盘失败（游标 + baseline 同一事务）: {e}");
     }
 }
 
@@ -1286,13 +1301,18 @@ mod tests {
             "剩下的不能误删"
         );
 
-        // ---- ④ 游标/baseline 落盘 + max_log 观测
+        // ---- ④ 游标/baseline 落盘（★ M5：SQLite，游标 + baseline 同一事务）+ max_log 观测
         {
             let g = store.lock().unwrap();
-            g.save_cursors().unwrap();
-            g.save_baseline().unwrap();
-            assert!(g.cursors_path().exists() && g.baseline_path().exists());
-            let back = Cursors::load(&g.cursors_path()).unwrap();
+            g.save_all().unwrap();
+            assert!(g.db_path().exists(), "状态库必须存在: {}", g.db_path().display());
+            assert_eq!(g.store.integrity_check().unwrap(), "ok", "integrity_check 必须是 ok");
+            assert_eq!(
+                g.store.baseline_len().unwrap() as usize,
+                g.baseline.len(),
+                "库里的 baseline 行数必须和内存一致"
+            );
+            let back = g.store.cursors().unwrap();
             assert!(back.max_log_seen >= 1, "max_log 必须落盘: {back:?}");
             let max = client.max_log().await.unwrap();
             println!(

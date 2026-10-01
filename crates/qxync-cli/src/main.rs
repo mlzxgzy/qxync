@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 use qxync_client::Client;
 use qxync_core::ipc::{
     default_socket_path, CacheInfo, CursorInfo, DehydrateData, ErrorKind, GetData, LsData,
-    MountInfo, PingData, PutData, Request, StatusData, SyncInfo,
+    MountInfo, PingData, PutData, Request, StatusData, StoreData, SyncInfo,
 };
 use qxync_core::{ConfigPaths, Credentials, DirEntry, LinkConfig, HOME_ROOT};
 use qxync_fuse::{CacheMode, QxyncFs};
@@ -184,6 +184,16 @@ enum Cmd {
         /// 只处理这个挂载点
         #[arg(long)]
         mount: Option<PathBuf>,
+    },
+
+    /// ★ M5：本地状态库（SQLite）—— 游标 / baseline / pin / 上传队列
+    Store {
+        /// 顺带跑 `PRAGMA integrity_check`（验收脚本用）
+        #[arg(long)]
+        integrity: bool,
+        /// 直接输出 JSON（给脚本/验收用，别解析人读文本）
+        #[arg(long)]
+        json: bool,
     },
 
     /// 查看/设置 pin：`qsync pin <远端路径> [pinned|unpinned|unspecified|excluded]`
@@ -471,8 +481,8 @@ async fn main() -> Result<()> {
             client.mkdir(parent, name).await?;
             println!("✅ 已建目录 {parent}/{name}");
         }
-        Cmd::Pin { .. } | Cmd::State { .. } | Cmd::Sync { .. } | Cmd::Dehydrate { .. } => {
-            bail!("`pin`/`state`/`sync`/`dehydrate` 需要 daemon：先 `qsync daemon start`（或用 --socket 指向运行中的 daemon）");
+        Cmd::Pin { .. } | Cmd::State { .. } | Cmd::Sync { .. } | Cmd::Dehydrate { .. } | Cmd::Store { .. } => {
+            bail!("`pin`/`state`/`sync`/`dehydrate`/`store` 需要 daemon：先 `qsync daemon start`（或用 --socket 指向运行中的 daemon）");
         }
         Cmd::Rm { dir, name } => {
             let (client, _) = connect(&cli, true).await?;
@@ -681,6 +691,9 @@ fn to_request(cli: &Cli) -> Option<Request> {
             dir: dir.clone(),
             name: name.clone(),
         },
+        Cmd::Store { integrity, .. } => Request::Store {
+            integrity: Some(*integrity),
+        },
         Cmd::Dehydrate {
             path,
             all,
@@ -836,6 +849,21 @@ async fn route_via_daemon(
             let d: DehydrateData = ipc_client::call(&socket, req).await?;
             print_dehydrate(&d, *dry_run);
         }
+        Cmd::Store { json, .. } => {
+            let raw: serde_json::Value = ipc_client::call(&socket, req).await?;
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&raw)
+                        .map_err(|e| qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string()))?
+                );
+            } else {
+                let d: StoreData = serde_json::from_value(raw).map_err(|e| {
+                    qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string())
+                })?;
+                print_store(&d);
+            }
+        }
         Cmd::Umount { mountpoint } => {
             ipc_client::call_ok(&socket, req).await?;
             println!("✅ 已卸载 {}", mountpoint.display());
@@ -860,6 +888,33 @@ async fn route_via_daemon(
         Cmd::State { .. } | Cmd::Daemon { .. } => unreachable!(),
     }
     Ok(())
+}
+
+/// ★ M5：本地状态库（SQLite：游标 / baseline / pin / 上传队列）。
+fn print_store(d: &StoreData) {
+    println!("状态库    : {}", d.path);
+    println!("schema    : v{}", d.schema_version);
+    if let Some(ic) = &d.integrity {
+        println!("完整性    : {ic}");
+    }
+    println!(
+        "游标      : config={} notify={} global_notify={} max_log_seen={}（日志空 -17 × {}）",
+        d.cursors.config,
+        d.cursors.notify,
+        d.cursors.global_notify,
+        d.cursors.max_log_seen,
+        d.cursors.log_missing_count
+    );
+    println!("baseline  : {} 项", d.baseline_entries);
+    println!("上传队列  : {} 个未完成作业", d.uploads);
+    if d.pins.is_empty() {
+        println!("pin       : （无）");
+    } else {
+        println!("pin       : {} 条", d.pins.len());
+        for (path, state) in &d.pins {
+            println!("            {state:<12} {path}");
+        }
+    }
 }
 
 /// ★ M3：缓存/脱水状态。

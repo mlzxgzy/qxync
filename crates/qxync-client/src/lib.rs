@@ -681,6 +681,446 @@ impl Client {
     }
 }
 
+// ------------------------------------------------- M5 版本化 / 增量 delta
+//
+// 真机探测原文见 `report/probe/probe-out/m5-versioning/`（只读参考）。要点：
+// * **只有新命名空间 `cgi-bin/qsync/qsyncsrv.cgi` 认 `versioning_*`**；
+//   旧命名空间 `cgi-bin/filemanager/utilRequest.cgi` 对全部 `versioning_*` 回 `status:20`（未知 func）。
+// * `versioning_lock&create_version=1` 真机可用（回 `lockid` + `version_id`），
+//   但这台 NAS 的 `versioning_support` 全为 0、`versioning_stat_delta` 恒 `{"exist":0,"size":"---"}`，
+//   所以 [`Client::delta_gate`] 目前必然判 `Unavailable` —— 这是**服务端能力**问题，不是解析问题。
+
+/// `func=versioning_probe` 的能力探测结果。
+///
+/// 真机（QTS 5.2.9 / Qsync QPKG 20260723）响应原文：
+/// `{"versioning_version": "1.0.0", "qbox_versioning_enable": 1, "qbox_user_versioning_enable": 1, "versioning_enable": 1}`。
+///
+/// 三个开关**都要为真**才算「服务端开放了版本化」：`versioning_enable` 是 QTS 全局版本化，
+/// `qbox_versioning_enable` 是 Qsync 侧开关，`qbox_user_versioning_enable` 是当前用户开关。
+#[derive(Debug, Clone)]
+pub struct VersioningProbe {
+    /// 版本化 CGI 版本号（反汇编里 `WFMQsyncGetVersioningProbe` 要求非空）。
+    pub versioning_version: Option<String>,
+    pub versioning_enable: bool,
+    pub qbox_versioning_enable: bool,
+    pub qbox_user_versioning_enable: bool,
+    /// 原始 JSON（服务端以后改键名时仍能自查）。
+    pub raw: serde_json::Value,
+}
+
+impl VersioningProbe {
+    /// 三个开关都打开才算「服务端启用了版本化」。
+    pub fn enabled(&self) -> bool {
+        self.versioning_enable && self.qbox_versioning_enable && self.qbox_user_versioning_enable
+    }
+
+    /// 给 [`Client::delta_gate`] 用的**可读原因**：三个开关全开时返回 `None`。
+    pub fn disabled_reason(&self) -> Option<String> {
+        if !self.versioning_enable {
+            return Some("版本化未启用（versioning_enable=0）".into());
+        }
+        if !self.qbox_versioning_enable {
+            return Some("Qsync 版本化未启用（qbox_versioning_enable=0）".into());
+        }
+        if !self.qbox_user_versioning_enable {
+            return Some("当前用户未启用版本化（qbox_user_versioning_enable=0）".into());
+        }
+        None
+    }
+}
+
+/// `func=versioning_lock` 的结果。
+///
+/// 真机 `lockid` / `version_id` 都是**字符串**（`"1790834873-5654"` / `"1790834873"`，前者是
+/// `<version_id>-<序号>`），失败时是 `"---"`，所以这里**不要**当数字解析。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersioningLock {
+    /// 原始 `status`：成功是 `1`；`4` / `12` 表示 `source_path` 非法（相对路径被拒）。
+    pub status: i64,
+    pub lockid: String,
+    pub version_id: String,
+}
+
+/// `func=versioning_stat_delta` 的结果。真机没有历史版本时回 `{"exist": 0, "size": "---"}`。
+#[derive(Debug, Clone)]
+pub struct DeltaInfo {
+    /// 服务端是否存在可算 delta 的旧版本（`exist:0` → `false`）。
+    pub exist: bool,
+    /// `size` 是数字或数字字符串；`"---"`（无 delta）→ `None`。
+    pub size: Option<u64>,
+    pub raw: serde_json::Value,
+}
+
+/// 某个远端文件「能不能走增量」的判定结果（给上层与验收用）。
+///
+/// **判定规则一句话**：`stat` 条目的 `versioning_support` 为真、`versioning_probe` 三个开关全开、
+/// 能拿到锁并且 `versioning_stat_delta` 回 `exist=1` → `Available`，任何一步失败/不满足 → `Unavailable`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeltaGate {
+    /// 服务端可用：`stat_delta` 说 `exist=1`（旧版本存在、可算 delta）。
+    Available {
+        version_id: String,
+        delta_size: Option<u64>,
+    },
+    /// 不可用（附**可读原因**）：例如 `versioning_support=0（该目录没有历史版本）` /
+    /// `stat_delta exist=0` / `版本化未启用`。
+    Unavailable { reason: String },
+}
+
+impl DeltaGate {
+    pub fn is_available(&self) -> bool {
+        matches!(self, DeltaGate::Available { .. })
+    }
+
+    /// `Unavailable` 时给出原因。
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            DeltaGate::Available { .. } => None,
+            DeltaGate::Unavailable { reason } => Some(reason),
+        }
+    }
+}
+
+/// 解析 `versioning_probe` 的 JSON。
+///
+/// 带 `status` 且非成功（例如把 `versioning_probe` 打到旧命名空间会回 `status:20`）时**报错**，
+/// 而不是假装「能力全 false」——否则 [`Client::delta_gate`] 会给出误导性的原因。
+pub fn parse_versioning_probe(body: &[u8]) -> Result<VersioningProbe> {
+    let v: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| Error::Parse(format!("versioning_probe 非 JSON: {e}")))?;
+    if let Some(s) = v.get("status").and_then(json_i64) {
+        if !ServerStatus(s).is_success() {
+            return Err(Error::status(s, "versioning_probe"));
+        }
+    }
+    Ok(VersioningProbe {
+        versioning_version: v
+            .get("versioning_version")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        versioning_enable: v.get("versioning_enable").map(json_bool).unwrap_or(false),
+        qbox_versioning_enable: v
+            .get("qbox_versioning_enable")
+            .map(json_bool)
+            .unwrap_or(false),
+        qbox_user_versioning_enable: v
+            .get("qbox_user_versioning_enable")
+            .map(json_bool)
+            .unwrap_or(false),
+        raw: v,
+    })
+}
+
+/// 解析 `versioning_lock` 的 JSON（**不求成功**：`status` 原样带出来，由调用方判定）。
+pub fn parse_versioning_lock(body: &[u8]) -> Result<VersioningLock> {
+    let v: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| Error::Parse(format!("versioning_lock 非 JSON: {e}")))?;
+    let s = |k: &str| -> String {
+        v.get(k)
+            .and_then(|x| x.as_str())
+            .unwrap_or("---")
+            .to_string()
+    };
+    Ok(VersioningLock {
+        // 没有 status 视为失败（别把畸形响应当成功）
+        status: v.get("status").and_then(json_i64).unwrap_or(-1),
+        lockid: s("lockid"),
+        version_id: s("version_id"),
+    })
+}
+
+/// 解析 `versioning_unlock`：`status` 成功且 `success` 不是 false/0 才算释放成功。
+pub fn parse_versioning_unlock(body: &[u8]) -> Result<bool> {
+    let v: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| Error::Parse(format!("versioning_unlock 非 JSON: {e}")))?;
+    let ok = v
+        .get("status")
+        .and_then(json_i64)
+        .map(|s| ServerStatus(s).is_success())
+        .unwrap_or(false);
+    // 真机成功响应：{ "status": 1, "success": "true" }
+    let success = v.get("success").map(json_bool).unwrap_or(true);
+    Ok(ok && success)
+}
+
+/// 解析 `versioning_stat_delta`。`size` 是字符串 `"---"`（或缺失）→ `None`。
+pub fn parse_delta_info(body: &[u8]) -> Result<DeltaInfo> {
+    let v: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| Error::Parse(format!("versioning_stat_delta 非 JSON: {e}")))?;
+    if let Some(s) = v.get("status").and_then(json_i64) {
+        if !ServerStatus(s).is_success() {
+            return Err(Error::status(s, "versioning_stat_delta"));
+        }
+    }
+    Ok(DeltaInfo {
+        exist: v.get("exist").map(json_bool).unwrap_or(false),
+        size: v.get("size").and_then(json_u64),
+        raw: v,
+    })
+}
+
+/// `versioning_gen_sig` 只把原始 JSON 交出去：真机回 `{"status": 33, "pid": 5703}`
+/// （`33` = 目标不可写/参数不适用，说明这台 NAS 没有可供造签名的旧版本），
+/// 具体语义由上层按报告 §6.5 判断。
+pub fn parse_gen_sig(body: &[u8]) -> Result<serde_json::Value> {
+    serde_json::from_slice(body)
+        .map_err(|e| Error::Parse(format!("versioning_gen_sig 非 JSON: {e}")))
+}
+
+/// `versioning_support=0` 的判定（[`Client::delta_gate`] 第 1 步）。
+fn unsupported_gate(dir: &str, name: &str) -> DeltaGate {
+    DeltaGate::Unavailable {
+        reason: format!("versioning_support=0（{dir}/{name} 没有可用的历史版本）"),
+    }
+}
+
+/// `stat_delta` 之后的判定（[`Client::delta_gate`] 第 3 步的收尾）。
+fn verdict_from_delta_info(version_id: &str, info: &DeltaInfo) -> DeltaGate {
+    if info.exist {
+        DeltaGate::Available {
+            version_id: version_id.to_string(),
+            delta_size: info.size,
+        }
+    } else {
+        DeltaGate::Unavailable {
+            reason: format!(
+                "stat_delta exist=0（version_id={version_id} 没有可算 delta 的旧版本）"
+            ),
+        }
+    }
+}
+
+fn json_i64(v: &serde_json::Value) -> Option<i64> {
+    match v {
+        serde_json::Value::Number(n) => n.as_i64(),
+        serde_json::Value::String(s) => s.parse().ok(),
+        serde_json::Value::Bool(b) => Some(*b as i64),
+        _ => None,
+    }
+}
+
+fn json_u64(v: &serde_json::Value) -> Option<u64> {
+    match v {
+        serde_json::Value::Number(n) => n.as_u64(),
+        // 真机是字符串："---" 解析失败 → None
+        serde_json::Value::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+fn json_bool(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Bool(b) => *b,
+        serde_json::Value::Number(n) => n.as_i64().unwrap_or(0) != 0,
+        serde_json::Value::String(s) => matches!(s.as_str(), "1" | "true" | "True"),
+        _ => false,
+    }
+}
+
+impl Client {
+    /// `func=versioning_probe`：读服务端版本化能力（响应字段见 [`VersioningProbe`]）。
+    ///
+    /// ⚠️ 只有新命名空间 `qsyncsrv.cgi` 认它；旧命名空间会回 `status:20`，这里会转成 `Err`。
+    pub async fn versioning_probe(&self) -> Result<VersioningProbe> {
+        let body = self.qsync_func("versioning_probe", &[]).await?;
+        parse_versioning_probe(&body)
+    }
+
+    /// `func=versioning_lock`：`create=true` → `create_version=1` 新建锁；
+    /// `create=false` → `check_version=1` + 已持有的 `version_id`/`lockid` 复核（报告 §6.4）。
+    ///
+    /// 成功时服务端回 `status:1`，这里返回 `Ok(VersioningLock)`；`status` 非成功（如 `4`/`12`
+    /// 表示路径非法）→ `Err(Error::Status{..})`，`lockid`/`version_id` 在这种响应里是 `"---"`。
+    ///
+    /// **用完必须 [`Client::versioning_unlock`]**（[`Client::delta_gate`] 会自己保证释放）。
+    pub async fn versioning_lock(
+        &self,
+        source_path: &str,
+        source_file: &str,
+        create: bool,
+        version_id: Option<&str>,
+        lockid: Option<&str>,
+    ) -> Result<VersioningLock> {
+        let mut extra: Vec<(&str, &str)> = Vec::new();
+        if create {
+            extra.push(("create_version", "1"));
+        } else {
+            extra.push(("check_version", "1"));
+        }
+        if let Some(v) = version_id {
+            extra.push(("version_id", v));
+        }
+        if let Some(l) = lockid {
+            extra.push(("lockid", l));
+        }
+        extra.push(("source_path", source_path));
+        extra.push(("source_file", source_file));
+        let body = self.qsync_func("versioning_lock", &extra).await?;
+        let lock = parse_versioning_lock(&body)?;
+        if !ServerStatus(lock.status).is_success() {
+            return Err(Error::Status {
+                status: ServerStatus(lock.status),
+                context: format!("versioning_lock {source_path}/{source_file}"),
+            });
+        }
+        Ok(lock)
+    }
+
+    /// `func=versioning_unlock`：释放版本锁。`true` = 服务端确认释放。
+    ///
+    /// 真机成功响应：`{ "status": 1, "success": "true" }`。
+    pub async fn versioning_unlock(
+        &self,
+        source_path: &str,
+        source_file: &str,
+        lockid: &str,
+    ) -> Result<bool> {
+        let body = self
+            .qsync_func(
+                "versioning_unlock",
+                &[
+                    ("lockid", lockid),
+                    ("source_path", source_path),
+                    ("source_file", source_file),
+                ],
+            )
+            .await?;
+        parse_versioning_unlock(&body)
+    }
+
+    /// `func=versioning_stat_delta`：查询 `version_id` 对应的旧版本能否算 delta、多大。
+    ///
+    /// **注意不带 `lockid`**（报告 §6.4）。真机无历史版本时回 `{"exist":0,"size":"---"}`。
+    pub async fn versioning_stat_delta(
+        &self,
+        source_path: &str,
+        source_file: &str,
+        version_id: &str,
+    ) -> Result<DeltaInfo> {
+        let body = self
+            .qsync_func(
+                "versioning_stat_delta",
+                &[
+                    ("version_id", version_id),
+                    ("source_path", source_path),
+                    ("source_file", source_file),
+                ],
+            )
+            .await?;
+        parse_delta_info(&body)
+    }
+
+    /// `func=versioning_gen_sig`：让服务端为旧版本生成 signature（报告 §6.5 分支 B 第 1 步）。
+    ///
+    /// 只返回原始 JSON：真机回 `{"status": 33, "pid": 5703}`（`33` = 目标不可写/参数不适用），
+    /// 后续可接 `versioning_get_sig` 下载签名（M5 未实现）。
+    pub async fn versioning_gen_sig(
+        &self,
+        source_path: &str,
+        source_file: &str,
+        lockid: &str,
+        version_id: &str,
+    ) -> Result<serde_json::Value> {
+        let body = self
+            .qsync_func(
+                "versioning_gen_sig",
+                &[
+                    ("lockid", lockid),
+                    ("version_id", version_id),
+                    ("source_path", source_path),
+                    ("source_file", source_file),
+                ],
+            )
+            .await?;
+        parse_gen_sig(&body)
+    }
+
+    /// 判定某个远端文件**能不能走增量**（M5 的能力门）。
+    ///
+    /// 顺序（任一步失败/不满足都返回 [`DeltaGate::Unavailable`]）：
+    /// 1. `stat(dir,name)` 的条目必须是存在文件且 `versioning_support=true`；
+    /// 2. `versioning_probe` 的三个 enable 位必须全开；
+    /// 3. `versioning_lock(create=1)` 拿 `version_id` → `versioning_stat_delta` 必须 `exist=1`；
+    ///    **锁无论如何都会尽力 unlock**（包括中间失败），不会把锁留在服务端。
+    ///
+    /// 网络/协议错误只当 `Unavailable`（附原因），**绝不会**把错误当 `Available`。
+    pub async fn delta_gate(&self, dir: &str, name: &str) -> DeltaGate {
+        // 1) 条目元数据：存在 + 是文件 + versioning_support
+        let entry = match self.stat(dir, name).await {
+            Ok(Some(e)) => e,
+            Ok(None) => {
+                return DeltaGate::Unavailable {
+                    reason: format!("stat {dir}/{name} 不存在（或不可见）"),
+                }
+            }
+            Err(e) => {
+                return DeltaGate::Unavailable {
+                    reason: format!("stat {dir}/{name} 失败: {e}"),
+                }
+            }
+        };
+        if entry.isfolder {
+            return DeltaGate::Unavailable {
+                reason: format!("{dir}/{name} 是目录，delta 只对文件有意义"),
+            };
+        }
+        if !entry.versioning_support {
+            return unsupported_gate(dir, name);
+        }
+
+        // 2) 服务端版本化能力
+        let probe = match self.versioning_probe().await {
+            Ok(p) => p,
+            Err(e) => {
+                return DeltaGate::Unavailable {
+                    reason: format!("versioning_probe 失败: {e}"),
+                }
+            }
+        };
+        if let Some(reason) = probe.disabled_reason() {
+            return DeltaGate::Unavailable { reason };
+        }
+
+        // 3) 加锁 → stat_delta；从这里起无论走哪条分支都必须 unlock
+        let lock = match self.versioning_lock(dir, name, true, None, None).await {
+            Ok(l) => l,
+            Err(e) => {
+                return DeltaGate::Unavailable {
+                    reason: format!("versioning_lock 失败: {e}"),
+                }
+            }
+        };
+        if lock.lockid.is_empty() || lock.lockid == "---" {
+            let gate = DeltaGate::Unavailable {
+                reason: format!(
+                    "versioning_lock 没返回有效 lockid（lockid={:?}）",
+                    lock.lockid
+                ),
+            };
+            let _ = self.versioning_unlock(dir, name, &lock.lockid).await;
+            return gate;
+        }
+
+        let gate = match self
+            .versioning_stat_delta(dir, name, &lock.version_id)
+            .await
+        {
+            Ok(d) => verdict_from_delta_info(&lock.version_id, &d),
+            Err(e) => DeltaGate::Unavailable {
+                reason: format!("stat_delta 失败: {e}"),
+            },
+        };
+        // ★ 尽力释放：即使 stat_delta 失败/网络断了也要让服务端解锁
+        match (gate, self.versioning_unlock(dir, name, &lock.lockid).await) {
+            (DeltaGate::Unavailable { reason }, Err(e)) => DeltaGate::Unavailable {
+                reason: format!("{reason}；另外 unlock 失败: {e}"),
+            },
+            (g, _) => g,
+        }
+    }
+}
+
 /// 上传响应的判定：`{"status":"1","files":[{"status":"1",...}]}`。
 pub fn parse_upload_result(body: &[u8], filename: &str) -> Result<()> {
     let v: serde_json::Value = serde_json::from_slice(body)
@@ -837,5 +1277,174 @@ mod tests {
         let empty = br#"{"version":"","build":"","status":-17,"success":"true"}"#;
         let e = parse_notify(empty, "qbox_query_notify").unwrap_err();
         assert!(qxync_core::sync::is_log_missing(&e), "{e}");
+    }
+
+    // ---- M5 版本化 / 增量 delta：输入全部是 `report/probe/probe-out/m5-versioning/` 的真机响应原文
+
+    #[test]
+    fn versioning_probe_parses_real_response() {
+        // 20_versioning_probe_new.json
+        let body = br#"{"versioning_version": "1.0.0", "qbox_versioning_enable": 1, "qbox_user_versioning_enable": 1, "versioning_enable": 1}"#;
+        let p = parse_versioning_probe(body).unwrap();
+        assert_eq!(p.versioning_version.as_deref(), Some("1.0.0"));
+        assert!(p.versioning_enable);
+        assert!(p.qbox_versioning_enable);
+        assert!(p.qbox_user_versioning_enable);
+        assert!(p.enabled());
+        assert_eq!(p.disabled_reason(), None);
+        assert_eq!(p.raw["versioning_version"], "1.0.0");
+    }
+
+    #[test]
+    fn versioning_probe_disabled_flags_and_old_namespace() {
+        // 全 0：必须给出可读原因（gate 第 2 步的输入）
+        let off = br#"{"versioning_version":"1.0.0","versioning_enable":0,"qbox_versioning_enable":0,"qbox_user_versioning_enable":0}"#;
+        let p = parse_versioning_probe(off).unwrap();
+        assert!(!p.enabled());
+        let r = p.disabled_reason().expect("全 0 必须给原因");
+        assert!(r.contains("versioning_enable=0"), "{r}");
+        let gate = DeltaGate::Unavailable { reason: r };
+        assert!(!gate.is_available());
+
+        // 只有用户级关掉时原因要指向用户开关
+        let user_off = br#"{"versioning_version":"1.0.0","versioning_enable":1,"qbox_versioning_enable":1,"qbox_user_versioning_enable":0}"#;
+        let p2 = parse_versioning_probe(user_off).unwrap();
+        assert!(p2
+            .disabled_reason()
+            .unwrap()
+            .contains("qbox_user_versioning_enable=0"));
+
+        // 旧命名空间 utilRequest.cgi 把未知 func 当 status 20 拒（73_old_bogus_func.json 同形）
+        let old =
+            br#"{ "version": "6.0.5.7994", "build": "20260914", "status": 20, "success": "true" }"#;
+        let e = parse_versioning_probe(old).unwrap_err();
+        assert!(e.to_string().contains("status=20"), "{e}");
+    }
+
+    #[test]
+    fn versioning_lock_keeps_string_ids() {
+        // 30_lock_new_spvar_abs.json / 40_lock_check_version_new.json
+        let ok = br#"{"status": 1, "lockid": "1790834873-5654", "version_id": "1790834873"}"#;
+        let l = parse_versioning_lock(ok).unwrap();
+        assert_eq!(l.status, 1);
+        assert_eq!(
+            l.lockid, "1790834873-5654",
+            "lockid 必须保持 <vid>-<seq> 字符串"
+        );
+        assert_eq!(l.version_id, "1790834873");
+        assert!(ServerStatus(l.status).is_success());
+
+        // 相对路径被拒（30_lock_new_spvar_dot.json）：status 4，两个 id 都是 "---"
+        let bad = br#"{"status": 4, "lockid": "---", "version_id": "---"}"#;
+        let b = parse_versioning_lock(bad).unwrap();
+        assert_eq!(b.status, 4);
+        assert_eq!(b.lockid, "---");
+        assert!(!ServerStatus(b.status).is_success());
+        // 30_lock_new_spvar_dotdot.json：status 12
+        assert_eq!(
+            parse_versioning_lock(br#"{"status": 12, "lockid": "---", "version_id": "---"}"#)
+                .unwrap()
+                .status,
+            12
+        );
+    }
+
+    #[test]
+    fn stat_delta_dash_size_is_none() {
+        // 43_stat_delta_new_withvid.json / 65_stat_delta_new_bigbin.json
+        let d = parse_delta_info(br#"{"exist": 0, "size": "---"}"#).unwrap();
+        assert!(!d.exist);
+        assert_eq!(d.size, None, "\"---\" 必须解析成 None 而不是数字");
+        assert_eq!(d.raw["size"], "---");
+        let d0 = parse_delta_info(br#"{"exist":0,"size":"---"}"#).unwrap();
+        assert!(!d0.exist);
+
+        // 不带 version_id 时（50_stat_delta_new_novid_spvar_abs.json）只回 status:0，没有 exist 字段
+        let novid = br#"{ "version": "", "build": "20260723", "status": 0, "success": "true" }"#;
+        let d2 = parse_delta_info(novid).unwrap();
+        assert!(!d2.exist);
+        assert_eq!(d2.size, None);
+
+        // 真有 delta：数字字符串与纯数字都要能解析
+        let d3 = parse_delta_info(br#"{"exist":1,"size":"4096"}"#).unwrap();
+        assert!(d3.exist);
+        assert_eq!(d3.size, Some(4096));
+        assert_eq!(
+            parse_delta_info(br#"{"exist":true,"size":4096}"#)
+                .unwrap()
+                .size,
+            Some(4096)
+        );
+    }
+
+    #[test]
+    fn unlock_and_gen_sig_parse_real_responses() {
+        // 90_unlock_new.json / 67_unlock_new_bigbin.json
+        let ok = br#"{ "version": "", "build": "20260723", "status": 1, "success": "true" }"#;
+        assert!(parse_versioning_unlock(ok).unwrap());
+        // 非成功 status 不能当释放成功
+        let rejected = br#"{ "version": "6.0.5.7994", "status": 20, "success": "true" }"#;
+        assert!(!parse_versioning_unlock(rejected).unwrap());
+
+        // 41_gen_sig_new.json：原样交出 JSON
+        let sig = parse_gen_sig(br#"{"status": 33, "pid": 5703}"#).unwrap();
+        assert_eq!(sig["status"], 33);
+        assert_eq!(sig["pid"], 5703);
+    }
+
+    /// `DeltaGate` 的三条路径（用真机响应驱动，不联网）。
+    #[test]
+    fn delta_gate_three_paths() {
+        // 路径 1：get_list 条目 versioning_support=0 → Unavailable
+        let listing = br#"{"status":0,"total":2,"datas":[
+            {"filename":"hello.txt","isfolder":0,"filesize":"24","versioning_support":0,"exist":1},
+            {"filename":"v.txt","isfolder":0,"filesize":"24","versioning_support":1,"exist":1}]}"#;
+        let l: Listing = parse_listing(listing).unwrap();
+        assert!(
+            !l.datas[0].versioning_support,
+            "versioning_support:0 → false"
+        );
+        assert!(l.datas[1].versioning_support, "versioning_support:1 → true");
+        let g1 = unsupported_gate("/home/qxync-test", "hello.txt");
+        assert_eq!(
+            g1,
+            DeltaGate::Unavailable {
+                reason: "versioning_support=0（/home/qxync-test/hello.txt 没有可用的历史版本）"
+                    .into()
+            }
+        );
+        assert!(g1.reason().unwrap().contains("versioning_support=0"));
+
+        // 路径 2：enable 全 0 → Unavailable
+        let probe = parse_versioning_probe(
+            br#"{"versioning_version":"1.0.0","versioning_enable":0,"qbox_versioning_enable":0,"qbox_user_versioning_enable":0}"#,
+        )
+        .unwrap();
+        let g2 = DeltaGate::Unavailable {
+            reason: probe.disabled_reason().expect("必须给原因"),
+        };
+        assert!(!g2.is_available());
+
+        // 路径 3：stat_delta exist=1 + size 正常 → Available
+        let info = parse_delta_info(br#"{"exist":1,"size":"123456"}"#).unwrap();
+        let g3 = verdict_from_delta_info("1790834873", &info);
+        assert_eq!(
+            g3,
+            DeltaGate::Available {
+                version_id: "1790834873".into(),
+                delta_size: Some(123456)
+            }
+        );
+        assert!(g3.is_available());
+        assert_eq!(g3.reason(), None);
+
+        // 路径 3 的否分支：exist=0 → Unavailable（真机当前就是这条）
+        let none = parse_delta_info(br#"{"exist":0,"size":"---"}"#).unwrap();
+        let g4 = verdict_from_delta_info("1790834873", &none);
+        assert!(!g4.is_available());
+        assert!(
+            g4.reason().unwrap().contains("stat_delta exist=0"),
+            "{g4:?}"
+        );
     }
 }

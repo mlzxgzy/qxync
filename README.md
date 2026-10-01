@@ -19,7 +19,8 @@
 | **M2c 变更发现**（三游标轮询 + baseline 三向对账 + 冲突副本 + 删除保护） | ✅ **已实现并真机验收**（矩阵 46/46，其中 M2c 16 项） |
 | **M3 脱水**（安全检查链 + 先 `inval_inode` 再清内容 + 闲置/限额 LRU + `--cache-mode`） | ✅ **已实现并真机验收**（矩阵 **67/67**，其中 M3 21 项） |
 | **M4 GUI**（Tauri 2：登录配置 / 挂载管理 / 状态与进度 / pin 管理） | ✅ **已实现并真机验收**（`gui-matrix.sh` **41/41**，5 个 tab 真窗口截图） |
-| M5 增量 delta + SQLite 元数据 | ⏳ 下一步 |
+| **M5 SQLite 元数据 + delta**（`sync.db` 承载游标/baseline/pin/队列 + librsync 兼容编解码 + 能力门控） | ✅ **已实现并真机验收**（`m5-matrix.sh` **28/28**；服务端无历史版本 → 增量走门控，见 [`M5-SQLite与delta.md`](docs/M5-SQLite与delta.md)） |
+| M6（另行规划：共享文件夹 `auth_data` AES、选择性同步、LAN 直连…） | ⏳ 下一步 |
 
 真机验证对象：`TS-464C` / `QTS 5.2.9` / Qsync QPKG `5.0.0.7`（build `20260723`）。
 
@@ -47,21 +48,33 @@ M1 实现说明（`crates/qxync-fuse`）：
 双方都改 → **冲突副本**（远端占原名，本地内容存 `xxx (conflicted copy from <设备> <日期>).txt` 并上传）；
 远端批量删除 → **熔断**（`qsync sync --force-deletes` 才放行）；本地批量删除也有滑动窗口熔断。
 
+**M5 把状态搬进 SQLite（`crates/qxync-core/src/store.rs`）**：`<data>/sync/<host>/sync.db` 承载
+三个事件游标 + baseline + **pin**（以前只在内存，daemon 一重启就丢 → M3 脱水安全检查会静默失守）
++ 上传队列（`marker_dir/queue.db`）。**游标与 baseline 在同一个事务里落盘**——JSON 时代两次
+`rename` 之间崩溃会出现「游标推了、baseline 没推」；M2c 的 `cursors.json`/`baseline.json` 首次启动
+自动迁移并归档成 `*.json.migrated`（保留备份、幂等）。看状态：`qsync store [--integrity] [--json]`。
+**M5 的 delta 部分**：NAS 侧没有历史版本（真机实测 `versioning_support` 全 0、
+`versioning_stat_delta` 恒 `exist:0`、`versioning_gen_sig` 恒 `status:33`），所以本地实现了
+**librsync 原生格式**的 sign/delta/patch（1 MiB 块 / 16 字节 MD4，`crates/qxync-core/src/delta.rs`），
+并用 `qxync-client` 的 **DeltaGate** 做能力门控：服务端可用才走增量，当前真实路径仍是整文件传输。
+详见 [`docs/M5-SQLite与delta.md`](docs/M5-SQLite与delta.md)。
+
 ## 目录结构
 
 ```
 crates/
-├── qxync-core/        共享类型：状态码、错误、URL 编码规则、数据模型、配置布局（零运行时依赖）
+├── qxync-core/        共享类型 + 配置布局 + **M5 状态库（store.rs，SQLite）与 delta 编解码（delta.rs）**
 ├── qxync-client/      NAS HTTP API 封装（登录 / 元数据 / 上传下载）
 ├── qxync-fuse/        FUSE 只读 + on-demand 水合（M1：Filesystem 实现 + 挂载参数）
 ├── qxync-daemon/      二进制 `qxyncd`（M1.5：常驻进程 + unix socket JSON IPC + 持有 FUSE；
 │                       M2c：`sync.rs` 三游标轮询 + baseline 对账 + 冲突/删除保护）
-├── qxync-cli/         二进制 `qsync`（login/status/ls/stat/get/put/mkdir/mount/umount/pin/state/daemon）
+├── qxync-cli/         二进制 `qsync`（login/status/ls/stat/get/put/mkdir/mount/umount/pin/state/store/daemon）
 ├── qxync-gui/         二进制 `qxync-gui`（M4：Tauri 2 桌面应用；`ui/` 是零依赖静态前端）
 └── qxync-proto-test/  真机集成测试（5 个协议测试 + 1 个 IPC 端到端，均 #[ignore] 手动跑）
 xtask/tests/
 ├── fuse-matrix.sh     ★ M1–M3 验收矩阵（挂载 → 67 项检查 → 卸载；--big 追加 128 MiB + 并发去重）
-└── gui-matrix.sh      ★ M4 验收矩阵（自检 + 登录链 + 5 个 tab 真窗口截图，41 项）
+├── gui-matrix.sh      ★ M4 验收矩阵（自检 + 登录链 + 5 个 tab 真窗口截图，41 项）
+└── m5-matrix.sh       ★ M5 验收矩阵（JSON→SQLite 迁移/幂等/不双写/pin 存活/编解码单测/真机 gate，28 项）
 docs/
 ├── 开发规划.md             第一版（MVP）规划
 ├── M1.5-设计.md           daemon/IPC 契约、生命周期、pin 语义、验收标准
@@ -69,6 +82,7 @@ docs/
 ├── M2c-变更发现.md        ★ 变更发现：三游标/事件契约、三向决策表、冲突副本、删除保护、已知限制
 ├── M3-脱水.md             ★ 脱水：安全检查链、inval_inode 顺序铁则、闲置/限额、cache-mode
 ├── M4-GUI.md              ★ GUI：边界（GUI 是 daemon 客户端）、命令面、5 个 tab、验收与踩坑
+├── M5-SQLite与delta.md    ★ 状态库 schema/迁移/单事务、真机 versioning 探测、delta 格式与能力门控
 ├── 执行方案-M0M1.md        ★ 真机验证后的修正版：实测事实 + 修正项 + 执行顺序 + 风险门
 └── 测试环境.local.md       测试 NAS 与账号（已 gitignore，禁止提交）
 report/                 逆向报告 + probe 工具（qs_probe.py / qs_fixture.py）
@@ -126,6 +140,9 @@ qsync dehydrate --cache-limit 2G --dry-run        # 按限额预演（LRU 该清
 qsync rm /home/qxync-test a.txt                  # 删远端条目（测试/脚本用；挂载点里 rm 走 FUSE）
 qsync umount ~/qsync-mnt
 qsync daemon stop           # 干净退出：卸载全部挂载 + 删 socket/pid
+qsync store                 # M5：状态库快照（游标 / baseline / pin / 上传队列）
+qsync store --integrity     #   顺带 PRAGMA integrity_check（正常输出 ok）
+qsync store --json          #   机器可读（给脚本/验收用）
 ```
 
 IPC 契约见 [`docs/M1.5-设计.md`](docs/M1.5-设计.md)：unix socket + **一行一个 JSON**
@@ -245,6 +262,20 @@ cargo test -p qxync-proto-test -- --ignored --test-threads=1 --nocapture   # 协
     「没有缓存内容」（实测：16 MiB 本地文件脱水被报「本来就是占位符」）。
 26. 稀疏缓存别用 `du -sb`（apparent size）量占用 —— 128 MiB 的稀疏文件会算成 128 MiB；
     要 `du -s --block-size=1`（allocated）。
+
+写 M5（SQLite 状态库 + delta）时踩到的：
+
+30. **换持久化时一定要确认没有老进程在跑**：调试中发现「迁移归档后 `cursors.json` 又冒出来」，
+    查下来是上一轮会话遗留的**旧二进制 daemon** 还在按 30s 轮询、用旧代码写 JSON（mtime 恰好落在
+    轮询节拍上是判据）。验收矩阵用**全新状态目录**就是为了隔离这类污染。
+31. **`rusqlite` 用 `bundled`**：自带 SQLite 源码，不需要系统 `libsqlite3-dev`；WAL 会在状态目录
+    留下 `-wal`/`-shm`，属正常现象，别当垃圾清掉。
+32. **delta 的格式细节都是「必须显式覆盖」的默认值**：librsync 默认 block 2048 / strong 8，
+    Qsync 用的是 **1 MiB / 16 字节 MD4**；magic 是 `0x72730136`(sig) / `0x72730236`(delta)，
+    全部**大端**。弱校验的 `CHAR_OFFSET=31` 差一点就对不上。
+33. **能力探测不能当成「有端点就是支持」**：这台 NAS 的 `versioning_probe` 三个 enable 位全是 1、
+    `versioning_lock` 也能拿到 lockid，但 `versioning_stat_delta` 恒 `exist:0`、`versioning_support` 全 0
+    —— 真正的判据是「**有没有历史版本**」，只看端点存在会得出完全错误的结论。
 
 写 GUI（M4）时踩到的：
 

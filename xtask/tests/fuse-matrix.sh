@@ -43,7 +43,6 @@ export RUST_LOG="${RUST_LOG:-info}"
 LOG="$RUNDIR/fuse-matrix.log"
 
 if ! [ -x "$QS" ]; then echo "缺少 $QS，先 cargo build"; exit 1; fi
-cleanup_stale
 
 # ★ 精确判断挂载点：`grep -F "$MNT"` 会把 mnt-rw / mnt-m3 也算进来（踩过：
 #   上一次跑留下的挂载会让这一次的检查全跑在旧挂载上，而且旧挂载的缓存目录刚被 rm 掉）。
@@ -64,6 +63,9 @@ cleanup_stale() {
   pkill -f "$REPO/target/debug/qsync mount" 2>/dev/null
   sleep 1
 }
+# ★ 必须在 cleanup_stale 定义之后再调用（以前写在定义前，每次跑都报「未找到命令」，
+#   上一次崩溃留下的挂载点就清不掉了）
+cleanup_stale
 
 # 卸载带退避重试：FUSE 会话可能正卡在一次慢下载上，fusermount 偶尔会忙
 unmount_retry() {

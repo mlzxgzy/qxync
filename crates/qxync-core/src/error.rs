@@ -29,6 +29,10 @@ pub enum Error {
     #[error("本地 IO 失败: {0}")]
     Io(String),
 
+    /// 本地状态库（SQLite）。
+    #[error("状态库失败: {0}")]
+    Db(String),
+
     /// 协议/端点在本机不支持。
     #[error("协议不支持: {0}")]
     Unsupported(String),
@@ -52,5 +56,11 @@ impl From<std::io::Error> for Error {
 impl From<serde_json::Error> for Error {
     fn from(e: serde_json::Error) -> Self {
         Error::Parse(e.to_string())
+    }
+}
+
+impl From<rusqlite::Error> for Error {
+    fn from(e: rusqlite::Error) -> Self {
+        Error::Db(e.to_string())
     }
 }

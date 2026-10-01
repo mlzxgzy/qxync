@@ -1,22 +1,35 @@
 //! 上传队列：本地改动 → 服务端。
 //!
-//! 设计要点（`docs/M2b-设计.md`）：
+//! 设计要点（`docs/M2b-写路径.md`；M5 起持久化改走 SQLite）：
 //!
-//! * **先落标记再改数据**：写操作先把 `<marker_dir>/<hash>.dirty`（JSON）刷盘，再改缓存内容。
-//!   中途崩溃 → 重启时扫描标记重新入队，绝不丢改动。
+//! * **先落盘再改数据**：`enqueue` 先把作业 upsert 进状态库 `uploads` 表（`<marker_dir>/queue.db`），
+//!   再改内存队列。中途崩溃 → 重启时 `store.uploads()` 重新入队，绝不丢改动。
+//! * **库 = 未完成作业**：上传成功 / 重试超限放弃 / 取消，都会删掉对应的行；
+//!   所以重启时表里剩下的就是「还没传完」的作业（对应 M5 之前「删 `.dirty` 标记」的语义）。
 //! * 单个 worker 线程串行消费（同一文件天然合并，避免把半成品推上去）；
 //!   失败指数退避重试，超过 `max_attempts` 记为 failed 并由 `status` 暴露。
+//! * M5 一次性迁移：老版本留在 `marker_dir` 里的 `<hash>.dirty`（JSON）会在 `new()` 时
+//!   读出来 → `put_upload` 入库 → 改名成 `*.dirty.migrated`（**保留备份，不删**）。迁移后不再依赖它。
+//! * **降级取舍**：状态库打不开时 `new()` 不返回 Err（挂载不该因为队列库坏了就起不来），
+//!   而是打 warn 退化成「无持久化」队列：内存语义照旧，但崩溃会丢未完成作业。
 //! * 上传成功后必须 `stat&settime=1&mtime=` 对齐时间戳（否则服务端判定「未同步」）。
 //! * `qbox_write_log` 尽力而为（服务端不校验 action；未注册同步对时不会落盘，见 client 注释）。
 
 use qxync_client::{write_action, Client};
+use qxync_core::store::{Store, UploadRow};
 use qxync_core::Error as CoreError;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
+
+/// 上传队列状态库文件名，放在 `marker_dir` 下。
+///
+/// 不复用 per-NAS 的 `sync.db`：`UploadQueue::new` 只拿得到队列目录，
+/// 队列单独一个库最省事，迁移老 `.dirty` 也只需扫这一个目录。
+const QUEUE_DB_FILE: &str = "queue.db";
 
 /// 一个待上传的改动。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,11 +55,28 @@ impl UploadJob {
             self.remote_name
         )
     }
-    fn marker(&self, dir: &std::path::Path) -> PathBuf {
-        dir.join(format!(
-            "{:016x}.dirty",
-            fnv1a64(self.remote_path().as_bytes())
-        ))
+
+    /// 转成状态库的行（主键 `remote_path` 由 `UploadRow` 派生，和本类型一致）。
+    fn to_row(&self) -> UploadRow {
+        UploadRow {
+            remote_dir: self.remote_dir.clone(),
+            remote_name: self.remote_name.clone(),
+            local: self.local.clone(),
+            mtime: self.mtime,
+            attempts: self.attempts,
+            ephemeral: self.ephemeral,
+        }
+    }
+
+    fn from_row(r: &UploadRow) -> Self {
+        Self {
+            remote_dir: r.remote_dir.clone(),
+            remote_name: r.remote_name.clone(),
+            local: r.local.clone(),
+            mtime: r.mtime,
+            attempts: r.attempts,
+            ephemeral: r.ephemeral,
+        }
     }
 }
 
@@ -79,7 +109,8 @@ pub type SuccessHook = Arc<dyn Fn(&str) + Send + Sync>;
 pub struct UploadQueue {
     client: Arc<Client>,
     rt: tokio::runtime::Handle,
-    marker_dir: PathBuf,
+    /// 状态库句柄；`None` = 降级模式（库打不开，队列只在内存里）。
+    store: Option<Arc<Store>>,
     max_attempts: u32,
     state: Mutex<State>,
     cv: Condvar,
@@ -95,37 +126,75 @@ struct State {
 }
 
 impl UploadQueue {
-    /// 建队列；`marker_dir` 里已有的 `.dirty` 会被**重新入队**（崩溃恢复）。
+    /// 建队列；状态库里未完成的作业会被**重新入队**（崩溃恢复），
+    /// 残留的 `.dirty` 标记会一次性迁移进库（见模块注释）。
     pub fn new(
         client: Arc<Client>,
         rt: tokio::runtime::Handle,
         marker_dir: PathBuf,
     ) -> std::io::Result<Arc<Self>> {
         std::fs::create_dir_all(&marker_dir)?;
+
+        // 取舍：状态库打不开（权限/磁盘/库损坏）时**不返回 Err** —— 挂载不该因为队列库
+        // 坏了就起不来。代价是降级成「无持久化」队列：内存语义（串行/退避/重试）照旧，
+        // 但崩溃会丢未完成作业；日志显眼提示。
+        let db_path = marker_dir.join(QUEUE_DB_FILE);
+        let store = match Store::open(&db_path) {
+            Ok(s) => Some(Arc::new(s)),
+            Err(e) => {
+                tracing::warn!(
+                    "上传队列状态库 {} 打不开，降级为无持久化队列（崩溃会丢未完成上传）: {e}",
+                    db_path.display()
+                );
+                None
+            }
+        };
+
         let mut pending = VecDeque::new();
-        for entry in std::fs::read_dir(&marker_dir)? {
-            let path = entry?.path();
-            if path.extension().map(|e| e == "dirty").unwrap_or(false) {
-                match std::fs::read(&path)
-                    .ok()
-                    .and_then(|b| serde_json::from_slice::<UploadJob>(&b).ok())
-                {
-                    Some(job) => {
-                        tracing::info!("恢复未完成的上传: {}", job.remote_path());
-                        pending.push_back(job);
+        match &store {
+            Some(s) => {
+                // 一次性迁移老版本的 `.dirty` JSON 标记：读 → put_upload → 改名备份。
+                let n = migrate_dirty_markers(s, &marker_dir);
+                if n > 0 {
+                    tracing::info!("已把 {n} 个 .dirty 标记迁入上传队列状态库");
+                }
+                match s.uploads() {
+                    Ok(rows) => {
+                        for r in rows {
+                            let job = UploadJob::from_row(&r);
+                            tracing::info!("恢复未完成的上传: {}", job.remote_path());
+                            pending.push_back(job);
+                        }
                     }
-                    None => {
-                        tracing::warn!("忽略损坏的标记文件 {}", path.display());
-                        let _ = std::fs::remove_file(&path);
+                    Err(e) => {
+                        tracing::warn!("读取上传队列状态库失败（本次从空队列开始，重启再试）: {e}")
+                    }
+                }
+            }
+            None => {
+                // 降级模式没有库可用：尽力从残留 `.dirty` 恢复一次内存队列。
+                // **不改名**：改名等于声称「已持久化」，而内存里的作业崩溃即丢。
+                for (path, job) in scan_dirty_markers(&marker_dir) {
+                    match job {
+                        Some(job) => {
+                            tracing::warn!(
+                                "降级模式：从 {} 恢复 {}",
+                                path.display(),
+                                job.remote_path()
+                            );
+                            pending.push_back(job);
+                        }
+                        None => tracing::warn!("忽略损坏的标记文件 {}", path.display()),
                     }
                 }
             }
         }
+
         let n = pending.len() as u64;
         Ok(Arc::new(Self {
             client,
             rt,
-            marker_dir,
+            store,
             max_attempts: 5,
             state: Mutex::new(State {
                 pending,
@@ -146,14 +215,15 @@ impl UploadQueue {
         *self.success_hook.lock().unwrap() = Some(hook);
     }
 
-    /// 入队：**先写盘标记，再改内存队列**（崩溃安全）。
+    /// 入队：**先写状态库，再改内存队列**（崩溃安全）。
+    ///
+    /// 入库失败不会让调用方失败（写路径不能被队列库拖死），只打 warn 并继续用内存队列 —
+    /// 那种情况下这次改动的崩溃安全就没了，日志里能看出来。
     pub fn enqueue(&self, job: UploadJob) -> std::io::Result<()> {
-        let marker = job.marker(&self.marker_dir);
-        let body = serde_json::to_vec(&job).map_err(std::io::Error::other)?;
-        std::fs::write(&marker, body)?;
+        self.persist_put(&job);
         {
             let mut st = self.state.lock().unwrap();
-            // 同一路径已在队列里 → 用新作业替换（后写覆盖先写）
+            // 同一路径已在队列里 → 用新作业替换（后写覆盖先写；库里由 upsert 保证一行）
             st.pending.retain(|j| j.remote_path() != job.remote_path());
             st.pending.push_back(job);
         }
@@ -169,7 +239,7 @@ impl UploadQueue {
         self.state.lock().unwrap().active
     }
 
-    /// 取消某路径**还没开始**的上传作业（含标记文件）。
+    /// 取消某路径**还没开始**的上传作业（含状态库里的行）。
     /// 返回是否取消了作业；已经在途的那个取消不了，要用 [`Self::drain`] 等它结束。
     pub fn cancel(&self, remote_path: &str) -> bool {
         let removed: Vec<UploadJob> = {
@@ -186,10 +256,8 @@ impl UploadQueue {
             st.pending = kept;
             removed
         };
-        for j in &removed {
-            let _ = std::fs::remove_file(j.marker(&self.marker_dir));
-        }
         if !removed.is_empty() {
+            self.persist_delete(remote_path);
             self.stats
                 .pending
                 .store(self.pending_len(), Ordering::Relaxed);
@@ -198,7 +266,7 @@ impl UploadQueue {
         removed.is_empty()
     }
 
-    /// 该远端路径是否还有未完成的上传（含崩溃恢复出来的标记）。
+    /// 该远端路径是否还有未完成的上传（含崩溃恢复出来的作业）。
     pub fn has_pending(&self, remote_path: &str) -> bool {
         self.state
             .lock()
@@ -220,6 +288,51 @@ impl UploadQueue {
             failed: self.stats.failed.load(Ordering::Relaxed),
             retries: self.stats.retries.load(Ordering::Relaxed),
             bytes: self.stats.bytes.load(Ordering::Relaxed),
+        }
+    }
+
+    // ------------------------------------------------------------ 状态库写穿
+    //
+    // 都是「尽力而为」：失败只 warn，绝不 panic、绝不阻塞 worker ——
+    // 内存队列仍然是权威工作副本，持久化只是崩溃恢复的保障。
+
+    /// 入库（`uploads` 表 upsert）。失败仍继续入内存队列。
+    fn persist_put(&self, job: &UploadJob) {
+        match self.store.as_deref() {
+            Some(s) => {
+                if let Err(e) = s.put_upload(&job.to_row()) {
+                    tracing::warn!(
+                        "上传队列落库失败（作业仍在内存队列，重启会丢）: {}: {e}",
+                        job.remote_path()
+                    );
+                }
+            }
+            None => tracing::warn!(
+                "上传队列无持久化（状态库不可用），入队仅存在于内存: {}",
+                job.remote_path()
+            ),
+        }
+    }
+
+    /// 重试计数变化落库。
+    fn persist_bump(&self, remote_path: &str, attempts: u32) {
+        if let Some(s) = self.store.as_deref() {
+            if let Err(e) = s.bump_upload_attempts(remote_path, attempts) {
+                tracing::warn!("上传重试次数落库失败: {remote_path}: {e}");
+            }
+        }
+    }
+
+    /// 作业结束（成功/放弃/取消）→ 删行，保持「库 = 未完成作业」。
+    fn persist_delete(&self, remote_path: &str) {
+        if let Some(s) = self.store.as_deref() {
+            match s.delete_upload(remote_path) {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::debug!("状态库里没有 {remote_path} 的行（可能已被删或被新作业覆盖）")
+                }
+                Err(e) => tracing::warn!("删除上传队列行失败: {remote_path}: {e}"),
+            }
         }
     }
 
@@ -278,7 +391,7 @@ impl UploadQueue {
 
             match self.rt.block_on(self.upload_one(&job)) {
                 Ok(()) => {
-                    let _ = std::fs::remove_file(job.marker(&self.marker_dir));
+                    self.persist_delete(&job.remote_path());
                     if job.ephemeral {
                         // 冲突副本的 stash 是一次性的：传完就删
                         let _ = std::fs::remove_file(&job.local);
@@ -299,10 +412,14 @@ impl UploadQueue {
                             "上传失败（放弃，已试 {attempts} 次）: {}: {e}",
                             job.remote_path()
                         );
-                        // 标记留着：重启后还会再试，人工介入也有痕迹
+                        // M5：库 = 未完成作业 —— 放弃的作业把行删掉（等价于当年删 `.dirty`），
+                        // 否则每次重启都会把注定失败的作业再捞起来。失败计数由 stats/日志留痕。
+                        self.persist_delete(&job.remote_path());
                     } else {
                         self.stats.retries.fetch_add(1, Ordering::Relaxed);
                         tracing::warn!("上传失败（第 {attempts} 次）: {}: {e}", job.remote_path());
+                        // 先写库再改内存：重启后重试计数不倒退
+                        self.persist_bump(&job.remote_path(), attempts);
                         let backoff = Duration::from_millis(300 * (1 << attempts.min(4)));
                         std::thread::sleep(backoff);
                         let mut retry = job.clone();
@@ -355,22 +472,120 @@ impl UploadQueue {
     }
 }
 
-/// FNV-1a 64：与缓存命名共用同一套稳定哈希。
-pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in bytes {
-        hash ^= *b as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+/// 扫老格式标记：`(文件, Some(作业))` 可解析，`(文件, None)` 损坏。
+///
+/// 只看 `*.dirty`（`*.dirty.migrated` 的扩展名是 `migrated`，不会被重复扫到）。
+fn scan_dirty_markers(dir: &Path) -> Vec<(PathBuf, Option<UploadJob>)> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().map(|e| e == "dirty").unwrap_or(false) {
+            let job = std::fs::read(&path)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<UploadJob>(&b).ok());
+            out.push((path, job));
+        }
     }
-    hash
+    out
+}
+
+/// M5 一次性迁移：`.dirty` → `uploads` 表，然后把文件改名成 `*.dirty.migrated`
+/// （保留备份，不删）。返回成功入库的作业数。
+///
+/// 入库失败的文件**不改名**，留着下次启动再试（改名了就等于丢掉这份作业）。
+fn migrate_dirty_markers(store: &Store, dir: &Path) -> usize {
+    let mut migrated = 0;
+    for (path, job) in scan_dirty_markers(dir) {
+        let archived = path.with_extension("dirty.migrated");
+        let Some(job) = job else {
+            tracing::warn!("忽略损坏的标记文件 {}（改名备份）", path.display());
+            let _ = std::fs::rename(&path, &archived);
+            continue;
+        };
+        match store.put_upload(&job.to_row()) {
+            Ok(()) => match std::fs::rename(&path, &archived) {
+                Ok(()) => {
+                    migrated += 1;
+                    tracing::info!(
+                        "迁移上传标记 {} → 状态库（备份 {}）",
+                        job.remote_path(),
+                        archived.display()
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    "作业 {} 已入库，但备份 {} 改名失败: {e}",
+                    job.remote_path(),
+                    path.display()
+                ),
+            },
+            Err(e) => tracing::warn!(
+                "迁移 {} 入库失败（保留原文件，下次启动再试）: {e}",
+                path.display()
+            ),
+        }
+    }
+    migrated
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU32;
+
+    static N: AtomicU32 = AtomicU32::new(0);
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "qxync-upload-{tag}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn test_link() -> qxync_core::LinkConfig {
+        qxync_core::LinkConfig {
+            id: "test".into(),
+            host: "nas.invalid".into(),
+            port: 9834,
+            https: true,
+            insecure: true,
+            user: "test1".into(),
+            home_root: "/home".into(),
+            ipv4_only: false,
+        }
+    }
+
+    /// 建一个队列（不 spawn worker，测试只验证持久化语义）。
+    /// 返回 Runtime 是为了让 `Handle` 背后的运行时活着。
+    fn test_queue(marker_dir: &Path) -> (Arc<UploadQueue>, tokio::runtime::Runtime) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = Arc::new(Client::new(&test_link()).unwrap());
+        let q = UploadQueue::new(client, rt.handle().clone(), marker_dir.to_path_buf()).unwrap();
+        (q, rt)
+    }
+
+    fn job(dir: &Path, name: &str) -> UploadJob {
+        UploadJob {
+            remote_dir: "/home/qxync-test/".into(),
+            remote_name: name.into(),
+            local: dir.join("cache").join(name),
+            mtime: 1234,
+            attempts: 0,
+            ephemeral: false,
+        }
+    }
 
     #[test]
-    fn job_remote_path_and_marker_are_stable() {
+    fn job_remote_path_is_stable_and_row_upserts() {
         let j = UploadJob {
             remote_dir: "/home/qxync-test/".into(),
             remote_name: "a b.txt".into(),
@@ -379,18 +594,149 @@ mod tests {
             attempts: 0,
             ephemeral: false,
         };
+        // remote_path 必须稳定（库里主键、write log、dirty 判定都靠它）
         assert_eq!(j.remote_path(), "/home/qxync-test/a b.txt");
-        let m1 = j.marker(std::path::Path::new("/tmp/q"));
-        let m2 = j.marker(std::path::Path::new("/tmp/q"));
-        assert_eq!(m1, m2);
+        assert_eq!(
+            UploadJob {
+                remote_dir: "/home/qxync-test".into(),
+                ..j.clone()
+            }
+            .remote_path(),
+            "/home/qxync-test/a b.txt",
+            "尾斜杠不能改变 remote_path"
+        );
         assert_ne!(
-            m1,
             UploadJob {
                 remote_name: "b.txt".into(),
                 ..j.clone()
             }
-            .marker(std::path::Path::new("/tmp/q"))
+            .remote_path(),
+            j.remote_path()
         );
-        assert!(m1.to_string_lossy().ends_with(".dirty"));
+
+        // 入库：同 remote_path 再写一次是 upsert（一行），字段被新值覆盖
+        let store = Store::open_in_memory().unwrap();
+        store.put_upload(&j.to_row()).unwrap();
+        let updated = UploadJob {
+            mtime: 99,
+            attempts: 3,
+            ephemeral: true,
+            ..j.clone()
+        };
+        store.put_upload(&updated.to_row()).unwrap();
+        let rows = store.uploads().unwrap();
+        assert_eq!(rows.len(), 1, "同 remote_path 只能有一行");
+        assert_eq!(rows[0].remote_path(), j.remote_path());
+        assert_eq!(rows[0].mtime, 99);
+        assert_eq!(rows[0].attempts, 3);
+        assert!(rows[0].ephemeral);
+        assert_eq!(UploadJob::from_row(&rows[0]).remote_path(), j.remote_path());
+    }
+
+    #[test]
+    fn enqueue_persists_row_with_unicode_and_space_name() {
+        let dir = tmpdir("enqueue");
+        let marker = dir.join("queue");
+        let (q, _rt) = test_queue(&marker);
+        let j = job(&dir, "中文 名字.txt");
+        q.enqueue(j.clone()).unwrap();
+
+        // 入队后库里立刻就有这一行，字段完整（含中文/空格文件名）
+        let store = Store::open(marker.join(QUEUE_DB_FILE)).unwrap();
+        let rows = store.uploads().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].remote_dir, "/home/qxync-test/");
+        assert_eq!(rows[0].remote_name, "中文 名字.txt");
+        assert_eq!(rows[0].remote_path(), "/home/qxync-test/中文 名字.txt");
+        assert_eq!(rows[0].local, j.local);
+        assert_eq!(rows[0].mtime, 1234);
+        assert_eq!(rows[0].attempts, 0);
+        assert!(!rows[0].ephemeral);
+
+        // 同路径再入队 → 库里仍一行，内容被覆盖（upsert）
+        let mut again = j.clone();
+        again.mtime = 4321;
+        again.attempts = 2;
+        q.enqueue(again).unwrap();
+        let rows = Store::open(marker.join(QUEUE_DB_FILE))
+            .unwrap()
+            .uploads()
+            .unwrap();
+        assert_eq!(rows.len(), 1, "同 remote_path 的重复入队是 upsert");
+        assert_eq!(rows[0].mtime, 4321);
+        assert_eq!(rows[0].attempts, 2);
+
+        // cancel 也要删掉库里的行（库 = 未完成作业）
+        q.cancel("/home/qxync-test/中文 名字.txt");
+        assert!(Store::open(marker.join(QUEUE_DB_FILE))
+            .unwrap()
+            .uploads()
+            .unwrap()
+            .is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_recovers_pending_jobs_from_store() {
+        let dir = tmpdir("recover");
+        let marker = dir.join("queue");
+        {
+            let (q, _rt) = test_queue(&marker);
+            q.enqueue(job(&dir, "恢复 一.txt")).unwrap();
+            q.enqueue(job(&dir, "恢复二.bin")).unwrap();
+            assert!(q.has_pending("/home/qxync-test/恢复 一.txt"));
+            // 队列 drop = 模拟进程退出（库连接随之关闭）
+        }
+
+        // 新队列指向同一个 queue.db → 未完成作业恢复出来
+        let (q2, _rt2) = test_queue(&marker);
+        assert_eq!(q2.snapshot().pending, 2);
+        assert!(q2.has_pending("/home/qxync-test/恢复 一.txt"));
+        assert!(q2.has_pending("/home/qxync-test/恢复二.bin"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_dirty_markers_are_migrated_and_archived() {
+        let dir = tmpdir("migrate");
+        let marker = dir.join("queue");
+        std::fs::create_dir_all(&marker).unwrap();
+        let old = job(&dir, "老 标记.txt");
+        let dirty = marker.join("00000000deadbeef.dirty");
+        let body = serde_json::to_vec(&old).unwrap();
+        std::fs::write(&dirty, &body).unwrap();
+
+        let (q, _rt) = test_queue(&marker);
+        // 作业进了内存队列（从库里恢复）...
+        assert!(q.has_pending("/home/qxync-test/老 标记.txt"));
+        // ...也进了库
+        let rows = Store::open(marker.join(QUEUE_DB_FILE))
+            .unwrap()
+            .uploads()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].remote_name, "老 标记.txt");
+        assert_eq!(rows[0].mtime, 1234);
+        // 原文件改名为 *.dirty.migrated，内容保留
+        assert!(!dirty.exists(), ".dirty 应已改名");
+        let archived = marker.join("00000000deadbeef.dirty.migrated");
+        assert_eq!(std::fs::read(&archived).unwrap(), body);
+
+        // 二次启动幂等：不再重复迁移、不产生重复行
+        let (q2, _rt2) = test_queue(&marker);
+        assert_eq!(q2.snapshot().pending, 1);
+        assert_eq!(
+            Store::open(marker.join(QUEUE_DB_FILE))
+                .unwrap()
+                .uploads()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(archived.exists(), "备份不能被删");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
