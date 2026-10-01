@@ -188,6 +188,105 @@ code {
 
 .topbar-meta span { white-space: nowrap; }
 
+/* ------------------------------------------------- 外壳：左侧图标栏 + 内容区 */
+/* 对齐 Qsync Client 6：左侧竖直图标栏（6 个目的地 + 专家模式「诊断」），右侧内容区。
+   注意 Qsync 6.x 的左栏只有图标、没有文字标签；这里保留小号文字是为了可发现性，
+   属**有意的偏离**（见 docs/M8-向Qsync-Client-6靠拢.md §1.1）。 */
+.shell {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  align-items: stretch;
+}
+
+.rail {
+  flex: 0 0 auto;
+  width: 64px;
+  background: var(--bg-elev);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  padding: 8px 0 10px;
+}
+
+.rail-logo {
+  flex: 0 0 auto;
+  height: 30px;
+  margin: 0 12px 10px;
+  border-radius: 8px;
+  background: var(--accent);
+  color: var(--accent-fg);
+  font-weight: 700;
+  font-size: 15px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  letter-spacing: .02em;
+  user-select: none;
+}
+
+.rail-nav { display: flex; flex-direction: column; gap: 2px; }
+
+.rail-spacer { flex: 1 1 auto; }
+
+.rail-item {
+  border: none;
+  background: transparent;
+  border-radius: 0;
+  padding: 6px 2px 5px;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  color: var(--fg-dim);
+  font-size: 10.5px;
+  line-height: 1.1;
+  cursor: pointer;
+  border-left: 3px solid transparent;
+}
+
+.rail-item svg {
+  width: 20px;
+  height: 20px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.rail-item:hover:not(.active) { background: var(--bg-sunken); color: var(--fg); }
+
+.rail-item.active {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-left-color: var(--accent);
+  font-weight: 600;
+}
+
+.rail-item.rail-expert { border-top: 1px solid var(--border-soft); }
+
+.main-col {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.pagetitle {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: .01em;
+  margin-right: 4px;
+  white-space: nowrap;
+}
+
+/* 页面容器（与诊断子页的 .panel 分开：.page 是一级目的地，.panel 是诊断内的子页） */
+.page { display: none; }
+.page.active { display: block; }
+
 /* ---------------------------------------------------------------- Tab */
 .tabs {
   display: flex;
@@ -220,6 +319,92 @@ code {
   color: var(--fg);
   font-weight: 600;
 }
+
+/* 诊断页内的子 tab：做成卡片式分段控件（它嵌在 #main 的 padding 里，不再是贴边 tab） */
+.diag-tabs {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0;
+  margin-bottom: var(--gap);
+  background: var(--bg-head);
+  overflow: hidden;
+}
+
+.diag-tabs .tab {
+  top: 0;
+  border-radius: 0;
+  padding: 6px 16px;
+  border: none;
+  border-right: 1px solid var(--border-soft);
+}
+
+.diag-tabs .tab.active {
+  background: var(--bg-elev);
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+
+/* ------------------------------------------------- 主页（对齐 Qsync 的任务卡） */
+.home-conn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.home-conn-actions { margin-left: auto; display: flex; gap: 6px; flex-wrap: wrap; }
+
+.conn-dot {
+  flex: 0 0 auto;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--fg-faint);
+}
+
+.conn-dot.ok { background: var(--ok); }
+.conn-dot.warn { background: var(--warn); }
+.conn-dot.err { background: var(--err); }
+
+.task-list { display: flex; flex-direction: column; gap: 8px; }
+
+.task-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elev);
+  padding: 9px 11px;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.task-mark {
+  flex: 0 0 auto;
+  font-size: 15px;
+  line-height: 1.2;
+}
+
+.task-body { flex: 1 1 auto; min-width: 0; }
+
+.task-state { font-weight: 600; margin-bottom: 2px; }
+
+.task-meta { font-size: 11.5px; color: var(--fg-dim); font-family: var(--mono); }
+
+.task-actions { flex: 0 0 auto; display: flex; gap: 5px; align-items: center; }
+
+/* 未实现页的说明块（M8.2/M8.3/M8.4 会替换成真页面） */
+.soon {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--fg-dim);
+  line-height: 1.6;
+  background: var(--bg-sunken);
+  border-left: 3px solid var(--fg-faint);
+  border-radius: 0 var(--radius) var(--radius) 0;
+  padding: 9px 11px;
+}
+
+.soon strong { color: var(--fg); }
+.soon em { font-style: normal; font-weight: 600; color: var(--accent); }
 
 /* --------------------------------------------------------------- 主体 */
 #main {
@@ -294,6 +479,29 @@ code {
 }
 
 .alert-stack:empty { display: none; }
+
+/* ★ M8.3：错误列表的一行（要能换行显示长路径） */
+.alert-err {
+  border-left-color: var(--err);
+  background: var(--err-soft);
+  color: var(--fg);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.alert-err .badge { flex: 0 0 auto; }
+.alert-err .mono { word-break: break-all; }
+
+/* ★ M8.3：更新中心的查询条（输入框别撑满整行） */
+#j-query { flex: 0 1 300px; width: auto; }
+#j-level { flex: 0 0 auto; }
+
+/* ★ M8.3：文件更新中心的表格列 */
+.col-kind { width: 1%; white-space: nowrap; }
+.tbl-journal td { vertical-align: top; }
+.tbl-journal td:nth-child(4) { word-break: break-word; }
 
 .result {
   margin-top: 10px;
@@ -720,3 +928,97 @@ button.link-btn {
 
 .modal-card h3 { font-size: 13px; margin-bottom: 4px; }
 .modal-card input { margin: 6px 0 10px; }
+
+/* ============================================================================
+ * ★ M8.4：设置中心分区 / 文件三态 / 行右键菜单
+ * ==========================================================================*/
+
+/* 设置页内的分区导航（与诊断子页同一套视觉：卡片式分段控件） */
+.settings-tabs {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0;
+  margin-bottom: var(--gap);
+  background: var(--bg-head);
+  overflow: hidden;
+  flex-wrap: wrap;
+}
+
+.settings-tabs .tab {
+  top: 0;
+  border-radius: 0;
+  padding: 6px 14px;
+  border: none;
+  border-right: 1px solid var(--border-soft);
+}
+
+.settings-tabs .tab.active {
+  background: var(--bg-elev);
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+
+/* 分区容器：一次只显示一个（与 .page/.panel 同一套语义） */
+.settings-sec { display: none; }
+.settings-sec.active { display: block; }
+
+/* 「释放空间」的三态徽章（online/局部/始终） */
+.badge-online { background: var(--bg-sunken); color: var(--fg-dim); border-color: var(--border); }
+.badge-local { background: var(--warn-soft); color: var(--warn); border-color: currentColor; }
+.badge-always { background: var(--ok-soft); color: var(--ok); border-color: currentColor; }
+
+/* 幽灵按钮（明确不做的功能：可点，点了给原因） */
+button.ghost {
+  background: transparent;
+  color: var(--fg-faint);
+  border-style: dashed;
+}
+
+button.ghost:hover { color: var(--fg-dim); }
+
+/* 行右键菜单 */
+.ctx-menu {
+  position: fixed;
+  z-index: 60;
+  min-width: 290px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 10px 26px rgba(0, 0, 0, .4);
+  padding: 4px;
+}
+
+.ctx-menu[hidden] { display: none; }
+
+.ctx-title {
+  font-size: 11px;
+  color: var(--fg-faint);
+  padding: 4px 8px 6px;
+  font-family: var(--mono);
+  border-bottom: 1px solid var(--border-soft);
+  margin-bottom: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 340px;
+}
+
+.ctx-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 12.5px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.ctx-item:hover { background: var(--bg-sunken); }
+.ctx-item.danger { color: var(--err); }
+.ctx-sep { height: 1px; background: var(--border-soft); margin: 4px 2px; }
+
+/* 文件行的三态列 */
+.tbl-files .col-state { width: 130px; }

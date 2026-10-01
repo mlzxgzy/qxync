@@ -5,7 +5,7 @@
 
 > ⚠️ 仅用于**你自己拥有或已获授权**的 QNAP NAS。不分发 QNAP 二进制，不绕过授权。
 
-## 现状（2026-09-30）
+## 现状（2026-10-01）
 
 | 里程碑 | 状态 |
 |---|---|
@@ -19,11 +19,32 @@
 | **M2c 变更发现**（三游标轮询 + baseline 三向对账 + 冲突副本 + 删除保护） | ✅ **已实现并真机验收**（矩阵 46/46，其中 M2c 16 项） |
 | **M3 脱水**（安全检查链 + 先 `inval_inode` 再清内容 + 闲置/限额 LRU + `--cache-mode`） | ✅ **已实现并真机验收**（矩阵 **68/68**，其中 M3 21 项；M2c-5c 已改查 M5 的状态库） |
 | **M4 GUI**（Tauri 2：登录配置 / 挂载管理 / 状态与进度 / pin 管理） | ✅ **已实现并真机验收**（`gui-matrix.sh` **41/41**，5 个 tab 真窗口截图） |
+| **M8.1 GUI 外壳**（左侧图标栏 + 主页 + 诊断收纳 + 9 个目的地 + 旧 `QSYNC_GUI_TAB` 值兼容） | ✅ **已实现并真机验收**（`gui-matrix.sh` **86/86**；同步回归 `fuse-matrix.sh` 68/68 等全绿） |
+| **M8.2 同步任务**（`tasks/<id>.json` 持久化 + 每任务暂停/继续 + `--restore-tasks` 重启恢复 + 自定义缓存目录 + GUI 任务页） | ✅ **已实现并真机验收**（`m82-matrix.sh` **37/37**；`fuse-matrix.sh` 68/68 回归） |
+| **M8.3 同步日志**（`sync.db` schema v2 加 `journal` 表 + 后台批量落库与轮转 + GUI 文件更新中心/错误列表） | ✅ **已实现并真机验收**（`m83-matrix.sh` **27/27**；`m5-matrix.sh` 扩到 30/30） |
+| **M8.4 设置中心 + 托盘/通知 + 自动释放空间 + M7 面板补课**（`settings.json` + 代理三模式接 reqwest + ksni 托盘 + 桌面通知 + 开机自启 + `statvfs` 自动释放空间（复用脱水安全链）+ 筛选器/LAN/冲突策略面板 + 文件页三态与右键菜单 + 文件选择器/opener/关于页） | ✅ **已实现并真机验收**（`m84-matrix.sh` **88/88**；全量回归见下方「M8.4 验收结论」） |
 | **M5 SQLite 元数据 + delta**（`sync.db` 承载游标/baseline/pin/队列 + librsync 兼容编解码 + 能力门控） | ✅ **已实现并真机验收**（`m5-matrix.sh` **28/28**；服务端无历史版本 → 增量走门控，见 [`M5-SQLite与delta.md`](docs/M5-SQLite与delta.md)） |
 | **M6 多根 / 共享文件夹**（link `roots` + 同步文件夹发现 + FUSE 多根视图 + 非家目录根只读保护） | ✅ **已实现并真机验收**（`m6-matrix.sh` **29/29**，含多根真挂载：两根都能按需水合、共享根写回 `EROFS`、家目录能写、共享根可脱水） |
 | **M7 选择性同步 + 设备配对 / LAN 直连**（`exclude` 规则引擎贯通 FUSE/同步/脱水 + 内置临时文件过滤；qxync↔qxync 自研对等协议：配对、事件快路径、LAN 直传） | ✅ **已实现并真机验收**（`m7-matrix.sh` **60/60** 含真挂载段；回归 `fuse-matrix.sh` 68/68，见 [`docs/M7-选择性同步与LAN直连.md`](docs/M7-选择性同步与LAN直连.md)） |
 
 真机验证对象：`TS-464C` / `QTS 5.2.9` / Qsync QPKG `5.0.0.7`（build `20260723`）。
+
+### M8.4 验收结论（2026-10-01）
+
+| 矩阵 | 结果 |
+|---|---|
+| `m84-matrix.sh`（本里程碑新增） | **88/88** |
+| `gui-matrix.sh` | **131/131**（比 M8.1 的 86 多出 7 个设置分区截图与 4 条 M8.4 数据源断言） |
+| `fuse-matrix.sh` | **68/68**（回归；M8.4 动过上传队列的取消语义，必须复跑） |
+| `m5 / m6 / m7 / m82 / m83` | **30 / 29 / 60 / 37 / 27** 全过（`m5`/`m83` 的 schema 断言随 v3 改动） |
+| `cargo test --workspace` | 全绿 |
+
+**NAS 数据基线**（`/home` 全树 16 项；基线 = M8.3 之后的 manifest）：`added 0 / removed 0`；
+`resized 1` = `/home/.recent`（**NAS 自己维护的「最近访问」索引**，M8.4 的第一次真读写让它增长）；
+`retimed 1` = `/home/qxync-test` 目录 mtime。**没有任何用户数据被删改**。
+全套矩阵在最终产物上**又复跑了一遍**（两次都 0 失败），第二次 manifest 比对是
+`added 0 / removed 0 / resized 0 / retimed 2` —— 与 M8.1–M8.3（那三次 `resized=0`）的差别及解释见
+[`docs/M8-向Qsync-Client-6靠拢.md`](docs/M8-向Qsync-Client-6靠拢.md) §12.6。
 
 M1 实现说明（`crates/qxync-fuse`）：
 **元数据不走数据面**（`ls -l` 直接答 NAS 元数据，真实大小、零下载）；`read()` 首次触发**整文件水合**到
@@ -95,21 +116,26 @@ crates/
 ├── qxync-fuse/        FUSE 只读 + on-demand 水合（M1：Filesystem 实现 + 挂载参数）
 ├── qxync-daemon/      二进制 `qxyncd`（M1.5：常驻进程 + unix socket JSON IPC + 持有 FUSE；
 │                       M2c：`sync.rs` 三游标轮询 + baseline 对账 + 冲突/删除保护）
-├── qxync-cli/         二进制 `qsync`（login/status/ls/stat/get/put/mkdir/mount/umount/roots/pin/state/store/daemon）
-├── qxync-gui/         二进制 `qxync-gui`（M4：Tauri 2 桌面应用；`ui/` 是零依赖静态前端）
+├── qxync-cli/         二进制 `qsync`（login/status/ls/stat/get/put/mkdir/mount/umount/roots/pin/state/store/daemon；
+│                       M8.4：settings / space / conflicts / file-states / task add --conflict）
+├── qxync-gui/         二进制 `qxync-gui`（M4：Tauri 2 桌面应用；`ui/` 是零依赖静态前端；
+│                       M8.4：ksni 托盘 + 桌面通知 + 文件选择器 + opener；`--self-test-notify`）
 └── qxync-proto-test/  真机集成测试（5 个协议测试 + 1 个 IPC 端到端，均 #[ignore] 手动跑）
 xtask/tests/
 ├── fuse-matrix.sh     ★ M1–M5 验收矩阵（挂载 → 68 项检查 → 卸载；--big 追加 128 MiB + 并发去重）
-├── gui-matrix.sh      ★ M4 验收矩阵（自检 + 登录链 + 5 个 tab 真窗口截图，41 项）
-├── m5-matrix.sh       ★ M5 验收矩阵（JSON→SQLite 迁移/幂等/不双写/pin 存活/编解码单测/真机 gate，28 项）
-└── m6-matrix.sh       ★ M6 验收矩阵（共享文件夹读写事实/roots 判定/布局单测/多根真挂载，29 项）
+├── gui-matrix.sh      ★ M4+M8.1 验收矩阵（自检 + 登录链 + 9 个目的地真窗口截图 + 旧 tab 值落点等价性，86 项）
+├── m5-matrix.sh       ★ M5 验收矩阵（JSON→SQLite 迁移/幂等/不双写/pin 存活/编解码单测/真机 gate，30 项）
+├── m6-matrix.sh       ★ M6 验收矩阵（共享文件夹读写事实/roots 判定/布局单测/多根真挂载，29 项）
+├── m82-matrix.sh      ★ M8.2 验收矩阵（任务登记/兼容/重启恢复/暂停隔离/安全/缓存目录，37 项）
+├── m83-matrix.sh      ★ M8.3 验收矩阵（schema 迁移/日志过滤/clear 隔离/轮转，27 项）
+└── m84-matrix.sh      ★ M8.4 验收矩阵（设置/代理三模式+假代理看 CONNECT/托盘+通知/自动释放空间+安全链/筛选器/冲突策略五选/三态+铁则 2，88 项）
 docs/
 ├── 开发规划.md             第一版（MVP）规划
 ├── M1.5-设计.md           daemon/IPC 契约、生命周期、pin 语义、验收标准
 ├── M2b-写路径.md          ★ 写路径：真机写接口契约、read-modify-write 铁则、上传队列、已知限制
 ├── M2c-变更发现.md        ★ 变更发现：三游标/事件契约、三向决策表、冲突副本、删除保护、已知限制
 ├── M3-脱水.md             ★ 脱水：安全检查链、inval_inode 顺序铁则、闲置/限额、cache-mode
-├── M4-GUI.md              ★ GUI：边界（GUI 是 daemon 客户端）、命令面、5 个 tab、验收与踩坑
+├── M4-GUI.md              ★ GUI：边界（GUI 是 daemon 客户端）、命令面、页面结构、验收与踩坑
 ├── M5-SQLite与delta.md    ★ 状态库 schema/迁移/单事务、真机 versioning 探测、delta 格式与能力门控
 ├── M6-多根与共享文件夹.md  ★ 多根布局/只读规则、真机共享文件夹探测、FUSE 虚拟根、同步与脱水按根展开
 ├── 执行方案-M0M1.md        ★ 真机验证后的修正版：实测事实 + 修正项 + 执行顺序 + 风险门
@@ -175,6 +201,22 @@ qsync store --json          #   机器可读（给脚本/验收用）
 qsync roots                 # M6：远端根一览（配置的根 + NAS 同步文件夹 + 可读/可写判定）
 qsync roots --json          #   机器可读
 qsync mount ~/qsync-mnt --remote /home --remote /Public   # M6：多根挂载（共享文件夹默认只读）
+qsync task list             # M8.2：同步任务一览（--json 可脚本判定）
+qsync task add --id default --mountpoint ~/qsync-mnt --root /home   # 登记并挂载
+qsync task pause default    # 暂停：停用登记并卸载（已入队的上传先排空）
+qsync task resume default   # 继续：启用并重新挂载
+qsync task rm default       # 删除登记（只删登记，不动挂载点里的数据）
+qsync journal               # M8.3：同步活动日志（--level error 就是「错误列表」）
+qsync journal --clear       #   清空日志（只清日志，不动游标/baseline/pin/队列）
+# M8.4：设置 / 释放空间 / 冲突策略 / 文件三态
+qsync settings              #   全局设置（代理 / 开机自启 / 通知 / 释放空间）—— 只读展示
+qsync settings --set proxy.mode=manual --set proxy.server=10.0.0.1 --set proxy.port=3128
+qsync settings --json       #   机器可读（含 autostart 路径与实际环境代理变量）
+qsync space                 #   释放空间状态：文件系统可用 % / 缓存占用 / 本轮判定
+qsync space --now           #   「立即释放空间」（仍走 M3 安全检查链，被挡下的会逐条列出）
+qsync conflicts             #   冲突待裁决队列（策略 = 每个文件都问我）
+qsync conflicts --resolve <id> --as keep_local|keep_remote|keep_both
+qsync file-states /home     #   文件三态：仅在线 / 本地可用 / 始终可用（--json 可脚本判定）
 qsync rules                 # M7：选择性同步规则（exclude + 内置临时文件过滤）
 qsync rules --match /home/qxync-test/1k.bin   #   判定单条路径：visible / excluded / temp / outside-roots
 qsync rules --json          #   机器可读
@@ -199,17 +241,23 @@ IPC 契约见 [`docs/M1.5-设计.md`](docs/M1.5-设计.md)：unix socket + **一
 ```bash
 cargo build -p qxync-gui
 qsync daemon start          # GUI 也会在「保存并登录 / 启动 daemon」时自己拉起
-./target/debug/qxync-gui    # 应用名 QSync；5 个 tab：状态/进度、连接/登录、挂载、文件/pin、同步/缓存
+./target/debug/qxync-gui    # 应用名 QSync；左侧图标栏：主页 / 任务 / 文件 / 更新 / 错误 / 设置 / 诊断（专家模式）
 
 # 无窗口自检（脚本/CI 用；daemon 在跑时退出码 0）
 ./target/debug/qxync-gui --self-test
 ./target/debug/qxync-gui --self-test-login   # 额外跑一遍「保存并登录」整条链（会重启 daemon）
 
-xtask/tests/gui-matrix.sh        # M4 验收矩阵 41 项（含 5 个 tab 真窗口截图）
+xtask/tests/gui-matrix.sh        # M4+M8.1+M8.4 验收矩阵 131 项（9 个目的地 + 7 个设置分区真窗口截图 + M8.4 数据源断言）
 xtask/tests/gui-matrix.sh --no-window   # 无 DISPLAY 的机器只跑自检
+
+# M8.4 专项：设置 / 代理（假代理看 CONNECT）/ 托盘+通知（D-Bus）/ 自动释放空间（注入剩余空间）/
+#            筛选器 / 冲突策略五选（真挂载三向冲突）/ 三态 + 铁则 2
+xtask/tests/m84-matrix.sh
+xtask/tests/m84-matrix.sh --no-fuse --no-gui --no-proxy   # 只跑设置本体与本地部分
 ```
 
-细节（命令面 / 5 个 tab / 已知限制 / 踩坑）见 [`docs/M4-GUI.md`](docs/M4-GUI.md)。
+细节（命令面 / 页面结构 / 已知限制 / 踩坑）见 [`docs/M4-GUI.md`](docs/M4-GUI.md)；
+界面改造（向 Qsync Client 6 靠拢）的研究与执行方案见 [`docs/M8-向Qsync-Client-6靠拢.md`](docs/M8-向Qsync-Client-6靠拢.md)。
 
 M1 验收矩阵（挂载 → 16 项检查 → 卸载）：
 
@@ -288,7 +336,13 @@ cargo test -p qxync-proto-test -- --ignored --test-threads=1 --nocapture   # 协
     「最后一条 `log_id` + 1」；区间内没有事件时返回 **`status:-17`**，这不是协议错。
 19. **事件里 `isfolder` 是 `1`=目录 / `2`=文件 / `0`=删除项**（不是布尔）；`size` 是字符串。
 20. **删除事件的 `filepath` 实测为空**，而且**我们自己的 CGI 写操作（upload/rename/move/delete）
-    不产生 sync log 事件**（本机未做设备配对）→ 变更发现必须**以 baseline 对账为主路径**，事件只是快路径。
+    不产生 sync log 事件** → 变更发现必须**以 baseline 对账为主路径**，事件只是快路径。
+    **2026-10-01 P0 探针更正了归因**（见 [`docs/M8-向Qsync-Client-6靠拢.md`](docs/M8-向Qsync-Client-6靠拢.md) §11）：
+    原因**不是**「本机未做设备配对」—— NAS 上早就有官方客户端注册的设备 `win-pc`，
+    但 `qbox_get_sync_log` 对**全区间 + 全参数变体**恒返回 `status:-17`，而该账号
+    `qbox_get_syncing_folder_list` 是 `total:0`（**从未登记过同步文件夹**）。
+    真正的闸门是「路径落在已注册的同步文件夹里」，而**现有 208 条端点清单里没有注册同步文件夹的端点**
+    → 这条路走不通，**baseline 对账主路径的结论不变、且证据更强**。
 21. `qbox_write_log` 会让 `max_log` 上涨但区间内取不到事件 → 游标**只按实际返回的事件推进**，
     `-17` 时不推进、只记账，避免「推进了游标但事件丢了」。
 

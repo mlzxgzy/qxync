@@ -113,11 +113,39 @@ pub enum Request {
         /// ★ M3：缓存模式 `pagecache`（默认）/ `direct`（绕过 page cache，mmap 不可用）。
         #[serde(default)]
         cache_mode: Option<String>,
+        /// ★ M8.2：把这次挂载登记成一条**持久化任务**（id 缺省 `default`）。
+        /// 省略 = 不登记 —— **M7 及以前的行为一字不变**（fuse-matrix 走的就是这条路）。
+        #[serde(default)]
+        task: Option<String>,
+        /// ★ M8.2：显式要求落盘（与 `task` 二选一；`task` 有值即视为要落盘）。
+        #[serde(default)]
+        save_task: Option<bool>,
+        /// ★ M8.4：这次挂载的冲突策略（5 选项见 `tasks::CONFLICTS`）。
+        /// 省略 = 默认「重命名本地文件」（= M2c 既有行为）。
+        #[serde(default)]
+        conflict: Option<String>,
     },
     Umount {
         mountpoint: PathBuf,
     },
     Mounts,
+    /// ★ M8.2：同步任务（持久化的挂载登记 + 策略）。
+    ///
+    /// * `action="list"`   → 全部任务 + 运行时状态（`TaskInfo`）；
+    /// * `action="get"`    → 单个任务（`id` 必填）；
+    /// * `action="save"`   → 落盘一个任务（`task` 必填，做归一化 + 校验）；
+    /// * `action="delete"` → 删掉登记（**不动挂载点里的任何数据**）；
+    /// * `action="pause"`  → `enabled=false` 并**卸载**该任务（见 docs/M8 §M8.2 的语义说明）；
+    /// * `action="resume"` → `enabled=true` 并重新挂载；
+    /// * `action="mount"`  → 按任务登记的参数挂载（不改登记）。
+    Tasks {
+        action: String,
+        #[serde(default)]
+        id: Option<String>,
+        /// `save` 用：完整任务对象。
+        #[serde(default)]
+        task: Option<crate::tasks::Task>,
+    },
     /// ★ M6：远端根一览（配置的 roots + NAS 上的同步文件夹 + 可读/可写判定）。
     Roots,
     /// ★ M7：选择性同步规则（`exclude` 编译结果 + 可选单路径判定）。
@@ -201,6 +229,66 @@ pub enum Request {
         #[serde(default)]
         mountpoint: Option<PathBuf>,
     },
+    /// ★ M8.3：同步活动日志（GUI 的「文件更新中心 / 错误列表」读它）。
+    ///
+    /// * `limit`  最多返回多少条（默认 200，上限 10000）；
+    /// * `since`  unix 秒下界（闭区间）；
+    /// * `query`  在 path/detail 上做子串匹配（「按文件名搜索」）；
+    /// * `level`  `all`（默认）/ `ok` / `error` / `blocked` —— `error` 就是「错误列表」；
+    /// * `clear`  true = 清空日志（**只清日志**，不动游标/baseline/pin/队列）。
+    Journal {
+        #[serde(default)]
+        limit: Option<usize>,
+        #[serde(default)]
+        since: Option<i64>,
+        #[serde(default)]
+        query: Option<String>,
+        #[serde(default)]
+        level: Option<String>,
+        #[serde(default)]
+        clear: Option<bool>,
+    },
+    /// ★ M8.4：全局设置（`~/.config/qsync/settings.json`）—— 只读。
+    ///
+    /// 返回 `SettingsData`（当前设置 + 落盘路径 + autostart 实际状态 + 环境里的代理变量）。
+    Settings,
+    /// ★ M8.4：写全局设置。
+    ///
+    /// * `settings` 完整设置对象（做归一化 + 校验；`manual` 代理缺服务器会**报错**）；
+    /// * `autostart_exe` 要写进 `~/.config/autostart/qsync.desktop` 的可执行文件路径
+    ///   （GUI 传自己的 `current_exe()`；CLI 不传则尝试取同目录下的 `qxync-gui`）。
+    SettingsSave {
+        settings: crate::settings::Settings,
+        #[serde(default)]
+        autostart_exe: Option<String>,
+    },
+    /// ★ M8.4：冲突策略为「每个文件都问我」时攒下的**待裁决队列**。
+    ///
+    /// * `action="list"`     → 全部待裁决（`resolution` 为空的 + 已裁决未执行的）；
+    /// * `action="resolve"`  → 给 `id` 定夺：`keep_local` / `keep_remote` / `keep_both`；
+    /// * `action="clear"`    → 清空队列（**只清队列，不动文件**）。
+    Decisions {
+        action: String,
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        resolution: Option<String>,
+    },
+    /// ★ M8.4：文件页的「节省空间模式」三态（仅在线 / 本地可用 / 始终可用）。
+    ///
+    /// `path` 是**远端目录**（如 `/home`）；返回该目录下每个条目的
+    /// pin 状态 + 本地已缓存字节 + 归纳出的三态。
+    FileStates {
+        path: String,
+    },
+    /// ★ M8.4：释放空间状态（设置 →「释放空间」页的数据源）。
+    ///
+    /// `now=true` = `Free Up Space Now`：按当前策略立刻跑一轮脱水
+    /// （仍然走 M3 的安全检查链）。
+    Space {
+        #[serde(default)]
+        now: Option<bool>,
+    },
     /// 干净退出：卸载所有挂载点、删 socket/pid。
     Shutdown,
 }
@@ -221,6 +309,7 @@ impl Request {
             Request::Mount { .. } => "mount",
             Request::Umount { .. } => "umount",
             Request::Mounts => "mounts",
+            Request::Tasks { .. } => "tasks",
             Request::Roots => "roots",
             Request::Rules { .. } => "rules",
             Request::Peer { .. } => "peer",
@@ -228,6 +317,12 @@ impl Request {
             Request::Store { .. } => "store",
             Request::Rm { .. } => "rm",
             Request::Dehydrate { .. } => "dehydrate",
+            Request::Journal { .. } => "journal",
+            Request::Settings => "settings",
+            Request::SettingsSave { .. } => "settings_save",
+            Request::Decisions { .. } => "decisions",
+            Request::FileStates { .. } => "file_states",
+            Request::Space { .. } => "space",
             Request::Shutdown => "shutdown",
         }
     }
@@ -242,6 +337,11 @@ impl Request {
                 | Request::Sync { .. }
                 | Request::Dehydrate { .. }
                 | Request::Peer { .. }
+        ) || matches!(
+            self,
+            // ★ M8.2：list/get/save/delete 很快，只有 mount/resume/pause 会真的挂载
+            Request::Tasks { action, .. }
+                if matches!(action.as_str(), "mount" | "resume" | "pause")
         )
     }
 }
@@ -593,6 +693,60 @@ pub struct RootsData {
     pub note: Option<String>,
 }
 
+/// ★ M8.3：`journal` 请求的返回。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct JournalData {
+    /// 明细（**最新的在前**）。
+    pub entries: Vec<crate::store::JournalEntry>,
+    /// 库里的总条数（不是本次返回的条数）。
+    pub total: i64,
+    /// 按状态分组的计数（`ok` / `error` / `blocked`）。
+    pub counts: BTreeMap<String, i64>,
+    /// 本次是否执行了清空。
+    pub cleared: bool,
+    /// 清空时删掉的行数。
+    pub removed: usize,
+    /// 上限与轮转参数（让界面能解释「为什么只有这些」）。
+    pub limit_rows: i64,
+    pub max_age_days: i64,
+    pub note: Option<String>,
+}
+
+/// ★ M8.2：一条任务的落盘登记 + 当前运行时状态。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TaskInfo {
+    pub task: crate::tasks::Task,
+    /// 该任务的挂载点此刻是否真的挂着（daemon 挂载表里有它）。
+    pub mounted: bool,
+    /// 最近一次挂载/恢复失败的原因（没有 = None）。
+    pub last_error: Option<String>,
+}
+
+/// ★ M8.2：`tasks` 请求 `action="list"` 的返回。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TasksData {
+    /// 落盘的任务。
+    pub tasks: Vec<TaskInfo>,
+    /// 解析失败的任务文件（路径，原因）—— **不整体失败**，单独报出来。
+    pub bad_files: Vec<(String, String)>,
+    /// 任务目录里**一个任务文件都没有**时为 true（界面据此提示「还没建过任务」）。
+    pub empty: bool,
+    /// 一句话解释。
+    pub note: Option<String>,
+}
+
+impl TasksData {
+    pub fn count(&self) -> usize {
+        self.tasks.len()
+    }
+    pub fn enabled_count(&self) -> usize {
+        self.tasks.iter().filter(|t| t.task.enabled).count()
+    }
+}
+
 /// ★ M7：`rules` 请求的返回（`qsync rules [--json] [--match PATH]`）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -733,6 +887,169 @@ pub struct ShutdownData {
     pub unmounted: usize,
 }
 
+// ---------------------------------------------------------------- ★ M8.4 数据体
+
+/// ★ M8.4：`settings` / `settings_save` 的返回。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SettingsData {
+    pub settings: crate::settings::Settings,
+    /// `settings.json` 的落盘路径（**可能还不存在**：全默认时不写文件）。
+    pub path: String,
+    /// `~/.config/autostart/qsync.desktop` 路径。
+    pub autostart_path: String,
+    /// 该桌面项此刻是否真的存在（「开机自启」是否已生效）。
+    pub autostart_present: bool,
+    /// 本次 save 是否真的写了文件。
+    pub saved: bool,
+    /// 环境里的代理变量（「自动检测」实际会读到什么，如实展示）。
+    pub proxy_env: BTreeMap<String, String>,
+    /// `manual` 代理解析出来的 URL（诊断用；无 = None）。
+    pub proxy_url: Option<String>,
+    /// 一句话说明（例如「改了 peer_listen 需要重启 daemon」）。
+    pub note: Option<String>,
+}
+
+/// ★ M8.4：待裁决队列里的一条冲突。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DecisionInfo {
+    /// 稳定 id（路径 + 首次发现时间）。
+    pub id: String,
+    /// 远端绝对路径（冲突的那个文件）。
+    pub path: String,
+    /// 属于哪个任务（事件里带的 task id；缺省 `default`）。
+    pub task_id: String,
+    /// 本地签名（大小 / mtime），裁决时给人看的。
+    pub local_size: u64,
+    pub local_mtime: i64,
+    /// 远端签名。
+    pub remote_size: u64,
+    pub remote_mtime: i64,
+    pub is_dir: bool,
+    /// 首次发现时间（unix 秒）。
+    pub created_unix: i64,
+    /// `None` = 还没裁决；否则是 `keep_local` / `keep_remote` / `keep_both`。
+    pub resolution: Option<String>,
+}
+
+/// ★ M8.4：一条文件的三态（对齐 Qsync 的 Online-only / Locally available / Always available）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpaceState {
+    /// 仅在线（占位符，没有任何本地内容）。
+    Online,
+    /// 本地可用（部分或全部内容已在本地缓存，但没有 pin）。
+    Local,
+    /// 始终可用（`pin=pinned`，永不自动脱水）。
+    Always,
+}
+
+impl SpaceState {
+    /// GUI 文案（照抄 §1.7 术语表）。
+    pub fn label(self) -> &'static str {
+        match self {
+            SpaceState::Online => "仅在线",
+            SpaceState::Local => "本地可用",
+            SpaceState::Always => "始终可用",
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SpaceState::Online => "online",
+            SpaceState::Local => "local",
+            SpaceState::Always => "always",
+        }
+    }
+}
+
+/// ★ M8.4：`file_states` 里的一条。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FileStateInfo {
+    pub name: String,
+    /// 该条目的远端绝对路径。
+    pub remote: String,
+    pub is_dir: bool,
+    pub size: u64,
+    /// 本地已缓存字节数（0 = 仅在线）。
+    pub hydrated_bytes: u64,
+    /// `online` / `local` / `always`。
+    pub state: String,
+    /// 原始 pin 状态（`pinned` / `unpinned` / `unspecified` / `excluded`）。
+    pub pin: String,
+    /// 是否本地有未上传改动（界面上要区别对待）。
+    pub dirty: bool,
+    /// 该条目是否被规则隐藏（隐藏的不该出现在三态列里，这里只是兜底信息）。
+    pub hidden: bool,
+}
+
+/// ★ M8.4：`file_states` 的返回。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FileStatesData {
+    pub path: String,
+    /// 命中的挂载点；没挂载时为 None（此时 `entries` 为空）。
+    pub mountpoint: Option<String>,
+    /// 命中的远端根。
+    pub root: Option<String>,
+    pub entries: Vec<FileStateInfo>,
+    /// 汇总（验收脚本直接断言这三个数）。
+    pub online: usize,
+    pub local: usize,
+    pub always: usize,
+    pub note: Option<String>,
+}
+
+/// ★ M8.4：`space` 的返回（设置 →「释放空间」页 + `qsync space`）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SpaceData {
+    /// 量的哪个路径（缓存目录所在文件系统）。
+    pub fs_path: String,
+    pub fs_total: u64,
+    pub fs_avail: u64,
+    pub fs_free: u64,
+    pub fs_avail_pct: u8,
+    /// 缓存当前占用字节。
+    pub cache_used_bytes: u64,
+    /// 设置里的自动释放策略。
+    pub auto: bool,
+    pub mode: String,
+    pub below_pct: u8,
+    pub every_hours: u64,
+    /// 按现在的空间/时间，这一轮**会不会**触发（判定结果，纯函数算出来的）。
+    pub would_run: bool,
+    pub reason: String,
+    /// 上一次触发时间（unix 秒；0 = 从未）。
+    pub last_run_unix: u64,
+    /// 是否在用 `QSYNC_TEST_FAKE_STATVFS` 注入值（验收要能看见这一点）。
+    pub injected: bool,
+    /// `now=true` 时是否真的跑了。
+    pub ran: bool,
+    pub dehydrated: u64,
+    pub freed_bytes: u64,
+    /// 被安全检查链挡下的项（(`路径`, 原因)）—— **自动释放也不例外**。
+    pub blocked: Vec<(String, String)>,
+    pub note: Option<String>,
+}
+
+/// ★ M8.4：`decisions` 的返回。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DecisionsData {
+    pub action: String,
+    /// 全部待裁决项（含已裁决待执行）。
+    pub decisions: Vec<DecisionInfo>,
+    /// 尚未裁决的条数。
+    pub pending: usize,
+    /// 已裁决待执行的条数。
+    pub resolved: usize,
+    /// `clear` 删掉了多少条。
+    pub removed: usize,
+    pub note: Option<String>,
+}
+
 /// sid 掩码（诊断用，绝不回传完整值）。
 pub fn mask_sid(sid: &str) -> String {
     let head: String = sid.chars().take(4).collect();
@@ -786,6 +1103,9 @@ mod tests {
             read_write: Some(false),
             delete_limit: Some(0),
             cache_mode: Some("direct".into()),
+            task: Some("t1".into()),
+            save_task: None,
+            conflict: Some("ask".into()),
         });
         let line = encode_line(&e).unwrap();
         let back: RequestEnvelope = decode_line(&line).unwrap();

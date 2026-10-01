@@ -8,11 +8,16 @@ use qxync_client::{Client, Session};
 use qxync_core::dehydrate::{Block, CacheLimit, Policy};
 use qxync_core::ipc::{
     decode_line, encode_line, mask_sid, mask_token, CacheInfo, CursorInfo, DaemonInfo, DehydrateData,
-    ErrorKind, GetData, HydroStats, IpcError, LinkInfo, LoginData, LsData, MountInfo, PeerData,
+    DecisionsData, DecisionInfo, ErrorKind, FileStateInfo, FileStatesData, GetData, HydroStats,
+    IpcError, LinkInfo, LoginData, LsData, MountInfo, PeerData,
     PingData, PutData, Request, RequestEnvelope, Response, RootInfo, RootsData, RulesData,
-    ServerInfo, SessionInfo, ShutdownData, StatusData, StoreData, SyncCursors, SyncInfo, IPC_VERSION,
+    JournalData, ServerInfo, SessionInfo, SettingsData, ShutdownData, StatusData, StoreData,
+    SpaceData, SyncCursors, SyncInfo, TaskInfo, TasksData, IPC_VERSION,
 };
 use qxync_core::rules::Rules;
+use qxync_core::settings::{ProxySpec, Settings};
+use qxync_core::store::JournalEntry;
+use qxync_core::tasks::{conflict_label, has_any_task, Task, CONFLICT_RENAME_LOCAL};
 use qxync_core::{ConfigPaths, Credentials, Error as CoreError, LinkConfig, PeerConfig, HOME_ROOT};
 use qxync_fuse::upload::UploadQueue;
 use qxync_fuse::{CacheMode, FsHandle, HydroCounters, LocalView, MountHandle, PinMap, QxyncFs};
@@ -28,10 +33,29 @@ use tokio::sync::{mpsc, Mutex, Notify};
 use crate::peer_host::PeerHost;
 use crate::sync::{self, MountView, SyncConfig, SyncState, SyncStats};
 
+/// ★ M8.3：journal 的保留上限（**必须有**：同步日志是无限增长型数据，
+/// 不加约束会把 `sync.db` 撑大）。默认 1 万条 / 30 天，环境变量可调。
+fn journal_max_rows() -> i64 {
+    std::env::var("QSYNC_JOURNAL_MAX_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(10_000)
+}
+fn journal_max_age_days() -> i64 {
+    std::env::var("QSYNC_JOURNAL_MAX_AGE_DAYS").ok().and_then(|v| v.parse().ok()).unwrap_or(30)
+}
+/// 轮转间隔秒数（默认 300；验收里调成 1 用来快速观察）。
+fn journal_trim_secs() -> u64 {
+    std::env::var("QSYNC_JOURNAL_TRIM_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(300).max(1)
+}
+
 pub struct Options {
     pub link_id: String,
     pub socket: PathBuf,
     pub auto_login: bool,
+    /// ★ M8.2：启动时恢复 `enabled=true` 的任务（显式开启，见 `--restore-tasks` / `QSYNC_TASK_RESTORE`）。
+    ///
+    /// **默认关闭**是刻意的：任务恢复会「凭空挂载」，如果默认打开，
+    /// 上一次跑崩留下的挂载会在下一次 daemon 启动时复活，把验收矩阵的前提打乱
+    /// （`fuse-matrix.sh` 依赖「开跑前环境是干净的」）。GUI 自己拉起 daemon 时会显式打开。
+    pub restore_tasks: bool,
 }
 
 pub(crate) struct MountEntry {
@@ -47,6 +71,8 @@ pub(crate) struct MountEntry {
     pub(crate) handle: FsHandle,
     /// ★ M3：缓存模式（pagecache / direct）。
     cache_mode: CacheMode,
+    /// ★ M8.4：该挂载点的冲突策略（同步引擎按它分派冲突）。
+    conflict: String,
 }
 
 pub(crate) struct State {
@@ -82,6 +108,17 @@ pub(crate) struct State {
     peer: StdMutex<Option<Arc<PeerHost>>>,
     /// ★ M7：对端事件到达时唤醒轮询线程。
     peer_wake: Arc<Notify>,
+    /// ★ M8.3：journal 写入缓冲。热路径（同步轮 / 脱水）只往这里 push，
+    /// 由后台任务每 500ms 批量落库 —— **绝不在热路径上开事务写库**。
+    journal_buf: StdMutex<Vec<qxync_core::store::JournalEntry>>,
+    /// ★ M8.4：全局设置（`settings.json`）。挂载/登录时的代理、自动释放空间、
+    /// 通知开关都从这里取；**默认值 = M8.3 的行为**。
+    settings: StdMutex<qxync_core::settings::Settings>,
+    /// ★ M8.4：解析好的代理规格（启动时算一次；`settings_save` 后刷新）。
+    /// 记下来是为了 `status` 能如实报告「当前到底走不走代理」。
+    proxy: StdMutex<qxync_core::settings::ProxySpec>,
+    /// ★ M8.4：上一次「按频率释放空间」的触发时间（unix 秒）。
+    auto_free_last: Arc<AtomicU64>,
 }
 
 // ---------------------------------------------------------------- 入口
@@ -113,7 +150,34 @@ pub async fn run(opts: Options) -> Result<()> {
     )
     .ok();
 
-    let client = Client::new(&link)?;
+    // ★ M8.4：全局设置（代理 / 自动释放空间 / 通知）。
+    //   读不到就全默认（= M8.3 行为）：**设置文件坏了也不该让 daemon 起不来**。
+    let settings = Settings::load(&paths).unwrap_or_else(|e| {
+        tracing::warn!("读取 settings.json 失败，按默认设置运行: {e}");
+        Settings::default()
+    });
+    let proxy = match settings.proxy.resolve() {
+        Ok(p) => {
+            match &p {
+                ProxySpec::None => tracing::info!("代理：不使用（显式 no_proxy）"),
+                ProxySpec::Auto => tracing::info!(
+                    "代理：自动检测（环境变量 {:?}）",
+                    Settings::proxy_env().keys().collect::<Vec<_>>()
+                ),
+                ProxySpec::Manual { url, auth } => tracing::info!(
+                    "代理：手动 {url}（认证 {}）",
+                    if auth.is_some() { "开" } else { "关" }
+                ),
+            }
+            p
+        }
+        Err(e) => {
+            tracing::warn!("代理设置无效（连接时会失败）: {e}");
+            ProxySpec::Auto
+        }
+    };
+    // ★ M8.4：所有 HTTP 客户端都按设置里的代理构造
+    let client = Client::new_with_proxy(&link, Some(&settings.proxy))?;
     // ★ M2c：游标 + baseline 落在 <data>/sync/<host>/（不同 NAS 互不污染）
     let sync_dir = qxync_core::sync::sync_state_dir(&paths.data_dir, &link.host);
     let sync_store = SyncState::load(&sync_dir)
@@ -173,6 +237,10 @@ pub async fn run(opts: Options) -> Result<()> {
         peers: Arc::new(StdMutex::new(Vec::new())),
         peer: StdMutex::new(None),
         peer_wake: Arc::new(Notify::new()),
+        journal_buf: StdMutex::new(Vec::new()),
+        settings: StdMutex::new(settings),
+        proxy: StdMutex::new(proxy),
+        auto_free_last: Arc::new(AtomicU64::new(0)),
     });
 
     // ★ M7：LAN 对等主机（`link.peer_listen` 配了才真正监听；失败只告警不致命 ——
@@ -211,10 +279,31 @@ pub async fn run(opts: Options) -> Result<()> {
         }
     }
 
+    // ★ M8.3：journal 后台落库（批量 + 轮转）
+    spawn_journal_flusher(state.clone());
+
+    // ★ M8.2：恢复启用的任务（**显式开启才跑**，见 Options::restore_tasks）
+    if opts.restore_tasks {
+        let st = state.clone();
+        let lid = opts.link_id.clone();
+        tokio::spawn(async move {
+            // 给 socket/会话一点时间就绪：恢复要挂载，需要已登录
+            for _ in 0..40 {
+                if st.client.lock().await.sid().is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            restore_tasks_on_start(&st, &lid).await;
+        });
+    }
+
     // ★ M2c：后台轮询（三游标 + baseline 对账）；QSYNC_POLL_INTERVAL=0 可暂停
     spawn_poller(state.clone());
     // ★ M3：后台脱水（闲置 + 缓存限额）；QSYNC_DEHYDRATE_IDLE / QSYNC_CACHE_LIMIT 开启
     spawn_dehydrator(state.clone());
+    // ★ M8.4：自动释放空间（设置里的 `free_space`；默认关 → 不改变 M8.3 行为）
+    spawn_auto_free(state.clone());
 
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
     loop {
@@ -333,8 +422,35 @@ async fn dispatch(state: &Arc<State>, req: Request, shutdown: &mpsc::Sender<()>)
             read_write,
             delete_limit,
             cache_mode,
+            task,
+            save_task,
+            conflict,
         } => {
-            mount(
+            // ★ M8.2：只有显式要求（`task` 或 `save_task`）才登记任务；
+            //   默认不登记 → qsync CLI / 验收矩阵的行为与 M7 **一字不变**。
+            let want_task = save_task.unwrap_or(false) || task.is_some();
+            let reg = if want_task {
+                // ★ 缓存目录也要落进任务登记，否则「任务方式挂载」改不了缓存位置
+                Some(
+                    Task::from_mount(
+                        task.clone(),
+                        mountpoint.clone(),
+                        roots.clone().unwrap_or_default(),
+                        read_write.unwrap_or(false),
+                        cache_mode.clone(),
+                        threads,
+                        hydrate_timeout_secs,
+                        delete_limit,
+                        auto_unmount,
+                    )
+                    .with_cache_dir(cache_dir.clone())
+                    // ★ M8.4：登记任务时把冲突策略一起落盘
+                    .with_conflict(conflict.clone()),
+                )
+            } else {
+                None
+            };
+            let out = mount(
                 state,
                 mountpoint,
                 remote,
@@ -346,13 +462,50 @@ async fn dispatch(state: &Arc<State>, req: Request, shutdown: &mpsc::Sender<()>)
                 read_write.unwrap_or(false),
                 delete_limit,
                 cache_mode,
+                conflict.clone(),
             )
-            .await
+            .await;
+            // 挂载成功后才落盘登记：失败不该留下一条「指向不存在挂载」的任务
+            if out.is_ok() {
+                if let Some(mut t) = reg {
+                    match ConfigPaths::discover() {
+                        Ok(paths) => match t.save(&paths) {
+                            Ok(p) => tracing::info!("M8.2 任务已登记: {} → {}", t.id, p.display()),
+                            Err(e) => tracing::warn!("登记任务失败（挂载仍然有效）：{e}"),
+                        },
+                        Err(e) => tracing::warn!("登记任务失败（读配置目录）：{e}"),
+                    }
+                }
+            }
+            out
         }
-        Request::Umount { mountpoint } => umount(state, mountpoint).await,
+        Request::Umount { mountpoint } => {
+            let mp = mountpoint.clone();
+            let out = umount(state, mountpoint).await;
+            // 卸载成功 → 把对应任务标成停用（**只改登记，不动数据**）
+            if out.is_ok() {
+                if let Err(e) = disable_task_by_mountpoint(&mp) {
+                    tracing::warn!("更新任务登记失败（卸载已完成）：{e}");
+                }
+            }
+            out
+        }
         Request::Mounts => mounts(state),
         Request::Roots => roots_cmd(state).await,
         Request::Rules { match_path } => rules_cmd(state, match_path),
+        Request::Tasks { action, id, task } => tasks_cmd(state, &action, id, task).await,
+        Request::Journal { limit, since, query, level, clear } => {
+            journal_cmd(state, limit, since, query, level, clear)
+        }
+        Request::Settings => settings_cmd(state),
+        Request::SettingsSave { settings, autostart_exe } => {
+            settings_save_cmd(state, settings, autostart_exe)
+        }
+        Request::Decisions { action, id, resolution } => {
+            decisions_cmd(state, &action, id, resolution)
+        }
+        Request::FileStates { path } => file_states_cmd(state, path).await,
+        Request::Space { now } => space_cmd(state, now.unwrap_or(false)).await,
         Request::Peer {
             action,
             addr,
@@ -982,6 +1135,7 @@ async fn mount(
     read_write: bool,
     delete_limit: Option<usize>,
     cache_mode: Option<String>,
+    conflict: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
     ensure_session(state).await?;
     let sid = require_sid(state).await?;
@@ -1039,7 +1193,9 @@ async fn mount(
         .unwrap_or_else(|| HOME_ROOT.to_string());
 
     // 给 FUSE 一个独立 Client（只带 sid），避免和 daemon 主体抢同一把锁
-    let mut fuse_client = Client::new(&state.link).map_err(map_err)?;
+    // ★ M8.4：FUSE 的客户端也要走设置里的代理（否则挂载后水合直连、绕开代理）
+    let mut fuse_client = Client::new_with_proxy(&state.link, Some(&state.settings.lock().unwrap().proxy))
+        .map_err(map_err)?;
     fuse_client.set_sid(sid);
     let counters = Arc::new(HydroCounters::default());
     let fuse_client = Arc::new(fuse_client);
@@ -1135,6 +1291,10 @@ async fn mount(
         readonly: !read_write,
         roots: layout.roots(),
     };
+    // ★ M8.4：冲突策略（未知值落回默认；与 Task::normalize 同一套判定）
+    let conflict = conflict
+        .filter(|c| qxync_core::tasks::CONFLICTS.contains(&c.as_str()))
+        .unwrap_or_else(|| CONFLICT_RENAME_LOCAL.to_string());
     state.mounts.lock().unwrap().insert(
         mp.clone(),
         MountEntry {
@@ -1145,14 +1305,16 @@ async fn mount(
             upload: upload_queue,
             handle,
             cache_mode: mode,
+            conflict: conflict.clone(),
         },
     );
     tracing::info!(
-        "已挂载 {} -> {}（{} 线程，auto_unmount={auto_unmount}，cache_mode={}，{}）",
+        "已挂载 {} -> {}（{} 线程，auto_unmount={auto_unmount}，cache_mode={}，冲突策略={}，{}）",
         mp.display(),
         info.roots.join(", "),
         threads,
         mode.as_str(),
+        conflict_label(&conflict),
         if layout.is_multi() {
             "多根视图"
         } else {
@@ -1335,7 +1497,8 @@ async fn engine_client(state: &Arc<State>) -> Result<Arc<Client>, IpcError> {
         .map(|c| c.sid() != Some(sid.as_str()))
         .unwrap_or(true);
     if stale {
-        let mut c = Client::new(&state.link).map_err(map_err)?;
+        let mut c = Client::new_with_proxy(&state.link, Some(&state.settings.lock().unwrap().proxy))
+            .map_err(map_err)?;
         c.set_sid(sid);
         *g = Some(Arc::new(c));
     }
@@ -1363,6 +1526,7 @@ fn build_views(state: &Arc<State>) -> Vec<MountView> {
                 upload: m.upload.clone(),
                 read_only: m.info.readonly,
                 rules: state.rules.clone(),
+                conflict: m.conflict.clone(),
             });
         }
     }
@@ -1384,6 +1548,9 @@ async fn run_sync_once(state: &Arc<State>) -> Result<sync::SyncReport, IpcError>
         &user,
     )
     .await;
+    // ★ M8.3：把这一轮的结论写进 journal（界面「文件更新中心 / 错误列表」的数据来源）。
+    //   只 push 到内存缓冲，落库交给后台批量任务 —— 这里位于轮询热路径上。
+    journal_record_sync(state, &report);
     // `--force-deletes` 只放行一轮
     {
         let mut c = state.sync_cfg.lock().unwrap();
@@ -1940,7 +2107,807 @@ fn spawn_dehydrator(state: Arc<State>) {
                     out.freed_bytes,
                     out.used_bytes
                 );
+                journal_log(
+                    &state,
+                    JournalEntry::ok(
+                        "dehydrate",
+                        "",
+                        format!("自动释放空间：脱水 {} 个文件 / 释放 {} 字节", out.dehydrated, out.freed_bytes),
+                    )
+                    .with_bytes(out.freed_bytes as i64),
+                );
             }
         }
     });
+}
+
+// ---------------------------------------------------------------- ★ M8.2 同步任务
+
+fn core_err(e: impl std::fmt::Display) -> IpcError {
+    IpcError::new(ErrorKind::Io, e.to_string())
+}
+
+fn bad_req(msg: impl Into<String>) -> IpcError {
+    IpcError::new(ErrorKind::BadRequest, msg.into())
+}
+
+/// 把落盘的任务与「此刻是否真的挂着」拼起来。
+fn task_info_join(state: &Arc<State>, task: Task) -> TaskInfo {
+    let mounted = {
+        let g = state.mounts.lock().unwrap();
+        g.keys().any(|k| k == &task.mountpoint)
+    };
+    TaskInfo {
+        task,
+        mounted,
+        last_error: None,
+    }
+}
+
+/// 卸载成功后把对应的任务标成停用（**只改登记，不动挂载点里的数据**）。
+fn disable_task_by_mountpoint(mp: &Path) -> Result<(), String> {
+    let paths = ConfigPaths::discover().map_err(|e| e.to_string())?;
+    let (list, _) = Task::list(&paths);
+    let want = std::fs::canonicalize(mp).unwrap_or_else(|_| mp.to_path_buf());
+    for mut t in list {
+        let cand = std::fs::canonicalize(&t.mountpoint).unwrap_or_else(|_| t.mountpoint.clone());
+        if cand == want && t.enabled {
+            t.enabled = false;
+            t.save(&paths).map_err(|e| e.to_string())?;
+            tracing::info!("M8.2 任务已停用: {}（挂载点 {}）", t.id, mp.display());
+        }
+    }
+    Ok(())
+}
+
+/// 按任务登记的参数挂载（**复用既有 `mount()` 路径，不改 FUSE**）。
+async fn mount_task(state: &Arc<State>, t: &Task) -> Result<serde_json::Value, IpcError> {
+    std::fs::create_dir_all(&t.mountpoint)
+        .map_err(|e| core_err(format!("建挂载点 {} 失败: {e}", t.mountpoint.display())))?;
+    let roots = if t.roots.is_empty() {
+        None
+    } else {
+        Some(t.roots.clone())
+    };
+    let remote = roots.as_ref().and_then(|r| r.first().cloned());
+    mount(
+        state,
+        t.mountpoint.clone(),
+        remote,
+        roots,
+        // ★ 任务里的缓存目录（None = 默认 $XDG_DATA_HOME/qsync/cache）
+        t.cache_dir.clone(),
+        t.threads.unwrap_or(4),
+        t.auto_unmount,
+        Duration::from_secs(t.hydrate_timeout_secs.unwrap_or(60)),
+        t.read_write,
+        t.delete_limit,
+        Some(t.cache_mode.clone()),
+        // ★ M8.4：任务上的冲突策略（5 选项）
+        Some(t.conflict.clone()),
+    )
+    .await
+}
+
+/// `Request::Tasks` 的实现。
+async fn tasks_cmd(
+    state: &Arc<State>,
+    action: &str,
+    id: Option<String>,
+    task: Option<Task>,
+) -> Result<serde_json::Value, IpcError> {
+    let paths = ConfigPaths::discover().map_err(core_err)?;
+    match action {
+        "list" => {
+            let (list, bad) = Task::list(&paths);
+            let infos: Vec<TaskInfo> = list.into_iter().map(|t| task_info_join(state, t)).collect();
+            let empty = !has_any_task(&paths);
+            let data = TasksData {
+                tasks: infos,
+                bad_files: bad
+                    .into_iter()
+                    .map(|(p, e)| (p.display().to_string(), e))
+                    .collect(),
+                empty,
+                note: Some(if empty {
+                    "还没有登记过任务；`mount` 时带 task/save_task 即可登记".into()
+                } else {
+                    "任务登记在 ~/.config/qsync/tasks/<id>.json；删除登记不会动挂载点里的数据".into()
+                }),
+            };
+            to_value(data)
+        }
+        "get" => {
+            let id = id.ok_or_else(|| bad_req("get 需要 id"))?;
+            let t = Task::load(&paths, &id).map_err(core_err)?;
+            to_value(task_info_join(state, t))
+        }
+        "save" => {
+            let mut t = task.ok_or_else(|| bad_req("save 需要 task"))?;
+            t.normalize().map_err(core_err)?;
+            let p = t.save(&paths).map_err(core_err)?;
+            to_value(serde_json::json!({
+                "saved": true,
+                "path": p.display().to_string(),
+                "task": t,
+            }))
+        }
+        "delete" => {
+            let id = id.ok_or_else(|| bad_req("delete 需要 id"))?;
+            let existed = Task::delete(&paths, &id).map_err(core_err)?;
+            // ⚠️ 只删登记；挂载点里的文件、缓存、baseline 一律不动
+            to_value(serde_json::json!({
+                "deleted": existed,
+                "id": id,
+                "note": "只删任务登记，未改动挂载点里的任何数据",
+            }))
+        }
+        "pause" => {
+            let id = id.ok_or_else(|| bad_req("pause 需要 id"))?;
+            let mut t = Task::load(&paths, &id).map_err(core_err)?;
+            t.enabled = false;
+            t.save(&paths).map_err(core_err)?;
+            // 语义（见 docs/M8 §M8.2）：暂停 = 停用登记 + **卸载该挂载点**。
+            // 已入队的上传在 umount 里会被排空（不丢改动）；其它任务完全不受影响。
+            let mp = t.mountpoint.clone();
+            let mounted = state.mounts.lock().unwrap().contains_key(
+                &std::fs::canonicalize(&mp).unwrap_or_else(|_| mp.clone()),
+            );
+            let mut unmounted = false;
+            if mounted {
+                umount(state, mp.clone()).await?;
+                unmounted = true;
+            }
+            to_value(serde_json::json!({
+                "id": id, "enabled": false, "unmounted": unmounted,
+                "note": "暂停 = 停用登记并卸载该挂载点；已入队的上传会先排空",
+            }))
+        }
+        "resume" => {
+            let id = id.ok_or_else(|| bad_req("resume 需要 id"))?;
+            let mut t = Task::load(&paths, &id).map_err(core_err)?;
+            t.enabled = true;
+            t.save(&paths).map_err(core_err)?;
+            let mounted = state.mounts.lock().unwrap().contains_key(
+                &std::fs::canonicalize(&t.mountpoint).unwrap_or_else(|_| t.mountpoint.clone()),
+            );
+            let mut m = serde_json::Value::Null;
+            if !mounted {
+                m = mount_task(state, &t).await?;
+            }
+            to_value(serde_json::json!({
+                "id": id, "enabled": true, "remounted": !mounted, "mount": m,
+            }))
+        }
+        "mount" => {
+            let id = id.ok_or_else(|| bad_req("mount 需要 id"))?;
+            let t = Task::load(&paths, &id).map_err(core_err)?;
+            let m = mount_task(state, &t).await?;
+            to_value(serde_json::json!({ "id": id, "mount": m }))
+        }
+        other => Err(bad_req(format!(
+            "未知的 tasks action: {other:?}（可用 list/get/save/delete/pause/resume/mount）"
+        ))),
+    }
+}
+
+/// ★ M8.2：daemon 启动时恢复 `enabled=true` 的任务。
+///
+/// **只有显式开启才跑**（`--restore-tasks` / `QSYNC_TASK_RESTORE=1`）：
+/// 任务恢复会「凭空挂载」，默认打开会让上一次跑崩留下的挂载在重启时复活，
+/// 把验收矩阵的前提（开跑前环境干净）打乱。
+pub(crate) async fn restore_tasks_on_start(state: &Arc<State>, link_id: &str) {
+    let paths = match ConfigPaths::discover() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("恢复任务：读配置目录失败 {e}");
+            return;
+        }
+    };
+    let (list, bad) = Task::list(&paths);
+    for (p, e) in &bad {
+        tracing::warn!("任务文件解析失败，已跳过 {}: {e}", p.display());
+    }
+    let todo: Vec<Task> = list.into_iter().filter(|t| t.enabled).collect();
+    if todo.is_empty() {
+        tracing::info!("恢复任务：没有启用的任务（link={link_id}）");
+        return;
+    }
+    tracing::info!("恢复任务：{} 个启用的任务待恢复", todo.len());
+    for t in todo {
+        match mount_task(state, &t).await {
+            Ok(_) => tracing::info!("恢复任务成功: {} → {}", t.id, t.mountpoint.display()),
+            Err(e) => tracing::warn!(
+                "恢复任务失败（跳过，不影响其它任务）: {} → {}: {}",
+                t.id,
+                t.mountpoint.display(),
+                e.message
+            ),
+        }
+    }
+}
+
+// ---------------------------------------------------------------- ★ M8.3 同步日志
+
+/// 往 journal 缓冲区塞一条（**非阻塞、不写库**）。
+fn journal_log(state: &Arc<State>, e: JournalEntry) {
+    let mut b = state.journal_buf.lock().unwrap();
+    // 极端情况下（库一直写不进去）也不许无限吃内存
+    if b.len() < 50_000 {
+        b.push(e);
+    }
+}
+
+/// 把一轮同步的结论翻译成 journal 条目。
+///
+/// 刻意**只记有内容的项**：一轮什么都没发生的轮询不写日志，否则日志会被噪声淹没
+/// （默认 30 秒一轮 = 一天 2880 条空记录）。
+fn journal_record_sync(state: &Arc<State>, r: &sync::SyncReport) {
+    let mut n = 0usize;
+    if r.events > 0 {
+        journal_log(state, JournalEntry::ok(
+            "remote_change", "", format!("拉到 {} 条事件（跳过 {} 条）", r.events, r.events_skipped)));
+        n += 1;
+    }
+    if r.refreshed > 0 {
+        journal_log(state, JournalEntry::ok(
+            "remote_change", "", format!("远端改动刷新本地元数据 {} 项", r.refreshed)));
+        n += 1;
+    }
+    if r.uploaded > 0 {
+        journal_log(state, JournalEntry::ok(
+            "upload", "", format!("本地改动上传回 NAS {} 项", r.uploaded)));
+        n += 1;
+    }
+    if r.conflicts > 0 {
+        journal_log(state, JournalEntry::ok(
+            "conflict", "", format!("双方都改 → 生成 {} 个冲突副本", r.conflicts)));
+        n += 1;
+    }
+    if r.deleted > 0 {
+        journal_log(state, JournalEntry::ok(
+            "delete", "", format!("按对账结果删除本地/远端条目 {} 项", r.deleted)));
+        n += 1;
+    }
+    if r.deletes_blocked > 0 {
+        journal_log(state, JournalEntry::blocked(
+            "delete", "", format!("{} 项删除被熔断挡住（`qsync sync --once --force-deletes` 可放行一轮）",
+                r.deletes_blocked)));
+        n += 1;
+    }
+    for e in &r.errors {
+        journal_log(state, JournalEntry::error("sync", "", e.clone()));
+        n += 1;
+    }
+    if n == 0 && r.dirs_scanned > 0 {
+        // 扫过但没变化：记一条很轻的，方便「更新中心」看出引擎活着
+        journal_log(state, JournalEntry::ok(
+            "scan", "", format!("对账完成：扫描 {} 个目录，无变化", r.dirs_scanned)));
+    }
+}
+
+/// 后台批量落库 + 轮转。
+fn spawn_journal_flusher(state: Arc<State>) {
+    tokio::spawn(async move {
+        let max_rows = journal_max_rows();
+        let max_age = journal_max_age_days();
+        let trim_secs = journal_trim_secs();
+        tracing::info!(
+            "同步日志（journal）已启动：上限 {max_rows} 条 / {max_age} 天，每 {trim_secs}s 轮转一次"
+        );
+        let mut last_trim = Instant::now() - Duration::from_secs(trim_secs + 1);
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let batch: Vec<JournalEntry> = {
+                let mut b = state.journal_buf.lock().unwrap();
+                if b.is_empty() { Vec::new() } else { std::mem::take(&mut *b) }
+            };
+            if !batch.is_empty() {
+                let g = state.sync_store.lock().unwrap();
+                if let Err(e) = g.store.journal_add_batch(&batch) {
+                    tracing::warn!("journal 落库失败（丢弃 {} 条）: {e}", batch.len());
+                }
+            }
+            // 周期性轮转（默认 300s，QSYNC_JOURNAL_TRIM_SECS 可调）
+            if last_trim.elapsed() >= Duration::from_secs(trim_secs) {
+                last_trim = Instant::now();
+                let g = state.sync_store.lock().unwrap();
+                match g.store.journal_trim(max_rows, max_age) {
+                    Ok(0) => {}
+                    Ok(n) => tracing::debug!("journal 轮转：删除 {n} 条"),
+                    Err(e) => tracing::warn!("journal 轮转失败: {e}"),
+                }
+            }
+        }
+    });
+}
+
+/// `Request::Journal`：查 / 清空。
+fn journal_cmd(
+    state: &Arc<State>,
+    limit: Option<usize>,
+    since: Option<i64>,
+    query: Option<String>,
+    level: Option<String>,
+    clear: Option<bool>,
+) -> Result<serde_json::Value, IpcError> {
+    let max_rows = journal_max_rows();
+    let max_age = journal_max_age_days();
+    let g = state.sync_store.lock().unwrap();
+    let mut removed = 0usize;
+    let cleared = clear.unwrap_or(false);
+    if cleared {
+        removed = g.store.journal_clear().map_err(core_err)?;
+        tracing::info!("journal 已清空（{removed} 条）");
+    }
+    let lvl = level.unwrap_or_else(|| "all".into());
+    let entries = g
+        .store
+        .journal_list(
+            limit.unwrap_or(200),
+            since,
+            query.as_deref(),
+            if lvl == "all" { None } else { Some(lvl.as_str()) },
+        )
+        .map_err(core_err)?;
+    let total = g.store.journal_count().map_err(core_err)?;
+    let counts = g.store.journal_counts().map_err(core_err)?;
+    to_value(JournalData {
+        entries,
+        total,
+        counts,
+        cleared,
+        removed,
+        limit_rows: max_rows,
+        max_age_days: max_age,
+        note: Some(format!(
+            "日志只保留最近 {max_rows} 条 / {max_age} 天（QSYNC_JOURNAL_MAX_ROWS / _MAX_AGE_DAYS 可调）；清空日志不影响同步状态"
+        )),
+    })
+}
+
+// ================================================================ ★ M8.4
+// 设置中心 / 冲突待裁决队列 / 文件三态 / 自动释放空间
+
+/// 拼一个状态快照（`settings` 与 `settings_save` 共用）。
+fn settings_data(state: &Arc<State>, saved: bool, note: Option<String>) -> SettingsData {
+    let paths = ConfigPaths::discover().ok();
+    let s = state.settings.lock().unwrap().clone();
+    let proxy = state.proxy.lock().unwrap().clone();
+    SettingsData {
+        path: paths
+            .as_ref()
+            .map(|p| Settings::file(p).display().to_string())
+            .unwrap_or_default(),
+        autostart_path: paths
+            .as_ref()
+            .map(|p| Settings::autostart_file(p).display().to_string())
+            .unwrap_or_default(),
+        autostart_present: paths.as_ref().map(Settings::autostart_present).unwrap_or(false),
+        saved,
+        proxy_env: Settings::proxy_env(),
+        proxy_url: match &proxy {
+            ProxySpec::Manual { url, .. } => Some(url.clone()),
+            _ => None,
+        },
+        note,
+        settings: s,
+    }
+}
+
+/// `Request::Settings`：只读当前设置。
+fn settings_cmd(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
+    to_value(settings_data(
+        state,
+        false,
+        Some("settings.json 不存在时一切取默认值（代理=自动检测、不自动释放、不开机自启）".into()),
+    ))
+}
+
+/// `Request::SettingsSave`：归一化 → 校验 → 落盘 → 刷新内存态（含 autostart 桌面项）。
+fn settings_save_cmd(
+    state: &Arc<State>,
+    mut s: Settings,
+    autostart_exe: Option<String>,
+) -> Result<serde_json::Value, IpcError> {
+    s.normalize();
+    // 手动代理缺服务器/缺用户名 → **明确报错**，不静默退回直连
+    let proxy = s.proxy.resolve().map_err(|e| bad_req(e.to_string()))?;
+    let paths = ConfigPaths::discover().map_err(core_err)?;
+
+    // 开机自启：只有真要用的时候才需要可执行文件路径
+    let mut autostart_written = false;
+    if s.launch_at_startup || autostart_exe.is_some() {
+        let exe = match autostart_exe.clone().map(PathBuf::from).or_else(default_gui_exe) {
+            Some(e) => e,
+            None => {
+                return Err(bad_req(
+                    "开机自启需要 qxync-gui 的绝对路径：没传 autostart_exe，\
+                     同目录下也没找到 qxync-gui（CLI 可显式传 GUI 路径）",
+                ))
+            }
+        };
+        s.apply_autostart(&paths, &exe).map_err(core_err)?;
+        autostart_written = s.launch_at_startup;
+    } else {
+        // 关掉自启：把桌面项删掉（不存在也算成功）
+        s.apply_autostart(&paths, &PathBuf::from("qxync-gui")).map_err(core_err)?;
+    }
+    let saved_path = s.save(&paths).map_err(core_err)?;
+    *state.settings.lock().unwrap() = s.clone();
+    *state.proxy.lock().unwrap() = proxy;
+    journal_log(
+        state,
+        JournalEntry::ok(
+            "settings",
+            "",
+            format!(
+                "设置已保存：代理={}，自动释放={}，开机自启={}，通知={}",
+                s.proxy.mode,
+                if s.free_space.auto { "开" } else { "关" },
+                if s.launch_at_startup { "开" } else { "关" },
+                if s.desktop_notifications { "开" } else { "关" }
+            ),
+        ),
+    );
+    tracing::info!("M8.4 设置已保存: {}", saved_path.display());
+    to_value(settings_data(
+        state,
+        true,
+        Some(if autostart_written {
+            "开机自启已写入 autostart 桌面项；代理改动手动模式后，已在跑的水合客户端要等下次挂载才生效".into()
+        } else {
+            "设置已落盘（代理改动对手动建立的连接要等下次挂载；LAN 监听地址改动要重启 daemon）".into()
+        }),
+    ))
+}
+
+/// 找 GUI 可执行文件：优先与当前进程同目录的 `qxync-gui`。
+fn default_gui_exe() -> Option<PathBuf> {
+    let cur = std::env::current_exe().ok()?;
+    let cand = cur.parent()?.join("qxync-gui");
+    cand.is_file().then_some(cand)
+}
+
+/// `Request::Decisions`：冲突待裁决队列。
+fn decisions_cmd(
+    state: &Arc<State>,
+    action: &str,
+    id: Option<String>,
+    resolution: Option<String>,
+) -> Result<serde_json::Value, IpcError> {
+    let mut removed = 0usize;
+    {
+        let g = state.sync_store.lock().unwrap();
+        match action {
+            "list" => {}
+            "resolve" => {
+                let id = id.ok_or_else(|| bad_req("resolve 需要 id"))?;
+                let res = resolution.unwrap_or_default();
+                if !matches!(res.as_str(), "keep_local" | "keep_remote" | "keep_both") {
+                    return Err(bad_req(format!(
+                        "resolution 只能是 keep_local / keep_remote / keep_both，收到 {res:?}"
+                    )));
+                }
+                if !g.store.decision_resolve(&id, Some(&res)).map_err(core_err)? {
+                    return Err(IpcError::new(ErrorKind::BadRequest, format!("没有这条待裁决：{id}")));
+                }
+                journal_log(
+                    state,
+                    JournalEntry::ok("conflict", "", format!("用户裁决冲突 {id} → {res}（下一轮同步执行）")),
+                );
+            }
+            "clear" => {
+                removed = g.store.decisions_clear().map_err(core_err)?;
+                journal_log(
+                    state,
+                    JournalEntry::ok("conflict", "", format!("清空冲突待裁决队列（{removed} 条，未动文件）")),
+                );
+            }
+            other => return Err(bad_req(format!("未知 action {other:?}"))),
+        }
+    }
+    let g = state.sync_store.lock().unwrap();
+    let rows = g.store.decisions().map_err(core_err)?;
+    let decisions: Vec<DecisionInfo> = rows
+        .iter()
+        .map(|r| DecisionInfo {
+            id: r.id.clone(),
+            path: r.path.clone(),
+            task_id: r.task_id.clone(),
+            local_size: r.local_size,
+            local_mtime: r.local_mtime,
+            remote_size: r.remote_size,
+            remote_mtime: r.remote_mtime,
+            is_dir: r.is_dir,
+            created_unix: r.created_unix,
+            resolution: r.resolution.clone(),
+        })
+        .collect();
+    let pending = decisions.iter().filter(|d| d.resolution.is_none()).count();
+    let resolved = decisions.len() - pending;
+    to_value(DecisionsData {
+        action: action.to_string(),
+        decisions,
+        pending,
+        resolved,
+        removed,
+        note: Some(
+            "「每个文件都问我」的冲突会停在这里：文件两边都不动，裁决后由下一轮同步执行".into(),
+        ),
+    })
+}
+
+/// `Request::FileStates`：目录里每个条目的三态（仅在线 / 本地可用 / 始终可用）。
+async fn file_states_cmd(state: &Arc<State>, path: String) -> Result<serde_json::Value, IpcError> {
+    // 该目录属于哪个挂载点/远端根？没有挂载就没有本地缓存可谈。
+    let hit = {
+        let g = state.mounts.lock().unwrap();
+        g.values().find_map(|m| {
+            let roots: Vec<String> = if m.info.roots.is_empty() {
+                vec![m.info.remote.clone()]
+            } else {
+                m.info.roots.clone()
+            };
+            roots
+                .iter()
+                .find(|r| {
+                    let r = r.trim_end_matches('/');
+                    path == r || path.starts_with(&format!("{r}/"))
+                })
+                .map(|r| (m.handle.clone(), r.clone(), m.info.mountpoint.clone()))
+        })
+    };
+    let Some((handle, root, mp)) = hit else {
+        return to_value(FileStatesData {
+            path,
+            note: Some("该目录不在任何挂载点下：三态（本地缓存情况）只有挂载后才算得出来".into()),
+            ..Default::default()
+        });
+    };
+    ensure_session(state).await?;
+    let dir = path.trim_end_matches('/').to_string();
+    let entries = with_client!(state, |c| c.list(&dir))?;
+    let mut out = Vec::new();
+    let (mut online, mut local, mut always) = (0usize, 0usize, 0usize);
+    for e in entries {
+        let remote = format!("{}/{}", dir, e.filename);
+        let cand = handle.candidate(&remote);
+        let pin = cand
+            .as_ref()
+            .map(|c| c.pin.clone())
+            .unwrap_or_else(|| "unspecified".into());
+        let hydrated_bytes = cand.as_ref().map(|c| c.hydrated_bytes).unwrap_or(0);
+        let dirty = cand.as_ref().map(|c| c.dirty).unwrap_or(false);
+        let state_str = if pin == "pinned" {
+            always += 1;
+            "always"
+        } else if !e.isfolder && hydrated_bytes > 0 {
+            local += 1;
+            "local"
+        } else {
+            online += 1;
+            "online"
+        };
+        out.push(FileStateInfo {
+            name: e.filename.clone(),
+            remote,
+            is_dir: e.isfolder,
+            size: e.filesize,
+            hydrated_bytes,
+            state: state_str.to_string(),
+            pin,
+            dirty,
+            hidden: handle.hidden(&format!("{}/{}", dir, e.filename), e.isfolder).is_some(),
+        });
+    }
+    to_value(FileStatesData {
+        path: dir,
+        mountpoint: Some(mp.display().to_string()),
+        root: Some(root),
+        entries: out,
+        online,
+        local,
+        always,
+        note: Some("仅在线 ← 无本地内容；本地可用 ← 已缓存部分/全部；始终可用 ← pin=pinned".into()),
+    })
+}
+
+/// 量空间用的路径：`statvfs` 只关心**文件系统**，所以目录还不存在时沿父目录往上找第一个存在的。
+///
+/// 为什么需要：刚装好、还没挂载过任何任务时缓存目录并不存在，
+/// 直接 `statvfs` 会 `ENOENT` —— 那会让「释放空间」页与自动释放任务一起失效（踩过）。
+fn space_probe_path(dir: &std::path::Path) -> PathBuf {
+    let mut cur = dir.to_path_buf();
+    loop {
+        if cur.exists() {
+            return cur;
+        }
+        match cur.parent() {
+            Some(p) if p != cur => cur = p.to_path_buf(),
+            _ => return PathBuf::from("/"),
+        }
+    }
+}
+
+/// 自动释放的「刚访问过」保护窗口秒数（默认 300；`QSYNC_AUTO_FREE_RECENT` 只在验收里调）。
+fn auto_free_recent_secs() -> u64 {
+    std::env::var("QSYNC_AUTO_FREE_RECENT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300)
+}
+
+/// ★ M8.4：自动释放空间的后台任务。
+///
+/// **与手动脱水走同一条路**（`run_dehydrate_with_recent`）—— 也就是说 M3 的安全检查链
+/// （dirty / pending / pinned / excluded / open / mapped / in-flight）一个都没绕过。
+/// 本函数只负责：量空间 → 判定该不该跑 → 把判定翻译成一次脱水调用。
+fn spawn_auto_free(state: Arc<State>) {
+    let interval = std::env::var("QSYNC_AUTO_FREE_INTERVAL")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(60)
+        .clamp(1, 3600);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(interval)).await;
+            let cfg = state.settings.lock().unwrap().free_space.clone();
+            if !cfg.auto {
+                continue;
+            }
+            let dir = space_probe_path(&first_cache_dir(&state));
+            let space = match qxync_core::freespace::probe(&dir) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("自动释放空间：量 {} 失败: {e}", dir.display());
+                    continue;
+                }
+            };
+            let used = cache_info(&state).used_bytes;
+            // 「按频率」也必须留出耐心值：绝不允许 idle=0 变成「把所有能脱的都脱掉」
+            let idle = state.dehydrate_cfg.lock().unwrap().idle_secs.max(3600);
+            let last = state.auto_free_last.load(Ordering::Relaxed);
+            let d = qxync_core::freespace::decide(&space, used, &cfg, last, now_secs(), idle);
+            if !d.run {
+                tracing::debug!("自动释放空间未触发：{}", d.reason);
+                continue;
+            }
+            tracing::info!(
+                "自动释放空间触发：{}（缓存已用 {} 字节，文件系统可用 {}%）",
+                d.reason,
+                used,
+                d.avail_pct
+            );
+            // 「刚访问过」保护窗口：默认 300s（M3 既有行为）；
+            // 验收可以用 QSYNC_AUTO_FREE_RECENT=0 把它关掉，观察低空间触发（**只是测试旋钮**）。
+            let recent = if d.idle_secs > 0 { 0 } else { auto_free_recent_secs() };
+            // ⚠ 限额 0 的语义是「能清多少清多少」，但 `CacheLimit::parse("0")` 会判为无效写法
+            //   而让整轮变成**空操作**（踩过）。所以这里夹到最小 1 字节 —— 与「腾不出那么多」等价。
+            let limit = d.cache_limit_bytes.map(|b| b.max(1).to_string());
+            let out = run_dehydrate_with_recent(
+                &state,
+                DehydrateOpts {
+                    path: None,
+                    all: true,
+                    idle_secs: Some(d.idle_secs),
+                    cache_limit: limit,
+                    force: false,
+                    dry_run: false,
+                    mountpoint: None,
+                },
+                recent,
+            )
+            .await;
+            state.auto_free_last.store(now_secs(), Ordering::Relaxed);
+            let blocked: u64 = out.blocked.len() as u64;
+            tracing::info!(
+                "自动释放空间完成：脱水 {} 个 / 释放 {} 字节 / 被挡下 {} 个（{}）",
+                out.dehydrated,
+                out.freed_bytes,
+                blocked,
+                d.reason
+            );
+            journal_log(
+                &state,
+                JournalEntry::ok(
+                    "dehydrate",
+                    "",
+                    format!(
+                        "自动释放空间：{} → 脱水 {} 个 / 释放 {} 字节 / 被挡下 {} 个",
+                        d.reason, out.dehydrated, out.freed_bytes, blocked
+                    ),
+                )
+                .with_bytes(out.freed_bytes as i64),
+            );
+        }
+    });
+}
+
+/// `Request::Space`：释放空间状态；`now=true` 顺带执行「立即释放空间」。
+///
+/// ⚠ 「立即释放空间」用的也是 [`run_dehydrate_with_recent`] —— **没有旁路**。
+async fn space_cmd(state: &Arc<State>, now: bool) -> Result<serde_json::Value, IpcError> {
+    let cfg = state.settings.lock().unwrap().free_space.clone();
+    let dir = space_probe_path(&first_cache_dir(state));
+    let injected = std::env::var("QSYNC_TEST_FAKE_STATVFS")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    let space = qxync_core::freespace::probe(&dir).map_err(core_err)?;
+    let used = cache_info(state).used_bytes;
+    let idle = state.dehydrate_cfg.lock().unwrap().idle_secs.max(3600);
+    let last = state.auto_free_last.load(Ordering::Relaxed);
+    let d = qxync_core::freespace::decide(&space, used, &cfg, last, now_secs(), idle);
+
+    let mut data = SpaceData {
+        fs_path: dir.display().to_string(),
+        fs_total: space.total,
+        fs_avail: space.avail,
+        fs_free: space.free,
+        fs_avail_pct: space.avail_pct(),
+        cache_used_bytes: used,
+        auto: cfg.auto,
+        mode: cfg.mode.clone(),
+        below_pct: cfg.below_pct,
+        every_hours: cfg.every_hours,
+        would_run: d.run,
+        reason: d.reason.clone(),
+        last_run_unix: last,
+        injected,
+        ..Default::default()
+    };
+
+    if now {
+        // Free Up Space Now：按判定结果跑（`below_pct` 模式只在真低于阈值时才腾；
+        // 用户点「立即」时若空间充足，就按「闲置 ≥ 1 小时」清一遍可清的）。
+        let (limit, idle_secs) = if d.run {
+            (d.cache_limit_bytes.map(|b| b.to_string()), d.idle_secs)
+        } else {
+            (None, idle)
+        };
+        let recent = if idle_secs > 0 { 0 } else { 300 };
+        let out = run_dehydrate_with_recent(
+            state,
+            DehydrateOpts {
+                path: None,
+                all: true,
+                idle_secs: Some(idle_secs),
+                cache_limit: limit,
+                force: false,
+                dry_run: false,
+                mountpoint: None,
+            },
+            recent,
+        )
+        .await;
+        data.ran = true;
+        data.dehydrated = out.dehydrated;
+        data.freed_bytes = out.freed_bytes;
+        data.blocked = out.blocked.clone();
+        // 「立即」也算一次触发：按频率模式要重置计时，否则会连着触发
+        state.auto_free_last.store(now_secs(), Ordering::Relaxed);
+        data.last_run_unix = now_secs();
+        data.cache_used_bytes = cache_info(state).used_bytes;
+        journal_log(
+            state,
+            JournalEntry::ok(
+                "dehydrate",
+                "",
+                format!(
+                    "立即释放空间：脱水 {} 个 / 释放 {} 字节 / 被挡下 {} 个",
+                    data.dehydrated,
+                    data.freed_bytes,
+                    data.blocked.len()
+                ),
+            )
+            .with_bytes(data.freed_bytes as i64),
+        );
+    }
+
+    data.note = Some(if injected {
+        "⚠ 正在使用 QSYNC_TEST_FAKE_STATVFS 注入的剩余空间（验收模式）".into()
+    } else {
+        "脱水永远走 M3 的安全检查链：dirty / 待上传 / pinned / excluded / 打开中 / mmap / 传输中 一律跳过".into()
+    });
+    to_value(data)
 }

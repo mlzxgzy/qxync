@@ -19,6 +19,40 @@
     unpinned: '已取消固定',
     excluded: '已排除'
   };
+
+  // ★ M8.1：一级目的地（左侧图标栏）。顺序 = 界面顺序。
+  var PAGES = ['home', 'tasks', 'files', 'journal', 'errors', 'settings', 'diag'];
+  var PAGE_TITLE = {
+    home: '主页',
+    tasks: '任务',
+    files: '文件',
+    journal: '文件更新中心',
+    errors: '错误列表',
+    settings: '设置',
+    diag: '诊断'
+  };
+  // 诊断页内的子 tab
+  var DIAG_PANELS = ['status', 'mounts', 'sync'];
+  // ★ M8.4：设置页内的分区（对齐 Qsync 的四个 tab + 连接/筛选/LAN/关于）
+  var SETTINGS_SECS = ['connect', 'proxy', 'sync', 'personal', 'advanced', 'free', 'lan', 'about'];
+  var SEC_TITLE = {
+    connect: '连接',
+    proxy: '代理',
+    sync: '同步与筛选',
+    personal: '个人',
+    advanced: '高级',
+    free: '释放空间',
+    lan: 'LAN 加速',
+    about: '关于'
+  };
+  // ★ 兼容：M8.1 之前 QSYNC_GUI_TAB 用的是这 5 个值，必须继续可用
+  var LEGACY_TABS = {
+    status: { page: 'diag', diag: 'status' },
+    mounts: { page: 'diag', diag: 'mounts' },
+    sync: { page: 'diag', diag: 'sync' },
+    connect: { page: 'settings' },
+    files: { page: 'files' }
+  };
   var tauri = (typeof window !== 'undefined' && window.__TAURI__) ? window.__TAURI__ : null;
   var invokeFn = (tauri && tauri.core && typeof tauri.core.invoke === 'function')
     ? function (cmd, args) { return tauri.core.invoke(cmd, args); }
@@ -26,7 +60,8 @@
 
   // --------------------------------------------------------------- 状态
   var state = {
-    tab: 'status',
+    page: 'home',      // 一级目的地（PAGES）
+    diag: 'status',    // 诊断页内的子 tab（DIAG_PANELS）
     files: {
       path: '/home',
       dir: '/home',
@@ -35,12 +70,29 @@
       loading: false
     },
     mounts: [],
+    tasks: null,        // ★ M8.2：tasks 请求的最近一次结果
+    journal: null,      // ★ M8.3：journal 请求的最近一次结果
+    errors: null,       // ★ M8.3：错误列表（journal level=error）
     busy: 0,
     home: '',
     appInfo: null,
     lastStatus: null,
     pollTimer: null,
-    logCount: 0
+    logCount: 0,
+    // ★ M8.4
+    sec: 'connect',       // 设置页内的分区
+    settings: null,       // settings 请求的最近一次结果
+    link: null,           // link_read 的最近一次结果（LAN / 关于 要用）
+    space: null,          // space 请求的最近一次结果
+    fileStates: {},       // 文件名 → 三态（file_states 请求）
+    fsSummary: null,      // file_states 的汇总（online/local/always）
+    m84Info: null,        // GUI 侧 M8.4 能力（托盘/插件）
+    lastErrorKey: '',     // 已通知过的错误条目（去重）
+    errorTick: 0,         // 轮询计数器（每 3 次查一遍错误列表）
+    rowMenu: null,        // 右键菜单当前作用的条目
+    decisions: null,      // 冲突待裁决队列
+    lastErrorId: 0,       // 已通知过的最大 journal id（桌面通知去重）
+    trayAction: ''        // 最近一次托盘动作（自检/排查用）
   };
 
   // ============================================================ 小工具
@@ -509,6 +561,601 @@
     }
   }
 
+  // ============================================================ 主页
+  /**
+   * 把一个「同步任务」的状态压成一句话 + 一个状态标记（对齐 Qsync 的任务卡片语言）。
+   * 现阶段的「任务」= 一个挂载点（M8.2 才会引入真正的 Task 持久化）。
+   * ⚠️ 只做**诚实**的归纳：拿不到证据就不说「已同步」。
+   */
+  function taskState(st, sy, hasMounts) {
+    if (!st || !st.running) {
+      return { mark: '⏸', tone: 'warn', text: 'qxyncd 未运行' };
+    }
+    var s = isObj(st.status) ? st.status : null;
+    if (!s || !s.logged_in) {
+      return { mark: '⚠️', tone: 'warn', text: '未登录 NAS' };
+    }
+    if (!hasMounts) {
+      return { mark: '⏸', tone: 'warn', text: '还没有同步任务' };
+    }
+    if (sy) {
+      if (sy.last_error) {
+        return { mark: '⚠️', tone: 'err', text: '同步出错：' + String(sy.last_error) };
+      }
+      if (sy.delete_block_reason) {
+        return { mark: '⚠️', tone: 'warn', text: '有删除被熔断挡住（待确认）' };
+      }
+      if (!sy.enabled) {
+        return { mark: '⏸', tone: 'warn', text: '已暂停轮询' };
+      }
+      if (!num(sy.polls, 0)) {
+        return { mark: '⏳', tone: 'warn', text: '尚未跑过同步轮次' };
+      }
+      if (num(sy.conflicts, 0) > 0) {
+        return { mark: '⚠️', tone: 'warn', text: '最近一轮有 ' + num(sy.conflicts, 0) + ' 个冲突副本' };
+      }
+    }
+    return { mark: '✅', tone: 'ok', text: '所有文件均处于最新状态' };
+  }
+
+  function renderHome(st) {
+    if (!$('home-conn-text')) { return; }
+
+    var s = (st && isObj(st.status)) ? st.status : null;
+    var link = (s && isObj(s.link)) ? s.link : null;
+    var dot = $('home-dot');
+    var txt = $('home-conn-text');
+
+    if (dot) { dot.className = 'conn-dot'; }
+    if (!st || !st.running) {
+      if (dot) { dot.className = 'conn-dot err'; }
+      if (txt) { txt.textContent = 'qxyncd 未运行 —— 点顶部「启动 daemon」'; }
+    } else if (!link) {
+      if (dot) { dot.className = 'conn-dot warn'; }
+      if (txt) { txt.textContent = 'daemon 在跑，但没有连接配置'; }
+    } else {
+      var logged = !!(s && s.logged_in);
+      if (dot) { dot.className = 'conn-dot ' + (logged ? 'ok' : 'warn'); }
+      if (txt) {
+        txt.textContent = str(link.user) + '@' + str(link.host) + ':' + str(link.port) +
+          (link.https ? ' (https)' : ' (http)') + ' · ' +
+          (logged ? '已连接' : '未登录') +
+          (s && s.server && s.server.qsync_version ? ' · Qsync ' + str(s.server.qsync_version) : '');
+      }
+    }
+
+    var mounts = (s && s.mounts && s.mounts.length) ? s.mounts : (state.mounts || []);
+    var sy = (s && isObj(s.sync)) ? s.sync : null;
+    // ★ M8.2：有任务登记就按任务展示（每张卡 = 一个同步任务），否则退回挂载点
+    var taskInfos = (state.tasks && state.tasks.tasks) ? state.tasks.tasks : null;
+    renderHomeTasks(st, sy, mounts, taskInfos);
+    renderHomeSync(sy);
+  }
+
+  /** ★ M8.2：把「任务登记」与「挂载点」统一成一种卡片视图。 */
+  function taskViews(mounts, taskInfos) {
+    var out = [];
+    if (taskInfos && taskInfos.length) {
+      for (var i = 0; i < taskInfos.length; i++) {
+        if (isObj(taskInfos[i]) && isObj(taskInfos[i].task)) {
+          out.push({ task: taskInfos[i].task, info: taskInfos[i], mounted: taskInfos[i].mounted === true });
+        }
+      }
+      return out;
+    }
+    // 没有任务登记 → 退回「一个挂载点 = 一个同步任务」（M8.1 的行为）
+    var list = (mounts || []).filter(isObj);
+    for (var k = 0; k < list.length; k++) {
+      out.push({ mount: list[k], mounted: true });
+    }
+    return out;
+  }
+
+  function taskRoots(v) {
+    if (v.task) { return (v.task.roots || []).filter(function (x) { return str(x); }); }
+    var m = v.mount || {};
+    return (m.roots && m.roots.length) ? m.roots : (str(m.remote) ? [str(m.remote)] : []);
+  }
+
+  function renderHomeTasks(st, sy, mounts, taskInfos) {
+    var box = $('home-tasks');
+    if (!box) { return; }
+    clear(box);
+    var views = taskViews(mounts, taskInfos);
+    setText('home-task-count', views.length ? '（' + views.length + '）' : '');
+    show('home-tasks-empty', views.length === 0);
+
+    var ts = taskState(st, sy, views.length > 0);
+    for (var i = 0; i < views.length; i++) {
+      box.appendChild(buildTaskCard(views[i], ts, sy, false));
+    }
+  }
+
+  /**
+   * 一张任务卡。`full=true` 时带完整操作（任务页用），否则只给「管理 + 立即同步」（主页用）。
+   */
+  function buildTaskCard(v, ts, sy, full) {
+    var t = v.task, m = v.mount || {};
+    var card = el('div', 'task-card');
+    var mark = ts.mark;
+    if (t) {
+      if (!t.enabled) { mark = '⏸'; }
+      else if (!v.mounted) { mark = '⚠️'; }
+    }
+    card.appendChild(el('div', 'task-mark', mark));
+
+    var body = el('div', 'task-body');
+    var stateText = ts.text;
+    if (t) {
+      if (!t.enabled) { stateText = '已暂停（登记停用，挂载点已卸载）'; }
+      else if (!v.mounted) { stateText = '已启用，但当前未挂载'; }
+    }
+    body.appendChild(el('div', 'task-state', stateText));
+
+    var roots = taskRoots(v);
+    var mp = t ? str(t.mountpoint) : str(m.mountpoint);
+    body.appendChild(el('div', 'task-meta',
+      '本地 ' + (mp || '（未设）') + '  ⇄  NAS ' + (roots.length ? roots.join(', ') : '（由 link home_root 决定）')));
+
+    var sub = [];
+    if (t) {
+      sub.push(t.read_write ? '读写' : '只读');
+      sub.push('缓存 ' + str(t.cache_mode));
+      if (t.direction && t.direction !== '2way') { sub.push('方向 ' + str(t.direction)); }
+      if (t.space_saving) { sub.push('节省空间模式'); }
+      if (t.smart_delete) { sub.push('智能删除'); }
+      if ((t.exclude || []).length) { sub.push('排除规则 ' + t.exclude.length); }
+      // ★ M8.4：冲突策略一眼可见（ask 的要显眼 —— 会攒待裁决队列）
+      sub.push('冲突 ' + conflictLabel(str(t.conflict) || 'rename_local'));
+    } else {
+      sub.push(m.readonly ? '只读' : '读写');
+    }
+    if (sy && num(sy.last_poll_age_secs, 0) > 0) {
+      sub.push('上次轮询 ' + humanDuration(sy.last_poll_age_secs) + '前');
+    }
+    body.appendChild(el('div', 'task-meta', sub.join(' · ')));
+
+    var badgeRow = el('div', 'task-meta');
+    badgeRow.appendChild(el('span', 'badge badge-on', 'Sync'));
+    badgeRow.appendChild(document.createTextNode(' '));
+    if (t && !t.enabled) {
+      badgeRow.appendChild(el('span', 'badge badge-off', '已暂停'));
+    } else if (t && !v.mounted) {
+      badgeRow.appendChild(el('span', 'badge badge-warn', '未挂载'));
+    } else {
+      badgeRow.appendChild(el('span', 'badge badge-on', '已挂载'));
+    }
+    if (roots.length > 1) {
+      badgeRow.appendChild(document.createTextNode(' '));
+      badgeRow.appendChild(el('span', 'badge', '多根'));
+    }
+    body.appendChild(badgeRow);
+    card.appendChild(body);
+
+    var act = el('div', 'task-actions');
+
+    if (full && t) {
+      if (!t.enabled) {
+        var bResume = el('button', 'mini primary', '继续');
+        bResume.type = 'button';
+        bResume.addEventListener('click', function () { doTaskAction('resume', t.id, '继续', bResume); });
+        act.appendChild(bResume);
+      } else if (v.mounted) {
+        var bPause = el('button', 'mini', '暂停');
+        bPause.type = 'button';
+        bPause.addEventListener('click', function () { doTaskAction('pause', t.id, '暂停', bPause); });
+        act.appendChild(bPause);
+      } else {
+        var bMount = el('button', 'mini primary', '挂载');
+        bMount.type = 'button';
+        bMount.addEventListener('click', function () { doTaskAction('mount', t.id, '挂载', bMount); });
+        act.appendChild(bMount);
+      }
+    }
+
+    if (full && t) {
+      var bEdit = el('button', 'mini', '设置');
+      bEdit.type = 'button';
+      bEdit.addEventListener('click', function () { editTask(t); });
+      act.appendChild(bEdit);
+    }
+
+    var bOpen = el('button', 'mini', '管理');
+    bOpen.type = 'button';
+    bOpen.addEventListener('click', function () { switchPage('diag', 'mounts'); });
+    act.appendChild(bOpen);
+
+    var bSync = el('button', 'mini primary', '立即同步');
+    bSync.type = 'button';
+    bSync.addEventListener('click', function () { doSync({ once: true }, [], '立即同步'); });
+    act.appendChild(bSync);
+
+    if (full && t) {
+      var bDel = el('button', 'mini danger', '删除登记');
+      bDel.type = 'button';
+      bDel.addEventListener('click', function () {
+        if (!window.confirm('删除任务登记？\n' + t.id + '\n\n只删 ~/.config/qsync/tasks/' + t.id +
+          '.json，**不动挂载点里的文件，也不动 NAS 上的数据**。')) { return; }
+        doTaskAction('delete', t.id, '删除登记', bDel);
+      });
+      act.appendChild(bDel);
+    }
+
+    card.appendChild(act);
+    return card;
+  }
+
+  // ============================================================ 更新中心 / 错误列表（M8.3）
+  var KIND_LABEL = {
+    remote_change: '远端改动',
+    upload: '上传',
+    download: '下载',
+    conflict: '冲突副本',
+    delete: '删除',
+    dehydrate: '释放空间',
+    scan: '对账'
+  };
+
+  function kindLabel(k) {
+    var s = str(k);
+    return KIND_LABEL[s] ? (KIND_LABEL[s] + '（' + s + '）') : s;
+  }
+
+  function statusMark(st) {
+    if (st === 'error') { return '❌'; }
+    if (st === 'blocked') { return '⛔'; }
+    return '✅';
+  }
+
+  function journalQuery(extra) {
+    var req = { method: 'journal' };
+    var q = $('j-query');
+    var lvl = $('j-level');
+    var lim = $('j-limit');
+    if (q && str(q.value).trim()) { req.query = str(q.value).trim(); }
+    if (lvl && str(lvl.value) && str(lvl.value) !== 'all') { req.level = str(lvl.value); }
+    if (lim && num(lim.value, 0) > 0) { req.limit = num(lim.value, 200); }
+    if (isObj(extra)) {
+      for (var k in extra) {
+        if (Object.prototype.hasOwnProperty.call(extra, k)) { req[k] = extra[k]; }
+      }
+    }
+    return req;
+  }
+
+  function refreshJournal(extra) {
+    return withBusy({ buttons: ['btn-journal-refresh'] }, function () {
+      return ipc(journalQuery(extra));
+    }).then(function (r) {
+      if (!r.ok) {
+        logErr('journal 查询失败：' + str(r.error));
+        return r;
+      }
+      state.journal = isObj(r.data) ? r.data : null;
+      renderJournalPage();
+      return r;
+    });
+  }
+
+  function renderJournalPage() {
+    var tb = $('journal-tbody');
+    if (!tb) { return; }
+    clear(tb);
+    var d = state.journal;
+    if (!d) {
+      setText('journal-count', '');
+      show('journal-empty', true);
+      setText('journal-empty', '日志不可用（daemon 未运行？）');
+      show('journal-note', false);
+      return;
+    }
+    var list = (d.entries || []).filter(isObj);
+    var counts = isObj(d.counts) ? d.counts : {};
+    setText('journal-count',
+      '共 ' + num(d.total, 0) + ' 条 · ok ' + num(counts.ok, 0) +
+      ' / error ' + num(counts.error, 0) + ' / blocked ' + num(counts.blocked, 0));
+    show('journal-empty', list.length === 0);
+    if (list.length === 0) {
+      setText('journal-empty', d.cleared
+        ? '日志已清空。'
+        : '没有符合条件的日志。挂载一个同步任务后点「立即同步」，或有实际同步活动时就会出现记录。');
+    }
+
+    for (var i = 0; i < list.length; i++) {
+      (function (e) {
+        var tr = el('tr');
+        tr.appendChild(el('td', 'col-time mono', humanTimeFromEpoch(e.ts)));
+        var tdKind = el('td', 'col-kind');
+        tdKind.appendChild(el('span', null, statusMark(str(e.status)) + ' '));
+        tdKind.appendChild(el('span', 'badge', kindLabel(e.kind)));
+        tr.appendChild(tdKind);
+        tr.appendChild(el('td', 'mono', str(e.path) || '—'));
+        tr.appendChild(el('td', null, str(e.detail) || '—'));
+        tr.appendChild(el('td', 'col-size mono', num(e.bytes, 0) > 0 ? humanSize(e.bytes) : ''));
+        tb.appendChild(tr);
+      })(list[i]);
+    }
+
+    var note = $('journal-note');
+    if (note) {
+      note.hidden = !d.note;
+      note.textContent = d.note ? ('说明：' + String(d.note)) : '';
+    }
+  }
+
+  /** 错误列表 = journal 里 status=error 的视图（复用同一份数据）。 */
+  function refreshErrors() {
+    return ipc({ method: 'journal', level: 'error', limit: 500 }).then(function (r) {
+      if (!r.ok) {
+        logErr('错误列表读取失败：' + str(r.error));
+        return r;
+      }
+      state.errors = isObj(r.data) ? r.data : null;
+      renderErrorsPage();
+      return r;
+    });
+  }
+
+  function renderErrorsPage() {
+    var box = $('errors-list');
+    if (!box) { return; }
+    clear(box);
+    var d = state.errors;
+    if (!d) {
+      setText('errors-count', '');
+      show('errors-empty', true);
+      setText('errors-empty', '错误列表不可用（daemon 未运行？）');
+      return;
+    }
+    var list = (d.entries || []).filter(isObj);
+    setText('errors-count', list.length ? '（' + list.length + '）' : '');
+    show('errors-empty', list.length === 0);
+
+    for (var i = 0; i < list.length; i++) {
+      (function (e) {
+        var row = el('div', 'alert alert-err');
+        row.appendChild(el('span', 'mono', humanTimeFromEpoch(e.ts) + '  '));
+        row.appendChild(el('span', 'badge badge-err', kindLabel(e.kind)));
+        row.appendChild(document.createTextNode('  ' + (str(e.detail) || '（无说明）')));
+        if (str(e.path)) {
+          row.appendChild(document.createTextNode('  '));
+          row.appendChild(el('span', 'mono', str(e.path)));
+          var b = el('button', 'mini', '复制路径');
+          b.type = 'button';
+          b.addEventListener('click', function () { copyText(str(e.path)); });
+          row.appendChild(document.createTextNode(' '));
+          row.appendChild(b);
+        }
+        box.appendChild(row);
+      })(list[i]);
+    }
+  }
+
+  function copyText(t) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(t).then(function () { logOk('已复制：' + t); },
+                                            function () { logInfo('复制失败：' + t); });
+    } else {
+      logInfo('当前环境不支持剪贴板，路径在此：' + t);
+    }
+  }
+
+  function doJournalClear() {
+    if (!window.confirm('清空同步日志？\n\n只删日志本身，**不动同步状态**（游标 / baseline / pin / 上传队列都不受影响），也不动 NAS 上的数据。')) {
+      return Promise.resolve(null);
+    }
+    return refreshJournal({ clear: true }).then(function (r) {
+      if (r && r.ok) { logOk('同步日志已清空'); }
+      return r;
+    });
+  }
+
+  // ============================================================ 任务页（M8.2）
+  function refreshTasks() {
+    return ipc({ method: 'tasks', action: 'list' }).then(function (r) {
+      // 任务列表回来后顺手刷一下冲突策略汇总与待裁决队列（M8.4）
+      window.setTimeout(function () { renderConflictKv(); }, 0);
+      refreshDecisions();
+      if (!r.ok) {
+        logErr('tasks list 失败：' + str(r.error));
+        return r;
+      }
+      state.tasks = isObj(r.data) ? r.data : null;
+      renderTasksPage();
+      return r;
+    });
+  }
+
+  function renderTasksPage() {
+    var box = $('tasks-list');
+    if (!box) { return; }
+    clear(box);
+    clear($('tasks-bad'));
+    var d = state.tasks;
+    if (!d) {
+      setText('tasks-count', '');
+      show('tasks-empty', true);
+      setText('tasks-empty', '任务信息不可用（daemon 未运行？）');
+      show('tasks-note', false);
+      return;
+    }
+    var infos = (d.tasks || []).filter(isObj);
+    var sy = (state.lastStatus && isObj(state.lastStatus.status)) ? state.lastStatus.status.sync : null;
+    var ts = taskState(state.lastStatus, sy, infos.length > 0);
+
+    setText('tasks-count', infos.length ? '（' + infos.length + '）' : '');
+    show('tasks-empty', infos.length === 0);
+    if (infos.length === 0) {
+      setText('tasks-empty', d.empty
+        ? '还没有登记过任务。点右上「＋ 添加配对文件夹」建一个。'
+        : '任务目录里没有可用的任务文件。');
+    }
+    for (var i = 0; i < infos.length; i++) {
+      box.appendChild(buildTaskCard(
+        { task: infos[i].task, info: infos[i], mounted: infos[i].mounted === true }, ts, sy, true));
+    }
+
+    var note = $('tasks-note');
+    if (note) {
+      note.hidden = !d.note;
+      note.textContent = d.note ? ('说明：' + String(d.note)) : '';
+    }
+    var badBox = $('tasks-bad');
+    var bad = (d.bad_files || []);
+    // 空的时候必须隐藏：`.plain-list:empty::after` 会渲染一个「(无)」，
+    // 放在「解析失败清单」下面会被误读成「有失败项」。
+    if (badBox) { badBox.hidden = bad.length === 0; }
+    for (var k = 0; k < bad.length; k++) {
+      var pair = bad[k];
+      badBox.appendChild(el('li', null,
+        '⚠️ 任务文件解析失败（已跳过）：' + str(pair[0]) + ' —— ' + str(pair[1])));
+    }
+  }
+
+  function doTaskAction(action, id, label, btn) {
+    return withBusy({ buttons: btn ? [btn.id] : [] }, function () {
+      return ipc({ method: 'tasks', action: action, id: id });
+    }).then(function (r) {
+      if (r.ok) {
+        logOk(label + ' ' + id + ' 完成');
+      } else {
+        logErr(label + ' ' + id + ' 失败：' + str(r.error));
+      }
+      return refreshTasks().then(function () { return refreshStatus(true); }).then(function () { return r; });
+    });
+  }
+
+  function openTaskForm() {
+    var card = $('task-form-card');
+    if (!card) { return; }
+    var mp = $('t-mountpoint');
+    if (mp && !mp.value) {
+      mp.value = (str(state.home) || '~') + '/qsync-mnt';
+    }
+    card.hidden = false;
+    card.scrollIntoView({ block: 'nearest' });
+    var idEl = $('t-id');
+    if (idEl) { idEl.focus(); }
+  }
+
+  /** ★ M8.4：把已有任务填进「文件夹对设置」表单（冲突策略就在这里面改）。 */
+  function editTask(t) {
+    var card = $('task-form-card');
+    if (!card || !t) { return; }
+    var set = function (id, v) { var n = $(id); if (n) { n.value = v; } };
+    var chk = function (id, v) { var n = $(id); if (n) { n.checked = !!v; } };
+    set('t-id', str(t.id));
+    set('t-mountpoint', str(t.mountpoint));
+    set('t-roots', (t.roots && t.roots.length) ? t.roots.join('\n') : '');
+    set('t-cache-dir', t.cache_dir ? str(t.cache_dir) : '');
+    set('t-cache-mode', str(t.cache_mode) || 'pagecache');
+    set('t-conflict', str(t.conflict) || 'rename_local');
+    set('t-direction', str(t.direction) || '2way');
+    chk('t-space-saving', t.space_saving === true);
+    chk('t-smart-delete', t.smart_delete === true);
+    chk('t-read-write', t.read_write === true);
+    chk('t-do-mount', t.enabled !== false);
+    setText('task-form-title', '文件夹对设置 · ' + str(t.id));
+    card.hidden = false;
+    card.scrollIntoView({ block: 'nearest' });
+  }
+
+  function closeTaskForm() {
+    var card = $('task-form-card');
+    if (card) { card.hidden = true; }
+    setText('task-form-title', '文件夹对设置');
+    show('task-result', false);
+  }
+
+  function doTaskSave() {
+    var id = str($('t-id') ? $('t-id').value : '').trim() || 'default';
+    var mp = str($('t-mountpoint') ? $('t-mountpoint').value : '').trim();
+    if (!mp) {
+      renderError('task-result', '参数错误', '本地文件夹（挂载点）不能为空');
+      return Promise.resolve(null);
+    }
+    var roots = parseRootLines('t-roots');
+    var cdir = str($('t-cache-dir') ? $('t-cache-dir').value : '').trim();
+    var task = {
+      id: id,
+      name: id,
+      enabled: true,
+      mountpoint: mp,
+      cache_dir: cdir ? cdir : null,
+      roots: roots,
+      read_write: isOn('t-read-write', false),
+      cache_mode: str($('t-cache-mode') ? $('t-cache-mode').value : 'pagecache') || 'pagecache',
+      auto_unmount: true,
+      // ★ M8.4：冲突策略 + 方向 + 节省空间（后端会 normalize：space_saving 为真时
+      //   强制 smart_delete=false，这是 Qsync 原文语义）
+      conflict: str($('t-conflict') ? $('t-conflict').value : 'rename_local') || 'rename_local',
+      direction: str($('t-direction') ? $('t-direction').value : '2way') || '2way',
+      space_saving: isOn('t-space-saving', false),
+      smart_delete: isOn('t-smart-delete', false)
+    };
+    return withBusy({ spinners: ['task-busy'], buttons: ['btn-task-save'] }, function () {
+      return ipc({ method: 'tasks', action: 'save', task: task });
+    }).then(function (r) {
+      if (!r.ok) {
+        renderError('task-result', '保存任务失败', str(r.error));
+        return r;
+      }
+      if (!isOn('t-do-mount', true)) {
+        renderResult('task-result', true, '任务已保存（未挂载）', [
+          ['id', id], ['本地', mp],
+          ['NAS', roots.length ? roots.join(', ') : '（由 link 决定）'],
+          ['缓存目录', cdir || '（默认 ~/.local/share/qsync/cache）'],
+          ['冲突策略', conflictLabel(task.conflict)]
+        ]);
+        refreshTasks();
+        return r;
+      }
+      return withBusy({ spinners: ['task-busy'] }, function () {
+        return ipc({ method: 'tasks', action: 'resume', id: id });
+      }).then(function (r2) {
+        var okMount = r2.ok;
+        renderResult('task-result', okMount, okMount ? '任务已保存并挂载' : '任务已保存，但挂载失败', [
+          ['id', id],
+          ['本地', mp],
+          ['NAS', roots.length ? roots.join(', ') : '（由 link 决定）'],
+          ['缓存目录', cdir || '（默认 ~/.local/share/qsync/cache）'],
+          ['冲突策略', conflictLabel(task.conflict)],
+          ['挂载', okMount ? '成功' : str(r2.error)]
+        ]);
+        refreshTasks();
+        refreshStatus(true);
+        return r2;
+      });
+    });
+  }
+
+  function renderHomeSync(sy) {
+    var dl = $('home-sync-kv');
+    if (!dl) { return; }
+    clear(dl);
+    clearAlerts('home-alerts');
+    if (!sy) {
+      kvText(dl, '同步', '不可用（daemon 未运行或未上报）');
+      return;
+    }
+    kvText(dl, '轮询', sy.enabled ? (num(sy.interval_secs, 0) + ' 秒') : '已暂停',
+      sy.enabled ? 'val-ok' : 'val-warn');
+    kvText(dl, '轮次', num(sy.polls, 0));
+    kvText(dl, '上次轮询', num(sy.last_poll_age_secs, 0) > 0
+      ? humanDuration(sy.last_poll_age_secs) + '前' : '未轮询');
+    kvText(dl, '刷新 / 上传 / 删除',
+      num(sy.refreshed, 0) + ' / ' + num(sy.uploaded, 0) + ' / ' + num(sy.deleted, 0));
+    kvText(dl, '冲突副本', num(sy.conflicts, 0), num(sy.conflicts, 0) > 0 ? 'val-warn' : null);
+    kvText(dl, 'baseline 条目', num(sy.baseline_entries, 0));
+
+    if (sy.last_error) { addAlert('home-alerts', '同步错误：' + String(sy.last_error)); }
+    if (sy.delete_block_reason) {
+      addAlert('home-alerts', '删除被熔断挡住：' + String(sy.delete_block_reason) +
+        '（到「诊断 → 同步 / 缓存」可强制放行一轮）');
+    }
+    if (sy.note) { addAlert('home-alerts', '说明：' + String(sy.note)); }
+  }
+
   // ============================================================ Tab 1 状态
   function renderStatusPanel(st) {
     var srv = $('srv-kv');
@@ -863,7 +1510,7 @@
   }
 
   function refreshRootsIfVisible() {
-    if (state.tab === 'status') { refreshRoots(); }
+    if (state.page === 'diag' && state.diag === 'status') { refreshRoots(); }
   }
 
   // ============================================================ Tab 2 连接
@@ -1107,7 +1754,7 @@
       var d = r.ok ? r.data : null;
       if (!d || !d.present) {
         logInfo('没有已保存的凭据：请到「连接 / 登录」页填写口令并「保存并登录」');
-        switchTab('connect');
+        switchPage('settings');
         var pw = $('f-password');
         if (pw) { pw.focus(); }
         return null;
@@ -1143,7 +1790,7 @@
   }
 
   function refreshMountsIfVisible() {
-    if (state.tab === 'mounts') { refreshMounts(); }
+    if (state.page === 'diag' && state.diag === 'mounts') { refreshMounts(); }
   }
 
   function doMount() {
@@ -1241,6 +1888,124 @@
       var fp = $('fp-path');
       if (fp) { fp.value = state.files.dir; }
       renderFiles();
+      // ★ M8.4：顺带取一次三态（仅在线 / 本地可用 / 始终可用）；失败不影响列表
+      refreshFileStates();
+      return r;
+    });
+  }
+
+  // ------------------------------------------------------------ ★ M8.4 文件三态 + 右键菜单
+
+  /** 取当前目录每个条目的三态。daemon 未挂载该目录时回空表（界面显示 —）。 */
+  function refreshFileStates() {
+    var dir = state.files.dir || state.files.path;
+    if (!dir) { return Promise.resolve(null); }
+    return ipc({ method: 'file_states', path: dir }).then(function (r) {
+      var map = {};
+      if (r.ok && isObj(r.data) && r.data.entries) {
+        var es = r.data.entries;
+        for (var i = 0; i < es.length; i++) {
+          if (es[i] && es[i].name) { map[str(es[i].name)] = es[i]; }
+        }
+        state.fsSummary = {
+          online: num(r.data.online, 0),
+          local: num(r.data.local, 0),
+          always: num(r.data.always, 0),
+          mountpoint: r.data.mountpoint,
+          note: r.data.note
+        };
+      } else {
+        state.fsSummary = null;
+      }
+      state.fileStates = map;
+      renderFiles();
+      return r;
+    }, function () { return { ok: false }; });
+  }
+
+  /** pin / 脱水之后稍等一会儿再刷新三态（daemon 侧状态要有落点）。 */
+  function refreshFileStatesSoon() {
+    window.setTimeout(function () {
+      if (state.page === 'files') { refreshFileStates(); }
+    }, 500);
+  }
+
+  function openRowMenu(ev, e, full) {
+    var menu = $('row-menu');
+    if (!menu) { return; }
+    state.rowMenu = { entry: e, path: full };
+    setText('row-menu-title', full);
+    menu.hidden = false;
+    var w = menu.offsetWidth || 300;
+    var h = menu.offsetHeight || 250;
+    var x = Math.min(ev.clientX, Math.max(4, window.innerWidth - w - 8));
+    var y = Math.min(ev.clientY, Math.max(4, window.innerHeight - h - 8));
+    menu.style.left = Math.max(4, x) + 'px';
+    menu.style.top = Math.max(4, y) + 'px';
+  }
+
+  function closeRowMenu() {
+    var m = $('row-menu');
+    if (m) { m.hidden = true; }
+    state.rowMenu = null;
+  }
+
+  function wireRowMenu() {
+    var menu = $('row-menu');
+    if (!menu) { return; }
+    var items = menu.querySelectorAll('.ctx-item');
+    for (var i = 0; i < items.length; i++) {
+      (function (b) {
+        b.addEventListener('click', function () {
+          doRowAction(str(b.getAttribute('data-act')));
+        });
+      })(items[i]);
+    }
+    document.addEventListener('click', function (ev) {
+      var m = $('row-menu');
+      if (m && !m.hidden && !m.contains(ev.target)) { closeRowMenu(); }
+    });
+    document.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Escape') { closeRowMenu(); }
+    });
+    window.addEventListener('blur', function () { closeRowMenu(); });
+  }
+
+  function doRowAction(act) {
+    var cur = state.rowMenu;
+    if (!cur) { return; }
+    var e = cur.entry;
+    var full = cur.path;
+    closeRowMenu();
+    if (act === 'pin') {
+      setPinState(full, 'pinned', null, null);
+      refreshFileStatesSoon();
+    } else if (act === 'unpin') {
+      setPinState(full, 'unspecified', null, null);
+      refreshFileStatesSoon();
+    } else if (act === 'free') {
+      doDehydratePath(full, null).then(refreshFileStatesSoon);
+    } else if (act === 'get') {
+      doDownload(e, null);
+    } else if (act === 'copy') {
+      copyText(full);
+    } else if (act === 'rm') {
+      doRemovePath(full);
+    }
+  }
+
+  function doRemovePath(full) {
+    if (!requireDaemon()) { return; }
+    if (!window.confirm('确定删除远端条目？\n' + full)) { return; }
+    withBusy({ spinners: ['files-busy'] }, function () {
+      return ipc({ method: 'rm', dir: state.files.dir, name: pathBase(full) });
+    }).then(function (r) {
+      if (r.ok) {
+        logOk('已删除：' + full);
+        refreshFiles(state.files.dir);
+      } else {
+        logErr('rm 失败：' + str(r.error));
+      }
       return r;
     });
   }
@@ -1259,7 +2024,15 @@
       shown++;
       tb.appendChild(buildFileRow(e, hideExcluded));
     }
-    setText('files-info', '共 ' + entries.length + ' 项' + (state.files.dir ? ' · ' + state.files.dir : ''));
+    var info = '共 ' + entries.length + ' 项' + (state.files.dir ? ' · ' + state.files.dir : '');
+    if (state.fsSummary) {
+      info += ' · 仅在线 ' + num(state.fsSummary.online, 0) +
+        ' / 本地可用 ' + num(state.fsSummary.local, 0) +
+        ' / 始终可用 ' + num(state.fsSummary.always, 0);
+    } else if (state.files.dir) {
+      info += ' · 三态需挂载后才能算（daemon 侧没有该目录的挂载视图）';
+    }
+    setText('files-info', info);
     show('files-empty', entries.length === 0);
   }
 
@@ -1314,6 +2087,36 @@
 
     // have_child
     tr.appendChild(el('td', 'col-child', e.have_child === true ? '✔' : ''));
+
+    // ★ M8.4：状态列（节省空间模式三态）
+    var fs = state.fileStates[str(e.filename)];
+    var tdState = el('td', 'col-state');
+    if (isDir) {
+      tdState.appendChild(el('span', 'badge', '目录'));
+    } else if (fs && str(fs.state) === 'always') {
+      tdState.appendChild(el('span', 'badge badge-always', '始终可用'));
+    } else if (fs && str(fs.state) === 'local') {
+      tdState.appendChild(el('span', 'badge badge-local', '本地可用'));
+    } else if (fs && str(fs.state) === 'online') {
+      tdState.appendChild(el('span', 'badge badge-online', '仅在线'));
+    } else {
+      tdState.appendChild(el('span', 'badge', '—'));
+    }
+    if (fs && !isDir && num(fs.hydrated_bytes, 0) > 0) {
+      tdState.appendChild(document.createTextNode(' '));
+      tdState.appendChild(el('span', 'task-meta', humanSize(num(fs.hydrated_bytes, 0))));
+    }
+    if (fs && fs.dirty === true) {
+      tdState.appendChild(document.createTextNode(' '));
+      tdState.appendChild(el('span', 'badge badge-warn', '未上传'));
+    }
+    tr.appendChild(tdState);
+
+    // 右键菜单（对齐 Qsync 的「节省空间模式 ▸ …」）
+    tr.addEventListener('contextmenu', function (ev) {
+      ev.preventDefault();
+      openRowMenu(ev, e, full);
+    });
 
     // pin 操作
     var tdPin = el('td', 'col-pin');
@@ -1650,9 +2453,13 @@
       renderTop(st);
       var s = (st && isObj(st.status)) ? st.status : null;
       if (s && s.mounts) { state.mounts = s.mounts; }
-      if (state.tab === 'status' || state.tab === 'sync') {
+      if (state.page === 'home') {
+        renderHome(st);
+      } else if (state.page === 'tasks') {
+        renderTasksPage();
+      } else if (state.page === 'diag' && (state.diag === 'status' || state.diag === 'sync')) {
         renderStatusPanel(st);
-      } else if (state.tab === 'mounts') {
+      } else if (state.page === 'diag' && state.diag === 'mounts') {
         renderMountTable('tbl-mounts', 'mounts-empty', 'mounts-count', state.mounts);
       }
       return r;
@@ -1669,46 +2476,877 @@
       if (document.hidden) { return; }
       if (inflight) { return; }
       refreshStatus(true);
+      // ★ M8.4：每 3 个 tick（≈6s）看一次错误列表，有新错误就发桌面通知
+      state.errorTick = (state.errorTick || 0) + 1;
+      if (state.errorTick % 3 === 0) { checkErrorsForNotify(); }
     }, POLL_MS);
   }
-  // 首轮 status 到位前切到某些 tab（用户手快，或 QSYNC_GUI_TAB 指定）时，
+  // 首轮 status 到位前切到某些页（用户手快，或 QSYNC_GUI_TAB 指定）时，
   // requireLogin() 还拿不到状态 → refreshFiles 会直接返回空态。status 回来后补一次。
-  function refreshCurrentTab() {
-    if (state.tab === 'mounts') { refreshMounts(); }
-    else if (state.tab === 'connect') { loadConnect(); }
-    else if (state.tab === 'status') { refreshRoots(); }
-    else if (state.tab === 'files' && !state.files.entries.length) { refreshFiles(state.files.path); }
+  function refreshCurrentPage() {
+    if (state.page === 'home') {
+      renderHome(state.lastStatus);
+      refreshMounts();
+      refreshTasks();
+    } else if (state.page === 'tasks') {
+      refreshTasks();
+    } else if (state.page === 'files' && !state.files.entries.length) {
+      refreshFiles(state.files.path);
+    } else if (state.page === 'settings') {
+      loadConnect();
+      refreshSettings();
+    } else if (state.page === 'diag') {
+      if (state.diag === 'mounts') { refreshMounts(); }
+      else if (state.diag === 'status') { refreshRoots(); }
+    }
   }
 
-  // ============================================================ Tab 切换
-  function switchTab(name) {
-    var prev = state.tab;
-    state.tab = name;
-    var tabs = document.querySelectorAll('.tab');
+  // ============================================================ ★ M8.4 设置中心
+  // 设置本体在 daemon 侧（settings.json）：GUI 只是编辑器 —— 读回来填表、改完整体回写，
+  // 于是「GUI 与 CLI 改的是同一份设置」，不存在两套真值。
+
+  /** 与 Rust 侧 `Settings::default()` 对齐的前端兜底（daemon 读不到时用）。 */
+  function settingsDefaults() {
+    return {
+      version: 1,
+      proxy: { mode: 'auto', server: '', port: null, auth: false, user: '', password: '' },
+      launch_at_startup: false,
+      desktop_notifications: true,
+      debug_log: false,
+      language: '',
+      region: '',
+      free_space: { auto: false, mode: 'below_pct', below_pct: 10, every_hours: 24 },
+      close_to_tray: true
+    };
+  }
+
+  /** 当前设置的**深拷贝**（改完整体回写，不污染 state）。 */
+  function currentSettings() {
+    var d = state.settings;
+    if (d && isObj(d.settings)) {
+      return JSON.parse(JSON.stringify(d.settings));
+    }
+    return settingsDefaults();
+  }
+
+  function proxyModeLabel(m) {
+    if (m === 'none') { return 'No proxy（无代理）'; }
+    if (m === 'manual') { return 'Manual（手动）'; }
+    return 'Auto-detect（自动检测）';
+  }
+
+  function refreshSettings() {
+    return ipc({ method: 'settings' }).then(function (r) {
+      if (r.ok) {
+        state.settings = isObj(r.data) ? r.data : null;
+      } else {
+        logErr('读取设置失败：' + str(r.error));
+      }
+      renderSettings();
+      return r;
+    });
+  }
+
+  function renderSettings() {
+    var d = state.settings;
+    var s = currentSettings();
+    var proxy = isObj(s.proxy) ? s.proxy : settingsDefaults().proxy;
+    var free = isObj(s.free_space) ? s.free_space : settingsDefaults().free_space;
+
+    // ---- 代理
+    var mode = $('p-mode');
+    if (mode) { mode.value = str(proxy.mode) || 'auto'; }
+    var server = $('p-server'); if (server) { server.value = str(proxy.server); }
+    var port = $('p-port');
+    if (port) { port.value = (proxy.port === null || proxy.port === undefined) ? '' : str(proxy.port); }
+    var auth = $('p-auth'); if (auth) { auth.checked = proxy.auth === true; }
+    var puser = $('p-user'); if (puser) { puser.value = str(proxy.user); }
+    var ppw = $('p-password'); if (ppw) { ppw.value = ''; }
+    toggleProxyFields();
+
+    setText('proxy-mode-badge', proxyModeLabel(str(proxy.mode)));
+    var env = (d && isObj(d.proxy_env)) ? d.proxy_env : {};
+    var envDl = $('proxy-env-kv');
+    if (envDl) {
+      clear(envDl);
+      var keys = Object.keys(env);
+      if (!keys.length) {
+        kvText(envDl, '环境变量', '（无 http_proxy / https_proxy / all_proxy）');
+      } else {
+        for (var i = 0; i < keys.length; i++) {
+          kvText(envDl, keys[i], str(env[keys[i]]));
+        }
+      }
+      kvText(envDl, '实际代理 URL', (d && d.proxy_url) ? str(d.proxy_url) : '（不走手动代理）');
+    }
+    setText('proxy-hint', d
+      ? ('设置文件：' + str(d.path) + (d.saved ? '（已保存）' : '') + (d.note ? ' · ' + str(d.note) : ''))
+      : '设置文件：—');
+
+    // ---- 个人
+    var su = $('s-startup'); if (su) { su.checked = s.launch_at_startup === true; }
+    var lang = $('s-lang'); if (lang) { lang.value = str(s.language); }
+    var region = $('s-region'); if (region) { region.value = str(s.region); }
+    var ct = $('s-close-tray'); if (ct) { ct.checked = s.close_to_tray !== false; }
+    setText('autostart-hint', d
+      ? ('autostart 桌面项：' + str(d.autostart_path) + '（' + (d.autostart_present ? '存在' : '不存在') + '）')
+      : '—');
+
+    // ---- 高级
+    var dl = $('s-debug-log'); if (dl) { dl.checked = s.debug_log === true; }
+    var nt = $('s-notifications'); if (nt) { nt.checked = s.desktop_notifications !== false; }
+
+    // ---- 释放空间
+    var fa = $('fs-auto'); if (fa) { fa.checked = free.auto === true; }
+    var mp = $('fs-mode-pct'); if (mp) { mp.checked = str(free.mode) !== 'frequency'; }
+    var mf = $('fs-mode-freq'); if (mf) { mf.checked = str(free.mode) === 'frequency'; }
+    var bp = $('fs-below-pct'); if (bp) { bp.value = str(num(free.below_pct, 10)); }
+    var eh = $('fs-every-hours'); if (eh) { eh.value = str(num(free.every_hours, 24)); }
+
+    // ---- 冲突策略（全局只是"显示 + 每个任务在哪改"）
+    renderConflictKv();
+
+    // ---- 关于
+    renderAbout();
+  }
+
+  /** 代理表单的联动（手动模式才显示服务器/认证；勾了认证才显示用户名口令）。 */
+  function toggleProxyFields() {
+    var mode = $('p-mode') ? str($('p-mode').value) : 'auto';
+    show('p-manual-wrap', mode === 'manual');
+    show('p-cred-wrap', mode === 'manual' && isOn('p-auth', false));
+    show('p-port', mode === 'manual');
+  }
+
+  /** 把某个分区的表单值写回一份设置对象（不动别的分区）。 */
+  function collectProxy(s) {
+    var mode = $('p-mode') ? str($('p-mode').value) : 'auto';
+    var oldPw = (s.proxy && isObj(s.proxy)) ? str(s.proxy.password) : '';
+    var typedPw = str($('p-password') ? $('p-password').value : '');
+    var p = {
+      mode: mode,
+      server: str($('p-server') ? $('p-server').value : '').trim(),
+      port: null,
+      auth: isOn('p-auth', false),
+      user: str($('p-user') ? $('p-user').value : '').trim(),
+      // 留空 = 不改动已存口令（否则每次保存都要重打一遍）
+      password: typedPw ? typedPw : oldPw
+    };
+    var portV = str($('p-port') ? $('p-port').value : '').trim();
+    if (portV) { p.port = num(portV, 0) || null; }
+    s.proxy = p;
+    return s;
+  }
+
+  function collectPersonal(s) {
+    s.launch_at_startup = isOn('s-startup', false);
+    s.language = str($('s-lang') ? $('s-lang').value : '').trim();
+    s.region = str($('s-region') ? $('s-region').value : '').trim();
+    s.close_to_tray = isOn('s-close-tray', true);
+    return s;
+  }
+
+  function collectAdvanced(s) {
+    s.debug_log = isOn('s-debug-log', false);
+    s.desktop_notifications = isOn('s-notifications', true);
+    return s;
+  }
+
+  function collectFree(s) {
+    s.free_space = {
+      auto: isOn('fs-auto', false),
+      mode: isOn('fs-mode-freq', false) ? 'frequency' : 'below_pct',
+      below_pct: num($('fs-below-pct') ? $('fs-below-pct').value : 10, 10),
+      every_hours: num($('fs-every-hours') ? $('fs-every-hours').value : 24, 24)
+    };
+    return s;
+  }
+
+  /** 整体回写设置（带 autostart_exe：开机自启要写 GUI 自己的绝对路径）。 */
+  function saveSettings(s, resultBox, okTitle, rows) {
+    var done = function (exe) {
+      var req = { method: 'settings_save', settings: s };
+      if (exe) { req.autostart_exe = exe; }
+      return withBusy({
+        buttons: ['btn-proxy-save', 'btn-personal-save', 'btn-advanced-save', 'btn-free-save']
+      }, function () {
+        return ipc(req);
+      }).then(function (r) {
+        if (!r.ok) {
+          renderError(resultBox, '保存失败', str(r.error));
+          return r;
+        }
+        state.settings = isObj(r.data) ? r.data : null;
+        renderSettings();
+        var extra = rows || [];
+        var out = [['设置文件', str(isObj(r.data) ? r.data.path : '')]].concat(extra);
+        renderResult(resultBox, true, okTitle, out);
+        logOk(okTitle);
+        return r;
+      });
+    };
+    // GUI 可执行文件路径：给 daemon 写 autostart 的 Exec=（拿不到就让 daemon 自己找同目录）
+    return call('app_exe_path', {}).then(function (r) {
+      var exe = (r.ok && isObj(r.data) && r.data.path) ? str(r.data.path) : '';
+      return done(exe);
+    }, function () { return done(''); });
+  }
+
+  function doProxySave() {
+    return saveSettings(collectProxy(currentSettings()), 'proxy-result', '代理设置已保存', [
+      ['模式', proxyModeLabel(str($('p-mode') ? $('p-mode').value : 'auto'))],
+      ['提示', '手动代理对**已建立**的连接要等下次挂载才生效']
+    ]);
+  }
+
+  function doPersonalSave() {
+    return saveSettings(collectPersonal(currentSettings()), 'personal-result', '个人设置已保存', []);
+  }
+
+  function doAdvancedSave() {
+    return saveSettings(collectAdvanced(currentSettings()), 'advanced-result', '高级设置已保存', []);
+  }
+
+  function doFreeSave() {
+    return saveSettings(collectFree(currentSettings()), 'free-result', '释放空间设置已保存', []).then(function (r) {
+      refreshSpace();
+      return r;
+    });
+  }
+
+  // ------------------------------------------------------------ 释放空间
+
+  function refreshSpace() {
+    return ipc({ method: 'space' }).then(function (r) {
+      if (!r.ok) {
+        logErr('读取释放空间状态失败：' + str(r.error));
+        setText('space-reason', '读取失败：' + str(r.error));
+        return r;
+      }
+      state.space = isObj(r.data) ? r.data : null;
+      renderSpace();
+      return r;
+    });
+  }
+
+  function renderSpace() {
+    var d = state.space;
+    var dl = $('space-kv');
+    if (!dl) { return; }
+    clear(dl);
+    if (!d) {
+      kvText(dl, '状态', '尚未读取');
+      return;
+    }
+    var total = num(d.fs_total, 0);
+    var avail = num(d.fs_avail, 0);
+    kvText(dl, '量空间', str(d.fs_path));
+    kvText(dl, '文件系统', humanSize(total) + '（可用 ' + humanSize(avail) + '，' + num(d.fs_avail_pct, 0) + '%）');
+    kvText(dl, '缓存占用', humanSize(num(d.cache_used_bytes, 0)));
+    kvText(dl, '本轮判定', (d.would_run ? '会触发' : '不触发') + ' —— ' + str(d.reason));
+    if (num(d.last_run_unix, 0) > 0) {
+      kvText(dl, '上次触发', clock(num(d.last_run_unix, 0) * 1000));
+    }
+    if (d.injected === true) {
+      kvRow(dl, '⚠ 注入', '正在使用 QSYNC_TEST_FAST_STATVFS 注入值（验收模式）', 'val-warn');
+    }
+    setText('space-used-label', '缓存 ' + humanSize(num(d.cache_used_bytes, 0)));
+
+    // 进度条按「可用百分比」画：越窄越危险
+    var pct = num(d.fs_avail_pct, 100);
+    var fill = $('space-bar-fill');
+    if (fill) { fill.style.width = Math.max(0, Math.min(100, pct)) + '%'; }
+    setText('space-bar-label', '可用 ' + pct + '% · 缓存 ' + humanSize(num(d.cache_used_bytes, 0)));
+    setText('space-reason', '判定依据：' + str(d.reason) + (d.note ? '　|　' + str(d.note) : ''));
+
+    clearAlerts('space-blocked');
+    if (isObj(d) && d.blocked && d.blocked.length) {
+      addAlert('space-blocked', '被安全检查链挡下 ' + d.blocked.length + ' 项（例：' +
+        str(d.blocked[0] && d.blocked[0][0]) + ' — ' + str(d.blocked[0] && d.blocked[0][1]) + '）');
+    }
+  }
+
+  function doFreeNow() {
+    return withBusy({ spinners: ['files-busy'], buttons: ['btn-free-now'] }, function () {
+      return ipc({ method: 'space', now: true });
+    }).then(function (r) {
+      if (!r.ok) {
+        renderError('free-result', '立即释放空间失败', str(r.error));
+        return r;
+      }
+      var d = isObj(r.data) ? r.data : {};
+      state.space = d;
+      renderSpace();
+      renderResult('free-result', true, '立即释放空间完成', [
+        ['脱水', str(num(d.dehydrated, 0)) + ' 个'],
+        ['释放', humanSize(num(d.freed_bytes, 0))],
+        ['被挡下', str((d.blocked || []).length) + ' 个（安全检查链）'],
+        ['缓存现在', humanSize(num(d.cache_used_bytes, 0))]
+      ]);
+      return r;
+    });
+  }
+
+  // ------------------------------------------------------------ 筛选器（link.exclude）
+
+  function refreshFilters() {
+    return call('link_read', { linkId: 'default' }).then(function (r) {
+      if (!r.ok || !isObj(r.data)) {
+        setText('flt-note', '读取连接配置失败：' + str(r.error));
+        return r;
+      }
+      state.link = isObj(r.data.link) ? r.data.link : null;
+      var link = state.link;
+      var lines = (link && link.exclude && link.exclude.length) ? link.exclude : [];
+      var ta = $('flt-lines');
+      if (ta) { ta.value = lines.join('\n'); }
+      var ft = $('flt-filter-temp');
+      if (ft) { ft.checked = !(link && link.filter_temp === false); }
+      return refreshRulesPreview();
+    });
+  }
+
+  function refreshRulesPreview() {
+    return ipc({ method: 'rules' }).then(function (r) {
+      var note = $('flt-note');
+      if (!note) { return r; }
+      if (!r.ok) {
+        note.hidden = false;
+        note.textContent = '规则读取失败（daemon 未运行？）：' + str(r.error);
+        return r;
+      }
+      var d = isObj(r.data) ? r.data : {};
+      var parts = [
+        '生效 ' + ((d.patterns || []).length) + ' 条规则（挂载点里会被剪掉）',
+        '临时文件过滤 ' + (d.filter_temp ? '开' : '关')
+      ];
+      if (d.bad && d.bad.length) { parts.push('⚠ 解析不了：' + d.bad.join(', ')); }
+      note.hidden = false;
+      note.textContent = parts.join(' · ');
+      return r;
+    });
+  }
+
+  function doFiltersSave() {
+    var raw = str($('flt-lines') ? $('flt-lines').value : '');
+    var lines = [];
+    var arr = raw.split('\n');
+    for (var i = 0; i < arr.length; i++) {
+      var v = arr[i].trim();
+      if (v) { lines.push(v); }
+    }
+    if (!lines.length) {
+      // ⚠ link_save 的语义是「空数组 = 保留旧值」，所以清空要用一条注释行表达
+      //   （规则解析器忽略 `#` 开头的行，效果等价于「没有任何排除规则」）。
+      lines = ['# 已清空（GUI）'];
+    }
+    var link = state.link || {};
+    if (!link.host || !link.user) {
+      renderError('flt-match-result', '无法保存筛选器', '连接配置里缺少 host/user：先在「连接」分区保存一次连接配置');
+      return Promise.resolve(null);
+    }
+    var input = {
+      id: link.id || 'default',
+      host: str(link.host),
+      port: num(link.port, 9834),
+      https: link.https !== false,
+      insecure: link.insecure === true,
+      user: str(link.user),
+      home_root: str(link.home_root) || '/home',
+      roots: (link.roots && link.roots.length) ? link.roots : [],
+      ipv4_only: link.ipv4_only === true,
+      exclude: lines,
+      filter_temp: isOn('flt-filter-temp', true)
+    };
+    return withBusy({ buttons: ['btn-flt-save'] }, function () {
+      return call('link_save', { input: input });
+    }).then(function (r) {
+      if (!r.ok) {
+        renderError('flt-match-result', '保存筛选器失败', str(r.error));
+        return r;
+      }
+      renderResult('flt-match-result', true, '筛选器已保存', [
+        ['规则', lines.join(' , ')],
+        ['文件', str(isObj(r.data) ? r.data.path : '')],
+        ['生效时机', '要在**已挂载**的任务上生效，需要重启 daemon（规则在挂载时注入 FUSE 与同步引擎）']
+      ]);
+      refreshFilters();
+      return r;
+    });
+  }
+
+  function doMatchPreview() {
+    var p = str($('flt-match') ? $('flt-match').value : '').trim();
+    if (!p) {
+      renderError('flt-match-result', '参数错误', '请输入一条远端绝对路径，例如 /home/qxync-test/secret.bin');
+      return Promise.resolve(null);
+    }
+    return ipc({ method: 'rules', match_path: p }).then(function (r) {
+      if (!r.ok) {
+        renderError('flt-match-result', '判定失败', str(r.error));
+        return r;
+      }
+      var d = isObj(r.data) ? r.data : {};
+      var verdict = '可见（会同步）';
+      if (d.match_hidden === true) {
+        verdict = (d.match_reason === 'temp') ? '隐藏（临时文件规则）' : '隐藏（命中排除规则）';
+      } else if (d.match_root === null || d.match_root === undefined) {
+        verdict = '不在任何配置的远端根之内';
+      }
+      renderResult('flt-match-result', true, '判定：' + verdict, [
+        ['路径', p],
+        ['归属根', d.match_root ? str(d.match_root) : '（不在任何根内）'],
+        ['根相对路径', d.match_rel ? str(d.match_rel) : '—'],
+        ['原因', str(d.match_reason) || '—']
+      ]);
+      return r;
+    });
+  }
+
+  // ------------------------------------------------------------ 冲突策略 / 待裁决
+
+  function conflictLabel(v) {
+    if (v === 'ask') { return '每个文件都问我'; }
+    if (v === 'rename_remote') { return '重命名 NAS 上的文件'; }
+    if (v === 'replace_remote') { return '用本地文件替换 NAS 上的文件（⚠ 会丢远端改动）'; }
+    if (v === 'replace_local') { return '用 NAS 上的文件替换本地文件（⚠ 会丢本地改动）'; }
+    return '重命名本地文件（默认，双方都不丢）';
+  }
+
+  function taskList() {
+    var d = state.tasks;
+    var out = [];
+    if (d && d.tasks && d.tasks.length) {
+      for (var i = 0; i < d.tasks.length; i++) {
+        var t = d.tasks[i] && d.tasks[i].task ? d.tasks[i].task : null;
+        if (t) { out.push(t); }
+      }
+    }
+    return out;
+  }
+
+  function renderConflictKv() {
+    var dl = $('conflict-kv');
+    if (!dl) { return; }
+    clear(dl);
+    var ts = taskList();
+    if (!ts.length) {
+      kvText(dl, '任务', '（还没有任务；策略在任务的「文件夹对设置」里选）');
+      return;
+    }
+    for (var i = 0; i < ts.length; i++) {
+      kvText(dl, str(ts[i].id), conflictLabel(str(ts[i].conflict) || 'rename_local'));
+    }
+  }
+
+  function refreshDecisions() {
+    return ipc({ method: 'decisions', action: 'list' }).then(function (r) {
+      if (!r.ok) {
+        logErr('读取冲突待裁决队列失败：' + str(r.error));
+        return r;
+      }
+      state.decisions = isObj(r.data) ? r.data : null;
+      renderDecisions();
+      return r;
+    });
+  }
+
+  function renderDecisions() {
+    var box = $('decisions-list');
+    if (!box) { return; }
+    var d = state.decisions;
+    var items = (d && d.decisions) ? d.decisions : [];
+    clear(box);
+    setText('decisions-count', items.length ? (items.length + ' 条（待裁决 ' + num(d.pending, 0) + '）') : '');
+    show('decisions-empty', items.length === 0);
+    var note = $('decisions-note');
+    if (note) {
+      note.hidden = !(d && d.note);
+      note.textContent = d && d.note ? str(d.note) : '';
+    }
+    for (var i = 0; i < items.length; i++) {
+      box.appendChild(buildDecisionCard(items[i]));
+    }
+  }
+
+  function buildDecisionCard(x) {
+    var card = el('div', 'task-card');
+    var body = el('div', 'task-body');
+    body.appendChild(el('div', 'task-state', pathBase(str(x.path)) + (x.resolution ? '（已裁决，待执行）' : '（待裁决）')));
+    body.appendChild(el('div', 'task-meta', '远端 ' + str(x.path)));
+    body.appendChild(el('div', 'task-meta',
+      '本地 ' + humanSize(num(x.local_size, 0)) + ' / 远端 ' + humanSize(num(x.remote_size, 0)) +
+      ' · 发现于 ' + clock(num(x.created_unix, 0) * 1000)));
+    card.appendChild(body);
+
+    var acts = el('div', 'task-actions');
+    var mk = function (label, res, cls) {
+      var b = el('button', 'mini' + (cls ? ' ' + cls : ''), label);
+      b.type = 'button';
+      b.addEventListener('click', function () { doDecisionResolve(str(x.id), res, b); });
+      return b;
+    };
+    acts.appendChild(mk('保留本地', 'keep_local', 'primary'));
+    acts.appendChild(mk('保留 NAS 上的', 'keep_remote'));
+    acts.appendChild(mk('两份都留', 'keep_both'));
+    card.appendChild(acts);
+    return card;
+  }
+
+  function doDecisionResolve(id, res, btn) {
+    return withBusy({ buttons: btn ? [btn.id] : [] }, function () {
+      return ipc({ method: 'decisions', action: 'resolve', id: id, resolution: res });
+    }).then(function (r) {
+      if (!r.ok) {
+        logErr('裁决失败：' + str(r.error));
+        return r;
+      }
+      logOk('已裁决 ' + id + ' → ' + res + '（下一轮同步执行）');
+      refreshDecisions();
+      return r;
+    });
+  }
+
+  // ------------------------------------------------------------ LAN 加速
+
+  function refreshLan() {
+    return ipc({ method: 'peer', action: 'status' }).then(function (r) {
+      if (!r.ok) {
+        logErr('读取 LAN 状态失败：' + str(r.error));
+        return r;
+      }
+      renderLanStatus(isObj(r.data) ? r.data : null);
+      return Promise.all([
+        ipc({ method: 'peer', action: 'list' }),
+        ipc({ method: 'peer', action: 'events', limit: 10 })
+      ]).then(function (rs) {
+        renderLanDevices(rs[0].ok ? rs[0].data : null);
+        renderLanEvents(rs[1].ok ? rs[1].data : null);
+        return r;
+      });
+    });
+  }
+
+  function renderLanStatus(d) {
+    var dl = $('lan-status-kv');
+    if (!dl) { return; }
+    clear(dl);
+    if (!d) {
+      kvText(dl, '状态', 'daemon 未运行或未响应');
+      return;
+    }
+    kvBool(dl, '启用', d.enabled === true, '监听中', '未监听');
+    kvText(dl, '绑定地址', d.listen ? str(d.listen) : '（未监听）');
+    kvText(dl, '身份名', str(d.identity));
+    kvText(dl, '配对码', d.pairing_code ? str(d.pairing_code) : '（没有开启配对）');
+    kvText(dl, '已配对设备', str((d.devices || []).length) + ' 台');
+    kvText(dl, '事件', '发出 ' + num(d.events_out, 0) + ' / 收到 ' + num(d.events_in, 0) +
+      ' / 拒绝 ' + num(d.rejected, 0));
+    kvText(dl, 'LAN 命中', num(d.lan_hits, 0) + ' 次，' + humanSize(num(d.lan_bytes, 0)));
+    var link = state.link;
+    var listen = $('lan-listen');
+    if (listen && link) { listen.value = link.peer_listen ? str(link.peer_listen) : ''; }
+    var name = $('lan-name');
+    if (name && link) { name.value = link.peer_name ? str(link.peer_name) : ''; }
+  }
+
+  function renderLanDevices(d) {
+    var ul = $('lan-devices');
+    if (!ul) { return; }
+    clear(ul);
+    var devs = (d && d.devices) ? d.devices : [];
+    show('lan-devices-empty', devs.length === 0);
+    for (var i = 0; i < devs.length; i++) {
+      ul.appendChild(el('li', null, str(devs[i].name) + '  ' + str(devs[i].addr) + '  ' + str(devs[i].token_masked)));
+    }
+  }
+
+  function renderLanEvents(d) {
+    var ul = $('lan-events');
+    if (!ul) { return; }
+    clear(ul);
+    var evs = (d && d.events) ? d.events : [];
+    show('lan-events-empty', evs.length === 0);
+    for (var i = 0; i < evs.length; i++) {
+      ul.appendChild(el('li', null, clock(num(evs[i].ts, 0) * 1000) + '  ' + str(evs[i].kind) + '  ' + str(evs[i].path)));
+    }
+  }
+
+  function doLanSave() {
+    var link = state.link;
+    if (!link || !link.host || !link.user) {
+      renderError('lan-result', '无法保存', '先到「连接」分区保存一次连接配置');
+      return Promise.resolve(null);
+    }
+    var listen = str($('lan-listen') ? $('lan-listen').value : '').trim();
+    var name = str($('lan-name') ? $('lan-name').value : '').trim();
+    var input = {
+      id: link.id || 'default',
+      host: str(link.host),
+      port: num(link.port, 9834),
+      https: link.https !== false,
+      insecure: link.insecure === true,
+      user: str(link.user),
+      home_root: str(link.home_root) || '/home',
+      roots: (link.roots && link.roots.length) ? link.roots : [],
+      ipv4_only: link.ipv4_only === true,
+      // 空串 = 关闭监听（daemon 侧 `peer_listen` 去空白后为空就不监听）
+      peer_listen: listen,
+      peer_name: name
+    };
+    return withBusy({ buttons: ['btn-lan-save'] }, function () {
+      return call('link_save', { input: input });
+    }).then(function (r) {
+      if (!r.ok) {
+        renderError('lan-result', '保存 LAN 设置失败', str(r.error));
+        return r;
+      }
+      renderResult('lan-result', true, 'LAN 设置已保存', [
+        ['监听', listen || '（关闭）'],
+        ['设备名', name || '（主机名）'],
+        ['生效', '需要重启 daemon']
+      ]);
+      refreshFilters();
+      return r;
+    });
+  }
+
+  function doLanPair() {
+    var addr = str($('lan-pair-addr') ? $('lan-pair-addr').value : '').trim();
+    var code = str($('lan-pair-code') ? $('lan-pair-code').value : '').trim();
+    if (!addr || !code) {
+      renderError('lan-result', '参数错误', '需要「地址 + 配对码」两样：先在对方机器上跑 qsync peer status 拿配对码');
+      return Promise.resolve(null);
+    }
+    return withBusy({ buttons: ['btn-lan-pair'] }, function () {
+      return ipc({ method: 'peer', action: 'pair', addr: addr, code: code });
+    }).then(function (r) {
+      if (!r.ok) {
+        renderError('lan-result', '配对失败', str(r.error));
+        return r;
+      }
+      var d = isObj(r.data) ? r.data : {};
+      renderResult('lan-result', true, '配对成功', [
+        ['设备名', str(d.paired_name)],
+        ['地址', str(d.paired_addr)],
+        ['令牌', str(d.paired_token_masked)]
+      ]);
+      refreshLan();
+      return r;
+    });
+  }
+
+  // ------------------------------------------------------------ 关于 / 快捷出口
+
+  function renderAbout() {
+    var dl = $('about-kv');
+    if (!dl) { return; }
+    clear(dl);
+    var info = state.appInfo;
+    kvText(dl, 'QSync for Linux', info ? str(info.version) : '—');
+    kvText(dl, '说明', 'FUSE 按需同步 + qxyncd 常驻守护；对齐 Qsync Client 6.1 的界面与术语');
+    kvText(dl, 'socket', info ? str(info.socket) : '—');
+    kvText(dl, '配置目录', info ? str(info.config_dir) : '—');
+    kvText(dl, '数据目录', info ? str(info.data_dir) : '—');
+    kvText(dl, '状态目录', info ? str(info.state_dir) : '—');
+    var st = state.lastStatus;
+    var s = (st && isObj(st.status)) ? st.status : null;
+    if (s && isObj(s.link)) {
+      kvText(dl, 'NAS', str(s.link.host) + ':' + str(s.link.port));
+    }
+    kvBool(dl, 'daemon', !!(s || (info && info.daemon_running)),
+      '运行中', '未运行');
+    var note = $('about-m84');
+    if (note) {
+      note.textContent = state.m84Info
+        ? ('托盘：' + (state.m84Info.tray_created ? '已创建' : '未创建') +
+           ' · 插件：' + ((state.m84Info.plugins || []).join(' / ') || '—') +
+           ' · 托盘事件：' + (state.trayAction ? state.trayAction : '（还没触发过）'))
+        : '托盘/通知/选择器（M8.4）：GUI 侧命令未就绪时这里显示 —';
+    }
+  }
+
+  function m84InfoRefresh() {
+    return call('m84_info', {}).then(function (r) {
+      state.m84Info = (r.ok && isObj(r.data)) ? r.data : null;
+      renderAbout();
+      return r;
+    }, function () { return { ok: false }; });
+  }
+
+  /** 打开一个路径/URL（走 GUI 的 opener 命令；未就绪时只记日志，不假装成功）。 */
+  function doOpen(what, target) {
+    var cmd = (what === 'url') ? 'open_url' : 'open_path';
+    var args = (what === 'url') ? { url: target } : { path: target };
+    return call(cmd, args).then(function (r) {
+      if (r.ok && isObj(r.data) && r.data.ok === false) {
+        logErr('打开失败：' + str(r.data.error));
+      } else if (!r.ok) {
+        logErr('打开 ' + target + ' 失败：' + str(r.error));
+      } else {
+        logOk('已请求打开：' + target);
+      }
+      return r;
+    });
+  }
+
+  function fileStationUrl() {
+    var st = state.lastStatus;
+    var s = (st && isObj(st.status)) ? st.status : null;
+    var link = (s && isObj(s.link)) ? s.link : (state.link || null);
+    if (!link || !link.host) { return ''; }
+    var scheme = link.https === false ? 'http' : 'https';
+    return scheme + '://' + str(link.host) + ':' + str(link.port) + '/cgi-bin/filemanager/index.html';
+  }
+
+  // ------------------------------------------------------------ 桌面通知
+
+  /** 发一条系统通知（尊重设置里的「显示桌面通知」；GUI 侧命令未就绪时静默降级）。 */
+  function notifyUser(title, body) {
+    return call('notify_show', { title: title, body: body });
+  }
+
+  /**
+   * 轮询里顺带看一下「错误列表」有没有新条目 —— 有新错误就发一条桌面通知。
+   * 刻意**不通知成功项**：Qsync 的「每个活动都通知」在 Linux 桌面上是噪声。
+   */
+  function checkErrorsForNotify() {
+    return ipc({ method: 'journal', level: 'error', limit: 1 }).then(function (r) {
+      if (!r.ok) { return r; }
+      var d = isObj(r.data) ? r.data : {};
+      var es = d.entries || [];
+      if (!es.length) { return r; }
+      var e = es[0];
+      var key = str(e.ts) + '|' + str(e.path) + '|' + str(e.detail);
+      if (state.lastErrorKey === key) { return r; }
+      state.lastErrorKey = key;
+      if (state.settings && isObj(state.settings.settings) &&
+          state.settings.settings.desktop_notifications === false) {
+        return r;   // 用户关掉了通知
+      }
+      notifyUser('QSync 同步出错', str(e.path) + ' —— ' + str(e.detail));
+      return r;
+    }, function () { return { ok: false }; });
+  }
+
+  // ============================================================ 页面切换
+  /** 旧值 → 新目的地（`QSYNC_GUI_TAB` 的历史值必须继续可用）。 */
+  function resolvePage(name) {
+    if (LEGACY_TABS[name]) { return LEGACY_TABS[name]; }
+    // `diag:<status|mounts|sync>` —— 给验收矩阵用的「直达诊断子页」写法
+    if (name.indexOf('diag:') === 0) {
+      var sub = name.slice(5);
+      if (DIAG_PANELS.indexOf(sub) >= 0) { return { page: 'diag', diag: sub }; }
+    }
+    // ★ M8.4：`settings:<connect|proxy|sync|personal|advanced|free|lan|about>`
+    //   —— 一个目的地里的八个分区，验收矩阵逐个出图
+    if (name.indexOf('settings:') === 0) {
+      var sec = name.slice(9);
+      if (SETTINGS_SECS.indexOf(sec) >= 0) { return { page: 'settings', sec: sec }; }
+    }
+    if (PAGES.indexOf(name) >= 0) { return { page: name, diag: null }; }
+    return null;
+  }
+
+  /** 切一级目的地；`diagPanel` 只在 page=diag 时有意义，`sec` 只在 page=settings 时有意义。 */
+  function switchPage(name, diagPanel, sec) {
+    var r = resolvePage(name) || { page: 'home', diag: null };
+    name = r.page;
+    if (r.diag) { diagPanel = r.diag; }
+    if (r.sec) { sec = r.sec; }
+
+    state.page = name;
+    if (diagPanel && DIAG_PANELS.indexOf(diagPanel) >= 0) { state.diag = diagPanel; }
+
+    var items = document.querySelectorAll('.rail-item');
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      if (it.getAttribute('data-page') === name) { it.classList.add('active'); }
+      else { it.classList.remove('active'); }
+    }
+
+    var pages = document.querySelectorAll('.page');
+    for (var j = 0; j < pages.length; j++) {
+      var p = pages[j];
+      if (p.id === 'page-' + name) { p.classList.add('active'); }
+      else { p.classList.remove('active'); }
+    }
+    setText('page-title', PAGE_TITLE[name] || name);
+
+    if (name === 'home') {
+      renderHome(state.lastStatus);
+      refreshMounts();
+      refreshTasks();
+    } else if (name === 'tasks') {
+      refreshTasks();
+      refreshDecisions();
+    } else if (name === 'journal') {
+      refreshJournal();
+    } else if (name === 'errors') {
+      refreshErrors();
+    } else if (name === 'files') {
+      if (!state.files.entries.length) { refreshFiles(state.files.path); }
+      else { renderFiles(); refreshFileStates(); }
+    } else if (name === 'settings') {
+      switchSettingsSec(sec || state.sec);
+      loadConnect();
+      refreshSettings();
+      if (state.sec === 'free') { refreshSpace(); }
+      if (state.sec === 'lan') { refreshLan(); }
+    } else if (name === 'diag') {
+      switchDiag(state.diag);
+    }
+  }
+
+  /** ★ M8.4：切设置页内的分区。 */
+  function switchSettingsSec(name) {
+    if (SETTINGS_SECS.indexOf(name) < 0) { name = 'connect'; }
+    state.sec = name;
+    var tabs = document.querySelectorAll('#settings-tabs .tab');
     for (var i = 0; i < tabs.length; i++) {
       var t = tabs[i];
-      if (t.getAttribute('data-tab') === name) { t.classList.add('active'); }
+      if (t.getAttribute('data-sec') === name) { t.classList.add('active'); }
       else { t.classList.remove('active'); }
     }
-    var panels = document.querySelectorAll('.panel');
+    var secs = document.querySelectorAll('#page-settings .settings-sec');
+    for (var j = 0; j < secs.length; j++) {
+      var s = secs[j];
+      if (s.id === 'sec-' + name) { s.classList.add('active'); }
+      else { s.classList.remove('active'); }
+    }
+    setText('page-title', '设置 · ' + (SEC_TITLE[name] || name));
+    if (name === 'free') { refreshSpace(); }
+    if (name === 'lan') { refreshLan(); }
+    if (name === 'about') { renderAbout(); }
+    if (name === 'sync') { refreshFilters(); }
+  }
+
+  /** 切诊断页内的子 tab（状态 / 挂载 / 同步缓存）。 */
+  function switchDiag(name) {
+    if (DIAG_PANELS.indexOf(name) < 0) { name = 'status'; }
+    var prev = state.diag;
+    state.diag = name;
+
+    var tabs = document.querySelectorAll('#diag-tabs .tab');
+    for (var i = 0; i < tabs.length; i++) {
+      var t = tabs[i];
+      if (t.getAttribute('data-panel') === name) { t.classList.add('active'); }
+      else { t.classList.remove('active'); }
+    }
+
+    var panels = document.querySelectorAll('#page-diag .panel');
     for (var j = 0; j < panels.length; j++) {
       var p = panels[j];
       if (p.id === 'panel-' + name) { p.classList.add('active'); }
       else { p.classList.remove('active'); }
     }
 
-    if (name === 'status') {
+    if (name === 'status' || name === 'sync') {
       renderStatusPanel(state.lastStatus);
-      // 切到这个 tab 拉一次远端根（roots 贵，不跟 2s 轮询）；重复点同一 tab 不重复拉
-      if (prev !== 'status') { refreshRoots(); }
+      // 切到「状态」拉一次远端根（roots 贵，不跟 2s 轮询）；重复点同一子页不重复拉
+      if (name === 'status' && prev !== 'status') { refreshRoots(); }
     }
-    if (name === 'sync') { renderStatusPanel(state.lastStatus); }
     if (name === 'mounts') { refreshMounts(); }
-    if (name === 'connect') { loadConnect(); }
-    if (name === 'files') {
-      if (!state.files.entries.length) { refreshFiles(state.files.path); }
-      else { renderFiles(); }
-    }
   }
 
   // ============================================================ 日志面板
@@ -1736,14 +3374,58 @@
 
   // ============================================================ 事件绑定
   function bindEvents() {
-    var tabs = document.querySelectorAll('.tab');
-    for (var i = 0; i < tabs.length; i++) {
+    // 左侧图标栏（一级目的地）
+    var rail = document.querySelectorAll('.rail-item');
+    for (var i = 0; i < rail.length; i++) {
+      (function (b) {
+        b.addEventListener('click', function () {
+          switchPage(str(b.getAttribute('data-page')));
+        });
+      })(rail[i]);
+    }
+
+    // 诊断页内的子 tab
+    var dtabs = document.querySelectorAll('#diag-tabs .tab');
+    for (var k = 0; k < dtabs.length; k++) {
       (function (t) {
         t.addEventListener('click', function () {
-          switchTab(str(t.getAttribute('data-tab')));
+          switchDiag(str(t.getAttribute('data-panel')));
         });
-      })(tabs[i]);
+      })(dtabs[k]);
     }
+
+    // ★ M8.3 更新中心 / 错误列表
+    on('btn-journal-refresh', 'click', function () { refreshJournal(); });
+    on('btn-journal-clear', 'click', function () { doJournalClear(); });
+    on('btn-errors-refresh', 'click', function () { refreshErrors(); });
+    var jq = $('j-query');
+    if (jq) {
+      jq.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Enter') { ev.preventDefault(); refreshJournal(); }
+      });
+    }
+    var jl = $('j-level');
+    if (jl) { jl.addEventListener('change', function () { refreshJournal(); }); }
+
+    // ★ M8.2 任务页
+    on('btn-tasks-refresh', 'click', function () { refreshTasks(); });
+    on('btn-tasks-add', 'click', function () { openTaskForm(); });
+    on('btn-task-cancel', 'click', function () { closeTaskForm(); });
+    var ft = $('form-task');
+    if (ft) {
+      ft.addEventListener('submit', function (ev) {
+        ev.preventDefault();
+        doTaskSave();
+      });
+    }
+
+    // 主页快捷动作
+    on('btn-home-settings', 'click', function () { switchPage('settings'); });
+    on('btn-home-add-task', 'click', function () { switchPage('diag', 'mounts'); });
+    on('btn-home-refresh', 'click', function () { refreshStatus(true); refreshMounts(); });
+    on('btn-home-sync-now', 'click', function () {
+      doSync({ once: true }, ['btn-home-sync-now'], '立即同步');
+    });
 
     // 顶部动作
     on('btn-daemon-start', 'click', function () { doDaemonStart(); });
@@ -1819,9 +3501,100 @@
       doDehydrate({ idle_secs: idle }, '释放闲置 ≥ ' + idle + 's');
     });
 
+    // ★ M8.4：设置中心
+    var stabs = document.querySelectorAll('#settings-tabs .tab');
+    for (var si = 0; si < stabs.length; si++) {
+      (function (t) {
+        t.addEventListener('click', function () {
+          switchSettingsSec(str(t.getAttribute('data-sec')));
+        });
+      })(stabs[si]);
+    }
+    on('btn-settings-refresh', 'click', function () { refreshSettings(); });
+    on('btn-proxy-save', 'click', function () { doProxySave(); });
+    on('btn-personal-save', 'click', function () { doPersonalSave(); });
+    on('btn-advanced-save', 'click', function () { doAdvancedSave(); });
+    on('btn-free-save', 'click', function () { doFreeSave(); });
+    on('btn-free-now', 'click', function () { doFreeNow(); });
+    on('btn-space-refresh', 'click', function () { refreshSpace(); });
+    on('btn-flt-save', 'click', function () { doFiltersSave(); });
+    on('btn-flt-reload', 'click', function () { refreshFilters(); });
+    on('btn-flt-match', 'click', function () { doMatchPreview(); });
+    on('btn-lan-save', 'click', function () { doLanSave(); });
+    on('btn-lan-status', 'click', function () { refreshLan(); });
+    on('btn-lan-pair', 'click', function () { doLanPair(); });
+    on('btn-about-refresh', 'click', function () { loadConnect(); m84InfoRefresh(); renderAbout(); });
+    on('btn-notify-test', 'click', function () {
+      notifyUser('QSync 测试通知', '如果你看到这条，说明桌面通知链路是通的。').then(function (r) {
+        if (r.ok && isObj(r.data) && r.data.ok === false) {
+          renderError('advanced-result', '通知未发出', str(r.data.error || r.data.reason));
+        } else if (r.ok) {
+          renderResult('advanced-result', true, '已请求发送测试通知', [
+            ['说明', '如果系统没弹窗，检查通知守护进程与「免打扰」设置']
+          ]);
+        } else {
+          renderError('advanced-result', '通知命令不可用', str(r.error));
+        }
+      });
+    });
+    on('btn-open-logdir', 'click', function () {
+      var info = state.appInfo;
+      // daemon/GUI 的日志在状态目录的 log/ 下
+      doOpen('path', info ? (str(info.state_dir) + '/log') : '');
+    });
+    on('btn-open-config', 'click', function () {
+      var info = state.appInfo;
+      doOpen('path', info ? str(info.config_dir) : '');
+    });
+    on('btn-open-station', 'click', function () {
+      var u = fileStationUrl();
+      if (!u) { renderError('about-result', '打不开', '还没有连接配置（先在「连接」分区保存）'); return; }
+      doOpen('url', u);
+      renderResult('about-result', true, '已请求打开 File Station', [
+        ['URL', u],
+        ['说明', 'File Station 的 Web 路径在不同 QTS 版本上略有差异，打不开就手动访问 NAS 首页']
+      ]);
+    });
+    var unsupported = {
+      'btn-unsupported-thumb': '创建缩略图属于 NAS 侧媒体索引优化，需要引入图像依赖与额外通道 —— 本客户端不做。',
+      'btn-unsupported-backup': '备份任务是 Qsync 6.0 的旗舰功能，但要一整套单向引擎 + 调度器；qxync 的定位是 Linux 按需同步，备份请用 HBS 3 / rsync / restic。',
+      'btn-unsupported-version': '「以前版本 / 还原」依赖 NAS 版本控制，本机实测 versioning_support 恒为 0 —— 已决策不做。'
+    };
+    Object.keys(unsupported).forEach(function (id) {
+      on(id, 'click', function () {
+        var note = $('unsupported-note');
+        if (note) { note.hidden = false; note.textContent = unsupported[id]; }
+      });
+    });
+    on('btn-decisions-refresh', 'click', function () { refreshDecisions(); });
+
     // 页面可见性恢复时立刻刷一次
     document.addEventListener('visibilitychange', function () {
       if (!document.hidden) { refreshStatus(true); }
+    });
+  }
+
+  /**
+   * ★ M8.4：托盘菜单动作。
+   * Rust 侧只负责 emit（`tray://action`），真正的动作在前端做 —— 前端持有 IPC 与界面状态。
+   */
+  function wireTray() {
+    if (!tauri || !tauri.event || !isFn(tauri.event.listen)) {
+      return;   // 老版本/非 Tauri 环境：托盘事件不可用（不影响其它功能）
+    }
+    tauri.event.listen('tray://action', function (ev) {
+      var action = str(ev && ev.payload);
+      state.trayAction = action;
+      logInfo('托盘动作：' + action);
+      if (action === 'open') {
+        call('window_show', {});
+        switchPage('home');
+      } else if (action === 'sync') {
+        doSync({ once: true }, [], '托盘：立即与 NAS 同步');
+      } else if (action === 'pause') {
+        doSync({ interval_secs: 0 }, [], '托盘：暂停轮询');
+      }
+      renderAbout();
     });
   }
 
@@ -1834,6 +3607,8 @@
   function boot() {
     wireModal();
     wireLogBox();
+    wireRowMenu();
+    wireTray();
     bindEvents();
 
     if (!invokeFn) {
@@ -1848,18 +3623,23 @@
     call('app_info', {}).then(function (r) {
       if (r.ok) {
         renderAppInfo(isObj(r.data) ? r.data : null);
-        // 调试/验收用：环境变量 QSYNC_GUI_TAB=<status|connect|mounts|files|sync>
-        // 指定初始 tab（后端 app_info 透传），截图矩阵靠它逐个 tab 出图。
+        // 调试/验收用：环境变量 QSYNC_GUI_TAB 指定初始目的地
+        //   新值：home|tasks|files|journal|errors|settings|diag
+        //   旧值（M8.1 之前，必须继续可用）：status|mounts|sync→诊断；connect→设置；files
+        // 后端 app_info 原样透传，截图矩阵靠它逐个目的地出图。
         var want = isObj(r.data) ? str(r.data.initial_tab) : '';
-        var names = ['status', 'connect', 'mounts', 'files', 'sync'];
-        if (want && names.indexOf(want) >= 0) { switchTab(want); }
+        if (want && resolvePage(want)) { switchPage(want); }
       }
     });
 
     loadConnect();
-    refreshStatus(true).then(function () { startPolling(); refreshCurrentTab(); },
-                             function () { startPolling(); refreshCurrentTab(); });
+    refreshSettings();
+    m84InfoRefresh();
+    refreshDecisions();
+    refreshStatus(true).then(function () { startPolling(); refreshCurrentPage(); },
+                             function () { startPolling(); refreshCurrentPage(); });
     refreshMounts();
+    refreshTasks();
     renderFiles();
   }
 

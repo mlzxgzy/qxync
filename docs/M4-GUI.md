@@ -1,6 +1,9 @@
 # M4 —— GUI（Tauri 2 桌面应用）
 
-> 状态：**已实现并真机验收**（`xtask/tests/gui-matrix.sh` 41/41）。
+> 状态：**已实现并真机验收**（M4：`gui-matrix.sh` 41/41）。
+> ★ **M8.1 已改造界面结构**（顶部 tab → 左侧图标栏 + 页面），验收矩阵扩到 **86/86**；
+> ★ **M8.4 补齐设置中心（8 个分区）、文件页三态与右键菜单、冲突策略与待裁决队列、托盘/通知/选择器**，
+> 见 §4.1、§4.3 与 [`M8-向Qsync-Client-6靠拢.md`](M8-向Qsync-Client-6靠拢.md)。
 > 里程碑定位见 [`开发规划.md`](开发规划.md) §2：GUI 在双向同步（M2b/M2c）与脱水（M3）可用后进场，
 > 首版只做四件事——**登录/连接配置、挂载管理、状态与进度面板、pin 管理**。
 
@@ -62,18 +65,59 @@ Tauri 2 的 `withGlobalTauri: true` 会把 `window.__TAURI__.core.invoke` 直接
 2. `login_flow` 会**重启 daemon**：`qxyncd` 只在启动时读 `links/<id>.json`，
    所以「换 NAS / 换账号」必须重启；只有连接参数（host/port/https/user/ipv4_only）没变才直接登录。
 
-## 4. 界面（5 个 tab）
+## 4. 界面
 
-| tab | 内容 |
-|---|---|
-| **状态 / 进度** | 服务端信息（Qsync 版本/QPKG/build/busy_reason）、会话、三游标、水合统计、上传队列（pending/active/done/failed/retries/bytes）、缓存限额进度条、`blocked_*` 分类、挂载列表、最近一轮同步摘要 |
-| **连接 / 登录** | host/port/https/insecure/user/password/home_root/ipv4_only 表单（打开时预填）；保存配置 / **保存并登录** / 启停 daemon；三个 XDG 目录与 socket 路径 |
-| **挂载** | 当前挂载表（可卸载）+ 新建挂载（挂载点默认 `$HOME/qsync-mnt`、读写开关、`cache_mode`、线程数、水合超时、删除熔断阈值、auto_unmount） |
-| **文件 / pin** | 远端目录浏览（真机 `ls`，目录优先）、每行 pin 查询/设置（`unspecified/pinned/unpinned/excluded`）、下载（`get`）、脱水（`dehydrate`）、新建目录、删除 |
-| **同步 / 缓存** | `SyncInfo` 全量（含 `devices`、`last_error`、`delete_block_reason`）+ 立即同步 / 强制放行删除 / 暂停轮询 / 设间隔；`CacheInfo` 全量 + 脱水预演 / 全部脱水 / 按限额 / 释放闲置 |
+> ★ **M8.1 起，界面从「顶部 5 个 tab」改成「左侧图标栏 + 页面」**（对齐 Qsync Client 6 的信息架构，
+> 见 [`M8-向Qsync-Client-6靠拢.md`](M8-向Qsync-Client-6靠拢.md)）。下面 §4.1 是新结构，§4.2 保留
+> 各页原来的字段说明（**元素 id 与字段全部未变**，只是搬了位置）。
+
+### 4.1 结构（M8.1）
+
+```
+┌────┬──────────────────────────────────────────────────────────────┐
+│ Q  │  页面标题        [daemon][连接][登录]      启动/停止/立即登录   │
+│    │  daemon: pid … · uptime … · socket …                          │
+│ 主页│                                                              │
+│ 任务│   内容区（页面容器）                                          │
+│ 文件│                                                              │
+│ 更新│                                                              │
+│ 错误│                                                              │
+│ 设置│                                                              │
+│ ── │                                                              │
+│ 诊断│                                                              │
+├────┴──────────────────────────────────────────────────────────────┤
+│ 操作日志（每次 invoke 一行，保留 200 条，可收起/清空）              │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+| 目的地 | 内容 | 状态 |
+|---|---|---|
+| **主页**（home） | 连接行（`user@host:port · 已连接 · Qsync 版本`）+ **任务卡片列表**（M8.2 起**优先按任务登记展示**，没有任务登记时退回挂载点）+ 最近一次同步摘要 + 快捷动作（连接设置 / 立即同步 / ＋添加任务） | ✅ M8.1/M8.2 |
+| **任务**（tasks） | ★ M8.2 已实现：同步任务列表（每张卡：状态 / 本地路径 ⇄ NAS 路径 / 只读·缓存模式·**冲突策略** / `Sync`+已挂载徽章 + 设置·管理·挂载·暂停·继续·删除登记·立即同步）+ **文件夹对设置**表单（保存到 `~/.config/qsync/tasks/<id>.json`，★ M8.4 起含**冲突策略下拉（5 选项）**/ 同步方向 / 节省空间模式 / 智能删除）+ **冲突待裁决卡片**（「每个文件都问我」的策略下逐条裁决） | ✅ M8.2 / M8.4 |
+| **文件**（files） | 远端目录浏览 + pin；★ M8.4：**三态列**（仅在线 / 本地可用 / 始终可用，来自 `file_states`）+ **行右键菜单**（始终保留在此设备 / 取消固定 / 释放空间 / 下载 / 复制路径 / 删除） | ✅ M8.4 |
+| **更新**（journal） | ★ M8.3 已实现：同步日志表格（时间 / 活动 / 路径 / 说明 / 字节）+ 按文件名·说明搜索 + `全部/成功/失败/被挡下` 过滤 + 条数 + 清空 | ✅ M8.3 |
+| **错误**（errors） | ★ M8.3 已实现：`journal` 里 `status='error'` 的失败项，每条可「复制路径」 | ✅ M8.3 |
+| **设置**（settings） | ★ M8.4 已补齐 **8 个分区**：连接 / 代理 / 同步与筛选 / 个人 / 高级 / 释放空间 / LAN 加速 / 关于（每个分区可用 `QSYNC_GUI_TAB=settings:<分区>` 直达） | ✅ M8.4 |
+| **诊断**（diag） | **专家模式**：原「状态 / 进度」「挂载」「同步 / 缓存」三个 tab 收纳为**子 tab**，字段与 id 全保留 | ✅ |
+
+**`QSYNC_GUI_TAB` 取值**（验收矩阵与排障用）：
+新值 `home|tasks|files|journal|errors|settings|diag`，并支持 **`diag:<status|mounts|sync>`** 与
+**`settings:<connect|proxy|sync|personal|advanced|free|lan|about>`**（M8.4）直达子页/分区；
+**旧值 `status|mounts|sync|connect|files` 必须继续可用**，分别落到 `diag:status`/`diag:mounts`/`diag:sync`/`settings`/`files`
+（`gui-matrix.sh` §3b 用截图 AE 断言「落点等价」）。
 
 底部固定「操作日志」面板：每次 invoke 记一行 `HH:MM:SS 命令 参数 → ok/error`，保留 200 条
-（排障 + 验收时肉眼可见，见 §6 截图）。
+（排障 + 验收时肉眼可见）。
+
+### 4.2 各页字段（元素 id 与字段名全部沿用 M4，未改动）
+
+| 原 tab（现位置） | 内容 |
+|---|---|
+| **状态 / 进度**（诊断 → 状态 / 进度） | 服务端信息（Qsync 版本/QPKG/build/busy_reason）、会话、三游标、水合统计、上传队列（pending/active/done/failed/retries/bytes）、缓存限额进度条、`blocked_*` 分类、挂载列表、远端根面板、最近一轮同步摘要 |
+| **连接 / 登录**（设置） | host/port/https/insecure/user/password/home_root/roots/ipv4_only 表单（打开时预填）；保存配置 / **保存并登录** / 启停 daemon；三个 XDG 目录与 socket 路径 |
+| **挂载**（诊断 → 挂载） | 当前挂载表（可卸载）+ 新建挂载（挂载点默认 `$HOME/qsync-mnt`、远端根多行、读写开关、`cache_mode`、线程数、水合超时、删除熔断阈值、auto_unmount） |
+| **文件 / pin**（文件） | 远端目录浏览（真机 `ls`，目录优先）、每行 pin 查询/设置（`unspecified/pinned/unpinned/excluded`）、下载（`get`）、脱水（`dehydrate`）、新建目录、删除 |
+| **同步 / 缓存**（诊断 → 同步 / 缓存） | `SyncInfo` 全量（含 `devices`、`last_error`、`delete_block_reason`）+ 立即同步 / 强制放行删除 / 暂停轮询 / 设间隔；`CacheInfo` 全量 + 脱水预演 / 全部脱水 / 按限额 / 释放闲置 |
 
 ## 5. 自检与验收
 
@@ -84,20 +128,52 @@ cargo run -p qxync-gui -- --self-test
 # 登录链自检：daemon_stop → login_flow（写 link/凭据 + 拉起 daemon + 登录）→ 复核
 cargo run -p qxync-gui -- --self-test-login
 
-# 完整验收矩阵（41 项）
-xtask/tests/gui-matrix.sh              # 自检 + 登录链 + 5 个 tab 真窗口截图
+### 4.3 设置中心与桌面集成（M8.4）
+
+**设置页的 8 个分区**（对应 Qsync 的四个 tab + qxync 自己的连接/筛选/LAN/关于）：
+
+| 分区 | 数据源 | 能做什么 |
+|---|---|---|
+| 连接 | `link_read` / `link_save` / `credential_*` / `app_info` | host/port/https/insecure/roots…；保存并登录；启停 daemon |
+| 代理 | `settings` / `settings_save` | `No proxy` / `Auto-detect` / `Manual`（+认证）；显示实际环境变量与解析出的代理 URL |
+| 同步与筛选 | `link_read` / `link_save` / `rules` | 编辑 `exclude`（每行一条）+ `filter_temp`；`--match` 实时预览；显示每个任务的冲突策略 |
+| 个人 | `settings` | 开机自启（写 XDG autostart 桌面项）/ 语言 / 地区 / 关闭进托盘 |
+| 高级 | `settings` | 调试日志位 / 桌面通知开关 + 测试通知；「明确不做」的三个按钮点了给原因 |
+| 释放空间 | `settings` / `space` | `Free up space automatically`（当空间少于 X% / 按频率）+ 立即释放空间 + 用量条 + 被挡下列表 |
+| LAN 加速 | `peer` / `link_save` | 监听地址 / 设备名 / 配对 / 已配对设备 / 最近事件 |
+| 关于 | `app_info` / `m84_info` | 版本与路径、打开日志/配置目录、File Station 深链、托盘与插件状态、明确不做的清单 |
+
+**桌面集成**（Rust 侧命令，前端一律经 `window.__TAURI__.core.invoke`）：
+
+| 命令 | 用途 |
+|---|---|
+| `m84_info` | 托盘是否建起来 / 插件清单 / autostart 路径与存在性 / `close_to_tray`（**只读**） |
+| `notify_show(title, body)` | 发桌面通知；设置里关了就回 `shown:false`（**不假装发**） |
+| `pick_folder` / `pick_file` | 文件选择器（回调式 API + oneshot，避免与 GTK 主循环互锁） |
+| `open_path` / `open_url` | 打开目录 / URL（`tauri-plugin-opener`） |
+| `window_show` / `window_hide` / `app_quit` / `app_exe_path` / `tray_emit` | 托盘动作与自启路径 |
+
+**托盘**：ksni（纯 Rust StatusNotifierItem）→ D-Bus 名字 `org.kde.StatusNotifierItem-<pid>-1`，
+菜单 4 项（打开主窗口 / 立即与 NAS 同步 / 暂停 / 退出）；前三项 emit `tray://action`，动作由前端执行。
+关闭主窗口按 `close_to_tray` 隐藏进托盘；**托盘不可用时照常关闭**。
+
+# 完整验收矩阵（M4 自检/登录链 + M8.1 的 9 个目的地 + 旧 tab 值落点等价性 + M8.4 的 7 个设置分区）
+xtask/tests/gui-matrix.sh              # 自检 + 登录链 + 9 个目的地真窗口截图
 xtask/tests/gui-matrix.sh --no-window  # 无 DISPLAY 的机器只跑自检
 xtask/tests/gui-matrix.sh --keep-open  # 结束时保留窗口，手动玩
 ```
 
-矩阵覆盖（41 项）：
+矩阵覆盖（86 项）：
 
 1. 三个二进制 + 连接配置前置检查；
 2. `--self-test`：资源嵌入、`status_ok`、`logged_in`、真机 `ls /home`、`mounts`、`sync`，
    以及**负向对照**——daemon 停掉后 `--self-test` 必须非 0 退出（防止自检变成橡皮图章）；
 3. `--self-test-login`：GUI 自己的「保存并登录」链路真的能把 daemon 拉起来并登录；
-4. 真窗口：5 个 tab 各起一次，窗口标题正确、截图非空白（stddev > 1500）、
-   与 status 页画面确有差异（AE > 4000 px）。
+4. 真窗口：9 个目的地各起一次，窗口标题正确、截图非空白（stddev > 1500）、
+   与主页画面确有差异（AE > 4000 px）；
+5. ★ M8.1：旧 `QSYNC_GUI_TAB` 的 5 个取值各起一次，用截图 AE 断言**落点等价**
+   （status→diag:status、mounts→diag:mounts、sync→diag:sync、connect→settings、files→files；
+   实测 AE ≈ 2000 px，只差时钟/uptime）。
 
 > 截图落在 `$QSYNC_TEST_RUNDIR/gui-shots/`（默认 `.local-run/gui-shots/`，已 gitignore），
 > 里面还有 `self-test.json` / `self-test-login.json` 两份原始自检输出。

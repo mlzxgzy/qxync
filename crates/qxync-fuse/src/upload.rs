@@ -139,6 +139,13 @@ struct State {
     pending: VecDeque<UploadJob>,
     /// 正在上传的作业（用于 drain 等待）
     active: bool,
+    /// ★ M8.4：**已被取消**的远端路径。
+    ///
+    /// 为什么需要它：`cancel()` 原本只能清掉「还没被 worker 取走」的作业，
+    /// 已经被取走但**还没发出去**的那个取消不了。M2c 的冲突处理靠
+    /// 「cancel + drain + 重新 stat」来避免「在途上传把远端改回本地内容」，
+    /// 那个窄窗口就落在这里。worker 在真正发请求前查一次这个集合即可关掉窗口。
+    cancelled: std::collections::BTreeSet<String>,
 }
 
 impl UploadQueue {
@@ -215,6 +222,7 @@ impl UploadQueue {
             state: Mutex::new(State {
                 pending,
                 active: false,
+                cancelled: std::collections::BTreeSet::new(),
             }),
             cv: Condvar::new(),
             shutdown: AtomicBool::new(false),
@@ -258,6 +266,11 @@ impl UploadQueue {
     /// 取消某路径**还没开始**的上传作业（含状态库里的行）。
     /// 返回是否取消了作业；已经在途的那个取消不了，要用 [`Self::drain`] 等它结束。
     pub fn cancel(&self, remote_path: &str) -> bool {
+        {
+            // 已取走但未发出的作业也要能取消（见 State::cancelled 的说明）
+            let mut st = self.state.lock().unwrap();
+            st.cancelled.insert(remote_path.to_string());
+        }
         let removed: Vec<UploadJob> = {
             let mut st = self.state.lock().unwrap();
             let mut kept = VecDeque::new();
@@ -404,6 +417,38 @@ impl UploadQueue {
             self.stats
                 .pending
                 .store(self.pending_len(), Ordering::Relaxed);
+
+            // ★ M8.4：**仅验收用**的注入点 —— 取到作业后先等一会儿再发。
+            //
+            // 为什么需要它：M2c 的「三向冲突」要求「本地有未上传改动 **且** 远端也变了」。
+            // 真实写路径是写穿的（写完几乎立刻上传），这个窗口只有几十毫秒，
+            // 端到端没法稳定复现冲突。停在这里 + 上面的 `cancelled` 集合，
+            // 就能让 `m84-matrix.sh` 逐个策略跑出确定性的冲突产物。
+            // **默认 0（不等待）**，对生产行为没有任何影响。
+            let hold_ms: u64 = std::env::var("QSYNC_TEST_UPLOAD_HOLD_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            if hold_ms > 0 {
+                std::thread::sleep(Duration::from_millis(hold_ms.min(60_000)));
+            }
+            let cancelled = {
+                let mut st = self.state.lock().unwrap();
+                st.cancelled.remove(&job.remote_path())
+            };
+            if cancelled {
+                tracing::info!("上传作业已被取消，跳过: {}", job.remote_path());
+                self.persist_delete(&job.remote_path());
+                {
+                    let mut st = self.state.lock().unwrap();
+                    st.active = false;
+                }
+                self.stats
+                    .pending
+                    .store(self.pending_len(), Ordering::Relaxed);
+                self.cv.notify_all();
+                continue;
+            }
 
             match self.rt.block_on(self.upload_one(&job)) {
                 Ok(()) => {

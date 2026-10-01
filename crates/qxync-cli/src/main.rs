@@ -9,10 +9,11 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use qxync_client::Client;
 use qxync_core::ipc::{
-    default_socket_path, CacheInfo, CursorInfo, DehydrateData, ErrorKind, GetData, LsData,
-    MountInfo, PeerData, PingData, PutData, Request, RootsData, RulesData, StatusData, StoreData,
-    SyncInfo,
+    default_socket_path, CacheInfo, CursorInfo, DecisionsData, DehydrateData, ErrorKind,
+    FileStatesData, GetData, LsData, MountInfo, PeerData, PingData, PutData, Request, RootsData,
+    RulesData, SettingsData, SpaceData, StatusData, StoreData, SyncInfo, TasksData,
 };
+use qxync_core::settings::{Settings, PROXY_AUTO, PROXY_MANUAL, PROXY_NONE};
 use qxync_core::{ConfigPaths, Credentials, DirEntry, LinkConfig, HOME_ROOT};
 use qxync_fuse::{CacheMode, QxyncFs};
 use std::path::PathBuf;
@@ -135,6 +136,10 @@ enum Cmd {
         /// ★ M3：缓存模式 `pagecache`（默认，脱水需先 inval_inode）/ `direct`（绕过 page cache，mmap 不可用）
         #[arg(long, value_name = "MODE")]
         cache_mode: Option<String>,
+        /// ★ M8.4：冲突策略 ask | rename_remote | rename_local | replace_remote | replace_local
+        /// （默认 rename_local = M2c 既有行为）
+        #[arg(long, value_name = "POLICY")]
+        conflict: Option<String>,
     },
     /// 卸载 FUSE 挂载点
     Umount { mountpoint: PathBuf },
@@ -175,6 +180,34 @@ enum Cmd {
         json: bool,
     },
 
+    /// ★ M8.3：同步活动日志（文件更新中心 / 错误列表的数据源）
+    Journal {
+        /// 最多返回多少条（默认 200）
+        #[arg(long)]
+        limit: Option<usize>,
+        /// 只要 unix 秒 >= 这个值的（闭区间）
+        #[arg(long)]
+        since: Option<i64>,
+        /// 按文件名 / 说明做子串过滤
+        #[arg(long)]
+        query: Option<String>,
+        /// ok | error | blocked | all（默认 all）；`error` 就是「错误列表」
+        #[arg(long)]
+        level: Option<String>,
+        /// 清空日志（**只清日志**，不动游标/baseline/pin/队列）
+        #[arg(long)]
+        clear: bool,
+        /// 直接输出 JSON（脚本/验收用）
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// ★ M8.2：同步任务（持久化的挂载登记 + 策略）
+    Task {
+        #[command(subcommand)]
+        action: TaskAction,
+    },
+
     /// ★ M7：LAN 对等设备（配对 / 探活 / 事件快路径 / 直传自检）
     Peer {
         #[command(subcommand)]
@@ -213,6 +246,56 @@ enum Cmd {
         mount: Option<PathBuf>,
     },
 
+    /// ★ M8.4：全局设置（settings.json）—— 不带 `--set` 就是只读展示
+    Settings {
+        /// 点号键赋值，可重复：`--set proxy.mode=manual --set proxy.server=10.0.0.1`
+        /// （可用键见 `qsync settings --help`）
+        #[arg(long = "set", value_name = "KEY=VALUE")]
+        set: Vec<String>,
+        /// 开机自启要写进 autostart 桌面项的可执行文件（默认找同目录的 qxync-gui）
+        #[arg(long, value_name = "PATH")]
+        autostart_exe: Option<PathBuf>,
+        /// 直接输出 JSON（脚本/验收用）
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// ★ M8.4：释放空间状态 / 立即释放空间（Free Up Space Now）
+    Space {
+        /// 立即按当前策略跑一轮脱水（仍走 M3 安全检查链）
+        #[arg(long)]
+        now: bool,
+        /// 直接输出 JSON（脚本/验收用）
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// ★ M8.4：冲突待裁决队列（策略 = 每个文件都问我）
+    Conflicts {
+        /// 裁决某一条：`--resolve <id> --as keep_local|keep_remote|keep_both`
+        #[arg(long, value_name = "ID")]
+        resolve: Option<String>,
+        /// 裁决方式：保留本地 / 保留 NAS 上的 / 两份都留
+        #[arg(long = "as", value_name = "RESOLUTION")]
+        resolution: Option<String>,
+        /// 清空队列（**只清队列，不动文件**）
+        #[arg(long)]
+        clear: bool,
+        /// 直接输出 JSON（脚本/验收用）
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// ★ M8.4：文件三态（仅在线 / 本地可用 / 始终可用）—— 文件页那一列的 CLI 形态
+    FileStates {
+        /// 远端目录（默认 /home）
+        #[arg(default_value = HOME_ROOT)]
+        path: String,
+        /// 直接输出 JSON（脚本/验收用）
+        #[arg(long)]
+        json: bool,
+    },
+
     /// ★ M5：本地状态库（SQLite）—— 游标 / baseline / pin / 上传队列
     Store {
         /// 顺带跑 `PRAGMA integrity_check`（验收脚本用）
@@ -233,6 +316,72 @@ enum Cmd {
     Daemon {
         #[command(subcommand)]
         action: DaemonAction,
+    },
+}
+
+/// ★ M8.2：`qsync task` 的子命令。
+#[derive(Subcommand, Debug)]
+enum TaskAction {
+    /// 列出全部任务（含「此刻是否真的挂着」）
+    List {
+        /// 直接输出 JSON（脚本/验收用）
+        #[arg(long)]
+        json: bool,
+    },
+    /// 新建/覆盖一个任务登记（默认同时挂载；`--no-mount` 只登记）
+    Add {
+        /// 任务 id（也是文件名，只允许 A-Za-z0-9 . _ -）
+        #[arg(long, default_value = "default")]
+        id: String,
+        /// 本地挂载点（绝对路径，不存在会被创建）
+        #[arg(long)]
+        mountpoint: PathBuf,
+        /// 远端根（可重复；不填 = 用 link 的 home_root）
+        #[arg(long = "root")]
+        roots: Vec<String>,
+        /// 读写挂载（默认只读）
+        #[arg(long)]
+        read_write: bool,
+        /// 缓存模式 pagecache | direct
+        #[arg(long)]
+        cache_mode: Option<String>,
+        /// 水合缓存目录（**父目录**；实际缓存会再拼一层 NAS 主机名）。
+        /// 不填 = 默认 ~/.local/share/qsync/cache
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
+        /// 只登记、不挂载
+        #[arg(long)]
+        no_mount: bool,
+        /// ★ M8.4：冲突策略（5 个取值，见 `qsync mount --help`）
+        #[arg(long, value_name = "POLICY")]
+        conflict: Option<String>,
+        /// 直接输出 JSON（脚本/验收用）
+        #[arg(long)]
+        json: bool,
+    },
+    /// 删除任务登记（**只删登记，不动挂载点里的任何数据**）
+    Rm {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 暂停：停用登记并卸载该挂载点（已入队的上传会先排空，不丢改动）
+    Pause {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 继续：启用登记并重新挂载
+    Resume {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 按任务登记的参数挂载（不改登记）
+    Mount {
+        id: String,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -357,7 +506,11 @@ fn resolve_password(cli: &Cli, link: &LinkConfig) -> Result<String> {
 
 async fn connect(cli: &Cli, need_creds: bool) -> Result<(Client, LinkConfig)> {
     let link = resolve_link(cli)?;
-    let mut client = Client::new(&link)?;
+    // ★ M8.4：直连模式也走 settings.json 里的代理（否则「设置里配了代理」在 CLI 直连时失效）
+    let mut client = match Settings::load(&paths()?) {
+        Ok(st) => Client::new_with_settings(&link, &st)?,
+        Err(_) => Client::new(&link)?,
+    };
     if need_creds {
         let pw = resolve_password(cli, &link)?;
         client
@@ -561,15 +714,43 @@ async fn main() -> Result<()> {
             client.mkdir(parent, name).await?;
             println!("✅ 已建目录 {parent}/{name}");
         }
+        // ★ M8.4：设置不依赖 daemon（就是读写 settings.json + autostart 桌面项）；
+        //   但**跑着的 daemon 不会自动重读**，所以这里提示一句。
+        Cmd::Settings { set, autostart_exe, json } => {
+            let paths = paths()?;
+            let mut st = Settings::load(&paths)?;
+            let mut saved = false;
+            if !set.is_empty() {
+                for kv in set {
+                    let (k, v) = kv
+                        .split_once('=')
+                        .ok_or_else(|| anyhow::anyhow!("--set 需要 key=value，收到 {kv:?}"))?;
+                    st.set_kv(k.trim(), v)?;
+                }
+                let exe = autostart_exe
+                    .clone()
+                    .or_else(|| default_gui_exe_from_cli());
+                st.apply_autostart(&paths, exe.as_deref().unwrap_or(std::path::Path::new("qxync-gui")))?;
+                st.save(&paths)?;
+                saved = true;
+                eprintln!("⚠️ 直连模式：设置已写入文件；正在运行的 daemon 要重启才会读到代理/释放空间的新值");
+            }
+            print_settings(&st, &paths, *json, saved)?;
+        }
         Cmd::Pin { .. }
         | Cmd::State { .. }
         | Cmd::Sync { .. }
         | Cmd::Dehydrate { .. }
+        | Cmd::Space { .. }
+        | Cmd::Conflicts { .. }
+        | Cmd::FileStates { .. }
         | Cmd::Store { .. }
         | Cmd::Roots { .. }
         | Cmd::Rules { .. }
+        | Cmd::Task { .. }
+        | Cmd::Journal { .. }
         | Cmd::Peer { .. } => {
-            bail!("`pin`/`state`/`sync`/`dehydrate`/`store`/`roots`/`rules`/`peer` 需要 daemon：先 `qsync daemon start`（或用 --socket 指向运行中的 daemon）");
+            bail!("`pin`/`state`/`sync`/`dehydrate`/`space`/`conflicts`/`file-states`/`store`/`roots`/`rules`/`task`/`peer` 需要 daemon：先 `qsync daemon start`（或用 --socket 指向运行中的 daemon）");
         }
         Cmd::Rm { dir, name } => {
             let (client, _) = connect(&cli, true).await?;
@@ -593,6 +774,8 @@ async fn main() -> Result<()> {
             rw,
             delete_limit,
             cache_mode,
+            // ★ M8.4：直连模式不接冲突策略（引擎在 daemon 侧）
+            conflict: _,
         } => {
             // 直连模式的 FUSE 进程只挂一个根；多根需要 daemon 侧合成视图。
             if remote.len() > 1 {
@@ -713,6 +896,12 @@ fn ipc_err(e: qxync_core::ipc::IpcError) -> anyhow::Error {
     anyhow::anyhow!("{}", e.message)
 }
 
+/// 参数/设置错误：CLI 直接退出（与 clap 的参数错误同一档，退出码 2）。
+fn fatal(msg: &str) -> ! {
+    eprintln!("❌ {msg}");
+    std::process::exit(2);
+}
+
 /// CLI 命令 → IPC 请求；返回 None 表示该命令没有 IPC 形态。
 fn to_request(cli: &Cli) -> Option<Request> {
     Some(match &cli.cmd {
@@ -750,6 +939,7 @@ fn to_request(cli: &Cli) -> Option<Request> {
             rw,
             delete_limit,
             cache_mode,
+            conflict,
         } => Request::Mount {
             mountpoint: mountpoint.clone(),
             remote: Some(remote[0].clone()),
@@ -757,10 +947,15 @@ fn to_request(cli: &Cli) -> Option<Request> {
             cache_dir: cache_dir.clone(),
             threads: Some(*threads),
             auto_unmount: Some(*auto_unmount),
+            // ★ M8.2：CLI 的 `mount` 默认**不登记任务**（行为与 M7 一致）；
+            //   要登记用 `qsync task add`。
+            task: None,
+            save_task: None,
             hydrate_timeout_secs: Some(*hydrate_timeout),
             read_write: Some(*rw),
             delete_limit: *delete_limit,
             cache_mode: cache_mode.clone(),
+            conflict: conflict.clone(),
         },
         Cmd::Umount { mountpoint } => Request::Umount {
             mountpoint: mountpoint.clone(),
@@ -786,6 +981,75 @@ fn to_request(cli: &Cli) -> Option<Request> {
             name: name.clone(),
         },
         Cmd::Roots { .. } => Request::Roots,
+        Cmd::Settings { set, autostart_exe, .. } => {
+            // 不带 --set = 只读；带了就是「读-改-写」：先把当前设置取回来，
+            // 逐键改，再整体回写（**顺序无关**，见 Settings::set_kv）。
+            if set.is_empty() {
+                Request::Settings
+            } else {
+                let mut want = local_settings().unwrap_or_else(|e| fatal(&format!("读取设置失败: {e}")));
+                for kv in set {
+                    let Some((k, v)) = kv.split_once('=') else {
+                        fatal(&format!("--set 需要 key=value，收到 {kv:?}"));
+                    };
+                    if let Err(e) = want.set_kv(k.trim(), v) {
+                        fatal(&e.to_string());
+                    }
+                }
+                Request::SettingsSave {
+                    settings: want,
+                    autostart_exe: autostart_exe.as_ref().map(|p| p.display().to_string()),
+                }
+            }
+        }
+        Cmd::Space { now, .. } => Request::Space { now: Some(*now) },
+        Cmd::Conflicts { resolve, resolution, clear, .. } => Request::Decisions {
+            action: if *clear {
+                "clear".to_string()
+            } else if resolve.is_some() {
+                "resolve".to_string()
+            } else {
+                "list".to_string()
+            },
+            id: resolve.clone(),
+            resolution: resolution.clone(),
+        },
+        Cmd::FileStates { path, .. } => Request::FileStates { path: path.clone() },
+        Cmd::Journal { limit, since, query, level, clear, .. } => Request::Journal {
+            limit: *limit,
+            since: *since,
+            query: query.clone(),
+            level: level.clone(),
+            clear: Some(*clear),
+        },
+        Cmd::Task { action } => match action {
+            TaskAction::List { .. } => Request::Tasks { action: "list".into(), id: None, task: None },
+            TaskAction::Add { id, mountpoint, roots, read_write, cache_mode, conflict, .. } => {
+                Request::Tasks {
+                    action: "save".into(),
+                    id: None,
+                    task: Some(
+                        qxync_core::tasks::Task::from_mount(
+                            Some(id.clone()),
+                            mountpoint.clone(),
+                            roots.clone(),
+                            *read_write,
+                            cache_mode.clone(),
+                            None,
+                            None,
+                            None,
+                            Some(true),
+                        )
+                        // ★ M8.4：任务上的冲突策略
+                        .with_conflict(conflict.clone()),
+                    ),
+                }
+            }
+            TaskAction::Rm { id, .. } => Request::Tasks { action: "delete".into(), id: Some(id.clone()), task: None },
+            TaskAction::Pause { id, .. } => Request::Tasks { action: "pause".into(), id: Some(id.clone()), task: None },
+            TaskAction::Resume { id, .. } => Request::Tasks { action: "resume".into(), id: Some(id.clone()), task: None },
+            TaskAction::Mount { id, .. } => Request::Tasks { action: "mount".into(), id: Some(id.clone()), task: None },
+        },
         Cmd::Rules { r#match, .. } => Request::Rules {
             match_path: r#match.clone(),
         },
@@ -1002,6 +1266,68 @@ async fn route_via_daemon(
                 if *rw { "读写" } else { "只读" }
             );
         }
+        Cmd::Task { action } => {
+            run_task_cmd(&socket, action).await?;
+        }
+        Cmd::Journal { json, .. } => {
+            let d: qxync_core::ipc::JournalData = ipc_client::call(&socket, req).await?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&d).unwrap_or_else(|_| "{}".into()));
+            } else {
+                print_journal(&d);
+            }
+        }
+        Cmd::Settings { json, set, .. } => {
+            let d: qxync_core::ipc::SettingsData = ipc_client::call(&socket, req).await?;
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&d)
+                        .map_err(|e| qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string()))?
+                );
+            } else {
+                print_settings_data(&d);
+                if !set.is_empty() {
+                    println!("✅ 已写入 {}", d.path);
+                }
+            }
+        }
+        Cmd::Space { json, now } => {
+            let d: qxync_core::ipc::SpaceData = ipc_client::call(&socket, req).await?;
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&d)
+                        .map_err(|e| qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string()))?
+                );
+            } else {
+                print_space(&d, *now);
+            }
+        }
+        Cmd::Conflicts { json, .. } => {
+            let d: qxync_core::ipc::DecisionsData = ipc_client::call(&socket, req).await?;
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&d)
+                        .map_err(|e| qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string()))?
+                );
+            } else {
+                print_decisions(&d);
+            }
+        }
+        Cmd::FileStates { json, .. } => {
+            let d: qxync_core::ipc::FileStatesData = ipc_client::call(&socket, req).await?;
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&d)
+                        .map_err(|e| qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string()))?
+                );
+            } else {
+                print_file_states(&d);
+            }
+        }
         Cmd::Roots { json } => {
             let raw: serde_json::Value = ipc_client::call(&socket, req).await?;
             if *json {
@@ -1117,6 +1443,235 @@ async fn route_via_daemon(
         Cmd::State { .. } | Cmd::Daemon { .. } => unreachable!(),
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------- ★ M8.4 打印与本地设置
+
+/// 本地读设置（不带 --set 时就是「展示当前设置」）。
+fn local_settings() -> Result<Settings> {
+    Ok(Settings::load(&paths()?)?)
+}
+
+/// 直连模式下找 GUI 可执行文件（用于 autostart 的 Exec=）。
+fn default_gui_exe_from_cli() -> Option<PathBuf> {
+    let cur = std::env::current_exe().ok()?;
+    let cand = cur.parent()?.join("qxync-gui");
+    cand.is_file().then_some(cand)
+}
+
+/// 代理模式 → Qsync 原文文案（§1.7）。
+fn proxy_label(mode: &str) -> &'static str {
+    match mode {
+        PROXY_NONE => "No proxy（无代理）",
+        PROXY_AUTO => "Auto-detect（自动检测）",
+        PROXY_MANUAL => "Manual（手动）",
+        _ => "未知",
+    }
+}
+
+/// 直连模式的设置打印（没有 daemon 时的 `qsync settings`）。
+fn print_settings(st: &Settings, paths: &ConfigPaths, json: bool, saved: bool) -> Result<()> {
+    if json {
+        let out = serde_json::json!({
+            "settings": st,
+            "path": Settings::file(paths).display().to_string(),
+            "autostart_path": Settings::autostart_file(paths).display().to_string(),
+            "autostart_present": Settings::autostart_present(paths),
+            "saved": saved,
+            "proxy_env": Settings::proxy_env(),
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+    println!("设置文件  : {}", Settings::file(paths).display());
+    println!("代理      : {}", proxy_label(&st.proxy.mode));
+    if st.proxy.mode == PROXY_MANUAL {
+        println!(
+            "            服务器 {}:{}  认证 {}",
+            if st.proxy.server.is_empty() { "-" } else { &st.proxy.server },
+            st.proxy.port.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+            if st.proxy.auth { format!("开（{}）", st.proxy.user) } else { "关".into() }
+        );
+    }
+    let env = Settings::proxy_env();
+    if env.is_empty() {
+        println!("            环境变量：（无 http_proxy/https_proxy）");
+    } else {
+        for (k, v) in &env {
+            println!("            环境变量 {k}={v}");
+        }
+    }
+    println!(
+        "开机自启  : {}（桌面项 {}）",
+        if st.launch_at_startup { "开" } else { "关" },
+        if Settings::autostart_present(paths) { "存在" } else { "不存在" }
+    );
+    println!(
+        "桌面通知  : {}   调试日志: {}   关闭进托盘: {}",
+        if st.desktop_notifications { "开" } else { "关" },
+        if st.debug_log { "开" } else { "关" },
+        if st.close_to_tray { "开" } else { "关" }
+    );
+    println!(
+        "释放空间  : {}（{}{}）",
+        if st.free_space.auto { "自动" } else { "不自动" },
+        if st.free_space.mode == "frequency" {
+            format!("按频率 每 {} 小时", st.free_space.every_hours)
+        } else {
+            format!("当空间少于 {}%", st.free_space.below_pct)
+        },
+        if saved { "，本次已保存" } else { "" }
+    );
+    Ok(())
+}
+
+/// 经 daemon 的设置打印。
+fn print_settings_data(d: &SettingsData) {
+    let st = &d.settings;
+    println!("设置文件  : {}{}", d.path, if d.saved { "（本次已写入）" } else { "" });
+    println!("代理      : {}", proxy_label(&st.proxy.mode));
+    if let Some(u) = &d.proxy_url {
+        println!("            URL {u}");
+    }
+    if d.proxy_env.is_empty() {
+        println!("            环境变量：（无 http_proxy/https_proxy）");
+    } else {
+        for (k, v) in &d.proxy_env {
+            println!("            环境变量 {k}={v}");
+        }
+    }
+    println!(
+        "开机自启  : {}（桌面项 {}：{}）",
+        if st.launch_at_startup { "开" } else { "关" },
+        d.autostart_path,
+        if d.autostart_present { "存在" } else { "不存在" }
+    );
+    println!(
+        "桌面通知  : {}   调试日志: {}   关闭进托盘: {}",
+        if st.desktop_notifications { "开" } else { "关" },
+        if st.debug_log { "开" } else { "关" },
+        if st.close_to_tray { "开" } else { "关" }
+    );
+    println!(
+        "释放空间  : {}（{}）",
+        if st.free_space.auto { "自动" } else { "不自动" },
+        if st.free_space.mode == "frequency" {
+            format!("按频率 每 {} 小时", st.free_space.every_hours)
+        } else {
+            format!("当空间少于 {}%", st.free_space.below_pct)
+        }
+    );
+    if let Some(n) = &d.note {
+        println!("说明      : {n}");
+    }
+}
+
+/// 释放空间状态。
+fn print_space(d: &SpaceData, now: bool) {
+    println!(
+        "量空间    : {}  总 {}  可用 {}（{}%）",
+        d.fs_path,
+        human_size(d.fs_total),
+        human_size(d.fs_avail),
+        d.fs_avail_pct
+    );
+    if d.injected {
+        println!("⚠️         : 正在使用 QSYNC_TEST_FAKE_STATVFS 注入值（验收模式）");
+    }
+    println!("缓存占用  : {}", human_size(d.cache_used_bytes));
+    println!(
+        "自动释放  : {}（{}）",
+        if d.auto { "开" } else { "关" },
+        if d.mode == "frequency" {
+            format!("按频率 每 {} 小时", d.every_hours)
+        } else {
+            format!("当空间少于 {}%", d.below_pct)
+        }
+    );
+    println!(
+        "本轮判定  : {} —— {}",
+        if d.would_run { "会触发" } else { "不触发" },
+        d.reason
+    );
+    if d.last_run_unix > 0 {
+        println!("上次触发  : {}（unix）", d.last_run_unix);
+    }
+    if now || d.ran {
+        println!(
+            "立即释放  : 脱水 {} 个 / 释放 {} / 被挡下 {} 个",
+            d.dehydrated,
+            human_size(d.freed_bytes),
+            d.blocked.len()
+        );
+        for (p, why) in d.blocked.iter().take(10) {
+            println!("            挡下 {p}（{why}）");
+        }
+    }
+    if let Some(n) = &d.note {
+        println!("说明      : {n}");
+    }
+}
+
+/// 冲突待裁决队列。
+fn print_decisions(d: &DecisionsData) {
+    println!(
+        "待裁决    : {} 条（已裁决待执行 {} 条）",
+        d.pending, d.resolved
+    );
+    if d.removed > 0 {
+        println!("本次清空  : {} 条", d.removed);
+    }
+    if d.decisions.is_empty() {
+        println!("（队列为空 —— 只有冲突策略为「每个文件都问我」时才会攒条目）");
+    }
+    for x in &d.decisions {
+        println!(
+            "  {:<10} {}  本地 {} / 远端 {}  {}",
+            x.resolution.as_deref().unwrap_or("待裁决"),
+            x.path,
+            human_size(x.local_size),
+            human_size(x.remote_size),
+            x.id
+        );
+    }
+    if let Some(n) = &d.note {
+        println!("说明      : {n}");
+    }
+}
+
+/// 文件三态。
+fn print_file_states(d: &FileStatesData) {
+    println!(
+        "# {}（挂载点 {}，根 {}）",
+        d.path,
+        d.mountpoint.as_deref().unwrap_or("-"),
+        d.root.as_deref().unwrap_or("-")
+    );
+    println!(
+        "三态汇总  : 仅在线 {} · 本地可用 {} · 始终可用 {}",
+        d.online, d.local, d.always
+    );
+    for e in &d.entries {
+        println!(
+            "{:<8} {:>12}  {:<12} {}{}",
+            if e.is_dir {
+                "目录"
+            } else {
+                match e.state.as_str() {
+                    "always" => "始终可用",
+                    "local" => "本地可用",
+                    _ => "仅在线",
+                }
+            },
+            human_size(e.size),
+            e.pin,
+            e.name,
+            if e.dirty { "（有未上传改动）" } else { "" }
+        );
+    }
+    if let Some(n) = &d.note {
+        println!("说明      : {n}");
+    }
 }
 
 /// ★ M5：本地状态库（SQLite：游标 / baseline / pin / 上传队列）。
@@ -1598,4 +2153,203 @@ async fn daemon_cmd(cli: &Cli, socket: &std::path::Path, action: &DaemonAction) 
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------- ★ M8.2 任务
+
+fn parse_err(msg: String) -> qxync_core::ipc::IpcError {
+    qxync_core::ipc::IpcError::new(qxync_core::ipc::ErrorKind::Parse, msg)
+}
+
+/// `qsync task …`
+///
+/// 与其它命令不同：**部分动作需要两次 IPC 调用**（`add` = 先登记再挂载），
+/// 所以这里自己发请求，而不是只用 `to_request` 生成的那一个。
+async fn run_task_cmd(
+    socket: &std::path::Path,
+    action: &TaskAction,
+) -> Result<(), qxync_core::ipc::IpcError> {
+    let dumps = |v: &serde_json::Value| -> Result<String, qxync_core::ipc::IpcError> {
+        serde_json::to_string_pretty(v).map_err(|e| parse_err(e.to_string()))
+    };
+    match action {
+        TaskAction::List { json } => {
+            let raw: serde_json::Value =
+                ipc_client::call(socket, Request::Tasks { action: "list".into(), id: None, task: None })
+                    .await?;
+            if *json {
+                println!("{}", dumps(&raw)?);
+                return Ok(());
+            }
+            let d: TasksData = serde_json::from_value(raw)
+                .map_err(|e| parse_err(format!("解析 tasks 响应失败: {e}（daemon 版本过旧？）")))?;
+            print_tasks(&d);
+        }
+        TaskAction::Add { id, mountpoint, roots, read_write, cache_mode, cache_dir, no_mount, json, conflict } => {
+            let task = qxync_core::tasks::Task::from_mount(
+                Some(id.clone()),
+                mountpoint.clone(),
+                roots.clone(),
+                *read_write,
+                cache_mode.clone(),
+                None,
+                None,
+                None,
+                Some(true),
+            )
+            .with_cache_dir(cache_dir.clone())
+            // ★ M8.4：冲突策略
+            .with_conflict(conflict.clone());
+            let saved: serde_json::Value = ipc_client::call(
+                socket,
+                Request::Tasks { action: "save".into(), id: None, task: Some(task.clone()) },
+            )
+            .await?;
+            let mut mounted = serde_json::Value::Null;
+            if !*no_mount {
+                mounted = ipc_client::call(
+                    socket,
+                    Request::Tasks { action: "resume".into(), id: Some(task.id.clone()), task: None },
+                )
+                .await?;
+            }
+            if *json {
+                println!("{}", dumps(&serde_json::json!({ "saved": saved, "mount": mounted }))?);
+            } else {
+                println!("✅ 任务已登记：{}", task.summary());
+                if *no_mount {
+                    println!("   --no-mount：只登记未挂载；要挂载用 `qsync task mount {}`", task.id);
+                } else {
+                    println!("   ✅ 已挂载");
+                }
+            }
+        }
+        TaskAction::Rm { id, json } => {
+            let raw: serde_json::Value = ipc_client::call(
+                socket,
+                Request::Tasks { action: "delete".into(), id: Some(id.clone()), task: None },
+            )
+            .await?;
+            if *json {
+                println!("{}", dumps(&raw)?);
+            } else if raw.get("deleted").and_then(|v| v.as_bool()).unwrap_or(false) {
+                println!("✅ 已删除任务登记：{id}（挂载点里的数据未改动）");
+            } else {
+                println!("ℹ️  没有这个任务：{id}");
+            }
+        }
+        TaskAction::Pause { id, json } => {
+            let raw: serde_json::Value = ipc_client::call(
+                socket,
+                Request::Tasks { action: "pause".into(), id: Some(id.clone()), task: None },
+            )
+            .await?;
+            if *json {
+                println!("{}", dumps(&raw)?);
+            } else {
+                let un = raw.get("unmounted").and_then(|v| v.as_bool()).unwrap_or(false);
+                println!(
+                    "⏸  已暂停任务：{id}（停用登记{}；已入队的上传会先排空）",
+                    if un { "并卸载" } else { "，未在挂载中" }
+                );
+            }
+        }
+        TaskAction::Resume { id, json } => {
+            let raw: serde_json::Value = ipc_client::call(
+                socket,
+                Request::Tasks { action: "resume".into(), id: Some(id.clone()), task: None },
+            )
+            .await?;
+            if *json {
+                println!("{}", dumps(&raw)?);
+            } else {
+                println!("▶  已继续任务：{id}");
+            }
+        }
+        TaskAction::Mount { id, json } => {
+            let raw: serde_json::Value = ipc_client::call(
+                socket,
+                Request::Tasks { action: "mount".into(), id: Some(id.clone()), task: None },
+            )
+            .await?;
+            if *json {
+                println!("{}", dumps(&raw)?);
+            } else {
+                println!("✅ 已按任务参数挂载：{id}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_tasks(d: &TasksData) {
+    println!(
+        "任务 {} 个（启用 {}）{}",
+        d.count(),
+        d.enabled_count(),
+        if d.empty { "· 还没有登记过任务" } else { "" }
+    );
+    if d.tasks.is_empty() {
+        println!("  （空）建一个：qsync task add --id default --mountpoint ~/qsync-mnt --root /home");
+    }
+    for ti in &d.tasks {
+        let t = &ti.task;
+        println!(
+            "  {} {} [{}] {}  →  {}",
+            if t.enabled { "▶" } else { "⏸" },
+            t.id,
+            if ti.mounted { "已挂载" } else { "未挂载" },
+            t.mountpoint.display(),
+            if t.roots.is_empty() {
+                "(link home_root)".to_string()
+            } else {
+                t.roots.join(",")
+            }
+        );
+        println!(
+            "       模式={} 方向={} 节省空间={} 智能删除={} 排除规则={} 选择性={}",
+            t.cache_mode,
+            t.direction,
+            t.space_saving,
+            t.smart_delete,
+            t.exclude.len(),
+            t.selective.len()
+        );
+    }
+    for (p, e) in &d.bad_files {
+        println!("  ⚠️  任务文件解析失败（已跳过）：{p} —— {e}");
+    }
+    if let Some(n) = &d.note {
+        println!("说明：{n}");
+    }
+}
+
+fn print_journal(d: &qxync_core::ipc::JournalData) {
+    if d.cleared {
+        println!("🧹 已清空同步日志（删除 {} 条）", d.removed);
+    }
+    let ok = d.counts.get("ok").copied().unwrap_or(0);
+    let err = d.counts.get("error").copied().unwrap_or(0);
+    let blk = d.counts.get("blocked").copied().unwrap_or(0);
+    println!(
+        "同步日志：共 {} 条（ok {} / error {} / blocked {}）· 本次返回 {} 条",
+        d.total, ok, err, blk, d.entries.len()
+    );
+    if d.entries.is_empty() {
+        println!("  （空）挂载一个同步任务后跑一轮 `qsync sync --once` 就会产生记录（没有挂载点就没有对账）");
+    }
+    for e in &d.entries {
+        let ts = e.ts;
+        let mark = match e.status.as_str() {
+            "error" => "❌",
+            "blocked" => "⛔",
+            _ => "✅",
+        };
+        let p = if e.path.is_empty() { String::new() } else { format!(" {}", e.path) };
+        let b = if e.bytes > 0 { format!(" [{} B]", e.bytes) } else { String::new() };
+        println!("  {mark} {ts}  {:<14}{}{}  {}", e.kind, p, b, e.detail);
+    }
+    if let Some(n) = &d.note {
+        println!("说明：{n}");
+    }
 }

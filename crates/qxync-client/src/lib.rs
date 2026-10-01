@@ -15,8 +15,8 @@
 use futures_util::StreamExt;
 use qxync_core::{
     build_query, encode_query_value, model::parse_listing, parse_max_log, parse_nas_uid,
-    parse_sync_log, DirEntry, Error, LinkConfig, Listing, MaxLog, NasUid, Result, ServerStatus,
-    SyncLogBatch,
+    parse_sync_log, DirEntry, Error, LinkConfig, Listing, MaxLog, NasUid, ProxySettings, ProxySpec,
+    Result, ServerStatus, Settings, SyncLogBatch,
 };
 use std::time::Duration;
 
@@ -57,12 +57,46 @@ pub struct Client {
 }
 
 impl Client {
+    /// 不带代理覆盖（= reqwest 默认行为：读 `http_proxy` 等环境变量）。
+    ///
+    /// 「无代理」与「手动代理」必须用 [`Client::new_with_proxy`]，因为 reqwest
+    /// 默认会自己读环境变量 —— 不显式 `no_proxy()` 就关不掉。
     pub fn new(link: &LinkConfig) -> Result<Self> {
+        Self::build(link, None)
+    }
+
+    /// ★ M8.4：按全局设置里的代理策略构造。
+    pub fn new_with_settings(link: &LinkConfig, settings: &Settings) -> Result<Self> {
+        Self::new_with_proxy(link, Some(&settings.proxy))
+    }
+
+    /// ★ M8.4：按 `ProxySettings` 构造（`None` = 不覆盖环境变量）。
+    pub fn new_with_proxy(link: &LinkConfig, proxy: Option<&ProxySettings>) -> Result<Self> {
+        Self::build(link, proxy)
+    }
+
+    fn build(link: &LinkConfig, proxy: Option<&ProxySettings>) -> Result<Self> {
         let mut builder = reqwest::Client::builder()
             .danger_accept_invalid_certs(link.insecure)
             .timeout(Duration::from_secs(300))
             .connect_timeout(Duration::from_secs(20))
             .user_agent("QSyncLinux/0.1 (qxync-client)");
+        if let Some(p) = proxy {
+            match p.resolve()? {
+                // 显式关掉：reqwest 默认会读环境变量，不显式关就关不掉
+                ProxySpec::None => builder = builder.no_proxy(),
+                // 自动检测 = reqwest 默认（环境变量）
+                ProxySpec::Auto => {}
+                ProxySpec::Manual { url, auth } => {
+                    let mut pr = reqwest::Proxy::all(&url)
+                        .map_err(|e| Error::Transport(format!("代理地址无效 {url:?}: {e}")))?;
+                    if let Some((user, pass)) = auth {
+                        pr = pr.basic_auth(&user, &pass);
+                    }
+                    builder = builder.proxy(pr);
+                }
+            }
+        }
         if link.ipv4_only {
             // 绑定 IPv4 源地址 → 只走 IPv4（Happy Eyeballs 在对端 IPv6 不通时会先失败）
             builder = builder.local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));

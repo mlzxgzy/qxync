@@ -31,7 +31,12 @@ use std::sync::Mutex;
 pub const DB_FILE: &str = "sync.db";
 
 /// schema 版本（写进 `PRAGMA user_version`；将来加表要迁移时用它判断）。
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 3;
+// ★ M8.3：v1 → v2 只是**新增 journal 表与索引**。
+// ★ M8.4：v2 → v3 只是**新增 decisions 表（冲突待裁决队列）**。
+// 因为整份 SCHEMA_SQL 都是
+// `CREATE TABLE/INDEX IF NOT EXISTS`，老库在下次 `Store::open()` 时会被自动补齐，
+// **不需要写迁移代码、也不会碰已有表里的数据**（迁移幂等由 m5-matrix 断言覆盖）。
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (
@@ -66,6 +71,37 @@ CREATE TABLE IF NOT EXISTS uploads (
   attempts    INTEGER NOT NULL DEFAULT 0,
   ephemeral   INTEGER NOT NULL DEFAULT 0
 );
+-- ★ M8.3：同步活动日志。GUI 的「文件更新中心 / 错误列表」读的就是它。
+-- 写入侧**必须批量**（见 Store::journal_add_batch）：同步/上传热路径不许逐条事务。
+CREATE TABLE IF NOT EXISTS journal (
+  id      INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts      INTEGER NOT NULL,
+  task_id TEXT    NOT NULL DEFAULT '',
+  kind    TEXT    NOT NULL,
+  path    TEXT    NOT NULL DEFAULT '',
+  detail  TEXT    NOT NULL DEFAULT '',
+  status  TEXT    NOT NULL DEFAULT 'ok',
+  bytes   INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS journal_ts     ON journal(ts DESC);
+CREATE INDEX IF NOT EXISTS journal_status ON journal(status);
+CREATE INDEX IF NOT EXISTS journal_kind   ON journal(kind);
+-- ★ M8.4：冲突策略 =「每个文件都问我」时的待裁决队列。
+-- 只有这一个策略会往里写；裁决完（引擎执行后）删行。
+CREATE TABLE IF NOT EXISTS decisions (
+  id            TEXT PRIMARY KEY,
+  path          TEXT NOT NULL UNIQUE,
+  task_id       TEXT NOT NULL DEFAULT '',
+  is_dir        INTEGER NOT NULL DEFAULT 0,
+  local_size    INTEGER NOT NULL DEFAULT 0,
+  local_mtime   INTEGER NOT NULL DEFAULT 0,
+  remote_size   INTEGER NOT NULL DEFAULT 0,
+  remote_mtime  INTEGER NOT NULL DEFAULT 0,
+  created_unix  INTEGER NOT NULL DEFAULT 0,
+  resolution    TEXT
+);
+CREATE INDEX IF NOT EXISTS decisions_created ON decisions(created_unix DESC);
+CREATE INDEX IF NOT EXISTS decisions_path    ON decisions(path);
 "#;
 
 /// 上传队列里的一行（M5 起队列也进状态库）。
@@ -87,6 +123,117 @@ impl UploadRow {
             self.remote_name
         )
     }
+}
+
+/// ★ M8.4：冲突待裁决队列的一行（`decisions` 表）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DecisionRow {
+    pub id: String,
+    /// 远端绝对路径。
+    pub path: String,
+    #[serde(default)]
+    pub task_id: String,
+    #[serde(default)]
+    pub is_dir: bool,
+    #[serde(default)]
+    pub local_size: u64,
+    #[serde(default)]
+    pub local_mtime: i64,
+    #[serde(default)]
+    pub remote_size: u64,
+    #[serde(default)]
+    pub remote_mtime: i64,
+    #[serde(default)]
+    pub created_unix: i64,
+    /// `None` = 待裁决；`keep_local` / `keep_remote` / `keep_both`。
+    #[serde(default)]
+    pub resolution: Option<String>,
+}
+
+impl DecisionRow {
+    /// 稳定 id：**只用路径**（同一路径只应有一条待裁决）。
+    ///
+    /// 不用散列是为了让 `qsync conflicts --json` 的输出可读、可 diff；
+    /// 路径里可能有 `/`，所以做一层转义。
+    pub fn id_for(path: &str) -> String {
+        path.trim_start_matches('/')
+            .replace('/', "_")
+            .chars()
+            .take(120)
+            .collect()
+    }
+    /// 已裁决且待执行。
+    pub fn is_resolved(&self) -> bool {
+        self.resolution.is_some()
+    }
+}
+
+/// ★ M8.3：一条同步活动记录（`journal` 表的一行）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct JournalEntry {
+    /// unix 秒。
+    pub ts: i64,
+    /// 关联的任务 id（M8.2 起有任务；旧调用点填空字符串）。
+    #[serde(default)]
+    pub task_id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub detail: String,
+    /// `ok` / `error` / `blocked`。
+    #[serde(default = "journal_ok")]
+    pub status: String,
+    #[serde(default)]
+    pub bytes: i64,
+}
+
+fn journal_ok() -> String {
+    "ok".to_string()
+}
+
+impl JournalEntry {
+    pub fn new(kind: &str, path: impl Into<String>, detail: impl Into<String>, status: &str) -> Self {
+        Self {
+            ts: now_unix(),
+            task_id: String::new(),
+            kind: kind.to_string(),
+            path: path.into(),
+            detail: detail.into(),
+            status: status.to_string(),
+            bytes: 0,
+        }
+    }
+
+    pub fn ok(kind: &str, path: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self::new(kind, path, detail, "ok")
+    }
+
+    pub fn error(kind: &str, path: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self::new(kind, path, detail, "error")
+    }
+
+    pub fn blocked(kind: &str, path: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self::new(kind, path, detail, "blocked")
+    }
+
+    pub fn with_bytes(mut self, b: i64) -> Self {
+        self.bytes = b;
+        self
+    }
+
+    pub fn with_task(mut self, id: impl Into<String>) -> Self {
+        self.task_id = id.into();
+        self
+    }
+}
+
+/// 当前 unix 秒（失败回 0，不 panic）。
+pub fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// 从 JSON 迁移的结果（验收脚本会读它）。
@@ -272,6 +419,156 @@ impl Store {
         Ok(m)
     }
 
+    // ------------------------------------------------------------ ★ M8.3 同步日志（journal）
+
+    /// 一条同步活动记录。
+    ///
+    /// `status`：`ok`（成功）/ `error`（失败，错误列表读的就是它）/ `blocked`（被安全策略挡下）。
+    /// `kind` 是自由字符串，当前用到：`remote_change` / `upload` / `download` / `conflict`
+    /// / `delete` / `dehydrate` / `scan`。
+    pub fn journal_add_batch(&self, entries: &[JournalEntry]) -> Result<usize> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(Error::from)?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO journal (ts, task_id, kind, path, detail, status, bytes)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )
+                .map_err(Error::from)?;
+            for e in entries {
+                stmt.execute(rusqlite::params![
+                    e.ts, e.task_id, e.kind, e.path, e.detail, e.status, e.bytes
+                ])
+                .map_err(Error::from)?;
+            }
+        }
+        tx.commit().map_err(Error::from)?;
+        Ok(entries.len())
+    }
+
+    /// 查日志。`since` 是 unix 秒下界（闭区间）；`query` 在 path/detail 上做子串匹配；
+    /// `level = Some("error")` 只返回失败项（GUI 的「错误列表」用）。
+    pub fn journal_list(
+        &self,
+        limit: usize,
+        since: Option<i64>,
+        query: Option<&str>,
+        level: Option<&str>,
+    ) -> Result<Vec<JournalEntry>> {
+        let conn = self.conn();
+        let mut sql = String::from(
+            "SELECT ts, task_id, kind, path, detail, status, bytes FROM journal WHERE 1=1",
+        );
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(s) = since {
+            sql.push_str(" AND ts >= ?");
+            args.push(Box::new(s));
+        }
+        if let Some(l) = level {
+            if l == "error" {
+                sql.push_str(" AND status = 'error'");
+            } else if l == "blocked" {
+                sql.push_str(" AND status = 'blocked'");
+            } else if l == "ok" {
+                sql.push_str(" AND status = 'ok'");
+            }
+        }
+        if let Some(q) = query {
+            if !q.trim().is_empty() {
+                let like = format!("%{}%", q.trim());
+                sql.push_str(" AND (path LIKE ? OR detail LIKE ?)");
+                args.push(Box::new(like.clone()));
+                args.push(Box::new(like));
+            }
+        }
+        sql.push_str(" ORDER BY id DESC LIMIT ?");
+        args.push(Box::new(limit.clamp(1, 10_000) as i64));
+
+        let mut stmt = conn.prepare(&sql).map_err(Error::from)?;
+        let refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt
+            .query_map(refs.as_slice(), |r| {
+                Ok(JournalEntry {
+                    ts: r.get(0)?,
+                    task_id: r.get(1)?,
+                    kind: r.get(2)?,
+                    path: r.get(3)?,
+                    detail: r.get(4)?,
+                    status: r.get(5)?,
+                    bytes: r.get(6)?,
+                })
+            })
+            .map_err(Error::from)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(Error::from)?);
+        }
+        Ok(out)
+    }
+
+    pub fn journal_count(&self) -> Result<i64> {
+        self.conn()
+            .query_row("SELECT COUNT(*) FROM journal", [], |r| r.get(0))
+            .map_err(Error::from)
+    }
+
+    /// 按状态计数（`ok` / `error` / `blocked`），给 GUI 的角标用。
+    pub fn journal_counts(&self) -> Result<std::collections::BTreeMap<String, i64>> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT status, COUNT(*) FROM journal GROUP BY status")
+            .map_err(Error::from)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
+            .map_err(Error::from)?;
+        let mut m = std::collections::BTreeMap::new();
+        for row in rows {
+            let (k, v) = row.map_err(Error::from)?;
+            m.insert(k, v);
+        }
+        Ok(m)
+    }
+
+    /// 清空日志（**只清日志，不碰游标/baseline/pin/队列**）。
+    pub fn journal_clear(&self) -> Result<usize> {
+        let n = self.conn().execute("DELETE FROM journal", []).map_err(Error::from)?;
+        Ok(n)
+    }
+
+    /// 轮转：先按天数删，再按条数删。返回删掉的行数。
+    ///
+    /// **必须有上限**：同步日志是无限增长型数据，不加约束会把 `sync.db` 撑大。
+    pub fn journal_trim(&self, max_rows: i64, max_age_days: i64) -> Result<usize> {
+        let (max_rows, max_age_days) = (max_rows.max(0), max_age_days.max(0));
+        let mut n = 0usize;
+        if max_age_days > 0 {
+            let cutoff = crate::store::now_unix() - max_age_days * 86_400;
+            n += self
+                .conn()
+                .execute("DELETE FROM journal WHERE ts < ?1", rusqlite::params![cutoff])
+                .map_err(Error::from)?;
+        }
+        if max_rows > 0 {
+            // 保留最新 max_rows 条
+            n += self
+                .conn()
+                .execute(
+                    "DELETE FROM journal WHERE id NOT IN (
+                        SELECT id FROM journal ORDER BY id DESC LIMIT ?1
+                     )",
+                    rusqlite::params![max_rows],
+                )
+                .map_err(Error::from)?;
+        }
+        Ok(n)
+    }
+
     pub fn pin(&self, path: &str) -> Result<Option<String>> {
         self.conn()
             .query_row("SELECT state FROM pins WHERE path = ?1", params![path], |r| {
@@ -298,6 +595,138 @@ impl Store {
             .execute("DELETE FROM pins WHERE path = ?1", params![path])
             .map_err(Error::from)?;
         Ok(n > 0)
+    }
+
+    // ------------------------------------------------------------ ★ M8.4 冲突待裁决队列
+
+    /// 记一条待裁决冲突。
+    ///
+    /// **同一个路径只保留一条**（`ON CONFLICT(path)`）—— 否则每一轮同步都会把
+    /// 同一个冲突再插一遍，队列会被噪声撑爆。`id` 取路径的稳定散列。
+    /// 已裁决（`resolution` 非空）的条目再次冲突时**保留裁决**（用户已经表过态）。
+    pub fn decision_upsert(&self, d: &DecisionRow) -> Result<()> {
+        self.conn()
+            .execute(
+                "INSERT INTO decisions
+                   (id, path, task_id, is_dir, local_size, local_mtime,
+                    remote_size, remote_mtime, created_unix, resolution)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+                 ON CONFLICT(path) DO UPDATE SET
+                    task_id      = excluded.task_id,
+                    is_dir       = excluded.is_dir,
+                    local_size   = excluded.local_size,
+                    local_mtime  = excluded.local_mtime,
+                    remote_size  = excluded.remote_size,
+                    remote_mtime = excluded.remote_mtime",
+                params![
+                    d.id,
+                    d.path,
+                    d.task_id,
+                    d.is_dir as i64,
+                    d.local_size as i64,
+                    d.local_mtime,
+                    d.remote_size as i64,
+                    d.remote_mtime,
+                    d.created_unix,
+                    d.resolution,
+                ],
+            )
+            .map_err(Error::from)?;
+        Ok(())
+    }
+
+    /// 队列全量（新的在前）。
+    pub fn decisions(&self) -> Result<Vec<DecisionRow>> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, path, task_id, is_dir, local_size, local_mtime,
+                        remote_size, remote_mtime, created_unix, resolution
+                   FROM decisions ORDER BY created_unix DESC, path",
+            )
+            .map_err(Error::from)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(DecisionRow {
+                    id: r.get(0)?,
+                    path: r.get(1)?,
+                    task_id: r.get(2)?,
+                    is_dir: r.get::<_, i64>(3)? != 0,
+                    local_size: r.get::<_, i64>(4)? as u64,
+                    local_mtime: r.get(5)?,
+                    remote_size: r.get::<_, i64>(6)? as u64,
+                    remote_mtime: r.get(7)?,
+                    created_unix: r.get(8)?,
+                    resolution: r.get(9)?,
+                })
+            })
+            .map_err(Error::from)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(Error::from)?);
+        }
+        Ok(out)
+    }
+
+    /// 按路径取一条（引擎每轮查一次）。
+    pub fn decision_by_path(&self, path: &str) -> Result<Option<DecisionRow>> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, path, task_id, is_dir, local_size, local_mtime,
+                        remote_size, remote_mtime, created_unix, resolution
+                   FROM decisions WHERE path = ?1",
+            )
+            .map_err(Error::from)?;
+        let mut rows = stmt.query_map(params![path], |r| {
+            Ok(DecisionRow {
+                id: r.get(0)?,
+                path: r.get(1)?,
+                task_id: r.get(2)?,
+                is_dir: r.get::<_, i64>(3)? != 0,
+                local_size: r.get::<_, i64>(4)? as u64,
+                local_mtime: r.get(5)?,
+                remote_size: r.get::<_, i64>(6)? as u64,
+                remote_mtime: r.get(7)?,
+                created_unix: r.get(8)?,
+                resolution: r.get(9)?,
+            })
+        })
+        .map_err(Error::from)?;
+        match rows.next() {
+            Some(r) => Ok(Some(r.map_err(Error::from)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// 裁决一条；返回是否命中（`resolution` 为 `None` = 退回未裁决）。
+    pub fn decision_resolve(&self, id: &str, resolution: Option<&str>) -> Result<bool> {
+        let n = self
+            .conn()
+            .execute(
+                "UPDATE decisions SET resolution = ?2 WHERE id = ?1",
+                params![id, resolution],
+            )
+            .map_err(Error::from)?;
+        Ok(n > 0)
+    }
+
+    /// 执行完（或用户清空）后删一条。
+    pub fn decision_delete(&self, id: &str) -> Result<bool> {
+        let n = self
+            .conn()
+            .execute("DELETE FROM decisions WHERE id = ?1", params![id])
+            .map_err(Error::from)?;
+        Ok(n > 0)
+    }
+
+    /// 清空队列（**只清队列，不动任何文件**）。
+    pub fn decisions_clear(&self) -> Result<usize> {
+        let n = self
+            .conn()
+            .execute("DELETE FROM decisions", [])
+            .map_err(Error::from)?;
+        Ok(n)
     }
 
     // ------------------------------------------------------------ 上传队列
@@ -588,6 +1017,85 @@ mod tests {
     }
 
     #[test]
+    fn journal_batch_insert_list_filter_and_trim() {
+        let s = Store::open_in_memory().unwrap();
+        assert_eq!(s.schema_version().unwrap(), SCHEMA_VERSION, "v3 schema（M8.4 加 decisions 表）");
+
+        let mut rows = Vec::new();
+        for i in 0..10 {
+            rows.push(JournalEntry::ok("upload", format!("/home/f{i}.txt"), "上传完成").with_bytes(i));
+        }
+        rows.push(JournalEntry::error("upload", "/home/fail.txt", "上传失败：连接重置"));
+        rows.push(JournalEntry::blocked("dehydrate", "/home/pin.bin", "被 pin 挡下"));
+        assert_eq!(s.journal_add_batch(&rows).unwrap(), 12);
+        assert_eq!(s.journal_add_batch(&[]).unwrap(), 0, "空批次是 no-op");
+        assert_eq!(s.journal_count().unwrap(), 12);
+
+        // 倒序（最新在前）
+        let all = s.journal_list(100, None, None, None).unwrap();
+        assert_eq!(all.len(), 12);
+        assert_eq!(all[0].kind, "dehydrate", "最新的在最前");
+
+        // level 过滤
+        let errs = s.journal_list(100, None, None, Some("error")).unwrap();
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].path, "/home/fail.txt");
+        let blk = s.journal_list(100, None, None, Some("blocked")).unwrap();
+        assert_eq!(blk.len(), 1);
+
+        // 子串查询（path 与 detail 都匹配）
+        assert_eq!(s.journal_list(100, None, Some("f3.txt"), None).unwrap().len(), 1);
+        assert_eq!(s.journal_list(100, None, Some("连接重置"), None).unwrap().len(), 1);
+
+        // limit
+        assert_eq!(s.journal_list(3, None, None, None).unwrap().len(), 3);
+
+        // 计数分组
+        let c = s.journal_counts().unwrap();
+        assert_eq!(c.get("ok").copied().unwrap_or(0), 10);
+        assert_eq!(c.get("error").copied().unwrap_or(0), 1);
+
+        // 轮转：按条数只留 5 条
+        let removed = s.journal_trim(5, 0).unwrap();
+        assert_eq!(removed, 7);
+        assert_eq!(s.journal_count().unwrap(), 5);
+        assert!(s.journal_list(100, None, None, None).unwrap().iter().all(|e| e.kind != "upload" || e.path == "/home/f9.txt" || e.path.starts_with("/home/f")),
+            "留下的应该是最新的那些");
+
+        // 清空只清 journal
+        assert_eq!(s.journal_clear().unwrap(), 5);
+        assert_eq!(s.journal_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn journal_added_to_existing_v1_db_without_touching_data() {
+        // 模拟老库：先按 v1 的 schema 建库并塞数据，再用 Store::open 打开 → 自动补 journal 表
+        let dir = std::env::temp_dir().join(format!(
+            "qxync-store-v1-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("sync.db");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS pins (path TEXT PRIMARY KEY, state TEXT NOT NULL);",
+            )
+            .unwrap();
+            conn.execute("INSERT INTO pins (path, state) VALUES ('/home/x', 'pinned')", [])
+                .unwrap();
+            conn.pragma_update(None, "user_version", 1i64).unwrap();
+        }
+        let s = Store::open(&db).unwrap();
+        assert_eq!(s.schema_version().unwrap(), SCHEMA_VERSION, "打开时升到 v3");
+        assert_eq!(s.pin("/home/x").unwrap().as_deref(), Some("pinned"), "老数据必须原样保留");
+        assert_eq!(s.journal_count().unwrap(), 0, "新表是空的");
+        assert_eq!(s.journal_add_batch(&[JournalEntry::ok("scan", "/", "一轮")]).unwrap(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn migrates_legacy_json_once_and_archives_it() {
         let dir = tmpdir("migrate");
         let db = dir.join(DB_FILE);
@@ -736,5 +1244,109 @@ mod tests {
         assert!(Sig::file(1, 2).exists && !Sig::file(1, 2).is_dir);
         assert!(Sig::dir().exists && Sig::dir().is_dir);
         assert!(!Sig::MISSING.exists);
+    }
+
+    /// ★ M8.4：待裁决队列 —— 同路径去重、裁决、删行、清空，且**不碰 pins/journal**。
+    #[test]
+    fn decisions_queue_upsert_resolve_and_isolation() {
+        let s = Store::open_in_memory().unwrap();
+        s.set_pin("/home/keep.bin", "pinned").unwrap();
+        s.journal_add_batch(&[JournalEntry::error("sync", "/home/a.txt", "冲突")])
+            .unwrap();
+
+        let mk = |path: &str, ls: u64, rs: u64| DecisionRow {
+            id: DecisionRow::id_for(path),
+            path: path.to_string(),
+            task_id: "t1".into(),
+            is_dir: false,
+            local_size: ls,
+            local_mtime: 100,
+            remote_size: rs,
+            remote_mtime: 200,
+            created_unix: 1_700_000_000,
+            resolution: None,
+        };
+        s.decision_upsert(&mk("/home/a.txt", 10, 20)).unwrap();
+        s.decision_upsert(&mk("/home/b.txt", 30, 40)).unwrap();
+        assert_eq!(s.decisions().unwrap().len(), 2);
+
+        // 同一路径再冲突：**不新增行**，只刷新签名（否则每轮同步都会灌一条）
+        s.decision_upsert(&mk("/home/a.txt", 11, 22)).unwrap();
+        let rows = s.decisions().unwrap();
+        assert_eq!(rows.len(), 2, "同路径必须去重");
+        let a = rows.iter().find(|r| r.path == "/home/a.txt").unwrap();
+        assert_eq!(a.local_size, 11);
+        assert!(!a.is_resolved());
+
+        // 裁决
+        assert!(s.decision_resolve(&a.id, Some("keep_local")).unwrap());
+        let a2 = s.decision_by_path("/home/a.txt").unwrap().unwrap();
+        assert_eq!(a2.resolution.as_deref(), Some("keep_local"));
+        assert!(a2.is_resolved());
+        assert!(!s.decision_resolve("不存在", Some("keep_local")).unwrap());
+
+        // 再冲突时**保留已有裁决**（用户已经表过态）
+        s.decision_upsert(&mk("/home/a.txt", 12, 24)).unwrap();
+        assert_eq!(
+            s.decision_by_path("/home/a.txt")
+                .unwrap()
+                .unwrap()
+                .resolution
+                .as_deref(),
+            Some("keep_local")
+        );
+
+        // 删一条 / 清空
+        assert!(s.decision_delete(&a.id).unwrap());
+        assert!(s.decision_delete(&a.id).unwrap() == false);
+        assert_eq!(s.decisions_clear().unwrap(), 1);
+        assert!(s.decisions().unwrap().is_empty());
+
+        // 隔离：pin 与 journal 一行没动
+        assert_eq!(s.pin("/home/keep.bin").unwrap().as_deref(), Some("pinned"));
+        assert_eq!(s.journal_count().unwrap(), 1);
+    }
+
+    /// ★ M8.4：v2 老库打开后自动补 decisions 表（不写迁移代码），旧数据原样保留。
+    #[test]
+    fn decisions_table_added_to_v2_db() {
+        let dir = std::env::temp_dir().join(format!(
+            "qxync-store-v2-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("sync.db");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS pins (path TEXT PRIMARY KEY, state TEXT NOT NULL);
+                 CREATE TABLE IF NOT EXISTS journal (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
+                   task_id TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL,
+                   path TEXT NOT NULL DEFAULT '', detail TEXT NOT NULL DEFAULT '',
+                   status TEXT NOT NULL DEFAULT 'ok', bytes INTEGER NOT NULL DEFAULT 0);
+                 INSERT INTO pins (path, state) VALUES ('/home/x', 'pinned');
+                 INSERT INTO journal (ts, kind, path) VALUES (1, 'scan', '/home');",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 2i64).unwrap();
+        }
+        let s = Store::open(&db).unwrap();
+        assert_eq!(s.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(s.pin("/home/x").unwrap().as_deref(), Some("pinned"));
+        assert_eq!(s.journal_count().unwrap(), 1);
+        assert!(s.decisions().unwrap().is_empty());
+        s.decision_upsert(&DecisionRow {
+            id: DecisionRow::id_for("/home/c.txt"),
+            path: "/home/c.txt".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(s.decisions().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

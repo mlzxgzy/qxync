@@ -174,11 +174,23 @@ cargo test -p qxync-proto-test -- --ignored --test-threads=1 --nocapture  # 协�
 
 ## 9. 已知限制（留给后续）
 
-* **我们的写操作不产生事件**：本机未做设备配对（`qbox_save_device_config` 不在 M2c 范围），
-  所以「其它设备立刻看到我们的改动」仍只有 `qbox_write_log` 尽力而为；对端看不到时，
-  靠对端自己的 baseline 对账发现（本实现即如此）。
-* 事件回声过滤目前只有两种手段：`user`/挂载根归属校验 + 「远端==baseline → 无动作」的幂等；
-  设备配对完成后应把本机 `device_uid` 填进 `SyncConfig::own_devices`。
+* **我们的写操作不产生事件** —— 原因**不是**「本机没做设备配对」，而是「账号下没有已登记的同步文件夹」。
+  **2026-10-01 真机复核（P0 探针，`report/probe/p0_device_probe.py`）推翻了旧结论**：
+  1. NAS 上**确有一台已注册设备** `win-pc`（`qbox_get_device_config_list` 可见，`modify_time`=2026-09-30 11:46，
+     `device_uid=01234567…567`）—— 那是**官方 Qsync 客户端**之前注册的，不是 qxync；
+  2. 但这台设备的配置是**空的**（`qbox_get_device_config` → `total: 0, config: []`），
+     即**没有任何配对文件夹**；
+  3. `qbox_get_syncing_folder_list` → `total: 0`，本账号（test1）**从未登记过同步文件夹**；
+  4. `qbox_get_sync_log` 对**全部区间**（0–400 / 75–331 / 331）与**全部参数变体**
+     （`device_uid` / `duid` / `uid` / `user` / `get_detail` / `sub_folder`）**恒返回 `status:-17`**；
+     `qbox_query_notify` 恒 `count:0`。
+  → **结论：设备注册不是缺失的那一环**（设备早就注册了，事件照样拿不到）。
+  代码注释里的判据才是对的：**只有路径落在「已注册的同步文件夹」里才会真正出现在 `qbox_get_sync_log`**。
+  而当前 208 条端点清单里**根本没有「注册同步文件夹」的端点** —— 那是官方客户端在 Qsync Central 里
+  做配对时才创建的。所以这条路在现有逆向成果下走不通，**baseline 对账作为主路径的设计必须保持**。
+  详见 `docs/M8-向Qsync-Client-6靠拢.md` §11。
+* 事件回声过滤目前只有两种手段：`user`/挂载根归属校验 + 「远端==baseline → 无动作」的幂等。
+  （原计划「设备配对完成后把本机 `device_uid` 填进 `SyncConfig::own_devices`」已按上面的结论**撤销**。）
 * **删除事件无路径**：删除只能等到下一轮对账（默认 30s）才发现。
 * 对账按「已知目录」列举：用户没浏览过的深目录不会主动扫（on-demand 的取舍）；
   单轮目录数上限 200。

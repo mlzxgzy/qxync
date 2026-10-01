@@ -21,6 +21,9 @@ use qxync_core::sync::{
 };
 use qxync_core::{Error as CoreError, MaxLog};
 use qxync_core::rules::{HideReason, Rules};
+use qxync_core::tasks::{
+    CONFLICT_ASK, CONFLICT_RENAME_REMOTE, CONFLICT_REPLACE_LOCAL, CONFLICT_REPLACE_REMOTE,
+};
 use qxync_fuse::upload::UploadQueue;
 use qxync_fuse::LocalView;
 use std::collections::{BTreeMap, BTreeSet};
@@ -40,6 +43,9 @@ pub struct MountView {
     pub read_only: bool,
     /// ★ M7：选择性同步规则（排除 / 临时文件）。默认「只有临时过滤」，向后兼容。
     pub rules: Arc<Rules>,
+    /// ★ M8.4：冲突策略（`tasks::CONFLICTS` 的 5 个取值）。
+    /// 默认 `rename_local` = M2c 的硬编码行为（远端占原名、本地另存副本）。
+    pub conflict: String,
 }
 
 impl MountView {
@@ -296,7 +302,7 @@ pub async fn poll_once(
                             uids.push(u.clone());
                         }
                     }
-                    apply_event(client, views, ev, cfg, user, &mut baseline, &mut report).await;
+                    apply_event(client, views, ev, cfg, user, &mut baseline, &mut report, store).await;
                 }
                 stats.record_devices(&uids);
                 for u in uids {
@@ -370,7 +376,7 @@ pub async fn poll_once(
 
     // ---- ④ baseline 对账（兜底：我们自己的写操作不产生事件）
     for view in views {
-        reconcile_view(client, view, cfg, &mut baseline, &mut report).await;
+        reconcile_view(client, view, cfg, &mut baseline, &mut report, store).await;
     }
 
     report.baseline_entries = baseline.len();
@@ -438,6 +444,7 @@ async fn apply_event(
     user: &str,
     baseline: &mut Baseline,
     report: &mut SyncReport,
+    state_store: &Mutex<SyncState>,
 ) {
     if !ev.has_usable_path() {
         // 真机实测：删除事件的 filepath 是空的 → 只能靠对账发现
@@ -479,7 +486,7 @@ async fn apply_event(
         let local = local_sig(view, &path);
         let base = baseline.get(&path);
         let d = decide(&local, &base, &remote);
-        apply_decision(client, view, &path, d, remote, baseline, report).await;
+        apply_decision(client, view, &path, d, remote, baseline, report, state_store).await;
         return;
     }
     report.events_skipped += 1;
@@ -502,6 +509,7 @@ async fn reconcile_view(
     cfg: &SyncConfig,
     baseline: &mut Baseline,
     report: &mut SyncReport,
+    state_store: &Mutex<SyncState>,
 ) {
     tracing::debug!(
         "对账视图 {}（远端根 {}）",
@@ -609,7 +617,7 @@ async fn reconcile_view(
         match d {
             Decision::DeleteLocal => deletes.push(path.clone()),
             _ => {
-                apply_decision(client, view, path, d, remote, baseline, report).await;
+                apply_decision(client, view, path, d, remote, baseline, report, state_store).await;
             }
         }
     }
@@ -654,6 +662,7 @@ async fn apply_decision(
     remote: Sig,
     baseline: &mut Baseline,
     report: &mut SyncReport,
+    state_store: &Mutex<SyncState>,
 ) {
     match d {
         Decision::Noop => {}
@@ -696,7 +705,7 @@ async fn apply_decision(
                 baseline.put(path, remote);
                 return;
             }
-            resolve_conflict(client, view, path, remote, baseline, report).await;
+            resolve_conflict(client, view, path, remote, baseline, report, state_store).await;
         }
         Decision::DeleteLocal => {
             // 调用方统一做删除保护，这里不应到达
@@ -704,7 +713,19 @@ async fn apply_decision(
     }
 }
 
-/// 冲突：远端内容占原名，本地内容另存冲突副本并上传（双方都不丢）。
+/// ★ M8.4：冲突分派 —— 按任务上的 `conflict` 策略决定「怎么解」。
+///
+/// 五个取值逐字对齐 Qsync 6（`docs/M8-向Qsync-Client-6靠拢.md` §1.7）：
+///
+/// | 策略 | 行为 | 谁丢数据 |
+/// |---|---|---|
+/// | `ask` | 两边都不动，写待裁决队列等用户裁决 | 都不丢 |
+/// | `rename_remote` | NAS 上那份改名成冲突副本，本地内容占原名 | 都不丢 |
+/// | `rename_local`（默认） | 本地内容另存冲突副本，远端占原名 | 都不丢 |
+/// | `replace_remote` | 本地内容覆盖 NAS 上的文件 | **远端那份丢** |
+/// | `replace_local` | NAS 上的文件覆盖本地内容 | **本地那份丢** |
+///
+/// 前置的「先等在途上传落地再重判」（M2c 踩过的坑）对所有策略都保留。
 async fn resolve_conflict(
     client: &Client,
     view: &MountView,
@@ -712,6 +733,7 @@ async fn resolve_conflict(
     mut remote: Sig,
     baseline: &mut Baseline,
     report: &mut SyncReport,
+    state_store: &Mutex<SyncState>,
 ) {
     // ★ 实测踩过：本地 4 MiB 改动还在上传时判定冲突，冲突副本还没传完，
     //   在途的「原名上传」就把远端改回了本地内容 —— 冲突副本白做、远端变更丢失。
@@ -777,21 +799,198 @@ async fn resolve_conflict(
         baseline.put(path, remote);
         return;
     }
-    let (dir, name) = split_path(path);
+
+    let policy = if view.conflict.is_empty() {
+        qxync_core::tasks::DEFAULT_CONFLICT
+    } else {
+        view.conflict.as_str()
+    };
+    match policy {
+        // ---- 用 NAS 上的文件替换本地（本地那份**丢**，UI 有显式警告）
+        CONFLICT_REPLACE_LOCAL => {
+            replace_local_with_remote(view, path, remote, baseline, report, "用 NAS 上的文件替换本地文件");
+        }
+        // ---- 用本地文件替换 NAS 上的（远端那份**丢**）
+        CONFLICT_REPLACE_REMOTE => {
+            upload_local_over_remote(view, path, report, "用本地文件替换 NAS 上的文件");
+        }
+        // ---- NAS 上那份改名成冲突副本，本地内容占原名
+        CONFLICT_RENAME_REMOTE => {
+            let (dir, name) = split_path(path);
+            let chosen = match pick_conflict_name(client, &dir, &name, report).await {
+                Some(c) => c,
+                None => return,
+            };
+            if let Err(e) = client.rename(&dir, &name, &chosen).await {
+                report.error(format!(
+                    "{path}: 远端改名成 {chosen} 失败（策略：重命名 NAS 上的文件）: {e}"
+                ));
+                return;
+            }
+            let conflict_remote = join(&dir, &chosen);
+            // 本地内容占原名 → 入队上传（远端这个名字此刻是空的）
+            upload_local_over_remote(
+                view,
+                path,
+                report,
+                "重命名 NAS 上的文件（NAS 上的文件已改名，本地内容占原名）",
+            );
+            report.conflicts += 1;
+            tracing::warn!("冲突：{path} → NAS 上的文件改名为 {conflict_remote}，本地内容占原名");
+            report.note(format!(
+                "冲突：NAS 上的文件已改名为 {conflict_remote}（本地内容占原名，双方都保留）"
+            ));
+            if let Err(e) = client
+                .write_log(&conflict_remote, write_action::UPSERT_FILE)
+                .await
+            {
+                tracing::debug!("冲突副本 write_log 失败（不影响）: {e}");
+            }
+        }
+        // ---- 每个文件都问我：没有裁决 → 入队等待；已有裁决 → 执行
+        CONFLICT_ASK => {
+            let decided = {
+                let g = state_store.lock().unwrap();
+                match g.store.decision_by_path(path) {
+                    Ok(Some(row)) => row.resolution,
+                    Ok(None) => None,
+                    Err(e) => {
+                        report.error(format!("读冲突待裁决队列失败 {path}: {e}"));
+                        return;
+                    }
+                }
+            };
+            match decided.as_deref() {
+                Some("keep_local") => {
+                    upload_local_over_remote(view, path, report, "按用户裁决：保留本地");
+                    finish_decision(state_store, path);
+                }
+                Some("keep_remote") => {
+                    replace_local_with_remote(view, path, remote, baseline, report, "按用户裁决：保留 NAS 上的");
+                    finish_decision(state_store, path);
+                }
+                Some("keep_both") => {
+                    rename_local_copy(client, view, path, remote, baseline, report, local.mtime).await;
+                    finish_decision(state_store, path);
+                }
+                _ => {
+                    // 入队（同路径只保留一条；每轮都冲突也只记一条）
+                    let (local_size, local_mtime) = (local.size, local.mtime);
+                    let row = qxync_core::store::DecisionRow {
+                        id: qxync_core::store::DecisionRow::id_for(path),
+                        path: path.to_string(),
+                        task_id: String::new(),
+                        is_dir: false,
+                        local_size,
+                        local_mtime,
+                        remote_size: remote.size,
+                        remote_mtime: remote.mtime,
+                        created_unix: now_secs() as i64,
+                        resolution: None,
+                    };
+                    match state_store.lock().unwrap().store.decision_upsert(&row) {
+                        Ok(()) => {
+                            report.conflicts += 1;
+                            report.note(format!(
+                                "{path}: 冲突等待裁决（策略：每个文件都问我）→ GUI 任务页 / `qsync conflicts`"
+                            ));
+                        }
+                        Err(e) => report.error(format!("{path} 写入待裁决队列失败: {e}")),
+                    }
+                }
+            }
+        }
+        // ---- 默认：重命名本地文件（M2c 的原始行为）
+        _ => {
+            rename_local_copy(client, view, path, remote, baseline, report, local.mtime).await;
+        }
+    }
+}
+
+/// 删掉一条已执行的裁决（只在**成功执行**后调用）。
+fn finish_decision(state_store: &Mutex<SyncState>, path: &str) {
+    let id = qxync_core::store::DecisionRow::id_for(path);
+    let g = state_store.lock().unwrap();
+    match g.store.decision_delete(&id) {
+        Ok(true) => tracing::info!("待裁决冲突已执行并出队: {path}"),
+        Ok(false) => {}
+        Err(e) => tracing::warn!("待裁决冲突出队失败 {path}: {e}"),
+    }
+}
+
+/// 冲突副本取名（原来内联在 resolve_conflict 里的一段）。
+async fn pick_conflict_name(
+    client: &Client,
+    dir: &str,
+    name: &str,
+    report: &mut SyncReport,
+) -> Option<String> {
     let device = hostname();
     let date = today();
-    let mut chosen = conflict_name(&name, &device, &date);
+    let mut chosen = conflict_name(name, &device, &date);
     for seq in 2..=20u32 {
-        match client.stat(&dir, &chosen).await {
+        match client.stat(dir, &chosen).await {
             Ok(None) => break,
-            Ok(Some(_)) => chosen = conflict_name_with_seq(&name, &device, &date, seq),
+            Ok(Some(_)) => chosen = conflict_name_with_seq(name, &device, &date, seq),
             Err(e) => {
                 report.error(format!("冲突副本取名失败（stat {dir}/{chosen}）: {e}"));
-                return;
+                return None;
             }
         }
     }
+    Some(chosen)
+}
 
+/// 「用 NAS 上的文件替换本地」：刷新元数据 + 丢掉本地内容。
+fn replace_local_with_remote(
+    view: &MountView,
+    path: &str,
+    remote: Sig,
+    baseline: &mut Baseline,
+    report: &mut SyncReport,
+    why: &str,
+) {
+    view.view
+        .apply_remote_meta(path, remote.is_dir, remote.size, remote.mtime);
+    view.view.invalidate_content(path);
+    baseline.put(path, remote);
+    report.conflicts += 1;
+    tracing::warn!("冲突：{path} → {why}（NAS 上的内容为准，本地改动被丢弃）");
+    report.note(format!("{path}: {why}（本地改动已丢弃）"));
+}
+
+/// 「用本地文件替换 NAS 上的」：把本地内容重新入队上传。
+fn upload_local_over_remote(view: &MountView, path: &str, report: &mut SyncReport, why: &str) {
+    if view.view.has_pending(path) {
+        // 已经在队列里了，不重复入队
+        report.conflicts += 1;
+        return;
+    }
+    match view.view.mark_dirty(path) {
+        Ok(()) => {
+            report.conflicts += 1;
+            report.uploaded += 1;
+            tracing::warn!("冲突：{path} → {why}（本地内容为准，NAS 上的改动将被覆盖）");
+            report.note(format!("{path}: {why}（NAS 上的改动将被覆盖）"));
+        }
+        Err(e) => report.error(format!("{path} 冲突后重新入队上传失败: {e}")),
+    }
+}
+
+/// 默认策略：本地内容另存冲突副本并上传，远端占原名（双方都不丢）。
+async fn rename_local_copy(
+    client: &Client,
+    view: &MountView,
+    path: &str,
+    remote: Sig,
+    baseline: &mut Baseline,
+    report: &mut SyncReport,
+    local_mtime: i64,
+) {
+    let (dir, name) = split_path(path);
+    let Some(chosen) = pick_conflict_name(client, &dir, &name, report).await else {
+        return;
+    };
     // ① 先把本地内容复制到 stash（下一步失效缓存会把它删掉）
     let stash = match view.view.stash_conflict(path, &chosen) {
         Ok(p) => p,
@@ -801,7 +1000,7 @@ async fn resolve_conflict(
         }
     };
     // ② 冲突副本入队上传
-    if let Err(e) = view.view.enqueue_upload(&dir, &chosen, stash, local.mtime) {
+    if let Err(e) = view.view.enqueue_upload(&dir, &chosen, stash, local_mtime) {
         report.error(format!("冲突副本 {dir}/{chosen} 入队失败: {e}"));
         return;
     }
@@ -1226,6 +1425,7 @@ mod tests {
             upload: Some(q.clone()),
             read_only: false,
             rules: Arc::new(Rules::temp_only(true)),
+            conflict: qxync_core::tasks::DEFAULT_CONFLICT.to_string(),
         }];
         let cfg = SyncConfig::default();
 
@@ -1408,6 +1608,7 @@ mod tests {
             upload: None,
             read_only: true,
             rules: Arc::new(rules),
+            conflict: qxync_core::tasks::DEFAULT_CONFLICT.to_string(),
         };
         assert!(mv.hidden("/home/secret", true).is_some());
         assert!(mv.hidden("/home/secret/deep/x.bin", false).is_some());
@@ -1423,6 +1624,7 @@ mod tests {
             upload: None,
             read_only: true,
             rules: Arc::new(Rules::temp_only(true)),
+            conflict: qxync_core::tasks::DEFAULT_CONFLICT.to_string(),
         };
         assert!(plain.hidden("/home/secret", true).is_none());
         assert!(plain.hidden("/home/x.crdownload", false).is_some());

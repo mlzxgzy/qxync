@@ -20,7 +20,25 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 qxync-core = { path = "../qxync-core" }
-tauri = { version = "2", features = [] }
+# ★ M8.4：托盘是本轮的硬需求，所以把 `tray-icon` 打开（Tauri 默认不带，省体积）。
+# `image-png` 是 `Image::from_bytes` 解码 PNG 的前提——没有它 `include_bytes!` 进来的
+# 图标字节没法变成 `tauri::image::Image`。两者都是编译期 feature，运行时不增加依赖。
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+# ★ M8.4：Linux 上 `tray-icon` 有两套后端 —— 默认的 libappindicator（GTK 老库，只用
+# `:<唯一连接名>/org/ayatana/NotificationItem/...` 注册）和纯 Rust 的 ksni（按
+# StatusNotifierItem 规范抢占众所周知的名字 `org.kde.StatusNotifierItem-<pid>-1`）。
+# 面板/验收脚本找的是后者，且 `libayatana-appindicator` 自己已经报 deprecated，
+# 所以这里切到 ksni：tray-icon 的 cfg 是「ksni 优先于 libappindicator」，只要图里
+# 有人打开 ksni 就会换后端。tauri 没给 ksni 直通 feature，因此靠 feature 合并打开它
+# （`default-features = false` 只表示「不额外加默认 feature」，tauri 想要的
+# `libappindicator`/`serde` 仍然由 tauri 自己声明，不影响）。
+tray-icon = { version = "0.25", default-features = false, features = ["ksni"] }
+# ★ M8.4：三个官方插件都只从 **Rust 命令**里调用（JS 侧不碰插件 API），
+# 因此 capabilities 里不需要给它们加权限；插件在这里的价值是提供跨平台的
+# 通知/文件选择器/opener 实现，而不是它的 IPC 命令面。
+tauri-plugin-notification = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

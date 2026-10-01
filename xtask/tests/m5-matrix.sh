@@ -111,7 +111,21 @@ grep -aq "baseline=3 条" "$DBG"; check $? "日志显示导入了 3 条 baseline
 "$QS" --socket "$SOCK" store --integrity --json >"$M5/store.json" 2>/dev/null
 check "$([ "$(sj .cursors.config)" = "188" ] && [ "$(sj .cursors.notify)" = "37" ] && [ "$(sj .cursors.global_notify)" = "177" ] && [ "$(sj .cursors.max_log_seen)" = "188" ] && [ "$(sj .cursors.log_missing_count)" = "111" ] && echo 0 || echo 1)" "三个游标 + max_log_seen + log_missing_count 原样迁移"
 check "$([ "$(sj .baseline_entries)" = "3" ] && echo 0 || echo 1)" "baseline 3 条进库"
-check "$([ "$(sj .schema_version)" = "1" ] && echo 0 || echo 1)" "schema 版本 v1"
+# ★ M8.3/M8.4：schema 升到 v3（v2 新增 journal 表，v3 新增 decisions 表）。
+#   老库在打开时**自动补表**（CREATE TABLE IF NOT EXISTS），不写迁移代码。
+#   已有数据一行不动 —— 这正是下面几条要断言的。
+check "$([ "$(sj .schema_version)" = "3" ] && echo 0 || echo 1)" "schema 版本 v3（M8.4 起：+decisions 冲突待裁决队列）"
+HASJ=$(python3 -c "
+import sqlite3,sys
+c=sqlite3.connect(sys.argv[1])
+print(1 if c.execute(\"SELECT name FROM sqlite_master WHERE type='table' AND name='journal'\").fetchone() else 0)
+" "$LEG/sync.db")
+check "$([ "$HASJ" = "1" ] && echo 0 || echo 1)" "★ journal 表已自动创建（老库补表，不需要迁移脚本）"
+JROWS=$(python3 -c "
+import sqlite3,sys
+print(sqlite3.connect(sys.argv[1]).execute('SELECT COUNT(*) FROM journal').fetchone()[0])
+" "$LEG/sync.db")
+check "$([ "$JROWS" = "0" ] && echo 0 || echo 1)" "新补的 journal 表是空的（$JROWS 行）"
 check "$([ "$(sj .integrity)" = "ok" ] && echo 0 || echo 1)" "PRAGMA integrity_check = ok"
 check "$([ "$(sj .path)" = "$LEG/sync.db" ] && echo 0 || echo 1)" "状态库路径正确（$(sj .path)）"
 check "$([ -f "$LEG/baseline.json.migrated" ] && [ -f "$LEG/cursors.json.migrated" ] && echo 0 || echo 1)" "旧 JSON 已归档成 *.json.migrated（保留备份）"

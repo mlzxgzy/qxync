@@ -15,297 +15,777 @@
   请用 QSync 桌面程序（或 <code>qxync-gui</code>）打开本界面。</span>
 </div>
 
-<!-- ============================= 顶部常驻状态条 ============================= -->
-<header id="topbar" class="topbar">
-  <div class="topbar-row">
-    <div class="brand">QSync<span class="brand-sub">QNAP 按需同步</span></div>
+<div class="shell">
 
-    <div class="status-chips">
-      <span id="chip-daemon" class="chip chip-unknown">qxyncd：检测中…</span>
-      <span id="chip-conn" class="chip chip-unknown">连接：—</span>
-      <span id="chip-login" class="chip chip-unknown">登录：—</span>
-    </div>
+  <!-- ======================= 左侧图标栏（对齐 Qsync Client 6） =======================
+       6.x 的左栏只有图标、没有文字标签；这里保留小号文字是为了可发现性
+       （7 个目的地靠 tooltip 认不全），属**有意的偏离**，见 docs/M8-向Qsync-Client-6靠拢.md §1.1。 -->
+  <aside class="rail">
+    <div class="rail-logo" title="QSync — QNAP 按需同步">Q</div>
 
-    <div class="topbar-actions">
-      <button id="btn-daemon-start" type="button">启动 daemon</button>
-      <button id="btn-daemon-stop" type="button">停止 daemon</button>
-      <button id="btn-quick-login" type="button" class="primary">立即登录</button>
-    </div>
-  </div>
+    <nav class="rail-nav" id="rail-nav">
+      <button type="button" class="rail-item active" data-page="home" title="主页（任务状态）">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/></svg>
+        <span>主页</span>
+      </button>
+      <button type="button" class="rail-item" data-page="tasks" title="任务（同步任务列表）">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16"/><path d="M4 12h16"/><path d="M4 18h10"/></svg>
+        <span>任务</span>
+      </button>
+      <button type="button" class="rail-item" data-page="files" title="文件（远端浏览 / 节省空间模式）">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+        <span>文件</span>
+      </button>
+      <button type="button" class="rail-item" data-page="journal" title="文件更新中心（同步日志）">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 8v4l3 2"/></svg>
+        <span>更新</span>
+      </button>
+      <button type="button" class="rail-item" data-page="errors" title="错误列表（失败项）">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4 2.5 20h19z"/><path d="M12 10v4"/><path d="M12 17.2v.1"/></svg>
+        <span>错误</span>
+      </button>
+      <button type="button" class="rail-item" data-page="settings" title="设置（连接 / 同步 / 缓存 / 网络 / 通知）">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M19 5l-2 2M7 17l-2 2"/></svg>
+        <span>设置</span>
+      </button>
+    </nav>
 
-  <div class="topbar-meta mono">
-    <span id="meta-daemon">daemon：—</span>
-    <span id="meta-conn">连接：—</span>
-    <span id="meta-session">session：—</span>
-  </div>
-</header>
+    <div class="rail-spacer"></div>
 
-<!-- ============================= Tab 导航 ============================= -->
-<nav class="tabs" id="tabs">
-  <button type="button" class="tab active" data-tab="status">状态 / 进度</button>
-  <button type="button" class="tab" data-tab="connect">连接 / 登录</button>
-  <button type="button" class="tab" data-tab="mounts">挂载</button>
-  <button type="button" class="tab" data-tab="files">文件 / pin</button>
-  <button type="button" class="tab" data-tab="sync">同步 / 缓存</button>
-</nav>
+    <!-- 专家模式：现有排障页（状态/挂载/同步缓存）收纳在这里，字段与 id 全部保留 -->
+    <button type="button" class="rail-item rail-expert" data-page="diag" title="诊断（专家模式：游标 / baseline / 水合 / 脱水）">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 4.5a4 4 0 0 0 5 5L21 8v3l-8 8-1.5-1.5"/><path d="M3 21l6-6"/><path d="M10.5 6.5 6 11l3 3 4.5-4.5z"/></svg>
+      <span>诊断</span>
+    </button>
+  </aside>
 
-<main id="main">
+  <div class="main-col">
 
-  <!-- ======================= Tab 1：状态 / 进度 ======================= -->
-  <section class="panel active" id="panel-status">
-    <div class="grid-2">
-      <div class="card">
-        <h2>服务端信息</h2>
-        <div id="srv-warn" class="warn" hidden></div>
-        <dl class="kv" id="srv-kv"></dl>
-      </div>
+    <!-- ============================= 顶部常驻状态条 ============================= -->
+    <header id="topbar" class="topbar">
+      <div class="topbar-row">
+        <h1 class="pagetitle" id="page-title">主页</h1>
 
-      <div class="card">
-        <h2>本次会话</h2>
-        <dl class="kv" id="sess-kv"></dl>
-        <h3 class="sub">游标（config / notify / global_notify）</h3>
-        <dl class="kv mono" id="cursors-kv"></dl>
-      </div>
-    </div>
-
-    <div class="grid-3">
-      <div class="card">
-        <h2>水合统计</h2>
-        <dl class="kv" id="hydro-kv"></dl>
-      </div>
-
-      <div class="card">
-        <h2>上传队列 <span id="uploads-active" class="badge-live" hidden>进行中</span></h2>
-        <dl class="kv" id="uploads-kv"></dl>
-      </div>
-
-      <div class="card">
-        <h2>缓存 / 脱水</h2>
-        <dl class="kv" id="cache-kv"></dl>
-        <div class="bar-wrap" id="cache-bar-wrap">
-          <div class="bar"><div class="bar-fill" id="cache-bar-fill" style="width:0%"></div></div>
-          <div class="bar-label mono" id="cache-bar-label">—</div>
+        <div class="status-chips">
+          <span id="chip-daemon" class="chip chip-unknown">qxyncd：检测中…</span>
+          <span id="chip-conn" class="chip chip-unknown">连接：—</span>
+          <span id="chip-login" class="chip chip-unknown">登录：—</span>
         </div>
-        <dl class="kv" id="cache-blocked-kv"></dl>
+
+        <div class="topbar-actions">
+          <button id="btn-daemon-start" type="button">启动 daemon</button>
+          <button id="btn-daemon-stop" type="button">停止 daemon</button>
+          <button id="btn-quick-login" type="button" class="primary">立即登录</button>
+        </div>
       </div>
-    </div>
 
-    <div class="card">
-      <h2>挂载点 <span class="count" id="mounts-status-count"></span>
-        <button type="button" class="mini" id="btn-status-mounts-refresh">刷新</button>
-      </h2>
-      <table class="tbl" id="tbl-status-mounts">
-        <thead><tr><th>挂载点</th><th>远端</th><th>模式</th><th class="col-act">操作</th></tr></thead>
-        <tbody></tbody>
-      </table>
-      <p class="empty-hint" id="status-mounts-empty" hidden>暂无挂载。</p>
-    </div>
+      <div class="topbar-meta mono">
+        <span id="meta-daemon">daemon：—</span>
+        <span id="meta-conn">连接：—</span>
+        <span id="meta-session">session：—</span>
+      </div>
+    </header>
 
-    <div class="card">
-      <h2>远端根 <span class="count" id="roots-count"></span>
-        <button type="button" class="mini" id="btn-roots-refresh">刷新</button>
-      </h2>
-      <dl class="kv mono" id="roots-summary-kv"></dl>
-      <ul class="root-list" id="roots-list"></ul>
-      <p class="empty-hint" id="roots-empty" hidden>尚未读取远端根（点右上「刷新」）。</p>
-      <p class="note" id="roots-note" hidden></p>
-      <h3 class="sub">NAS 同步文件夹</h3>
-      <ul class="root-list mono" id="roots-folders"></ul>
-      <p class="empty-hint" id="roots-folders-empty" hidden>NAS 未登记 Qsync 同步文件夹</p>
-    </div>
+    <main id="main">
 
-    <div class="card">
-      <h2>最近一次同步摘要</h2>
-      <div id="sync-alerts" class="alert-stack"></div>
-      <dl class="kv kv-inline" id="sync-summary-kv"></dl>
-      <p class="note" id="sync-note" hidden></p>
-      <p class="empty-hint" id="sync-missing" hidden>daemon 未上报 sync 状态。</p>
-    </div>
-  </section>
+      <!-- ======================= 页面 1：主页 ======================= -->
+      <section class="page active" id="page-home">
+        <div class="card">
+          <h2>连接</h2>
+          <div class="home-conn">
+            <span class="conn-dot" id="home-dot"></span>
+            <span class="mono" id="home-conn-text">—</span>
+            <span class="home-conn-actions">
+              <button type="button" class="mini" id="btn-home-settings">连接设置</button>
+              <button type="button" class="mini" id="btn-home-sync-now">立即同步</button>
+              <button type="button" class="mini primary" id="btn-home-add-task">＋ 添加任务</button>
+            </span>
+          </div>
+        </div>
 
-  <!-- ======================= Tab 2：连接 / 登录 ======================= -->
-  <section class="panel" id="panel-connect">
-    <div class="grid-2">
-      <div class="card">
-        <h2>连接配置</h2>
-        <p class="hint" id="connect-hint">加载中…</p>
-        <p class="hint mono" id="cred-hint">凭据：—</p>
+        <div class="card">
+          <h2>任务 <span class="count" id="home-task-count"></span>
+            <button type="button" class="mini" id="btn-home-refresh">刷新</button>
+          </h2>
+          <div id="home-tasks" class="task-list"></div>
+          <p class="empty-hint" id="home-tasks-empty" hidden>
+            还没有同步任务。点右上「＋ 添加任务」把本地文件夹与 NAS 文件夹配成一对。
+          </p>
+        </div>
 
-        <form id="form-connect" class="form" autocomplete="off">
-          <label>主机 / NAS 地址
-            <input type="text" id="f-host" placeholder="nas.local 或 192.168.1.10" spellcheck="false">
-          </label>
-          <div class="row-2">
-            <label>端口
-              <input type="number" id="f-port" min="1" max="65535" step="1" placeholder="9834">
+        <div class="card">
+          <h2>最近一次同步</h2>
+          <dl class="kv kv-inline" id="home-sync-kv"></dl>
+          <div id="home-alerts" class="alert-stack"></div>
+        </div>
+      </section>
+
+      <!-- ======================= 页面 2：任务（M8.2，M8.4 补冲突策略） ======================= -->
+      <section class="page" id="page-tasks">
+        <!-- ★ M8.4：冲突策略 =「每个文件都问我」时攒下的待裁决队列 -->
+        <div class="card" id="decisions-card">
+          <h2>冲突待裁决 <span class="count" id="decisions-count"></span>
+            <button type="button" class="mini" id="btn-decisions-refresh">刷新</button>
+          </h2>
+          <p class="hint">
+            只有把某个任务的冲突策略设成 <code>ask</code>（每个文件都问我）时才会有条目。
+            待裁决期间**两边都不动**（谁的改动都不会被覆盖）；裁决后由下一轮同步执行。
+          </p>
+          <div id="decisions-list" class="task-list"></div>
+          <p class="empty-hint" id="decisions-empty" hidden>没有待裁决的冲突。</p>
+          <p class="note" id="decisions-note" hidden></p>
+        </div>
+
+        <div class="card">
+          <h2>同步任务 <span class="count" id="tasks-count"></span>
+            <button type="button" class="mini" id="btn-tasks-refresh">刷新</button>
+            <button type="button" class="mini primary" id="btn-tasks-add">＋ 添加配对文件夹</button>
+          </h2>
+          <div id="tasks-list" class="task-list"></div>
+          <p class="empty-hint" id="tasks-empty" hidden>
+            还没有同步任务。点右上「＋ 添加配对文件夹」把本地文件夹与 NAS 文件夹配成一对。
+          </p>
+          <p class="note" id="tasks-note" hidden></p>
+          <ul class="plain-list mono" id="tasks-bad"></ul>
+        </div>
+
+        <div class="card" id="task-form-card" hidden>
+          <h2 id="task-form-title">文件夹对设置</h2>
+          <form id="form-task" class="form" autocomplete="off">
+            <div class="row-2">
+              <label>任务 id（也是文件名）
+                <input type="text" id="t-id" class="mono" value="default" spellcheck="false">
+              </label>
+              <label>缓存模式
+                <select id="t-cache-mode">
+                  <option value="pagecache">pagecache（默认）</option>
+                  <option value="direct">direct（绕过 page cache，不可 mmap）</option>
+                </select>
+              </label>
+            </div>
+            <label>本地文件夹（挂载点，绝对路径）
+              <input type="text" id="t-mountpoint" class="mono" spellcheck="false">
             </label>
-            <label>登录用户
-              <input type="text" id="f-user" spellcheck="false" autocomplete="username">
+            <label>NAS 文件夹（远端根，每行一个）
+              <textarea id="t-roots" rows="2" class="mono" spellcheck="false" placeholder="/home">/home</textarea>
             </label>
+            <label>水合缓存目录（留空 = 默认 <code>~/.local/share/qsync/cache</code>）
+              <input type="text" id="t-cache-dir" class="mono" spellcheck="false"
+                     placeholder="留空用默认；实际缓存会再拼一层 NAS 主机名">
+            </label>
+            <div class="row-2">
+              <label>冲突策略（Conflict policies）
+                <select id="t-conflict">
+                  <option value="rename_local">重命名本地文件（默认；远端占原名，本地另存冲突副本）</option>
+                  <option value="ask">每个文件都问我（进待裁决队列）</option>
+                  <option value="rename_remote">重命名 NAS 上的文件（本地内容占原名）</option>
+                  <option value="replace_remote">用本地文件替换 NAS 上的文件（⚠ 远端那份会丢）</option>
+                  <option value="replace_local">用 NAS 上的文件替换本地文件（⚠ 本地那份会丢）</option>
+                </select>
+              </label>
+              <label>同步方向（记录；1-way 的实际执行在 M9）
+                <select id="t-direction">
+                  <option value="2way">双向（2-way）</option>
+                  <option value="1way-up">仅上传（1-way up）</option>
+                  <option value="1way-down">仅下载（1-way down）</option>
+                </select>
+              </label>
+            </div>
+            <div class="row-checks">
+              <label class="check"><input type="checkbox" id="t-space-saving"> 节省空间模式（按需同步 / 可脱水）</label>
+              <label class="check"><input type="checkbox" id="t-smart-delete"> 智能删除（≈ 待确认删除；与节省空间模式互斥）</label>
+            </div>
+            <div class="row-checks">
+              <label class="check"><input type="checkbox" id="t-read-write"> 读写（默认只读）</label>
+              <label class="check"><input type="checkbox" id="t-do-mount" checked> 保存后立即挂载</label>
+            </div>
+            <p class="hint">
+              保存位置 <code>~/.config/qsync/tasks/&lt;id&gt;.json</code>；**只登记参数，不动 NAS 上的任何数据**。
+              冲突策略与节省空间模式已经接到后端；选择性同步（勾选子文件夹）仍是 M9 的事，
+              现在用「多任务 / 多根」近似。
+            </p>
+            <div class="btn-row">
+              <button type="submit" id="btn-task-save" class="primary">保存任务</button>
+              <button type="button" id="btn-task-cancel">取消</button>
+              <span class="busy" id="task-busy" hidden>进行中…</span>
+            </div>
+          </form>
+          <div id="task-result" class="result" hidden></div>
+        </div>
+      </section>
+
+      <!-- ======================= 页面 3：文件 ======================= -->
+      <section class="page" id="page-files">
+        <div class="card">
+          <h2>远端目录</h2>
+          <form id="form-path" class="pathbar" autocomplete="off">
+            <input type="text" id="fp-path" value="/home" spellcheck="false" class="mono">
+            <button type="submit" id="btn-path-go">打开</button>
+            <button type="button" id="btn-path-up">上级目录</button>
+            <button type="button" id="btn-path-refresh">刷新</button>
+            <label class="check"><input type="checkbox" id="fp-hide-excluded"> 隐藏 excluded</label>
+          </form>
+          <div class="toolbar">
+            <button type="button" id="btn-mkdir">新建目录</button>
+            <button type="button" id="btn-rm" class="danger">删除选中</button>
+            <span class="toolbar-info" id="files-info">—</span>
+            <span class="busy" id="files-busy" hidden>进行中…</span>
           </div>
-          <label>口令
-            <input type="password" id="f-password" autocomplete="current-password" placeholder="留空则不解写凭据">
-          </label>
-          <div class="row-checks">
-            <label class="check"><input type="checkbox" id="f-https" checked> 使用 HTTPS</label>
-            <label class="check"><input type="checkbox" id="f-insecure"> 自签证书：跳过 TLS 校验</label>
-            <label class="check"><input type="checkbox" id="f-ipv4-only"> 仅 IPv4</label>
-          </div>
-          <label>home_root（远端家目录根）
-            <input type="text" id="f-home-root" placeholder="/home" spellcheck="false" class="mono">
-          </label>
-          <label>远端根（roots，每行一个）
-            <textarea id="f-roots" rows="3" class="mono" spellcheck="false" placeholder="/home"></textarea>
-          </label>
-          <p class="hint">留空 = 只同步家目录 <code>/home</code>；多根时挂载点顶层会出现每个根的名字（如 <code>home/</code>、<code>Public/</code>）。共享文件夹默认只读。</p>
-          <div class="btn-row">
-            <button type="submit" id="btn-link-save">保存连接配置</button>
-            <button type="button" id="btn-login" class="primary">保存并登录</button>
-            <button type="button" id="btn-connect-start">启动 daemon</button>
-            <button type="button" id="btn-connect-stop">停止 daemon</button>
-          </div>
-        </form>
+          <table class="tbl tbl-files">
+            <thead>
+              <tr>
+                <th class="col-sel">选</th>
+                <th class="col-type">类型</th>
+                <th>文件名</th>
+                <th class="col-size">大小</th>
+                <th class="col-time">修改时间</th>
+                <th class="col-child">have_child</th>
+                <th class="col-state">状态（节省空间模式）</th>
+                <th class="col-pin">pin 状态 / 操作</th>
+              </tr>
+            </thead>
+            <tbody id="files-tbody"></tbody>
+          </table>
+          <p class="empty-hint" id="files-empty" hidden>目录为空，或尚未加载。</p>
+          <p class="note">
+            <strong>状态</strong>列就是 Qsync 的「节省空间模式」三态：
+            <span class="badge badge-online">仅在线</span>（占位符，没有本地内容）·
+            <span class="badge badge-local">本地可用</span>（已缓存）·
+            <span class="badge badge-always">始终可用</span>（<code>pin=pinned</code>，永不自动释放）。
+            右键任意一行可以「始终保留在此设备 / 释放空间 / 下载 / 删除 / 复制路径」。
+          </p>
+        </div>
+      </section>
 
-        <div id="login-result" class="result" hidden></div>
-      </div>
-
-      <div class="card">
-        <h2>本机路径 / 运行环境</h2>
-        <dl class="kv mono" id="paths-kv"></dl>
-        <button type="button" class="mini" id="btn-app-info-refresh">刷新</button>
-        <p class="hint" id="link-path-hint">—</p>
-      </div>
-    </div>
-  </section>
-
-  <!-- ======================= Tab 3：挂载 ======================= -->
-  <section class="panel" id="panel-mounts">
-    <div class="card">
-      <h2>当前挂载 <span class="count" id="mounts-count"></span>
-        <button type="button" class="mini" id="btn-mounts-refresh">刷新</button>
-      </h2>
-      <table class="tbl" id="tbl-mounts">
-        <thead><tr><th>挂载点</th><th>远端</th><th>模式</th><th class="col-act">操作</th></tr></thead>
-        <tbody></tbody>
-      </table>
-      <p class="empty-hint" id="mounts-empty" hidden>暂无挂载。</p>
-    </div>
-
-    <div class="card">
-      <h2>新建挂载</h2>
-      <form id="form-mount" class="form" autocomplete="off">
-        <label>挂载点（本地目录，会被创建）
-          <input type="text" id="m-mountpoint" spellcheck="false" class="mono">
-        </label>
-        <label>远端根（每行一个，第一个是默认根）
-          <textarea id="m-remote" rows="3" class="mono" spellcheck="false" placeholder="/home">/home</textarea>
-        </label>
-        <div class="row-2">
-          <label>缓存模式
-            <select id="m-cache-mode">
-              <option value="pagecache">pagecache（默认）</option>
-              <option value="direct">direct（绕过 page cache，不可 mmap）</option>
+      <!-- ======================= 页面 4：文件更新中心（M8.3） ======================= -->
+      <section class="page" id="page-journal">
+        <div class="card">
+          <h2>文件更新中心 <span class="count" id="journal-count"></span></h2>
+          <div class="toolbar">
+            <input type="text" id="j-query" class="mono" placeholder="按文件名 / 说明搜索" spellcheck="false">
+            <select id="j-level">
+              <option value="all">全部</option>
+              <option value="ok">成功</option>
+              <option value="error">失败</option>
+              <option value="blocked">被挡下</option>
             </select>
-          </label>
-          <label>并发线程数 threads
-            <input type="number" id="m-threads" min="1" max="64" step="1" value="4">
-          </label>
+            <label class="inline-num">条数 <input type="number" id="j-limit" min="1" max="10000" step="50" value="200"></label>
+            <button type="button" id="btn-journal-refresh">查询</button>
+            <button type="button" id="btn-journal-clear" class="danger">清空日志</button>
+            <span class="busy" id="journal-busy" hidden>进行中…</span>
+          </div>
+          <table class="tbl tbl-journal">
+            <thead>
+              <tr>
+                <th class="col-time">时间</th>
+                <th class="col-kind">活动</th>
+                <th>路径</th>
+                <th>说明</th>
+                <th class="col-size">字节</th>
+              </tr>
+            </thead>
+            <tbody id="journal-tbody"></tbody>
+          </table>
+          <p class="empty-hint" id="journal-empty" hidden>
+            没有日志。挂载一个同步任务后点「立即同步」，或有实际同步活动时就会出现记录。
+          </p>
+          <p class="note" id="journal-note" hidden></p>
         </div>
-        <div class="row-3">
-          <label>水合超时（秒）
-            <input type="number" id="m-hydrate-timeout" min="1" step="1" value="600">
-          </label>
-          <label>删除熔断阈值 delete_limit
-            <input type="number" id="m-delete-limit" min="0" step="1" value="100">
-          </label>
-          <label class="check"><input type="checkbox" id="m-read-write"> 读写挂载（否则只读）</label>
+      </section>
+
+      <!-- ======================= 页面 5：错误列表（M8.3） ======================= -->
+      <section class="page" id="page-errors">
+        <div class="card">
+          <h2>错误列表 <span class="count" id="errors-count"></span>
+            <button type="button" class="mini" id="btn-errors-refresh">刷新</button>
+          </h2>
+          <div id="errors-list" class="alert-stack"></div>
+          <p class="empty-hint" id="errors-empty" hidden>没有失败项 —— 同步、上传、脱水目前都正常。</p>
         </div>
-        <label class="check"><input type="checkbox" id="m-auto-unmount" checked> 异常退出时自动卸载 auto_unmount</label>
-        <div class="btn-row">
-          <button type="submit" id="btn-mount" class="primary">挂载</button>
-          <span class="busy" id="mount-busy" hidden>进行中…</span>
+      </section>
+
+      <!-- ======================= 页面 6：设置（M8.4 补齐全部分区） ======================= -->
+      <section class="page" id="page-settings">
+        <!-- ★ M8.4：设置内分区（对齐 Qsync 的四个 tab + 连接/筛选/LAN/关于）
+             直达写法：QSYNC_GUI_TAB=settings:proxy（验收矩阵逐个分区出图） -->
+        <nav class="tabs settings-tabs" id="settings-tabs">
+          <button type="button" class="tab active" data-sec="connect">连接</button>
+          <button type="button" class="tab" data-sec="proxy">代理</button>
+          <button type="button" class="tab" data-sec="sync">同步与筛选</button>
+          <button type="button" class="tab" data-sec="personal">个人</button>
+          <button type="button" class="tab" data-sec="advanced">高级</button>
+          <button type="button" class="tab" data-sec="free">释放空间</button>
+          <button type="button" class="tab" data-sec="lan">LAN 加速</button>
+          <button type="button" class="tab" data-sec="about">关于</button>
+        </nav>
+
+        <!-- ---------------- 设置 1：连接 ---------------- -->
+        <div class="settings-sec active" id="sec-connect">
+          <div class="grid-2">
+            <div class="card">
+              <h2>连接配置</h2>
+              <p class="hint" id="connect-hint">加载中…</p>
+              <p class="hint mono" id="cred-hint">凭据：—</p>
+
+              <form id="form-connect" class="form" autocomplete="off">
+                <label>主机 / NAS 地址
+                  <input type="text" id="f-host" placeholder="nas.local 或 192.168.1.10" spellcheck="false">
+                </label>
+                <div class="row-2">
+                  <label>端口
+                    <input type="number" id="f-port" min="1" max="65535" step="1" placeholder="9834">
+                  </label>
+                  <label>登录用户
+                    <input type="text" id="f-user" spellcheck="false" autocomplete="username">
+                  </label>
+                </div>
+                <label>口令
+                  <input type="password" id="f-password" autocomplete="current-password" placeholder="留空则不解写凭据">
+                </label>
+                <div class="row-checks">
+                  <label class="check"><input type="checkbox" id="f-https" checked> 使用 HTTPS</label>
+                  <label class="check"><input type="checkbox" id="f-insecure"> 自签证书：跳过 TLS 校验</label>
+                  <label class="check"><input type="checkbox" id="f-ipv4-only"> 仅 IPv4</label>
+                </div>
+                <label>home_root（远端家目录根）
+                  <input type="text" id="f-home-root" placeholder="/home" spellcheck="false" class="mono">
+                </label>
+                <label>远端根（roots，每行一个）
+                  <textarea id="f-roots" rows="3" class="mono" spellcheck="false" placeholder="/home"></textarea>
+                </label>
+                <p class="hint">留空 = 只同步家目录 <code>/home</code>；多根时挂载点顶层会出现每个根的名字（如 <code>home/</code>、<code>Public/</code>）。共享文件夹默认只读。</p>
+                <div class="btn-row">
+                  <button type="submit" id="btn-link-save">保存连接配置</button>
+                  <button type="button" id="btn-login" class="primary">保存并登录</button>
+                  <button type="button" id="btn-connect-start">启动 daemon</button>
+                  <button type="button" id="btn-connect-stop">停止 daemon</button>
+                </div>
+              </form>
+
+              <div id="login-result" class="result" hidden></div>
+            </div>
+
+            <div class="card">
+              <h2>本机路径 / 运行环境</h2>
+              <dl class="kv mono" id="paths-kv"></dl>
+              <button type="button" class="mini" id="btn-app-info-refresh">刷新</button>
+              <p class="hint" id="link-path-hint">—</p>
+            </div>
+          </div>
         </div>
-      </form>
-      <div id="mount-result" class="result" hidden></div>
-    </div>
-  </section>
 
-  <!-- ======================= Tab 4：文件 / pin ======================= -->
-  <section class="panel" id="panel-files">
-    <div class="card">
-      <h2>远端目录</h2>
-      <form id="form-path" class="pathbar" autocomplete="off">
-        <input type="text" id="fp-path" value="/home" spellcheck="false" class="mono">
-        <button type="submit" id="btn-path-go">打开</button>
-        <button type="button" id="btn-path-up">上级目录</button>
-        <button type="button" id="btn-path-refresh">刷新</button>
-        <label class="check"><input type="checkbox" id="fp-hide-excluded"> 隐藏 excluded</label>
-      </form>
-      <div class="toolbar">
-        <button type="button" id="btn-mkdir">新建目录</button>
-        <button type="button" id="btn-rm" class="danger">删除选中</button>
-        <span class="toolbar-info" id="files-info">—</span>
-        <span class="busy" id="files-busy" hidden>进行中…</span>
-      </div>
-      <table class="tbl tbl-files">
-        <thead>
-          <tr>
-            <th class="col-sel">选</th>
-            <th class="col-type">类型</th>
-            <th>文件名</th>
-            <th class="col-size">大小</th>
-            <th class="col-time">修改时间</th>
-            <th class="col-child">have_child</th>
-            <th class="col-pin">pin 状态 / 操作</th>
-          </tr>
-        </thead>
-        <tbody id="files-tbody"></tbody>
-      </table>
-      <p class="empty-hint" id="files-empty" hidden>目录为空，或尚未加载。</p>
-    </div>
-  </section>
+        <!-- ---------------- 设置 2：代理（Qsync「代理」tab） ---------------- -->
+        <div class="settings-sec" id="sec-proxy">
+          <div class="card">
+            <h2>代理 <span class="badge" id="proxy-mode-badge"></span></h2>
+            <p class="hint">
+              <code>Auto-detect</code>（官方推荐）= 跟随 <code>http_proxy</code>/<code>https_proxy</code> 环境变量；
+              <code>No proxy</code> = 显式不做代理（注意：reqwest 默认会读环境变量，所以「无代理」必须显式关掉）；
+              <code>Manual</code> = 指定服务器（可带认证）。
+            </p>
+            <div class="form">
+              <label>模式
+                <select id="p-mode">
+                  <option value="auto">Auto-detect（自动检测，官方推荐）</option>
+                  <option value="none">No proxy（无代理）</option>
+                  <option value="manual">Manual（手动）</option>
+                </select>
+              </label>
+              <div id="p-manual-wrap">
+                <div class="row-2">
+                  <label>服务器（IP 或 URL）
+                    <input type="text" id="p-server" class="mono" spellcheck="false" placeholder="proxy.corp 或 http://proxy.corp">
+                  </label>
+                  <label>端口（URL 里已写端口可留空）
+                    <input type="number" id="p-port" min="1" max="65535" step="1" placeholder="3128">
+                  </label>
+                </div>
+                <label class="check"><input type="checkbox" id="p-auth"> 代理服务器需要口令（Proxy server requires a password）</label>
+                <div class="row-2" id="p-cred-wrap">
+                  <label>用户名 <input type="text" id="p-user" spellcheck="false" autocomplete="username"></label>
+                  <label>口令 <input type="password" id="p-password" autocomplete="current-password" placeholder="留空则不改动已存口令"></label>
+                </div>
+              </div>
+              <dl class="kv mono" id="proxy-env-kv"></dl>
+              <div class="btn-row">
+                <button type="button" id="btn-proxy-save" class="primary">保存代理设置</button>
+                <button type="button" id="btn-settings-refresh">重新读取</button>
+              </div>
+              <p class="hint" id="proxy-hint">—</p>
+              <div id="proxy-result" class="result" hidden></div>
+            </div>
+          </div>
+        </div>
 
-  <!-- ======================= Tab 5：同步 / 缓存 ======================= -->
-  <section class="panel" id="panel-sync">
-    <div class="card">
-      <h2>同步状态（SyncInfo）</h2>
-      <div class="btn-row">
-        <button type="button" id="btn-sync-once" class="primary">立即同步</button>
-        <button type="button" id="btn-sync-force" class="danger">强制放行删除</button>
-        <button type="button" id="btn-sync-pause">暂停轮询</button>
-        <label class="inline-num">间隔秒数 <input type="number" id="sy-interval" min="1" step="1" value="60"></label>
-        <button type="button" id="btn-sync-interval">设置轮询间隔</button>
-        <span class="busy" id="sync-busy" hidden>进行中…</span>
-      </div>
-      <div id="sync2-alerts" class="alert-stack"></div>
-      <dl class="kv kv-inline" id="sync-full-kv"></dl>
-      <h3 class="sub">游标</h3>
-      <dl class="kv kv-inline mono" id="sync-cursors-kv"></dl>
-      <h3 class="sub">事件设备（uid:次数）</h3>
-      <ul class="plain-list mono" id="sync-devices"></ul>
-    </div>
+        <!-- ---------------- 设置 3：同步与筛选（Qsync「筛选器设置」） ---------------- -->
+        <div class="settings-sec" id="sec-sync">
+          <div class="card">
+            <h2>筛选器设置（Filter settings）</h2>
+            <p class="hint">
+              通配符规则，每行一条（<code>thumbs.db</code> / <code>*.crdownload</code> / <code>.*</code> / <code>/cache/</code>）。
+              以 <code>/</code> 结尾的规则会**剪掉整棵子树**（这一点 qxync 比 Qsync 6.x 强，不要退化）。
+              规则改完要重启 daemon 才对挂载点生效（同步引擎与 FUSE 在启动时注入规则）。
+            </p>
+            <label>排除规则（exclude）
+              <textarea id="flt-lines" rows="6" class="mono" spellcheck="false"
+                        placeholder="*.iso&#10;/cache/&#10;thumbs.db"></textarea>
+            </label>
+            <label class="check"><input type="checkbox" id="flt-filter-temp"> 过滤临时文件（*.crdownload / ~$* / .goutputstream-* / *.qsync-part）</label>
+            <div class="btn-row">
+              <button type="button" id="btn-flt-save" class="primary">保存筛选器</button>
+              <button type="button" id="btn-flt-reload">重新读取</button>
+            </div>
+            <h3 class="sub">实时预览（判定一条远端路径）</h3>
+            <div class="toolbar">
+              <input type="text" id="flt-match" class="mono" spellcheck="false" placeholder="/home/qxync-test/secret.bin">
+              <button type="button" id="btn-flt-match">判定</button>
+            </div>
+            <div id="flt-match-result" class="result" hidden></div>
+            <p class="note" id="flt-note" hidden></p>
+          </div>
 
-    <div class="card">
-      <h2>缓存 / 脱水（CacheInfo）</h2>
-      <div class="btn-row">
-        <button type="button" id="btn-dehy-dry">脱水（预演）</button>
-        <button type="button" id="btn-dehy-all">全部脱水</button>
-        <label class="inline-num">限额 <input type="text" id="dehy-limit" placeholder="512M / 2G / 25%" class="mono" size="8"></label>
-        <button type="button" id="btn-dehy-limit">按限额脱水</button>
-        <label class="inline-num">闲置秒 <input type="number" id="dehy-idle" min="0" step="1" value="3600"></label>
-        <button type="button" id="btn-dehy-idle">释放闲置</button>
-        <span class="busy" id="dehy-busy" hidden>进行中…</span>
-      </div>
-      <dl class="kv kv-inline" id="cache-full-kv"></dl>
-      <div class="bar-wrap">
-        <div class="bar"><div class="bar-fill" id="cache2-bar-fill" style="width:0%"></div></div>
-        <div class="bar-label mono" id="cache2-bar-label">—</div>
-      </div>
-      <div id="dehy-result" class="result" hidden></div>
-    </div>
-  </section>
+          <div class="card">
+            <h2>冲突策略（Conflict policies）</h2>
+            <p class="hint">
+              策略挂在**任务**上（不是全局）。没配过的任务默认 <code>rename_local</code>，也就是 M2c 一直以来的行为
+              「远端占原名、本地内容另存 <code>xxx (conflicted copy from …)</code>」。
+              <code>replace_*</code> 两个选项会**丢一边的改动**，界面上有显式警告。
+            </p>
+            <dl class="kv kv-inline" id="conflict-kv"></dl>
+            <p class="hint">
+              每个任务的策略在「任务」页的**文件夹对设置**里改；
+              「每个文件都问我」的待裁决项也在任务页顶部处理。
+            </p>
+          </div>
+        </div>
 
-</main>
+        <!-- ---------------- 设置 4：个人（Qsync「个人」tab） ---------------- -->
+        <div class="settings-sec" id="sec-personal">
+          <div class="card">
+            <h2>个人</h2>
+            <div class="form">
+              <label class="check"><input type="checkbox" id="s-startup"> 开机自启（Launch Qsync at startup）</label>
+              <p class="hint" id="autostart-hint">—</p>
+              <div class="row-2">
+                <label>语言（本轮只有 zh-CN 文案，先记录）
+                  <input type="text" id="s-lang" class="mono" placeholder="zh-CN（留空 = 跟随系统）" spellcheck="false">
+                </label>
+                <label>地区（Select the correct region to ensure better connectivity）
+                  <input type="text" id="s-region" class="mono" placeholder="cn / us / auto" spellcheck="false">
+                </label>
+              </div>
+              <label class="check"><input type="checkbox" id="s-close-tray"> 关闭主窗口时最小化到托盘</label>
+              <div class="btn-row">
+                <button type="button" id="btn-personal-save" class="primary">保存个人设置</button>
+              </div>
+              <div id="personal-result" class="result" hidden></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ---------------- 设置 5：高级（Qsync「高级」tab） ---------------- -->
+        <div class="settings-sec" id="sec-advanced">
+          <div class="card">
+            <h2>高级</h2>
+            <div class="form">
+              <label class="check"><input type="checkbox" id="s-debug-log"> 启用调试日志（Enable debug log，⚠ 影响同步性能）</label>
+              <p class="hint">
+                真正的日志级别仍由 <code>RUST_LOG</code> 控制（qsync 的日志落在状态目录 <code>log/</code>，按天滚动）；
+                这个开关是给界面/后续里程碑用的记录位。
+              </p>
+              <label class="check"><input type="checkbox" id="s-notifications"> 显示桌面通知（Show desktop notifications）</label>
+              <p class="hint">同步出错时发一条系统通知（经 <code>org.freedesktop.Notifications</code>）；关掉就完全不发。</p>
+              <div class="btn-row">
+                <button type="button" id="btn-advanced-save" class="primary">保存高级设置</button>
+                <button type="button" id="btn-notify-test">发一条测试通知</button>
+              </div>
+              <div id="advanced-result" class="result" hidden></div>
+              <h3 class="sub">明确不做（点了会说明原因）</h3>
+              <div class="btn-row">
+                <button type="button" class="ghost" id="btn-unsupported-thumb">创建缩略图</button>
+                <button type="button" class="ghost" id="btn-unsupported-backup">备份任务</button>
+                <button type="button" class="ghost" id="btn-unsupported-version">以前版本 / 还原</button>
+              </div>
+              <p class="note" id="unsupported-note" hidden></p>
+            </div>
+          </div>
+        </div>
+
+        <!-- ---------------- 设置 6：释放空间（Qsync「释放空间」tab） ---------------- -->
+        <div class="settings-sec" id="sec-free">
+          <div class="card">
+            <h2>释放空间 <span class="count" id="space-used-label"></span></h2>
+            <div class="form">
+              <label class="check"><input type="checkbox" id="fs-auto"> 自动释放空间（Free up space automatically）</label>
+              <div class="row-checks" id="fs-mode-row">
+                <label class="check"><input type="radio" name="fs-mode" id="fs-mode-pct" value="below_pct"> 当本地可用空间少于
+                  <input type="number" id="fs-below-pct" min="1" max="99" step="1" value="10" class="inline-num"> %</label>
+                <label class="check"><input type="radio" name="fs-mode" id="fs-mode-freq" value="frequency"> 按频率，每
+                  <input type="number" id="fs-every-hours" min="1" max="720" step="1" value="24" class="inline-num"> 小时</label>
+              </div>
+              <div class="btn-row">
+                <button type="button" id="btn-free-save" class="primary">保存释放空间设置</button>
+                <button type="button" id="btn-free-now">立即释放空间</button>
+                <button type="button" id="btn-space-refresh">刷新用量</button>
+              </div>
+              <dl class="kv" id="space-kv"></dl>
+              <div class="bar-wrap">
+                <div class="bar"><div class="bar-fill" id="space-bar-fill" style="width:0%"></div></div>
+                <div class="bar-label mono" id="space-bar-label">—</div>
+              </div>
+              <p class="hint" id="space-reason">—</p>
+              <div id="space-blocked" class="alert-stack"></div>
+              <p class="note">
+                脱水永远走 M3 的安全检查链：有未上传改动 / 待上传 / <code>pin=pinned</code> / <code>excluded</code> /
+                打开中 / 被 mmap / 正在传输 —— 任一命中就**跳过并计入「被挡下」**，与手动脱水完全同一条路。
+              </p>
+              <div id="free-result" class="result" hidden></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ---------------- 设置 7：LAN 加速（Qsync「Enable LAN sync」，qxync 是自研协议） ---------------- -->
+        <div class="settings-sec" id="sec-lan">
+          <div class="card">
+            <h2>LAN 加速（LAN sync）</h2>
+            <p class="hint">
+              qxync 的 LAN 通道是**自研协议**（与官方 Windows 客户端的 LAN 二进制通道不互通，已决策不做）。
+              它的作用是：同一账号的另一台 qxync 设备上已有内容时，水合优先走局域网直传，失败自动回落 NAS。
+              默认**不监听**（要显式打开）；配对用的是明文 TCP + 共享令牌，只在可信局域网里用。
+            </p>
+            <div class="form">
+              <div class="row-2">
+                <label>监听地址（<code>0.0.0.0:9840</code> 表示所有网卡；留空 = 关闭）
+                  <input type="text" id="lan-listen" class="mono" spellcheck="false" placeholder="0.0.0.0:9840">
+                </label>
+                <label>此设备名称（对端看到的名字）
+                  <input type="text" id="lan-name" class="mono" spellcheck="false" placeholder="（缺省 = 主机名）">
+                </label>
+              </div>
+              <div class="btn-row">
+                <button type="button" id="btn-lan-save" class="primary">保存 LAN 设置</button>
+                <button type="button" id="btn-lan-status">刷新对等状态</button>
+              </div>
+              <p class="hint">监听地址改动要**重启 daemon** 才生效（保存后可以在「诊断 → 挂载」里停止再启动）。</p>
+              <dl class="kv" id="lan-status-kv"></dl>
+              <h3 class="sub">配对一台设备</h3>
+              <div class="toolbar">
+                <input type="text" id="lan-pair-addr" class="mono" spellcheck="false" placeholder="192.168.1.5:9840">
+                <input type="text" id="lan-pair-code" class="mono" spellcheck="false" placeholder="对方 status 里的 6 位配对码" size="24">
+                <button type="button" id="btn-lan-pair">配对</button>
+              </div>
+              <h3 class="sub">已配对设备</h3>
+              <ul class="plain-list mono" id="lan-devices"></ul>
+              <p class="empty-hint" id="lan-devices-empty" hidden>还没有配对的设备。</p>
+              <h3 class="sub">最近收到的对端事件</h3>
+              <ul class="plain-list mono" id="lan-events"></ul>
+              <p class="empty-hint" id="lan-events-empty" hidden>还没有收到对端事件。</p>
+              <div id="lan-result" class="result" hidden></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ---------------- 设置 8：关于 ---------------- -->
+        <div class="settings-sec" id="sec-about">
+          <div class="card">
+            <h2>关于 / 快捷出口</h2>
+            <dl class="kv" id="about-kv"></dl>
+            <p class="hint" id="about-m84">—</p>
+            <div class="btn-row">
+              <button type="button" id="btn-about-refresh">刷新</button>
+              <button type="button" id="btn-open-logdir">打开日志目录</button>
+              <button type="button" id="btn-open-config">打开配置目录</button>
+              <button type="button" id="btn-open-station">在 File Station 打开</button>
+            </div>
+            <div id="about-result" class="result" hidden></div>
+            <h3 class="sub">本客户端明确不做的事（避免用户以为「界面没找到」）</h3>
+            <ul class="plain-list">
+              <li>备份任务 / 时间点还原（官方 6.0 旗舰功能，qxync 定位是 Linux 按需同步）</li>
+              <li>以前版本还原（NAS 版本控制在本机实测不可用）</li>
+              <li>团队文件夹 / 分享链接（依赖 Qsync Central，线格式未还原）</li>
+              <li>创建缩略图 / USB 导入</li>
+              <li>与官方 Windows 客户端的 LAN 二进制通道互通</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <!-- ======================= 页面 7：诊断（专家模式） ======================= -->
+      <section class="page" id="page-diag">
+        <nav class="tabs diag-tabs" id="diag-tabs">
+          <button type="button" class="tab active" data-panel="status">状态 / 进度</button>
+          <button type="button" class="tab" data-panel="mounts">挂载</button>
+          <button type="button" class="tab" data-panel="sync">同步 / 缓存</button>
+        </nav>
+
+        <!-- ---------------- 诊断子页 1：状态 / 进度（id 与字段全部保留） ---------------- -->
+        <section class="panel active" id="panel-status">
+          <div class="grid-2">
+            <div class="card">
+              <h2>服务端信息</h2>
+              <div id="srv-warn" class="warn" hidden></div>
+              <dl class="kv" id="srv-kv"></dl>
+            </div>
+
+            <div class="card">
+              <h2>本次会话</h2>
+              <dl class="kv" id="sess-kv"></dl>
+              <h3 class="sub">游标（config / notify / global_notify）</h3>
+              <dl class="kv mono" id="cursors-kv"></dl>
+            </div>
+          </div>
+
+          <div class="grid-3">
+            <div class="card">
+              <h2>水合统计</h2>
+              <dl class="kv" id="hydro-kv"></dl>
+            </div>
+
+            <div class="card">
+              <h2>上传队列 <span id="uploads-active" class="badge-live" hidden>进行中</span></h2>
+              <dl class="kv" id="uploads-kv"></dl>
+            </div>
+
+            <div class="card">
+              <h2>缓存 / 脱水</h2>
+              <dl class="kv" id="cache-kv"></dl>
+              <div class="bar-wrap" id="cache-bar-wrap">
+                <div class="bar"><div class="bar-fill" id="cache-bar-fill" style="width:0%"></div></div>
+                <div class="bar-label mono" id="cache-bar-label">—</div>
+              </div>
+              <dl class="kv" id="cache-blocked-kv"></dl>
+            </div>
+          </div>
+
+          <div class="card">
+            <h2>挂载点 <span class="count" id="mounts-status-count"></span>
+              <button type="button" class="mini" id="btn-status-mounts-refresh">刷新</button>
+            </h2>
+            <table class="tbl" id="tbl-status-mounts">
+              <thead><tr><th>挂载点</th><th>远端</th><th>模式</th><th class="col-act">操作</th></tr></thead>
+              <tbody></tbody>
+            </table>
+            <p class="empty-hint" id="status-mounts-empty" hidden>暂无挂载。</p>
+          </div>
+
+          <div class="card">
+            <h2>远端根 <span class="count" id="roots-count"></span>
+              <button type="button" class="mini" id="btn-roots-refresh">刷新</button>
+            </h2>
+            <dl class="kv mono" id="roots-summary-kv"></dl>
+            <ul class="root-list" id="roots-list"></ul>
+            <p class="empty-hint" id="roots-empty" hidden>尚未读取远端根（点右上「刷新」）。</p>
+            <p class="note" id="roots-note" hidden></p>
+            <h3 class="sub">NAS 同步文件夹</h3>
+            <ul class="root-list mono" id="roots-folders"></ul>
+            <p class="empty-hint" id="roots-folders-empty" hidden>NAS 未登记 Qsync 同步文件夹</p>
+          </div>
+
+          <div class="card">
+            <h2>最近一次同步摘要</h2>
+            <div id="sync-alerts" class="alert-stack"></div>
+            <dl class="kv kv-inline" id="sync-summary-kv"></dl>
+            <p class="note" id="sync-note" hidden></p>
+            <p class="empty-hint" id="sync-missing" hidden>daemon 未上报 sync 状态。</p>
+          </div>
+        </section>
+
+        <!-- ---------------- 诊断子页 2：挂载 ---------------- -->
+        <section class="panel" id="panel-mounts">
+          <div class="card">
+            <h2>当前挂载 <span class="count" id="mounts-count"></span>
+              <button type="button" class="mini" id="btn-mounts-refresh">刷新</button>
+            </h2>
+            <table class="tbl" id="tbl-mounts">
+              <thead><tr><th>挂载点</th><th>远端</th><th>模式</th><th class="col-act">操作</th></tr></thead>
+              <tbody></tbody>
+            </table>
+            <p class="empty-hint" id="mounts-empty" hidden>暂无挂载。</p>
+          </div>
+
+          <div class="card">
+            <h2>新建挂载</h2>
+            <form id="form-mount" class="form" autocomplete="off">
+              <label>挂载点（本地目录，会被创建）
+                <input type="text" id="m-mountpoint" spellcheck="false" class="mono">
+              </label>
+              <label>远端根（每行一个，第一个是默认根）
+                <textarea id="m-remote" rows="3" class="mono" spellcheck="false" placeholder="/home">/home</textarea>
+              </label>
+              <div class="row-2">
+                <label>缓存模式
+                  <select id="m-cache-mode">
+                    <option value="pagecache">pagecache（默认）</option>
+                    <option value="direct">direct（绕过 page cache，不可 mmap）</option>
+                  </select>
+                </label>
+                <label>并发线程数 threads
+                  <input type="number" id="m-threads" min="1" max="64" step="1" value="4">
+                </label>
+              </div>
+              <div class="row-3">
+                <label>水合超时（秒）
+                  <input type="number" id="m-hydrate-timeout" min="1" step="1" value="600">
+                </label>
+                <label>删除熔断阈值 delete_limit
+                  <input type="number" id="m-delete-limit" min="0" step="1" value="100">
+                </label>
+                <label class="check"><input type="checkbox" id="m-read-write"> 读写挂载（否则只读）</label>
+              </div>
+              <label class="check"><input type="checkbox" id="m-auto-unmount" checked> 异常退出时自动卸载 auto_unmount</label>
+              <div class="btn-row">
+                <button type="submit" id="btn-mount" class="primary">挂载</button>
+                <span class="busy" id="mount-busy" hidden>进行中…</span>
+              </div>
+            </form>
+            <div id="mount-result" class="result" hidden></div>
+          </div>
+        </section>
+
+        <!-- ---------------- 诊断子页 3：同步 / 缓存 ---------------- -->
+        <section class="panel" id="panel-sync">
+          <div class="card">
+            <h2>同步状态（SyncInfo）</h2>
+            <div class="btn-row">
+              <button type="button" id="btn-sync-once" class="primary">立即同步</button>
+              <button type="button" id="btn-sync-force" class="danger">强制放行删除</button>
+              <button type="button" id="btn-sync-pause">暂停轮询</button>
+              <label class="inline-num">间隔秒数 <input type="number" id="sy-interval" min="1" step="1" value="60"></label>
+              <button type="button" id="btn-sync-interval">设置轮询间隔</button>
+              <span class="busy" id="sync-busy" hidden>进行中…</span>
+            </div>
+            <div id="sync2-alerts" class="alert-stack"></div>
+            <dl class="kv kv-inline" id="sync-full-kv"></dl>
+            <h3 class="sub">游标</h3>
+            <dl class="kv kv-inline mono" id="sync-cursors-kv"></dl>
+            <h3 class="sub">事件设备（uid:次数）</h3>
+            <ul class="plain-list mono" id="sync-devices"></ul>
+          </div>
+
+          <div class="card">
+            <h2>缓存 / 脱水（CacheInfo）</h2>
+            <div class="btn-row">
+              <button type="button" id="btn-dehy-dry">脱水（预演）</button>
+              <button type="button" id="btn-dehy-all">全部脱水</button>
+              <label class="inline-num">限额 <input type="text" id="dehy-limit" placeholder="512M / 2G / 25%" class="mono" size="8"></label>
+              <button type="button" id="btn-dehy-limit">按限额脱水</button>
+              <label class="inline-num">闲置秒 <input type="number" id="dehy-idle" min="0" step="1" value="3600"></label>
+              <button type="button" id="btn-dehy-idle">释放闲置</button>
+              <span class="busy" id="dehy-busy" hidden>进行中…</span>
+            </div>
+            <dl class="kv kv-inline" id="cache-full-kv"></dl>
+            <div class="bar-wrap">
+              <div class="bar"><div class="bar-fill" id="cache2-bar-fill" style="width:0%"></div></div>
+              <div class="bar-label mono" id="cache2-bar-label">—</div>
+            </div>
+            <div id="dehy-result" class="result" hidden></div>
+          </div>
+        </section>
+      </section>
+
+    </main>
+  </div>
+</div>
 
 <!-- ============================= 底部操作日志 ============================= -->
 <footer id="logbox" class="logbox">
@@ -317,6 +797,20 @@
   </div>
   <div class="logbox-body" id="log-body"></div>
 </footer>
+
+<!-- ============================= 文件页行右键菜单（M8.4） =============================
+     对齐 Qsync 的「节省空间模式 ▸ 始终保留在此设备 / 释放空间」。用自绘菜单而不是
+     系统菜单：前端零依赖、验收矩阵能直接断言条目；所有字符串来自 daemon，绝不拼 innerHTML。 -->
+<div id="row-menu" class="ctx-menu" hidden>
+  <div class="ctx-title" id="row-menu-title">—</div>
+  <button type="button" class="ctx-item" data-act="pin">☑ 始终保留在此设备（Always keep on this device）</button>
+  <button type="button" class="ctx-item" data-act="unpin">☐ 取消固定</button>
+  <button type="button" class="ctx-item" data-act="free">⤓ 释放空间（Free up space）</button>
+  <div class="ctx-sep"></div>
+  <button type="button" class="ctx-item" data-act="get">下载到本地…</button>
+  <button type="button" class="ctx-item" data-act="copy">复制远端路径</button>
+  <button type="button" class="ctx-item danger" data-act="rm">删除（远端）</button>
+</div>
 
 <!-- ============================= 通用输入弹窗 ============================= -->
 <div id="modal" class="modal" hidden>

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# gui-matrix.sh —— M4（GUI：Tauri 2 桌面应用）验收矩阵
+# gui-matrix.sh —— M4 + M8.1（GUI：Tauri 2 桌面应用 + Qsync 风格外壳）验收矩阵
 #
 # 用法:
-#   xtask/tests/gui-matrix.sh                 # 全量：无窗口自检 + 5 个 tab 真实截图（~1min）
+#   xtask/tests/gui-matrix.sh                 # 全量：无窗口自检 + 9 个目的地真实截图（~2min）
 #   xtask/tests/gui-matrix.sh --no-window     # 只跑无窗口自检（无 DISPLAY / 无人值守机器）
 #   xtask/tests/gui-matrix.sh --keep-open     # 结束时保留 GUI 窗口（手动看）
 #
@@ -13,9 +13,16 @@
 #
 # 验的是什么:
 #   1. `qxync-gui --self-test`：前端资源真的嵌进二进制了 + GUI 自己的 IPC 通道能拿到
-#      daemon 状态、真实 NAS 的 ls、挂载表、同步状态（这四条就是 GUI 四个面板的数据源）；
+#      daemon 状态、真实 NAS 的 ls、挂载表、同步状态（这四条就是 GUI 的数据源）；
 #   2. daemon 不在时自检**必须失败**（负向对照，防止自检变成橡皮图章）；
-#   3. 真窗口：5 个 tab 各起一次，窗口标题正确、截图非空白、tab 之间画面确实不同。
+#   3. ★ M8.1：**9 个目的地**各起一次真窗口 —— 左侧图标栏的 6 个一级页面
+#      （home/tasks/files/journal/errors/settings）+ 诊断页的 3 个子页
+#      （`diag:status` / `diag:mounts` / `diag:sync`），逐个断言窗口标题/尺寸/非空白/与主页不同；
+#   4. ★ M8.4：设置页的 **8 个分区**（连接/代理/同步与筛选/个人/高级/释放空间/LAN/关于）
+#      也能用 `settings:<分区>` 直达并逐个出图（`QSYNC_GUI_TAB=settings:proxy`）；
+#   5. ★ M8.1：**旧 `QSYNC_GUI_TAB` 取值必须继续可用且落点不变** ——
+#      status/mounts/sync/connect/files 五个旧值各起一次，用截图 AE 证明它们
+#      落在与对应的新目的地**完全相同**的页面上（AE 很小 = 同页，落错页会极大）。
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -27,7 +34,9 @@ SOCK="$RUNDIR/gui-matrix.sock"
 SHOTS="$RUNDIR/gui-shots"
 LINK="${QSYNC_TEST_LINK:-default}"
 LOG="$RUNDIR/gui-matrix.log"
-TABS="status connect mounts files sync"
+TABS="home tasks files journal errors settings diag:status diag:mounts diag:sync"
+# ★ M8.4：设置页各分区（每个分区一张图，判据同其它目的地：非空白 + 与主页不同）
+SECS="settings:proxy settings:sync settings:personal settings:advanced settings:free settings:lan settings:about"
 
 NO_WINDOW=0; KEEP_OPEN=0
 for a in "$@"; do
@@ -119,6 +128,15 @@ check "$([ "$(jqv .logged_in)" = "true" ] && echo 0 || echo 1)" "会话已登录
 check "$([ "$(jqv .ls.ok)" = "true" ] && [ "$(jqv .ls.total)" -gt 0 ] && echo 0 || echo 1)" "ipc_call ls /home 成功（$(jqv .ls.total) 项，文件面板数据源）"
 check "$([ "$(jqv .mounts_ok)" = "true" ] && echo 0 || echo 1)" "ipc_call mounts 成功（$(jqv .mounts_count) 个挂载，挂载面板数据源）"
 check "$([ "$(jqv .sync_ok)" = "true" ] && echo 0 || echo 1)" "ipc_call sync 成功（同步/缓存面板数据源）"
+# ★ M8.4：设置 / 释放空间 / 冲突队列三条新数据源也要能拿到（GUI 的那几个页面全靠它们）
+ST4=$("$QS" --socket "$SOCK" settings --json 2>/dev/null)
+check "$([ "$(echo "$ST4" | jq -r '.settings.proxy.mode' 2>/dev/null)" != "null" ] && echo 0 || echo 1)" "M8.4 数据源：settings（代理模式 $(echo "$ST4" | jq -r '.settings.proxy.mode' 2>/dev/null)）"
+SP4=$("$QS" --socket "$SOCK" space --json 2>/dev/null)
+check "$([ "$(echo "$SP4" | jq -r '.fs_avail_pct' 2>/dev/null)" != "null" ] && echo 0 || echo 1)" "M8.4 数据源：space（可用 $(echo "$SP4" | jq -r '.fs_avail_pct' 2>/dev/null)%）"
+DC4=$("$QS" --socket "$SOCK" file-states /home --json 2>/dev/null)
+check "$([ "$(echo "$DC4" | jq -r '.path' 2>/dev/null)" = "/home" ] && echo 0 || echo 1)" "M8.4 数据源：file_states（三态：仅在线 $(echo "$DC4" | jq -r '.online' 2>/dev/null) / 本地可用 $(echo "$DC4" | jq -r '.local' 2>/dev/null) / 始终可用 $(echo "$DC4" | jq -r '.always' 2>/dev/null)）"
+CF4=$("$QS" --socket "$SOCK" conflicts --json 2>/dev/null)
+check "$([ "$(echo "$CF4" | jq -r '.pending' 2>/dev/null)" != "null" ] && echo 0 || echo 1)" "M8.4 数据源：conflicts（待裁决 $(echo "$CF4" | jq -r '.pending' 2>/dev/null)）"
 cp -f "$ST" "$SHOTS/self-test.json"
 
 # 负向对照：daemon 停了必须以非 0 退出（否则自检没有意义）
@@ -146,39 +164,87 @@ cp -f "$LT" "$SHOTS/self-test-login.json"
 # 后面窗口项要用 daemon；本步结束后 daemon 由 GUI 拉起（pid 不在 $DAEMON_PID 里）
 DAEMON_PID=""
 
-# ---------------------------------------------------------------- 3. 真窗口 + 逐 tab 截图
-echo "== 3. 真窗口（5 个 tab） =="
+# ---------------------------------------------------------------- 3. 真窗口 + 逐目的地截图
+# 目的地取值：一级页面（home/tasks/files/journal/errors/settings）+ `diag:<子页>`。
+# 旧的 status/mounts/sync/connect/files 在 3b 单独验「仍然可用且落点不变」。
+echo "== 3. 真窗口（$(echo $TABS | wc -w) 个目的地） =="
+
+# 起一次 GUI、等窗口、截图、做尺寸/非空白断言。$1=QSYNC_GUI_TAB 值 $2=输出 png $3=日志/文件名 slug
+shot_page() {
+  local t="$1" out="$2" slug="$3" wid=""
+  pkill -x qxync-gui 2>/dev/null; sleep 0.6
+  QSYNC_GUI_TAB="$t" "$GUI" >"$RUNDIR/gui-window-$slug.log" 2>&1 &
+  GUI_PID=$!
+  for _ in $(seq 1 40); do
+    wid=$(xdotool search --name "QSync" 2>/dev/null | head -1)
+    [ -n "$wid" ] && break
+    sleep 0.5
+  done
+  if [ -z "$wid" ]; then
+    bad "page=$t：20s 内没找到 QSync 窗口"
+    kill "$GUI_PID" 2>/dev/null; GUI_PID=""
+    return 1
+  fi
+  local title; title=$(xdotool getwindowname "$wid" 2>/dev/null)
+  case "$title" in *QSync*) ok "page=$t：窗口标题正确（$title）";; *) bad "page=$t：窗口标题异常（$title）";; esac
+  sleep 5   # 等首轮 status + 该页自己的数据（files 要打真机 ls）
+  import -window "$wid" "$out" 2>/dev/null
+  [ -s "$out" ]; check $? "page=$t：截图产出（$(basename "$out")）"
+  local dim; dim=$(identify -format "%wx%h" "$out" 2>/dev/null)
+  check "$([ "$dim" = "1200x800" ] && echo 0 || echo 1)" "page=$t：窗口尺寸 $dim"
+  local sd; sd=$(identify -format "%[standard-deviation]" "$out" 2>/dev/null | cut -d. -f1)
+  check "$([ "${sd:-0}" -gt 1500 ] && echo 0 || echo 1)" "page=$t：画面非空白（stddev $sd > 1500）"
+  kill "$GUI_PID" 2>/dev/null; wait "$GUI_PID" 2>/dev/null; GUI_PID=""
+  return 0
+}
+
+ae_of() {  # $1 $2 → 输出 AE 像素数
+  compare -metric AE -fuzz 2% "$1" "$2" null: 2>&1 | cut -d' ' -f1 | cut -d. -f1
+}
+
 if [ "$NO_WINDOW" = "1" ]; then
   skip "窗口检查与截图（--no-window / 无 DISPLAY）"
 else
   first_shot=""
   for t in $TABS; do
-    pkill -x qxync-gui 2>/dev/null; sleep 0.6
-    QSYNC_GUI_TAB="$t" "$GUI" >"$RUNDIR/gui-window-$t.log" 2>&1 &
-    GUI_PID=$!
-    WID=""
-    for _ in $(seq 1 40); do
-      WID=$(xdotool search --name "QSync" 2>/dev/null | head -1)
-      [ -n "$WID" ] && break
-      sleep 0.5
-    done
-    if [ -z "$WID" ]; then bad "tab=$t：20s 内没找到 QSync 窗口"; kill "$GUI_PID" 2>/dev/null; GUI_PID=""; continue; fi
-    TITLE=$(xdotool getwindowname "$WID" 2>/dev/null)
-    case "$TITLE" in *QSync*) check 0 "tab=$t：窗口标题正确（$TITLE）";; *) check 1 "tab=$t：窗口标题异常（$TITLE）";; esac
-    sleep 5   # 等首轮 status + 该 tab 自己的数据（files 要打真机 ls）
-    SHOT="$SHOTS/tab-$t.png"
-    import -window "$WID" "$SHOT" 2>/dev/null
-    [ -s "$SHOT" ]; check $? "tab=$t：截图产出（$SHOT）"
-    DIM=$(identify -format "%wx%h" "$SHOT" 2>/dev/null)
-    check "$([ "$DIM" = "1200x800" ] && echo 0 || echo 1)" "tab=$t：窗口尺寸 $DIM"
-    SD=$(identify -format "%[standard-deviation]" "$SHOT" 2>/dev/null | cut -d. -f1)
-    check "$([ "${SD:-0}" -gt 1500 ] && echo 0 || echo 1)" "tab=$t：画面非空白（stddev $SD > 1500）"
+    slug=$(echo "$t" | tr ':' '-')
+    SHOT="$SHOTS/tab-$slug.png"
+    shot_page "$t" "$SHOT" "$slug" || continue
     [ -n "$first_shot" ] && {
-      AE=$(compare -metric AE -fuzz 2% "$first_shot" "$SHOT" null: 2>&1 | cut -d' ' -f1 | cut -d. -f1)
-      check "$([ "${AE:-0}" -gt 4000 ] && echo 0 || echo 1)" "tab=$t：与 status 页画面不同（AE $AE px）"
+      AE=$(ae_of "$first_shot" "$SHOT")
+      check "$([ "${AE:-0}" -gt 4000 ] && echo 0 || echo 1)" "page=$t：与主页画面不同（AE $AE px）"
     }
     first_shot="$SHOT"
-    kill "$GUI_PID" 2>/dev/null; wait "$GUI_PID" 2>/dev/null; GUI_PID=""
+  done
+
+  # 3a. ★ M8.4：设置页的每个分区各出一张图（同一目的地内的不同分区必须**互不相同**）
+  echo "== 3a. M8.4 设置分区截图（$(echo $SECS | wc -w) 个） =="
+  prev_sec=""
+  for t in $SECS; do
+    slug=$(echo "$t" | tr ':' '-')
+    SHOT="$SHOTS/tab-$slug.png"
+    shot_page "$t" "$SHOT" "$slug" || continue
+    AE=$(ae_of "$SHOTS/tab-settings.png" "$SHOT")
+    check "$([ "${AE:-0}" -gt 4000 ] && echo 0 || echo 1)" "sec=$t：与「连接」分区画面不同（AE $AE px）"
+    if [ -n "$prev_sec" ]; then
+      AE2=$(ae_of "$prev_sec" "$SHOT")
+      check "$([ "${AE2:-0}" -gt 4000 ] && echo 0 || echo 1)" "sec=$t：与上一个分区也不同（AE $AE2 px）"
+    fi
+    prev_sec="$SHOT"
+  done
+
+  # 3b. ★ M8.1：旧的 QSYNC_GUI_TAB 取值必须继续可用，而且落到**同一个目的地**
+  #     判据 = 截图 AE 很小（同一目的地）而不是极大（落错页）。
+  echo "== 3b. 旧 QSYNC_GUI_TAB 值兼容（落点等价性） =="
+  for pair in "status:diag-status" "mounts:diag-mounts" "sync:diag-sync" "connect:settings" "files:files"; do
+    old="${pair%%:*}"; want="${pair##*:}"
+    ref="$SHOTS/tab-$want.png"
+    cur="$SHOTS/legacy-$old.png"
+    if [ ! -s "$ref" ]; then bad "legacy=$old：缺少参照截图 tab-$want.png"; continue; fi
+    shot_page "$old" "$cur" "legacy-$old" || continue
+    AE=$(ae_of "$ref" "$cur")
+    check "$([ "${AE:-999999}" -lt 30000 ] && echo 0 || echo 1)" \
+      "legacy=$old → 落在 $want（AE $AE < 30000）"
   done
 fi
 

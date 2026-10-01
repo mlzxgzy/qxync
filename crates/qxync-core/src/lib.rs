@@ -21,24 +21,30 @@ pub mod dehydrate;
 pub mod delta;
 pub mod encode;
 pub mod error;
+pub mod freespace;
 pub mod ipc;
 pub mod model;
 pub mod roots;
 pub mod rules;
+pub mod settings;
 pub mod status;
 pub mod store;
 pub mod sync;
+pub mod tasks;
 
 pub use config::{ConfigPaths, Credentials, LinkConfig, PeerConfig, PeerRegistry};
 pub use dehydrate::{Block, CacheLimit, Candidate, Policy};
 pub use delta::Signature;
 pub use encode::{build_query, encode_query_value};
 pub use error::{Error, Result};
+pub use freespace::{statvfs, AutoFreeDecision, FsSpace};
 pub use model::{parse_listing, parse_max_log, parse_nas_uid, DirEntry, Listing, MaxLog, NasUid};
 pub use roots::{layout, normalize_roots, RootSpec, ViewLayout};
 pub use rules::{HideReason, RuleParse, Rules, TEMP_PATTERNS};
+pub use settings::{ProxySettings, ProxySpec, Settings};
 pub use status::ServerStatus;
-pub use store::{MigrateReport, Store, DB_FILE};
+pub use store::{JournalEntry, MigrateReport, Store, DB_FILE};
+pub use tasks::{Task, DIR_2WAY, DIR_DOWN, DIR_UP};
 pub use sync::{
     parse_sync_log, Baseline, Cursors, Decision, DeleteProtection, LocalSig, Sig, SyncEvent,
     SyncLogBatch,

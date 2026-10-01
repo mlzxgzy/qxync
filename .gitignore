@@ -30,3 +30,6 @@ Cargo.lock
 crates/qxync-gui/gen/schemas/
 
 .local-run/
+
+# ===== 研究留档（QNAP 教程正文/截图，版权属 QNAP，仅供本地比对，不提交）=====
+.research/

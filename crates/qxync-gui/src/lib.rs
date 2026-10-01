@@ -9,6 +9,7 @@
 
 pub mod commands;
 pub mod ipc;
+pub mod tray;
 
 use serde_json::{json, Value};
 use std::sync::OnceLock;
@@ -24,10 +25,15 @@ pub fn ui_assets() -> Value {
     })
 }
 
-/// 启动 GUI 事件循环（阻塞直到窗口关闭）。
+/// 启动 GUI 事件循环（阻塞直到窗口关闭 / 托盘「退出」）。
 pub fn run() {
     init_logging();
     let result = tauri::Builder::default()
+        // ★ M8.4：三个官方插件都只被**本进程的 Rust 命令**调用（见 commands.rs），
+        // JS 侧不直接使用它们的 API —— 所以 capabilities/default.json 不必为它们开口子。
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             commands::app_info,
             commands::daemon_status,
@@ -39,12 +45,73 @@ pub fn run() {
             commands::daemon_start,
             commands::daemon_stop,
             commands::login_flow,
+            // ★ M8.4：托盘 / 通知 / 选择器 / opener / 窗口控制
+            commands::m84_info,
+            commands::notify_show,
+            commands::pick_folder,
+            commands::pick_file,
+            commands::open_path,
+            commands::open_url,
+            commands::app_exe_path,
+            commands::window_hide,
+            commands::window_show,
+            commands::app_quit,
+            commands::tray_emit,
         ])
+        // 托盘放在 setup：配置里的主窗口已经建好，`emit_to("main", ...)` 一定有目标。
+        .setup(|app| {
+            tray::setup(app.handle());
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            // ★ M8.4：关闭主窗口 = 收进托盘（Qsync 的默认行为）。
+            let tauri::WindowEvent::CloseRequested { api, .. } = event else {
+                return;
+            };
+            // 只管主窗口：以后若加「关于/设置」等独立窗口，关掉它们不该被拦下来。
+            if window.label() != "main" {
+                return;
+            }
+            let want_tray = close_to_tray_now();
+            // 托盘没建起来（缺 appindicator / 当时没有 StatusNotifierHost）时必须**真的关闭**：
+            // 窗口一隐藏就再也没人能把它叫回来，进程会变成用户够不着的僵尸 ——
+            // 那不叫「降级为普通窗口」，叫挖坑。这里正好落回普通窗口的语义。
+            if want_tray && !tray::created() {
+                tracing::warn!(
+                    "★ M8.4：close_to_tray=true 但托盘未创建成功，直接关闭窗口（藏起来就找不回来了）"
+                );
+                return;
+            }
+            if want_tray {
+                // prevent_close + hide：窗口对象还在，事件循环因此不会退出，
+                // 托盘菜单仍能把窗口叫回来（真正销毁窗口的话就只能重启进程了）。
+                api.prevent_close();
+                if let Err(e) = window.hide() {
+                    tracing::warn!("★ M8.4：隐藏主窗口失败（按关闭处理）: {e}");
+                } else {
+                    tracing::info!("★ M8.4：主窗口已收进托盘（close_to_tray=true）");
+                }
+            } else {
+                tracing::info!("★ M8.4：close_to_tray=false，主窗口正常关闭并退出");
+            }
+        })
         .run(tauri::generate_context!());
     if let Err(e) = result {
         tracing::error!("GUI 退出: {e}");
         eprintln!("❌ QSync GUI 启动失败: {e}");
         std::process::exit(1);
+    }
+}
+
+/// ★ M8.4：关闭窗口时是否收进托盘。
+///
+/// **每次关闭都重新读盘**：`close_to_tray` 是运行时可改的设置（前端设置页会写
+/// `settings.json`），缓存住的话用户改完得重启才生效。读失败（文件损坏/没权限）
+/// 按 `true` 处理 —— 那正好是 `Settings::default()` 的取值，也和 QSync 一致。
+fn close_to_tray_now() -> bool {
+    match qxync_core::ConfigPaths::discover() {
+        Ok(p) => qxync_core::Settings::load(&p).map(|s| s.close_to_tray).unwrap_or(true),
+        Err(_) => true,
     }
 }
 
@@ -167,6 +234,127 @@ async fn self_test_login_inner() -> Value {
     })
 }
 
+/// 通知自检（`qxync-gui --self-test-notify`）：**无窗口**起一个最小 Tauri app，
+/// 用与 [`commands::notify_show`] 完全相同的代码发一条桌面通知，打印一行 JSON 后退出。
+///
+/// 为什么要有这条：`--self-test` 是纯 IPC 自检，碰不到 GTK/D-Bus；而通知链路的坑
+/// 恰恰都在那里（没有通知守护、`dbus` 会话不对、插件没注册）。验收脚本用
+/// `dbus-monitor --session "interface='org.freedesktop.Notifications'"` 抓 `Notify`
+/// 方法调用来证明「真的发出去了」，所以这里必须是**真发一条**，不能只是自报成功。
+///
+/// 注意：本自检**不看 `desktop_notifications` 设置**。那条设置是「用户想不想收通知」
+/// 的产品开关（由 `notify_show` 命令负责遵守），而这里是「通知链路通不通」的探针，
+/// 关了开关也仍然要证明链路可用。
+pub fn self_test_notify() -> bool {
+    init_logging();
+
+    // 兜底：无窗口的 Tauri 事件循环如果因为环境问题没能退出，别把验收脚本挂死。
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        eprintln!(
+            "{}",
+            json!({"ok": false, "shown": false, "error": "10s 超时：Tauri 事件循环没有退出"})
+        );
+        std::process::exit(3);
+    });
+
+    let mut ctx = tauri::generate_context!();
+    // 无窗口：把配置里的窗口清单清空。否则 `setup()` 会照 tauri.conf.json 建出主窗口，
+    // 自检就会在验收脚本里闪一个真窗口出来。
+    ctx.config_mut().app.windows.clear();
+
+    let outcome: std::sync::Arc<std::sync::Mutex<Option<Value>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let slot = outcome.clone();
+
+    let app = match tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
+        .build(ctx)
+    {
+        Ok(a) => a,
+        Err(e) => {
+            println!(
+                "{}",
+                json!({"ok": false, "shown": false, "error": format!("建 Tauri app 失败: {e}")})
+            );
+            return false;
+        }
+    };
+
+    // 放在 `RunEvent::Ready` 而不是 `setup`：Ready 时插件已经 `initialize_plugins` 完毕，
+    // 且事件循环已经跑起来，`exit(0)` 一定被处理（在 setup 里 exit 有可能被吞掉）。
+    //
+    // ⚠ 这里必须用 `run_return` 而不是 `run`：Linux 上 `run` 最终落到 tao 的
+    // `EventLoop::run`，它**永不返回**（循环结束时直接 `process::exit(code)`），
+    // 于是在 `run` 之后打印 JSON 是打印不出来的（这个坑踩过一次）。
+    let loop_code = app.run_return(move |handle, event| {
+        if !matches!(event, tauri::RunEvent::Ready) {
+            return;
+        }
+        // ★ 尊重设置里的「显示桌面通知」：关掉时必须**如实**报 shown=false，
+        //   而不是自检里偷偷发一条（那会让验收的「关掉后一个 Notify 都没有」变成假绿）。
+        let result = if commands::notifications_enabled() {
+            commands::show_notification(
+                handle,
+                "QSync 桌面通知自检",
+                "如果你看到这条通知，说明 qxync-gui 的通知链路是通的。",
+            )
+        } else {
+            Err("桌面通知已关闭".to_string())
+        };
+        let payload = match &result {
+            Err(_) if !commands::notifications_enabled() => json!({
+                "ok": true,
+                "shown": false,
+                "reason": "桌面通知已关闭",
+                "title": "QSync 桌面通知自检",
+                "note": "settings.json 里 desktop_notifications=false：按设置**不发**通知",
+            }),
+            Ok(()) => json!({
+                "ok": true,
+                "shown": true,
+                "title": "QSync 桌面通知自检",
+                // `shown=true` 的准确含义：已交给通知后端**异步**派发（插件内部 spawn 后
+                // 立即返回，连 D-Bus 错误都被它吞掉了），不代表已经确认投递到托盘区。
+                "dispatch": "async",
+                "note": "shown=true 表示已交给通知后端派发；是否真正弹到桌面请看 dbus-monitor 抓到的 Notify 调用",
+            }),
+            Err(e) => json!({"ok": false, "shown": false, "error": e}),
+        };
+        // 事件循环的退出码与 JSON 保持一致（脚本两个都可能看）。
+        let code = if payload["ok"].as_bool().unwrap_or(false) { 0 } else { 1 };
+        *slot.lock().unwrap() = Some(payload);
+        // 通知是 spawn 出去异步发的：立刻 exit 会让它随进程一起消失。
+        // 给 D-Bus 往返留 ~700ms（正常几毫秒就够，这里只是别把自己坑了）。
+        let handle = handle.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(700));
+            handle.exit(code);
+        });
+    });
+
+    let payload = outcome
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap_or_else(|| json!({"ok": false, "shown": false, "error": "事件循环结束了但没跑过通知分支"}));
+    // 事件循环在子线程里 request_exit 之后才返回，这里才轮到我们说话。
+    {
+        use std::io::Write as _;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".into())
+        );
+        let _ = std::io::stdout().flush();
+    }
+    if loop_code != 0 {
+        tracing::warn!("★ M8.4：通知自检的事件循环退出码异常: {loop_code}");
+    }
+    // 成败以 JSON 为准（main 用它决定进程退出码）；`loop_code` 只用来核对 ——
+    // 万一事件循环是被别的东西结束的，两者会不一致，下面那条 warning 就是线索。
+    payload["ok"].as_bool().unwrap_or(false)
+}
+
 async fn self_test_inner() -> Value {
     let assets = ui_assets();
     let assets_ok = assets["index_html"].as_u64().unwrap_or(0) > 64
@@ -202,6 +390,10 @@ async fn self_test_inner() -> Value {
     }
 
     let ls_ok = !logged_in || ls["ok"].as_bool().unwrap_or(false);
+
+    // ★ M8.4：桌面集成（托盘/通知/选择器/自启开关）也要能被脚本看见。
+    // 这里复用 `m84_info` 命令本身，保证「脚本看到的」和「前端看到的」是同一份数据。
+    let m84 = commands::m84_info().await.unwrap_or(Value::Null);
 
     // 挂载面板 / 同步面板用的两条**只读**请求也在这里打一遍：
     // 验收脚本据此确认「GUI 按钮会发的请求」在真实 daemon 上都能拿到数据。
@@ -239,6 +431,20 @@ async fn self_test_inner() -> Value {
         "mounts_ok": mounts_ok,
         "mounts_count": mounts_count,
         "sync_ok": sync_ok,
+        // ★ M8.4：桌面集成（托盘/通知/选择器/自启）自检。
+        // `tray_code=true` 是**编译期**事实（托盘代码在这个二进制里，且 tauri 开了
+        // `tray-icon` feature）；`tray_created=false` 是**运行时**事实 —— 本模式不开窗口，
+        // 也就没有 `setup`，托盘从未被创建。两者不能混为一谈。
+        "m84": {
+            "plugins": m84["plugins"],
+            "tray_code": true,
+            "tray_created": false,
+            "note": "无窗口自检不建托盘",
+            "app_exe": m84["app_exe"],
+            "autostart_path": m84["autostart_path"],
+            "autostart_present": m84["autostart_present"],
+            "close_to_tray": m84["close_to_tray"],
+        },
     })
 }
 

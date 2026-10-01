@@ -43,6 +43,12 @@ struct Args {
     /// 只打印解析后的配置，不做任何事（排障用）
     #[arg(long)]
     print_config: bool,
+
+    /// ★ M8.2：启动时恢复 enabled=true 的同步任务（默认关闭）。
+    /// 也可用环境变量 QSYNC_TASK_RESTORE=1 打开。
+    /// 默认关闭是刻意的：恢复会「凭空挂载」，可能让上一次跑崩留下的挂载复活。
+    #[arg(long)]
+    restore_tasks: bool,
 }
 
 fn main() -> Result<()> {
@@ -76,10 +82,17 @@ fn main() -> Result<()> {
         .enable_all()
         .build()
         .context("建 tokio 运行时失败")?;
+    // ★ M8.2：`--restore-tasks` 或 QSYNC_TASK_RESTORE=1 → 启动时恢复启用的任务
+    let restore = args.restore_tasks
+        || matches!(
+            std::env::var("QSYNC_TASK_RESTORE").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes")
+        );
     rt.block_on(daemon::run(daemon::Options {
         link_id: args.link,
         socket,
         auto_login: args.auto_login,
+        restore_tasks: restore,
     }))
 }
 
