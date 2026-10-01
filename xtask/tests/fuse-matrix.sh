@@ -465,22 +465,26 @@ else
   "$QS" status >"$RUNDIR/m2c-status.txt" 2>&1
   check "$(grep -q '变更发现' "$RUNDIR/m2c-status.txt" && echo 0 || echo 1)" "M2c-5 status 显示变更发现状态"
   check "$(grep -q '游标' "$RUNDIR/m2c-status.txt" && echo 0 || echo 1)" "M2c-5b status 显示三游标"
-  cfile=$(find "$RUNDIR/data" -name cursors.json 2>/dev/null | head -1)
-  bfile=$(find "$RUNDIR/data" -name baseline.json 2>/dev/null | head -1)
-  echo "  状态文件：$cfile / $bfile"
-  if [ -n "$cfile" ] && [ -n "$bfile" ]; then
-    if python3 -c "
-import json,sys
-c=json.load(open('$cfile')); b=json.load(open('$bfile'))
-assert c['max_log_seen'] >= 1, c
-assert len(b.get('entries',{})) >= 1, b
-"; then
-      ok "M2c-5c cursors.json / baseline.json 已原子落盘"
+  # ★ M5 起状态从 JSON 搬到了 SQLite（<data>/sync/<host>/sync.db），这里改查状态库
+  dbfile=$(find "$RUNDIR/data" -name sync.db 2>/dev/null | head -1)
+  echo "  状态库：$dbfile"
+  if [ -n "$dbfile" ] && [ -f "$dbfile" ]; then
+    ST=$("$QS" store --integrity --json 2>/dev/null)
+    MAXLOG=$(echo "$ST" | jq -r '.cursors.max_log_seen // 0')
+    NBASE=$(echo "$ST" | jq -r '.baseline_entries // 0')
+    INTEG=$(echo "$ST" | jq -r '.integrity // "?"')
+    if [ "${MAXLOG:-0}" -ge 1 ] && [ "${NBASE:-0}" -ge 1 ] && [ "$INTEG" = "ok" ]; then
+      ok "M2c-5c 状态已落进 sync.db（max_log_seen=$MAXLOG，baseline=$NBASE 项，integrity=$INTEG）"
     else
-      bad "M2c-5c 状态文件内容不对"
+      bad "M2c-5c 状态库内容不对（max_log_seen=$MAXLOG baseline=$NBASE integrity=$INTEG）"
+    fi
+    if [ -n "$(find "$RUNDIR/data" -name 'baseline.json' 2>/dev/null | head -1)" ]; then
+      bad "M2c-5d 旧 baseline.json 还在（M5 起状态只写 sync.db）"
+    else
+      ok "M2c-5d 不再写 baseline.json（状态只在 sync.db）"
     fi
   else
-    bad "M2c-5c 找不到 cursors.json / baseline.json"
+    bad "M2c-5c 找不到状态库 sync.db"
   fi
 
   # ---- M2c 收尾：恢复轮询 + 清远端沙盒 + 卸载

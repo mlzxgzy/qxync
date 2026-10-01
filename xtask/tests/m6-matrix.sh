@@ -176,12 +176,16 @@ else
     B=$(head -c 24 "$MNT/home/qxync-test/hello.txt" 2>/dev/null | wc -c)
     check "$([ "$B" -gt 0 ] && echo 0 || echo 1)" "家目录根按需水合成功（hello.txt 前 24 字节）"
     # 共享根写 → EROFS（明确报错，而不是服务端 status 20）
-    if printf 'x' >"$MNT/$SHARE/m6-write-test.txt" 2>"$M6/err.txt"; then
+    # 注意：重定向失败是 **shell** 报的（"只读文件系统"），要连 shell 自己的 stderr 一起收
+    if ( printf 'x' >"$MNT/$SHARE/m6-write-test.txt" ) 2>"$M6/err.txt"; then
       bad "向共享根写居然成功了（应 EROFS）"
       rm -f "$MNT/$SHARE/m6-write-test.txt" 2>/dev/null
     else
-      grep -qi "read-only\|只读" "$M6/err.txt" && ok "向共享根写被拒（$(cat "$M6/err.txt" | tail -1 | cut -c1-50)…）" \
-        || ok "向共享根写失败（$(cat "$M6/err.txt" | tail -1 | cut -c1-50)…）"
+      if grep -qi "read-only\|只读" "$M6/err.txt"; then
+        ok "向共享根写被 EROFS 挡住（$(tail -1 "$M6/err.txt" | cut -c1-60)）"
+      else
+        ok "向共享根写失败（$(tail -1 "$M6/err.txt" | cut -c1-60)）"
+      fi
     fi
     # 家目录根写 → 成功（M2b 写路径）
     if printf 'm6 home write\n' >"$MNT/home/qxync-test/m6-write-$$.txt" 2>"$M6/err2.txt"; then

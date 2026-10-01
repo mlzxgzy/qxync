@@ -17,10 +17,10 @@
 | **M2a 区间水合（128 KiB）** | ✅ **已实现并验收**：`head -c 100 big.bin` 只下载 1 个 128 KiB 区间（`chunks=1/1024`） |
 | **M2b 写路径**（FUSE 写操作 + 上传队列 + dirty 标记崩溃恢复） | ✅ **已实现并验收**（矩阵 30/30，其中写路径 10 项） |
 | **M2c 变更发现**（三游标轮询 + baseline 三向对账 + 冲突副本 + 删除保护） | ✅ **已实现并真机验收**（矩阵 46/46，其中 M2c 16 项） |
-| **M3 脱水**（安全检查链 + 先 `inval_inode` 再清内容 + 闲置/限额 LRU + `--cache-mode`） | ✅ **已实现并真机验收**（矩阵 **67/67**，其中 M3 21 项） |
+| **M3 脱水**（安全检查链 + 先 `inval_inode` 再清内容 + 闲置/限额 LRU + `--cache-mode`） | ✅ **已实现并真机验收**（矩阵 **68/68**，其中 M3 21 项；M2c-5c 已改查 M5 的状态库） |
 | **M4 GUI**（Tauri 2：登录配置 / 挂载管理 / 状态与进度 / pin 管理） | ✅ **已实现并真机验收**（`gui-matrix.sh` **41/41**，5 个 tab 真窗口截图） |
 | **M5 SQLite 元数据 + delta**（`sync.db` 承载游标/baseline/pin/队列 + librsync 兼容编解码 + 能力门控） | ✅ **已实现并真机验收**（`m5-matrix.sh` **28/28**；服务端无历史版本 → 增量走门控，见 [`M5-SQLite与delta.md`](docs/M5-SQLite与delta.md)） |
-| **M6 多根 / 共享文件夹**（link `roots` + 同步文件夹发现 + FUSE 多根视图 + 非家目录根只读保护） | ✅ **已实现并真机验收**（`m6-matrix.sh` **21/21**；FUSE 多根挂载项需有 `/dev/fuse` 的机器，见 [`M6-多根与共享文件夹.md`](docs/M6-多根与共享文件夹.md)） |
+| **M6 多根 / 共享文件夹**（link `roots` + 同步文件夹发现 + FUSE 多根视图 + 非家目录根只读保护） | ✅ **已实现并真机验收**（`m6-matrix.sh` **29/29**，含多根真挂载：两根都能按需水合、共享根写回 `EROFS`、家目录能写、共享根可脱水） |
 | M7（另行规划：选择性同步、设备配对事件快路径、LAN 直连…） | ⏳ 下一步 |
 
 真机验证对象：`TS-464C` / `QTS 5.2.9` / Qsync QPKG `5.0.0.7`（build `20260723`）。
@@ -82,10 +82,10 @@ crates/
 ├── qxync-gui/         二进制 `qxync-gui`（M4：Tauri 2 桌面应用；`ui/` 是零依赖静态前端）
 └── qxync-proto-test/  真机集成测试（5 个协议测试 + 1 个 IPC 端到端，均 #[ignore] 手动跑）
 xtask/tests/
-├── fuse-matrix.sh     ★ M1–M3 验收矩阵（挂载 → 67 项检查 → 卸载；--big 追加 128 MiB + 并发去重）
+├── fuse-matrix.sh     ★ M1–M5 验收矩阵（挂载 → 68 项检查 → 卸载；--big 追加 128 MiB + 并发去重）
 ├── gui-matrix.sh      ★ M4 验收矩阵（自检 + 登录链 + 5 个 tab 真窗口截图，41 项）
 ├── m5-matrix.sh       ★ M5 验收矩阵（JSON→SQLite 迁移/幂等/不双写/pin 存活/编解码单测/真机 gate，28 项）
-└── m6-matrix.sh       ★ M6 验收矩阵（共享文件夹读写事实/roots 配置与判定/布局单测/多根 FUSE，21 项）
+└── m6-matrix.sh       ★ M6 验收矩阵（共享文件夹读写事实/roots 判定/布局单测/多根真挂载，29 项）
 docs/
 ├── 开发规划.md             第一版（MVP）规划
 ├── M1.5-设计.md           daemon/IPC 契约、生命周期、pin 语义、验收标准
@@ -188,7 +188,7 @@ xtask/tests/gui-matrix.sh --no-window   # 无 DISPLAY 的机器只跑自检
 M1 验收矩阵（挂载 → 16 项检查 → 卸载）：
 
 ```bash
-xtask/tests/fuse-matrix.sh          # 快测 67 项（M1 + M2a 区间水合 + M2b 写路径 + M2c 变更发现 + M3 脱水），~12min
+xtask/tests/fuse-matrix.sh          # 快测 68 项（M1 + M2a 区间水合 + M2b 写路径 + M2c 变更发现 + M3 脱水 + M5 状态库），~12min
 xtask/tests/fuse-matrix.sh --big    # 追加 128 MiB 全量读 + 并发去重（~5min，取决于带宽）
 ```
 
@@ -301,7 +301,7 @@ cargo test -p qxync-proto-test -- --ignored --test-threads=1 --nocapture   # 协
     返回的是「NAS 上登记过同步的文件夹」（本账号 `total:0`，正常）→ 根只能由用户配置，
     不能自动发现。端点 200 但空数组不是错误。
 36. **多根绝不能动单根那条路**：多根逻辑全部以 `multi_root` 为开关，`roots.rs` 里专门有一条
-    「单根必须还是 Passthrough」的断言；否则 M1–M5 的 67 项 FUSE 矩阵会整体失效。
+    「单根必须还是 Passthrough」的断言；否则 M1–M5 的 68 项 FUSE 矩阵会整体失效。
 37. **脱水候选与 mmap 映射必须按根展开**：否则同一个文件被每个根各算一遍（`freed_bytes` 翻倍），
     更糟的是 mmap 映射错了会让「被 mmap 的文件不脱水」这条安全检查失守 —— 直接违反脱水铁则。
 
