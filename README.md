@@ -23,7 +23,7 @@
 | **M8.2 同步任务**（`tasks/<id>.json` 持久化 + 每任务暂停/继续 + `--restore-tasks` 重启恢复 + 自定义缓存目录 + GUI 任务页） | ✅ **已实现并真机验收**（`m82-matrix.sh` **37/37**；`fuse-matrix.sh` 68/68 回归） |
 | **M8.3 同步日志**（`sync.db` schema v2 加 `journal` 表 + 后台批量落库与轮转 + GUI 文件更新中心/错误列表） | ✅ **已实现并真机验收**（`m83-matrix.sh` **27/27**；`m5-matrix.sh` 扩到 30/30） |
 | **M8.4 设置中心 + 托盘/通知 + 自动释放空间 + M7 面板补课**（`settings.json` + 代理三模式接 reqwest + ksni 托盘（含「真可见」探测）+ 桌面通知 + 开机自启 + `statvfs` 自动释放空间（复用脱水安全链）+ 筛选器/LAN/冲突策略面板 + 文件页三态与右键菜单 + 文件选择器/opener/关于页） | ✅ **已实现并真机验收**（`m84-matrix.sh` **92/92**；全量回归见下方「M8.4 验收结论」） |
-| **M8.6 打磨与验收收口**（视觉规范 token 化（浅/深两份）+ 键盘可达性与焦点环 + 空/错/加载四态全库复查 + i18n 文案表（zh-CN 163 条 + en 预留）+ `ui_spec` 静态自检 + `gui-matrix.sh` 覆盖） | ✅ **已完成并验收**（`gui-matrix.sh` **148/148**，含 M8.6 新增 17 条：`ui_spec` 15 + 真窗口键盘 2；回归矩阵见下方「M8.6 验收结论」） |
+| **M8.6 打磨与验收收口**（视觉规范 token 化（浅/深两份）+ 键盘可达性与焦点环 + 空/错/加载四态全库复查 + i18n 文案表（zh-CN 163 条 + en 预留）+ `ui_spec` 静态自检 + `gui-matrix.sh` 覆盖） | ✅ **已完成并验收**（`gui-matrix.sh` **148/148**（M8.6 新增 17 条：`ui_spec` 15 + 真窗口键盘 2）；**全量真挂载回归 491 项全过**（fuse 68/68 · m5 30 · m6 29 · m7 60 · m82 37 · m83 27 · m84 92 + gui 148），详见下方「M8.6 验收结论」） |
 | **M5 SQLite 元数据 + delta**（`sync.db` 承载游标/baseline/pin/队列 + librsync 兼容编解码 + 能力门控） | ✅ **已实现并真机验收**（`m5-matrix.sh` **28/28**；服务端无历史版本 → 增量走门控，见 [`M5-SQLite与delta.md`](docs/M5-SQLite与delta.md)） |
 | **M6 多根 / 共享文件夹**（link `roots` + 同步文件夹发现 + FUSE 多根视图 + 非家目录根只读保护） | ✅ **已实现并真机验收**（`m6-matrix.sh` **29/29**，含多根真挂载：两根都能按需水合、共享根写回 `EROFS`、家目录能写、共享根可脱水） |
 | **M7 选择性同步 + 设备配对 / LAN 直连**（`exclude` 规则引擎贯通 FUSE/同步/脱水 + 内置临时文件过滤；qxync↔qxync 自研对等协议：配对、事件快路径、LAN 直传） | ✅ **已实现并真机验收**（`m7-matrix.sh` **60/60** 含真挂载段；回归 `fuse-matrix.sh` 68/68，见 [`docs/M7-选择性同步与LAN直连.md`](docs/M7-选择性同步与LAN直连.md)） |
@@ -39,26 +39,35 @@
 ④ i18n：`ui/i18n.js`（zh-CN **163 条** + `en` 预留 + `data-i18n*` + `T(key, vars)`，无框架）；
 ⑤ `qxync-gui --self-test` 新增 **`ui_spec`** 静态自检；⑥ `gui-matrix.sh` 新增 2c/3c 两段（含文案表的运行时回落断言）。
 
-| 矩阵 | 结果 |
+| 矩阵 | 结果（**含真挂载**，全量口径） |
 |---|---|
 | `gui-matrix.sh`（M8.6 主判据） | ✅ **148/148**（= M8.4 的 131 + M8.6 新增 17：2c 的 15 条静态断言 + 3c 的 2 条真窗口键盘断言） |
 | `ui_spec`（随 `--self-test`，不开窗口） | ✅ 无 HTML 拼接（`innerHTML`/`outerHTML`/`insertAdjacentHTML`/`document.write` **全 0**）；文案表 `T()` 用 124 条 / DOM 挂 58 条 / **两边缺词都是 0**；焦点环 / skip-link / tablist+tabpanel / dialog / aria-busy / aria-current / reduced-motion / 深色 token 全绿；四态入口 + 13 个 `data-state` 标记 |
 | 真窗口键盘 | ✅ Tab 一次 → 画面变化 **AE 2918 px**（skip-link 显形 + 焦点环），截图 `.local-run/gui-shots/kbd-{before,after}.png` |
+| `fuse-matrix.sh` | ✅ **68/68**（真挂载：区间水合 / 写路径 / 变更发现 / 脱水安全检查链 / 状态库） |
 | `m5-matrix.sh` | ✅ **30/30** |
-| `m83-matrix.sh` | ✅ **24/24**（3 项挂载相关按环境跳过） |
-| `m84-matrix.sh` | ✅ **48/48**（4 段需真挂载/代理的子段跳过：筛选器不可见段 / 自动释放空间 / 冲突策略五选 / 三态） |
-| `m6-matrix.sh` · `m7-matrix.sh` | ✅ **21/21** · **42/42**（FUSE 段按环境整段跳过） |
-| `m82-matrix.sh` | ⚠️ **18 通过 / 2 失败** —— 两条失败**都是「要求真挂载」的断言**（`task add`、`task resume`），本机没有 `/dev/fuse`；其余 4 项跳过 |
-| `fuse-matrix.sh` | ⛔ **本环境跑不了**：`fusermount3: fuse device /dev/fuse not found. Kernel module not loaded?`（内核有 `fuse`，但沙箱没有设备节点，也没有 `CAP_MKNOD`/`sudo`）。**是跳过而不是通过** —— 有 `/dev/fuse` 的机器上重跑即可（M6/M7/M8.4 当年也是这么补的） |
+| `m6-matrix.sh` · `m7-matrix.sh` | ✅ **29/29** · **60/60**（含多根真挂载、排除路径不可见/不可写、LAN 直传） |
+| `m82-matrix.sh` | ✅ **37/37**（含「登记 + 真挂载」「重启恢复 --restore-tasks」） |
+| `m83-matrix.sh` | ✅ **27/27** |
+| `m84-matrix.sh` | ✅ **92/92**（含筛选器真挂载不可见段、自动释放空间走脱水安全链、冲突策略五选真挂载三向冲突、文件三态 + 铁则 2） |
 | `cargo test --workspace` | ✅ 全绿（6 个测试二进制 `test result: ok`，0 failed） |
+| **合计** | **491 项全过**（68+148+30+29+60+37+27+92） |
 
-**NAS 数据基线**（`/home` 全树 16 项；基线 = M8.6 改动后、回归矩阵之前）：
+**NAS 数据基线**（`/home` 全树 16 项；基线 = M8.6 改动后、**真挂载全量回归之前**）：
 `added 0 / removed 0 / resized 0 / retimed 2` —— 两处 mtime 是老面孔（`/home/.recent` 这个 NAS 自维护索引、
-`/home/qxync-test` 夹具目录）。**没有任何用户数据被删除或改写。**
+`/home/qxync-test` 夹具目录）。**这一轮跑了 313 项真挂载矩阵（fuse 68 + m6 29 + m7 60 + m82 37 + m83 27 + m84 92，
+含真机上传/下载/冲突副本/脱水/多根写保护），之后依旧没有任何用户数据被删除或改写。**
 
 M8.6 的写域只有 `crates/qxync-gui/ui/**` + `crates/qxync-gui/src/lib.rs`（新增 `ui_spec`）+
 `xtask/tests/gui-matrix.sh` + 文档：**`qsync` / `qxyncd` / FUSE / 协议一行未改**，
-所以上面 `m82` 的两条失败**不可能由本次改动引入**（它只跑 `qsync`/`qxyncd` 二进制的挂载路径）。
+所以这一轮真挂载回归同时也是**对 M8.6「零后端改动」这条承诺的验证** —— 各矩阵的项数与 M8.4 的记录逐项一致
+（fuse 68 / m5 30 / m6 29 / m7 60 / m82 37 / m83 27 / m84 92）。
+
+> 📌 **补跑记录（第一轮 → 第二轮）**：第一次跑验收时沙箱里**没有 `/dev/fuse`**，只能按 `--no-fuse` 口径跑，
+> `fuse-matrix` 直接停在 `fusermount3: fuse device /dev/fuse not found`，`m82` 因此报了 2 条「要求真挂载」的失败
+> （`task add` / `task resume`），其余矩阵的真挂载段按设计跳过。
+> **沙箱放开后 `/dev/fuse`（`crw-rw-rw- 10,229`）可见，同一份冻结产物按全量口径重跑：fuse 68/68、
+> m82 37/37、m83 27/27、m84 92/92、m6 29/29、m7 60/60，全部 0 失败** —— 那 2 条失败确系环境所致。
 
 > 🔎 **顺带发现的既有问题（不在 M8.6 写域，未修，如实记录）**：机器上**没有 `/dev/fuse`** 时，
 > `qsync task add` / `task resume`（默认要挂载）会让 daemon 的一个 worker **panic 并断连**：
@@ -348,7 +357,8 @@ cargo test -p qxync-proto-test -- --ignored --test-threads=1 --nocapture   # 协
 * **没有 `/dev/fuse` 时** `qsync task add` / `task resume`（默认要挂载）会让 daemon 的 worker
   panic 并断连（`Cannot drop a runtime in a context where blocking is not allowed`）。
   这是**既有问题**（不是 M8.6 引入的，M8.6 未改 `qxyncd`），临时绕法是 `--no-mount`；
-  详见下方「M8.6 验收结论」末尾的复现与建议修法。
+  详见下方「M8.6 验收结论」末尾的复现与建议修法。**有 `/dev/fuse` 的机器不受影响**
+  （2026-10-01 的全量真挂载回归：fuse 68/68、m6 29/29、m7 60/60、m82 37/37、m83 27/27、m84 92/92）。
 * 直连（`--direct`）模式下改 `settings.json` 只写文件，**跑着的 daemon 要重启才读到**新代理/释放空间设置。
 
 ## 已实测的协议要点（踩过的坑）
