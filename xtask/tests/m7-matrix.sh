@@ -57,10 +57,12 @@ cleanup() {
   [ -n "$PID_A" ] && kill "$PID_A" 2>/dev/null
   [ -n "$PID_B" ] && kill "$PID_B" 2>/dev/null
   if [ "$KEEP" != "1" ]; then
+    # 稳妥起见：无论 /proc/mounts 怎么想都尝试一次，再补一次 lazy 卸载
     for mp in "$A/mnt" "$B/mnt"; do
-      if [ -d "$mp" ] && awk -v m="$mp" '$2==m{found=1} END{exit !found}' /proc/mounts; then
-        fusermount3 -u "$mp" >/dev/null 2>&1 || true
-      fi
+      [ -d "$mp" ] || continue
+      fusermount3 -u "$mp" >/dev/null 2>&1 || fusermount -u "$mp" >/dev/null 2>&1 || true
+      awk -v m="$mp" '$2==m{found=1} END{exit !found}' /proc/mounts \
+        && fusermount3 -uz "$mp" >/dev/null 2>&1 || true
     done
   fi
   return 0
@@ -271,10 +273,44 @@ else
     check "$(echo "$LS" | grep -q "$VISIBLE_FILE" && echo 0 || echo 1)" "正常文件可见（$VISIBLE_FILE）"
     check "$(echo "$LS" | grep -q "$HIDDEN_FILE" && echo 1 || echo 0)" "被排除文件在挂载点里不可见（$HIDDEN_FILE）"
     if [ -e "$MNT_A/qxync-test/$HIDDEN_FILE" ]; then bad "lookup 应 ENOENT"; else ok "被排除路径 lookup → ENOENT"; fi
-    if ( printf 'x' >"$MNT_A/qxync-test/$HIDDEN_FILE" ) 2>"$M7/err.txt"; then
+
+    # ★ 回归断言（曾经的真 bug）：`open(O_CREAT)` 不走 lookup，写入口必须自己挡规则，
+    #   否则会「新建 0 字节节点 → 入队上传 → 把 NAS 上那个文件覆盖成 0 字节」。
+    qa get "$SHARE_DIR" "$HIDDEN_FILE" -o "$M7/hidden-before.bin" >/dev/null 2>&1
+    rm -f "$M7/hidden-after.bin"
+    if ( printf 'm7 must not land\n' >"$MNT_A/qxync-test/$HIDDEN_FILE" ) 2>"$M7/err.txt"; then
       bad "向被排除路径写居然成功了"
     else
       ok "向被排除路径写失败（$(tail -1 "$M7/err.txt" | cut -c1-50)）"
+    fi
+    UP=$(qa store --json 2>/dev/null | jq -r '.uploads // 0')
+    check "$([ "${UP:-1}" = "0" ] && echo 0 || echo 1)" "被排除路径的写入没有产生上传作业（uploads=$UP）"
+    sleep 1
+    qa get "$SHARE_DIR" "$HIDDEN_FILE" -o "$M7/hidden-after.bin" >/dev/null 2>&1
+    if cmp -s "$M7/hidden-before.bin" "$M7/hidden-after.bin" && [ -s "$M7/hidden-before.bin" ]; then
+      ok "远端文件内容原封不动（$(wc -c <"$M7/hidden-before.bin") 字节，排除 ≠ 删除）"
+    else
+      bad "远端文件被写坏了（before=$(wc -c <"$M7/hidden-before.bin" 2>/dev/null) after=$(wc -c <"$M7/hidden-after.bin" 2>/dev/null)）"
+    fi
+    # mkdir 同理：不能凭空在 NAS 上造出被排除的目录
+    if mkdir "$MNT_A/qxync-test/nope-dir" 2>"$M7/err2.txt"; then
+      bad "被排除路径 mkdir 居然成功了"
+      rmdir "$MNT_A/qxync-test/nope-dir" 2>/dev/null
+    else
+      ok "被排除路径 mkdir 失败（$(tail -1 "$M7/err2.txt" | cut -c1-50)）"
+    fi
+    if qa ls "$SHARE_DIR" 2>/dev/null | grep -q "nope-dir"; then
+      bad "NAS 上凭空出现了被排除目录 nope-dir"
+      qa rm "$SHARE_DIR" nope-dir >/dev/null 2>&1
+    else
+      ok "NAS 上没有出现被排除目录（写入口挡在客户端）"
+    fi
+    # 临时文件路径同样不可写（内置规则）
+    if ( printf 'x' >"$MNT_A/qxync-test/m7-temp-probe.crdownload" ) 2>/dev/null; then
+      bad "临时文件路径居然可写"
+      rm -f "$MNT_A/qxync-test/m7-temp-probe.crdownload" 2>/dev/null
+    else
+      ok "临时文件路径（*.crdownload）写失败"
     fi
     # 临时文件过滤：远端放一个 .crdownload → 挂载点里看不到
     printf 'temp\n' >"$M7/tmp-probe.crdownload"

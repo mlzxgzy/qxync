@@ -1391,6 +1391,21 @@ impl QxyncFs {
         self.rules.hides_in_roots(&self.remote_roots(), remote, is_dir)
     }
 
+    /// ★ M7：被规则隐藏的路径**任何写操作都不许落地**（返回 `ENOENT`：它在挂载点里不存在）。
+    ///
+    /// 为什么必须在写入口挡：`open(O_CREAT)` 走的是 `create`，**不经过 `lookup`**。
+    /// 实测踩过（本矩阵 FUSE 段抓到的真 bug）：往被排除的文件里 `printf` 会新建节点 →
+    /// 0 字节缓存入队上传 → **把 NAS 上那个文件的内容覆盖成 0 字节**，
+    /// 直接违反「排除 ≠ 删除、绝不动远端」这条硬约束。
+    fn deny_hidden(&self, remote: &str, is_dir: bool) -> Result<(), fuser::Errno> {
+        if self.hide_reason(remote, is_dir).is_some() {
+            tracing::warn!("拒绝写入被选择性同步排除的路径: {remote}");
+            Err(fuser::Errno::ENOENT)
+        } else {
+            Ok(())
+        }
+    }
+
     /// 在目录里查一个名字（不水合）。返回节点克隆。
     fn lookup_child(&self, parent: INodeNo, name: &str) -> Result<Node, fuser::Errno> {
         // ★ M6：虚拟根不映射任何远端路径 —— 只在节点表里找合成目录，
@@ -1653,6 +1668,10 @@ impl QxyncFs {
         // ★ M6：虚拟根的直接子节点是合成目录（挂载视图本身），只能靠卸载移除。
         if self.multi_root && parent == INodeNo::ROOT {
             return reply.error(fuser::Errno::EROFS);
+        }
+        // ★ M7：被排除的路径在挂载点里不存在 —— 删除它同样回 ENOENT
+        if let Err(e) = self.deny_hidden(&join_path(&parent_remote, name), is_dir) {
+            return reply.error(e);
         }
         // ★ M6：非家目录根只读 —— 共享文件夹里删除的直接回 EROFS。
         if let Err(e) = self.ensure_writable(&join_path(&parent_remote, name)) {
@@ -2069,6 +2088,10 @@ impl Filesystem for QxyncFs {
                 Ok(r) => r,
                 Err(e) => return reply.error(e),
             };
+            // ★ M7：写意图打开排除路径 → ENOENT（纵深防御）
+            if let Err(e) = self.deny_hidden(&remote, false) {
+                return reply.error(e);
+            }
             if let Err(e) = self.ensure_writable(&remote) {
                 return reply.error(e);
             }
@@ -2156,6 +2179,10 @@ impl Filesystem for QxyncFs {
                 Ok(r) => r,
                 Err(e) => return reply.error(e),
             };
+            // ★ M7：绝不把内容写进被排除的路径
+            if let Err(e) = self.deny_hidden(&remote, false) {
+                return reply.error(e);
+            }
             if let Err(e) = self.ensure_writable(&remote) {
                 return reply.error(e);
             }
@@ -2244,6 +2271,10 @@ impl Filesystem for QxyncFs {
                 Ok(r) => r,
                 Err(e) => return reply.error(e),
             };
+            // ★ M7：截断/改 mtime 也是写操作 —— 排除路径一律 ENOENT
+            if let Err(e) = self.deny_hidden(&remote, false) {
+                return reply.error(e);
+            }
             if let Err(e) = self.ensure_writable(&remote) {
                 return reply.error(e);
             }
@@ -2363,6 +2394,10 @@ impl Filesystem for QxyncFs {
             }
         };
         let remote = join_path(&parent_remote, name);
+        // ★ M7：排除路径不可创建（否则 0 字节缓存会被上传，覆盖远端文件）
+        if let Err(e) = self.deny_hidden(&remote, false) {
+            return reply.error(e);
+        }
         // ★ M6：非家目录根只读；虚拟根下新建（remote 不属于任何根）同样是 EROFS
         if let Err(e) = self.ensure_writable(&remote) {
             return reply.error(e);
@@ -2408,6 +2443,10 @@ impl Filesystem for QxyncFs {
             }
         };
         let remote = join_path(&parent_remote, name);
+        // ★ M7：排除路径不可建目录（否则会在 NAS 上凭空造出一个被排除的目录）
+        if let Err(e) = self.deny_hidden(&remote, true) {
+            return reply.error(e);
+        }
         // ★ M6：非家目录根只读；虚拟根下 `mkdir ~/mnt/NewDir` 也自然回 EROFS
         if let Err(e) = self.ensure_writable(&remote) {
             return reply.error(e);
@@ -2465,6 +2504,13 @@ impl Filesystem for QxyncFs {
         // ★ M6：虚拟根的直接子节点是合成目录（挂载视图本身），不允许改名/挪走。
         if self.multi_root && (parent == INodeNo::ROOT || newparent == INodeNo::ROOT) {
             return reply.error(fuser::Errno::EROFS);
+        }
+        // ★ M7：改名的两端都不能落在被排除的路径上（挪进去/挪出来都算写）
+        if let Err(e) = self.deny_hidden(&old_remote, false) {
+            return reply.error(e);
+        }
+        if let Err(e) = self.deny_hidden(&new_remote, false) {
+            return reply.error(e);
         }
         // ★ M6：改名的**两端**都要可写 —— 从 /Public 挪出、或挪进 /Public 都回 EROFS。
         if let Err(e) = self.ensure_writable(&old_remote) {
@@ -2993,6 +3039,29 @@ mod tests {
         assert_eq!(plain.hide_reason("/home/a.crdownload", false), Some(HideReason::Temp));
         let off = test_fs(&dir.join("off"), false).with_rules(m7_rules(&[], false));
         assert!(off.hide_reason("/home/a.crdownload", false).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M7：写入口的规则闸门 —— `open(O_CREAT)` 不经过 lookup，必须自己挡。
+    ///
+    /// 这条单测守的是「排除 ≠ 删除」：曾经的真 bug 是往被排除路径 `printf` 会
+    /// 新建节点 → 0 字节缓存入队 → 覆盖掉 NAS 上那个文件。
+    #[test]
+    fn m7_write_entry_denies_hidden_paths() {
+        let dir = m7_tmpdir("deny");
+        let fs = test_fs(&dir, false).with_rules(m7_rules(&["/secret", "*.crdownload"], true));
+        // 被排除的文件/目录：create / mkdir / write / setattr / rename 全走这个闸门
+        // （Errno 没实现 PartialEq，用 Debug 串断言错误码是 ENOENT）
+        let enoent = |r: Result<(), fuser::Errno>| {
+            let e = r.expect_err("必须被拒绝");
+            format!("{e:?}") == format!("{:?}", fuser::Errno::ENOENT)
+        };
+        assert!(enoent(fs.deny_hidden("/home/secret", true)));
+        assert!(enoent(fs.deny_hidden("/home/secret/new.txt", false)));
+        assert!(enoent(fs.deny_hidden("/home/a.crdownload", false)));
+        // 正常路径放行；卷根目录本身也放行
+        assert!(fs.deny_hidden("/home/ok.txt", false).is_ok());
+        assert!(fs.deny_hidden("/home", true).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

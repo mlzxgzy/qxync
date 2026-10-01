@@ -586,12 +586,26 @@ async fn reconcile_view(
         report.note(format!("规则排除：清理了 {} 条 baseline 记录", stale.len()));
     }
 
+    tracing::debug!(
+        "对账 {}：dirs={} candidates={} remote_items={}",
+        view.remote_root,
+        dirs.len(),
+        candidates.len(),
+        remote_map.len()
+    );
+
     let mut deletes: Vec<String> = Vec::new();
     for path in &candidates {
         let remote = remote_map.get(path).copied().unwrap_or(Sig::MISSING);
         let local = local_sig(view, path);
         let base = baseline.get(path);
         let d = decide(&local, &base, &remote);
+        if d != Decision::Noop {
+            tracing::debug!(
+                "决策 {path}: local={:?} base={base:?} remote={remote:?} → {d:?}",
+                local
+            );
+        }
         match d {
             Decision::DeleteLocal => deletes.push(path.clone()),
             _ => {

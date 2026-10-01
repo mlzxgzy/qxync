@@ -21,7 +21,7 @@
 | **M4 GUI**（Tauri 2：登录配置 / 挂载管理 / 状态与进度 / pin 管理） | ✅ **已实现并真机验收**（`gui-matrix.sh` **41/41**，5 个 tab 真窗口截图） |
 | **M5 SQLite 元数据 + delta**（`sync.db` 承载游标/baseline/pin/队列 + librsync 兼容编解码 + 能力门控） | ✅ **已实现并真机验收**（`m5-matrix.sh` **28/28**；服务端无历史版本 → 增量走门控，见 [`M5-SQLite与delta.md`](docs/M5-SQLite与delta.md)） |
 | **M6 多根 / 共享文件夹**（link `roots` + 同步文件夹发现 + FUSE 多根视图 + 非家目录根只读保护） | ✅ **已实现并真机验收**（`m6-matrix.sh` **29/29**，含多根真挂载：两根都能按需水合、共享根写回 `EROFS`、家目录能写、共享根可脱水） |
-| **M7 选择性同步 + 设备配对 / LAN 直连**（`exclude` 规则引擎贯通 FUSE/同步/脱水 + 内置临时文件过滤；qxync↔qxync 自研对等协议：配对、事件快路径、LAN 直传） | ✅ **已实现并真机验收**（`m7-matrix.sh` **42/42**；FUSE 段因沙箱无 `/dev/fuse` 跳过，见 [`docs/M7-选择性同步与LAN直连.md`](docs/M7-选择性同步与LAN直连.md)） |
+| **M7 选择性同步 + 设备配对 / LAN 直连**（`exclude` 规则引擎贯通 FUSE/同步/脱水 + 内置临时文件过滤；qxync↔qxync 自研对等协议：配对、事件快路径、LAN 直传） | ✅ **已实现并真机验收**（`m7-matrix.sh` **60/60**；FUSE 段因沙箱无 `/dev/fuse` 跳过，见 [`docs/M7-选择性同步与LAN直连.md`](docs/M7-选择性同步与LAN直连.md)） |
 
 真机验证对象：`TS-464C` / `QTS 5.2.9` / Qsync QPKG `5.0.0.7`（build `20260723`）。
 
@@ -216,7 +216,7 @@ M1 验收矩阵（挂载 → 16 项检查 → 卸载）：
 ```bash
 xtask/tests/fuse-matrix.sh          # 快测 68 项（M1 + M2a 区间水合 + M2b 写路径 + M2c 变更发现 + M3 脱水 + M5 状态库），~12min
 xtask/tests/fuse-matrix.sh --big    # 追加 128 MiB 全量读 + 并发去重（~5min，取决于带宽）
-xtask/tests/m7-matrix.sh            # M7 验收 42 项（规则 / FUSE 过滤 / LAN 配对·事件·直传 / 真机）
+xtask/tests/m7-matrix.sh            # M7 验收 60 项（含真挂载段）（规则 / FUSE 过滤 / LAN 配对·事件·直传 / 真机）
 xtask/tests/m7-matrix.sh --no-nas   #   不需要 NAS：单测 + 两个真 daemon 的 loopback 配对/事件
 ```
 

@@ -363,20 +363,26 @@ if ! "$QS" mount "$MNTC" --remote "${QSYNC_REMOTE_ROOT:-/home}" --cache-dir "$CA
 else
   # ---- M2c-1 远端改动 → 元数据刷新 + 缓存失效（下一次读拿到新内容）
   python3 -c "open('$RUNDIR/m2c-r1.bin','wb').write(b'R1-ORIGINAL\n')"
-  "$QS" --direct put "$RUNDIR/m2c-r1.bin" "$M2C" --name r.txt >/dev/null 2>&1
+  if ! "$QS" --direct put "$RUNDIR/m2c-r1.bin" "$M2C" --name r.txt >/dev/null 2>&1; then
+    echo "  ⚠️  M2c-1 前置 put 失败（真机/网络抖动），后面的断言可能连带失败"
+  fi
   n1=$(wc -c <"$RUNDIR/m2c-r1.bin")
   ok1=0
-  for _ in $(seq 1 30); do
+  for _ in $(seq 1 60); do
     [ "$(stat -c %s "$MC/r.txt" 2>/dev/null)" = "$n1" ] && { ok1=1; break; }
     sleep 0.5
   done
   check "$([ "$ok1" = 1 ] && echo 0 || echo 1)" "M2c-1 远端新文件对挂载点可见（$n1 字节）"
   cat "$MC/r.txt" >"$RUNDIR/m2c-r1.out" 2>/dev/null     # 先水合，制造本地缓存
   python3 -c "open('$RUNDIR/m2c-r2.bin','wb').write(b'R2-REMOTE-CHANGED-0123456789\n')"
-  "$QS" --direct put "$RUNDIR/m2c-r2.bin" "$M2C" --name r.txt >/dev/null 2>&1
+  if ! "$QS" --direct put "$RUNDIR/m2c-r2.bin" "$M2C" --name r.txt >/dev/null 2>&1; then
+    echo "  ⚠️  M2c-1b 前置 put 失败（真机/网络抖动）：远端没变，刷新断言必然失败"
+  fi
   n2=$(wc -c <"$RUNDIR/m2c-r2.bin")
   ok2=0
-  for _ in $(seq 1 30); do
+  # ★ 30s 预算：一轮对账要列 ~29 个目录（真机 WAN 下 3–7s/轮），
+  #   原来的 15s 在 NAS 抖动时会假失败（M7 期间实测到过一次）。
+  for _ in $(seq 1 60); do
     [ "$(stat -c %s "$MC/r.txt" 2>/dev/null)" = "$n2" ] && { ok2=1; break; }
     sleep 0.5
   done

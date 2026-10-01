@@ -106,6 +106,22 @@ pub struct UploadSnapshot {
 /// 上传成功回调（M3：让 FUSE 节点清掉 `dirty`，否则脱水永远被 dirty 挡住）。
 pub type SuccessHook = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// 调用成功回调 —— **回调 panic 绝不能打死上传 worker**。
+///
+/// ★ M7 实测踩过：回调跑在**上传 worker 的 OS 线程**里（不是 tokio worker），
+/// 里面误用 `tokio::spawn` 会立刻 panic（"must be called from the context of a Tokio
+/// runtime"），worker 线程随之死掉 —— 表现是「上传队列永远卡住、drain 超时、
+/// 整个 daemon 像挂了」（fuse-matrix 的 M2c 冲突段卡了 3 分钟）。
+/// 这里把回调隔离起来：它只能坏它自己，队列必须继续跑。
+pub(crate) fn invoke_success_hook(hook: Option<SuccessHook>, remote: &str) {
+    let Some(hook) = hook else {
+        return;
+    };
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(remote))).is_err() {
+        tracing::error!("上传成功回调 panic（已隔离，队列继续）: {remote}");
+    }
+}
+
 pub struct UploadQueue {
     client: Arc<Client>,
     rt: tokio::runtime::Handle,
@@ -396,9 +412,10 @@ impl UploadQueue {
                         // 冲突副本的 stash 是一次性的：传完就删
                         let _ = std::fs::remove_file(&job.local);
                     }
-                    if let Some(hook) = self.success_hook.lock().unwrap().clone() {
-                        hook(&job.remote_path());
-                    }
+                    invoke_success_hook(
+                        self.success_hook.lock().unwrap().clone(),
+                        &job.remote_path(),
+                    );
                     let n = std::fs::metadata(&job.local).map(|m| m.len()).unwrap_or(0);
                     self.stats.done.fetch_add(1, Ordering::Relaxed);
                     self.stats.bytes.fetch_add(n, Ordering::Relaxed);
@@ -536,6 +553,33 @@ mod tests {
     use std::sync::atomic::AtomicU32;
 
     static N: AtomicU32 = AtomicU32::new(0);
+
+    /// ★ M7 回归：成功回调 panic 不能打死上传 worker（真 bug：回调里 `tokio::spawn`
+    /// 在非 tokio 线程 panic → worker 死 → 队列永久卡住）。
+    #[test]
+    fn panicking_success_hook_is_isolated() {
+        use std::sync::atomic::AtomicU64;
+        let called = Arc::new(AtomicU64::new(0));
+        let c1 = called.clone();
+        invoke_success_hook(
+            Some(Arc::new(move |_| {
+                c1.fetch_add(1, Ordering::Relaxed);
+                panic!("hook 里的 bug（真实场景：tokio::spawn 在非 tokio 线程）");
+            })),
+            "/home/boom.txt",
+        );
+        // 第一次 panic 被隔离 → 后续回调照常执行（worker 还活着）
+        let c2 = called.clone();
+        invoke_success_hook(
+            Some(Arc::new(move |_| {
+                c2.fetch_add(1, Ordering::Relaxed);
+            })),
+            "/home/ok.txt",
+        );
+        assert_eq!(called.load(Ordering::Relaxed), 2, "回调 panic 不能中断调用点");
+        // 没有回调也不能有事
+        invoke_success_hook(None, "/home/none.txt");
+    }
 
     fn tmpdir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(

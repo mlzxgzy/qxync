@@ -97,7 +97,15 @@ pub struct PeerHost {
     /// 收到的事件（环形，最新在前）；接收任务与 host 共用同一份。
     events_in: Arc<StdMutex<VecDeque<PeerEventInfo>>>,
     /// 发出的事件条数（尽力而为）。
-    events_out: AtomicU64,
+    events_out: Arc<AtomicU64>,
+    /// 待广播的事件队列。
+    ///
+    /// ★ 关键：上传成功回调跑在 **上传 worker 的 OS 线程**里（不是 tokio worker），
+    /// 那里 `tokio::spawn` 会直接 panic（"must be called from the context of a Tokio runtime"），
+    /// 把上传 worker 打死 —— 表现是「上传队列永远卡住、drain 超时、整个 daemon 像挂了」。
+    /// 实测踩过：fuse-matrix 的 M2c 冲突段卡了 3 分钟。所以发送端只做**同步 send**，
+    /// 真正的广播在这个常驻 task 里做。
+    outbox: mpsc::UnboundedSender<PeerEvent>,
     /// 最近一次操作的提示（诊断用）。
     last_note: StdMutex<Option<String>>,
 }
@@ -131,6 +139,26 @@ impl PeerHost {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
+        // 事件出口：发送端（可能是 FUSE/上传线程）只 send，广播在常驻 task 里做
+        let (outbox, mut out_rx) = mpsc::unbounded_channel::<PeerEvent>();
+        let events_out = Arc::new(AtomicU64::new(0));
+        {
+            let peers = peers.clone();
+            let out_count = events_out.clone();
+            tokio::spawn(async move {
+                while let Some(ev) = out_rx.recv().await {
+                    let list = peers.lock().map(|g| g.clone()).unwrap_or_default();
+                    if list.is_empty() {
+                        continue;
+                    }
+                    let n = peer::broadcast_event(&list, ev).await;
+                    if n > 0 {
+                        out_count.fetch_add(n as u64, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+
         let Some(bind) = bind else {
             tracing::info!("LAN 对等服务未开启（link.peer_listen 为空）");
             return Ok(Arc::new(Self {
@@ -142,7 +170,8 @@ impl PeerHost {
                 roots,
                 server: None,
                 events_in,
-                events_out: AtomicU64::new(0),
+                events_out,
+                outbox,
                 last_note: StdMutex::new(None),
             }));
         };
@@ -235,7 +264,8 @@ impl PeerHost {
             roots,
             server: Some(srv),
             events_in,
-            events_out: AtomicU64::new(0),
+            events_out,
+            outbox,
             last_note: StdMutex::new(None),
         }))
     }
@@ -463,16 +493,11 @@ impl PeerHost {
     }
 
     /// 非阻塞广播（上传成功回调里用：FUSE 的写路径不能被网络拖住）。
-    pub fn notify_async(self: &Arc<Self>, path: String, size: u64, mtime: i64, kind: &str) {
-        let host = self.clone();
-        let kind = kind.to_string();
-        tokio::spawn(async move {
-            let ev = PeerEvent::new(path, size, mtime, &kind);
-            let n = host.notify(ev).await;
-            if n > 0 {
-                tracing::debug!("LAN 事件已广播给 {n} 台设备");
-            }
-        });
+    pub fn notify_async(&self, path: String, size: u64, mtime: i64, kind: &str) {
+        let ev = PeerEvent::new(path, size, mtime, kind);
+        if self.outbox.send(ev).is_err() {
+            tracing::warn!("事件队列已关闭，LAN 广播被丢弃（不影响 NAS 同步）");
+        }
     }
 }
 
@@ -483,5 +508,41 @@ impl std::fmt::Debug for PeerHost {
             .field("listen", &self.listen)
             .field("peers", &self.peer_list().len())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ★ M7 回归：`notify_async` 会被**上传 worker 的 OS 线程**（没有 tokio 上下文）调用。
+    /// 曾经它内部用 `tokio::spawn` → panic → 打死上传 worker（队列永久卡住）。
+    /// 这里从裸线程调一次：panic 会被 `join().unwrap()` 抓住。
+    #[test]
+    fn notify_async_is_safe_off_runtime() {
+        let (outbox, mut rx) = mpsc::unbounded_channel::<PeerEvent>();
+        let host = Arc::new(PeerHost {
+            link_id: "unit-test".into(),
+            paths: ConfigPaths::discover().unwrap(),
+            name: "unit-test".into(),
+            listen: None,
+            peers: Arc::new(StdMutex::new(Vec::new())),
+            roots: vec!["/home".into()],
+            server: None,
+            events_in: Arc::new(StdMutex::new(VecDeque::new())),
+            events_out: Arc::new(AtomicU64::new(0)),
+            outbox,
+            last_note: StdMutex::new(None),
+        });
+        let h = host.clone();
+        std::thread::spawn(move || {
+            // 没有 runtime 也必须能调：只做同步 send
+            h.notify_async("/home/qxync-test/x.bin".into(), 3, 4, "modified");
+        })
+        .join()
+        .expect("notify_async 在非 tokio 线程里 panic 了（历史上就是这么把上传 worker 打死的）");
+        let ev = rx.try_recv().expect("事件应该已经进队列");
+        assert_eq!(ev.path, "/home/qxync-test/x.bin");
+        assert_eq!((ev.size, ev.mtime), (3, 4));
     }
 }

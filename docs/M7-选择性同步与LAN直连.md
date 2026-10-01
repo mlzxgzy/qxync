@@ -1,6 +1,7 @@
 # M7 —— 选择性同步 + 设备配对 / LAN 直连
 
-> 状态：**已实现并真机验收**（`xtask/tests/m7-matrix.sh` **42/42**；FUSE 真挂载段在无 `/dev/fuse` 的沙箱里整段 SKIP，与 M6 同样处理）。
+> 状态：**已实现并真机验收**（`xtask/tests/m7-matrix.sh` **60/60**，含真挂载段：
+> 排除路径不可见/不可写、临时文件隐藏、LAN 直传命中）。
 >
 > 一句话：M7 补上「同步范围」与「传输路径」这两块 ——
 > **选择性同步**（路径规则引擎，排除的子树在挂载点里根本不存在，同步/水合/脱水都不碰它）与
@@ -74,7 +75,7 @@
 |---|---|---|
 | FUSE `lookup` | 排除路径 → `ENOENT`（**挂载点里根本看不到**，不是「看得到拉不下来」） | `qxync-fuse/src/lib.rs` `lookup_child` |
 | FUSE `readdir` | 列目录时直接剔除（临时文件同样剔除） | `load_children` |
-| FUSE 写路径 | 父目录被排除 → `ENOENT`（`create`/`mkdir` 落不下去，天然挡住） | `create`/`mkdir`/`ensure_writable` |
+| FUSE 写路径 | **所有写入口**都过规则闸门 → `ENOENT`：`open(O_CREAT)` 走的是 `create`（**不经过 `lookup`**），`mkdir`/`write`/`setattr`（截断/改 mtime）/`rename`（两端）/`remove_entry` 同样要挡 | `deny_hidden` + `create`/`mkdir`/`write`/`setattr`/`rename`/`remove_entry` |
 | FUSE 水合 | 兜底防御：即使拿到 ino 也拒绝下载（`EACCES`） | `hydrate_all`/`ensure_chunk` |
 | 同步对账 | 排除的目录**不列**、候选路径跳过、远端新条目不登记 baseline | `qxync-daemon/src/sync.rs` `reconcile_view` |
 | 事件快路径 | 排除路径的事件直接跳过（计入 `events_skipped`） | `apply_event` |
@@ -193,13 +194,13 @@ qsync rules [--json] [--match PATH]   # 规则一览 / 单路径判定
 qsync peer status|list|pair|ping|events|notify|fetch
 ```
 
-矩阵覆盖（**42 项**，本机全绿；FUSE 段因沙箱无 `/dev/fuse` 整段 SKIP，与 M6 同样处理）：
+矩阵覆盖（**60 项**，本机全绿，含真挂载段）：
 
 1. **规则引擎单测**（core 10 项）：锚定/任意层级/`**`/尾 `/` 目录剪枝/`!` 反向包含/
    内置临时文件与开关/根相对判定/最长根前缀/坏规则不 panic/逗号文件名不误拆；
-2. **FUSE 层单测**（4 项）：排除路径 `hide_reason` → `Excluded`、临时文件 → `Temp`、
-   `filter_visible` 剔除、脱水候选永不含排除路径、多根时根目录不被隐藏、默认规则与 M6 一致、
-   **LAN 水合命中与「元数据不符 → 回落 NAS」**；
+2. **FUSE 层单测**（5 项）：排除路径 `hide_reason` → `Excluded`、临时文件 → `Temp`、
+   `filter_visible` 剔除、**写入口闸门 `deny_hidden` → `ENOENT`**、脱水候选永不含排除路径、
+   多根时根目录不被隐藏、默认规则与 M6 一致、**LAN 水合命中与「元数据不符 → 回落 NAS」**；
 3. **同步引擎单测**（1 项）：`MountView::hidden` 语义（根目录永不 hidden；默认规则不误伤）；
 4. **LAN 协议单测**（client 7 项）：配对码轮换/尝试限流、错 token 拒绝、路径越权(`/etc/passwd`、
    `..`)、`hello` 双向登记、部分水合不可服务、`get` 全量/Range、长度上限、事件送达、
@@ -210,17 +211,31 @@ qsync peer status|list|pair|ping|events|notify|fetch
    （B 轮询间隔 3600 s，polls 0 → 1）、B 事件日志与 `events_in`；
 6. **真机（NAS）**：`qsync ls` 仍能看到被排除文件（选择性同步**不动远端**）、
    无挂载时 `peer fetch` 被拒（没有完整水合就不服务）、`qsync put` 上传后 A 自动广播且 B 收到；
-7. **FUSE 真挂载段**（有 `/dev/fuse` 时）：被排除文件在挂载点里不可见且写失败、
-   `*.crdownload` 被内置规则隐藏、正常文件可读、B 读同一文件时 **LAN 直传命中**
-   （`peer status.lan_hits ≥ 1` + 日志「LAN 直传命中」）。
+7. **FUSE 真挂载段**：被排除文件在挂载点里不可见、**写它失败且不产生上传作业、
+   远端内容逐字节不变（`cmp` 基线对比）**、`mkdir` 被排除目录失败且 NAS 上不会凭空出现、
+   `*.crdownload` 既不可写也不可见、正常文件可读、B 读同一文件时 **LAN 直传命中**
+   （`peer status.lan_hits ≥ 1` + 日志「LAN 直传命中」）；
+8. **回归**：`fuse-matrix.sh` **68/68**（M1–M5 的 68 项在 M7 之后全绿；顺手把 M2c-1b 的等待预算
+   从 15s 提到 30s 并让 `--direct put` 的失败可见 —— 真机 WAN 下一轮对账要列 ~29 个目录，
+   3–7s/轮，15s 会在 NAS 抖动时假失败）。
 
 **实测输出（2026-10-01，`xtask/tests/m7-matrix.sh`）**：
 
 ```
+== 5. FUSE 真挂载：隐藏 / 写保护 / LAN 直传 ==
+  ✅ 被排除文件在挂载点里不可见（1k.bin）
+  ✅ 被排除路径 lookup → ENOENT
+  ✅ 向被排除路径写失败
+  ✅ 被排除路径的写入没有产生上传作业（uploads=0）
+  ✅ 远端文件内容原封不动（1024 字节，排除 ≠ 删除）
+  ✅ 被排除路径 mkdir 失败
+  ✅ NAS 上没有出现被排除目录（写入口挡在客户端）
+  ✅ 临时文件路径（*.crdownload）写失败
+  ✅ B 的这次水合走了 LAN 直传（lan_hits=1）
+
 == 汇总 ==
-  通过 42 / 失败 0
+  通过 60 / 失败 0
   🎉 M7 验收矩阵全过
-  通过 42 / 失败 0   （FUSE 段：本机没有 /dev/fuse → SKIP）
 ```
 
 ## 4. 已知限制
@@ -236,6 +251,22 @@ qsync peer status|list|pair|ping|events|notify|fetch
   没有 UDP 广播自动发现（报告 03 §3.10 的 `UpdateUDPInfo` 不在 M7 范围）。
 
 ## 5. 踩到的坑
+
+0. **`open(O_CREAT)` 不经过 `lookup` —— 这是本里程碑唯一一个「会毁数据」的 bug**。
+   第一版只在 `lookup_child`/`load_children` 上过滤，真挂载段一跑就发现：
+   `printf x > mnt/qxync-test/1k.bin`（被排除的文件）**居然成功**，而且因为 `create`
+   先把节点建成 0 字节、`mark_dirty` 直接入队上传 → **NAS 上那个 1024 字节的文件被覆盖成 0 字节**。
+   修复：写入口统一过 `deny_hidden()` → `ENOENT`（`create`/`mkdir`/`write`/`setattr`/
+   `rename` 两端/`remove_entry`），并在矩阵里加了三条硬断言（写失败 + `uploads=0` +
+   **下载前后 `cmp` 远端内容不变**）。教训：**「读路径挡住了」不等于「写路径挡住了」**，
+   内核的 atomic_open 会绕过 lookup，必须逐个写入口过闸门。
+0b. **回调跑在哪个线程上，决定你能不能 `tokio::spawn`**。事件快路径最初在「上传成功回调」里
+   `tokio::spawn` 一个广播任务 —— 那个回调跑在**上传 worker 的 OS 线程**里（不是 tokio worker），
+   于是 spawn 直接 panic，把 worker 打死：表现是「上传队列永远卡住、`drain` 超时、
+   `qsync status` 一直显示上传中」，整个 daemon 像挂了（fuse-matrix 的冲突段卡了 3 分钟才被发现）。
+   修复两层：① 事件广播改成**同步 send + 常驻 task 消费**（发送端不需要 runtime 上下文）；
+   ② 回调调用点用 `catch_unwind` 兜住 —— 回调只能坏它自己，队列必须继续跑。
+   教训：**任何会从 FUSE/上传线程调用的代码，都不能假设自己在 tokio 上下文里**。
 
 1. **「排除」的命名空间只能选一个**：一开始想在挂载视图上匹配（`home/qxync-test/x`），
    但 baseline/pin/缓存键/上传队列全用远端路径，且多根时视图名是布局推导出来的 ——
