@@ -3,15 +3,17 @@
 //! 设计见 `docs/M1.5-设计.md`：单进程持有 FUSE；CLI/GUI 通过 unix socket 的 JSON 行协议访问。
 
 use anyhow::{bail, Context, Result};
+use qxync_client::peer::PeerEvent;
 use qxync_client::{Client, Session};
 use qxync_core::dehydrate::{Block, CacheLimit, Policy};
 use qxync_core::ipc::{
-    decode_line, encode_line, mask_sid, CacheInfo, CursorInfo, DaemonInfo, DehydrateData,
-    ErrorKind, GetData, HydroStats, IpcError, LinkInfo, LoginData, LsData, MountInfo, PingData,
-    PutData, Request, RequestEnvelope, Response, RootInfo, RootsData, ServerInfo, SessionInfo,
-    ShutdownData, StatusData, StoreData, SyncCursors, SyncInfo, IPC_VERSION,
+    decode_line, encode_line, mask_sid, mask_token, CacheInfo, CursorInfo, DaemonInfo, DehydrateData,
+    ErrorKind, GetData, HydroStats, IpcError, LinkInfo, LoginData, LsData, MountInfo, PeerData,
+    PingData, PutData, Request, RequestEnvelope, Response, RootInfo, RootsData, RulesData,
+    ServerInfo, SessionInfo, ShutdownData, StatusData, StoreData, SyncCursors, SyncInfo, IPC_VERSION,
 };
-use qxync_core::{ConfigPaths, Credentials, Error as CoreError, LinkConfig, HOME_ROOT};
+use qxync_core::rules::Rules;
+use qxync_core::{ConfigPaths, Credentials, Error as CoreError, LinkConfig, PeerConfig, HOME_ROOT};
 use qxync_fuse::upload::UploadQueue;
 use qxync_fuse::{CacheMode, FsHandle, HydroCounters, LocalView, MountHandle, PinMap, QxyncFs};
 use std::collections::HashMap;
@@ -21,8 +23,9 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify};
 
+use crate::peer_host::PeerHost;
 use crate::sync::{self, MountView, SyncConfig, SyncState, SyncStats};
 
 pub struct Options {
@@ -31,7 +34,7 @@ pub struct Options {
     pub auto_login: bool,
 }
 
-struct MountEntry {
+pub(crate) struct MountEntry {
     info: MountInfo,
     /// ★ M3：fuser 的后台会话（`umount` 时 join）。
     session: Option<qxync_fuse::BackgroundSession>,
@@ -41,21 +44,21 @@ struct MountEntry {
     /// 读写挂载时的上传队列（卸载前要排空）。
     upload: Option<Arc<UploadQueue>>,
     /// ★ M2c：共享节点表句柄（同步引擎在挂载线程外刷新远端变更）。
-    handle: FsHandle,
+    pub(crate) handle: FsHandle,
     /// ★ M3：缓存模式（pagecache / direct）。
     cache_mode: CacheMode,
 }
 
-struct State {
+pub(crate) struct State {
     version: &'static str,
     started: Instant,
     socket: PathBuf,
-    link: LinkConfig,
+    pub(crate) link: LinkConfig,
     client: Mutex<Client>,
     session: Mutex<Option<Session>>,
     /// 远端路径 → pin 状态（与 FUSE 实例共享，`getfattr -n user.qsync.pin` 能看到）。
     pins: PinMap,
-    mounts: StdMutex<HashMap<PathBuf, MountEntry>>,
+    pub(crate) mounts: StdMutex<HashMap<PathBuf, MountEntry>>,
     /// ★ M2c：引擎专用的 HTTP 客户端（不抢 `client` 的锁，长轮询不阻塞 IPC 命令）。
     engine_client: Mutex<Option<Arc<Client>>>,
     /// 游标 + baseline（原子落盘）。
@@ -69,6 +72,16 @@ struct State {
     /// ★ M3：脱水配置 + 计数。
     dehydrate_cfg: StdMutex<DehydrateCfg>,
     dehydrate_stats: Arc<DehydrateStats>,
+    /// ★ M7：选择性同步规则（`link.exclude` + 临时文件过滤）；挂载时注入 FUSE 与同步引擎。
+    rules: Arc<Rules>,
+    /// ★ M7：解析失败的规则原文（`qsync rules` 要显示，不静默）。
+    rules_bad: Vec<String>,
+    /// ★ M7：已配对的对等设备（与 FUSE 共享：水合时先试 LAN）。
+    peers: Arc<StdMutex<Vec<PeerConfig>>>,
+    /// ★ M7：对等主机（事件快路径 / 配对 / 直传）；`peer_listen` 没配时也持有（listen=None）。
+    peer: StdMutex<Option<Arc<PeerHost>>>,
+    /// ★ M7：对端事件到达时唤醒轮询线程。
+    peer_wake: Arc<Notify>,
 }
 
 // ---------------------------------------------------------------- 入口
@@ -123,6 +136,22 @@ pub async fn run(opts: Options) -> Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(qxync_core::sync::DEFAULT_POLL_INTERVAL_SECS);
+    // ★ M7：选择性同步规则 —— 坏规则不静默，启动日志里点名
+    let parsed_rules = link.rules();
+    if !parsed_rules.rules.is_empty() {
+        tracing::info!(
+            "选择性同步：{} 条排除规则（临时文件过滤 {}）",
+            parsed_rules.rules.len(),
+            if parsed_rules.rules.filter_temp() {
+                "开"
+            } else {
+                "关"
+            }
+        );
+    }
+    for bad in &parsed_rules.bad {
+        tracing::warn!("排除规则无法解析，已忽略: {bad:?}");
+    }
     let state = Arc::new(State {
         version: env!("CARGO_PKG_VERSION"),
         started: Instant::now(),
@@ -139,7 +168,35 @@ pub async fn run(opts: Options) -> Result<()> {
         sync_interval: StdMutex::new(sync_interval),
         dehydrate_cfg: StdMutex::new(DehydrateCfg::from_env()),
         dehydrate_stats: Arc::new(DehydrateStats::default()),
+        rules: Arc::new(parsed_rules.rules),
+        rules_bad: parsed_rules.bad,
+        peers: Arc::new(StdMutex::new(Vec::new())),
+        peer: StdMutex::new(None),
+        peer_wake: Arc::new(Notify::new()),
     });
+
+    // ★ M7：LAN 对等主机（`link.peer_listen` 配了才真正监听；失败只告警不致命 ——
+    //   同步主路径永远不依赖 LAN）
+    match PeerHost::start(
+        paths.clone(),
+        &state.link,
+        &state,
+        state.peers.clone(),
+        state.peer_wake.clone(),
+    )
+    .await
+    {
+        Ok(host) => {
+            tracing::info!(
+                "对等主机就绪：身份={} 监听={:?} 已配对={}",
+                host.name,
+                host.listen,
+                host.peer_list().len()
+            );
+            *state.peer.lock().unwrap() = Some(host);
+        }
+        Err(e) => tracing::warn!("LAN 对等服务启动失败（不影响 NAS 同步）: {e}"),
+    }
 
     tracing::info!(
         "qxyncd 启动 pid={} socket={} link={}",
@@ -295,6 +352,16 @@ async fn dispatch(state: &Arc<State>, req: Request, shutdown: &mpsc::Sender<()>)
         Request::Umount { mountpoint } => umount(state, mountpoint).await,
         Request::Mounts => mounts(state),
         Request::Roots => roots_cmd(state).await,
+        Request::Rules { match_path } => rules_cmd(state, match_path),
+        Request::Peer {
+            action,
+            addr,
+            code,
+            name,
+            path,
+            dest,
+            limit,
+        } => peer_cmd(state, action, addr, code, name, path, dest, limit).await,
         Request::Sync {
             once,
             force_deletes,
@@ -606,6 +673,10 @@ async fn put(
     if mtime > 0 {
         with_client!(state, |c| c.set_mtime(&dest, &target, mtime))?;
     }
+    // ★ M7：事件快路径 —— 已配对的对端立刻知道这个路径变了（失败只记日志）
+    if let Some(host) = state.peer.lock().unwrap().clone() {
+        host.notify_async(format!("{dest}/{target}"), bytes.len() as u64, mtime, "modified");
+    }
     to_value(PutData {
         bytes: bytes.len() as u64,
         remote_path: format!("{dest}/{target}"),
@@ -760,6 +831,144 @@ async fn roots_cmd(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
     })
 }
 
+/// ★ M7：`qsync rules [--match PATH]` —— 选择性同步规则一览 + 单路径判定。
+fn rules_cmd(state: &Arc<State>, match_path: Option<String>) -> Result<serde_json::Value, IpcError> {
+    let rules = &state.rules;
+    let roots = state.link.roots();
+    let mut data = RulesData {
+        roots: roots.clone(),
+        exclude: state.link.exclude.clone(),
+        patterns: rules.pattern_list(),
+        bad: state.rules_bad.clone(),
+        filter_temp: rules.filter_temp(),
+        temp_patterns: qxync_core::rules::TEMP_PATTERNS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        ..Default::default()
+    };
+    if let Some(path) = match_path {
+        let root = qxync_core::rules::containing_root(&roots, &path).map(|s| s.to_string());
+        let rel = root
+            .as_deref()
+            .and_then(|r| qxync_core::rules::rel_under(r, &path));
+        let (hidden, reason) = match &root {
+            None => (false, "outside-roots".to_string()),
+            Some(r) => match rules.hides_remote(r, &path, false) {
+                Some(h) => (true, h.as_str().to_string()),
+                None => (false, "visible".to_string()),
+            },
+        };
+        data.match_path = Some(path.clone());
+        data.match_root = root;
+        data.match_rel = rel;
+        data.match_hidden = Some(hidden);
+        data.match_reason = Some(reason);
+    }
+    to_value(data)
+}
+
+/// ★ M7：`qsync peer <action>` —— 设备配对 / 探活 / 事件 / LAN 直传自检。
+#[allow(clippy::too_many_arguments)]
+async fn peer_cmd(
+    state: &Arc<State>,
+    action: String,
+    addr: Option<String>,
+    code: Option<String>,
+    name: Option<String>,
+    path: Option<String>,
+    dest: Option<PathBuf>,
+    limit: Option<usize>,
+) -> Result<serde_json::Value, IpcError> {
+    let host = state
+        .peer
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or_else(|| IpcError::new(ErrorKind::Unsupported, "对等主机未初始化"))?;
+    let bad = |m: String| IpcError::new(ErrorKind::BadRequest, m);
+    // ★ M7：LAN 直传命中统计（各挂载求和），`peer status` 里能看到省了多少 NAS 请求
+    let (lan_hits, lan_bytes) = {
+        let g = state.mounts.lock().unwrap();
+        let mut hits = 0u64;
+        let mut bytes = 0u64;
+        for m in g.values() {
+            let (_, h, b, _) = m.handle.lan_stats().snapshot();
+            hits += h;
+            bytes += b;
+        }
+        (hits, bytes)
+    };
+    let with_lan = |d: PeerData| PeerData {
+        lan_hits,
+        lan_bytes,
+        ..d
+    };
+    match action.as_str() {
+        "status" => to_value(with_lan(host.status())),
+        "list" => {
+            let devices: Vec<qxync_core::ipc::PeerDeviceInfo> = host
+                .peer_list()
+                .into_iter()
+                .map(|p| qxync_core::ipc::PeerDeviceInfo {
+                    name: p.name,
+                    addr: p.addr,
+                    token_masked: mask_token(&p.token),
+                })
+                .collect();
+            to_value(with_lan(PeerData {
+                action: "list".into(),
+                devices,
+                ..host.status()
+            }))
+        }
+        "pair" => {
+            let addr = addr.ok_or_else(|| bad("pair 需要 addr".into()))?;
+            let code = code.ok_or_else(|| bad("pair 需要 code（配对码）".into()))?;
+            host.pair(&addr, &code).await.map_err(bad).and_then(to_value)
+        }
+        "ping" => {
+            let target = addr
+                .or(name)
+                .ok_or_else(|| bad("ping 需要 addr 或 name".into()))?;
+            host.ping(&target).await.map_err(bad).and_then(to_value)
+        }
+        "events" => to_value(with_lan(PeerData {
+            action: "events".into(),
+            events: host.events(limit.unwrap_or(50).min(200)),
+            ..host.status()
+        })),
+        "notify" => {
+            let path = path.ok_or_else(|| bad("notify 需要 path".into()))?;
+            // 事件只是「某路径可能变了」的提示，不携带内容：size/mtime 由接收方自己 stat。
+            let n = host
+                .notify(PeerEvent::new(path.clone(), 0, 0, "modified"))
+                .await;
+            to_value(with_lan(PeerData {
+                action: "notify".into(),
+                events_out: n as u64,
+                note: Some(format!("事件已送达 {n} 台对端")),
+                ..host.status()
+            }))
+        }
+        "fetch" => {
+            let target = addr
+                .or(name)
+                .ok_or_else(|| bad("fetch 需要 addr 或 name".into()))?;
+            let path = path.ok_or_else(|| bad("fetch 需要 path".into()))?;
+            let dest = dest.ok_or_else(|| bad("fetch 需要 dest".into()))?;
+            host.fetch(&target, &path, &dest)
+                .await
+                .map_err(bad)
+                .and_then(to_value)
+        }
+        other => Err(IpcError::new(
+            ErrorKind::BadRequest,
+            format!("未知 peer action {other:?}（可用：status/list/pair/ping/events/notify/fetch）"),
+        )),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn mount(
     state: &Arc<State>,
@@ -845,7 +1054,10 @@ async fn mount(
     .map_err(|e| IpcError::new(ErrorKind::Io, e.to_string()))?
     .with_hydrate_timeout(hydrate_timeout)
     .with_counters(counters.clone())
-    .with_pins(state.pins.clone());
+    .with_pins(state.pins.clone())
+    // ★ M7：选择性同步规则 + LAN 对端（水合时先试 LAN，失败回落 NAS）
+    .with_rules(state.rules.clone())
+    .with_peers(state.peers.clone());
     if let Some(limit) = delete_limit {
         fs = fs.with_delete_limit(limit);
     }
@@ -881,7 +1093,15 @@ async fn mount(
     // ★ M3：上传成功后清掉节点 dirty（否则脱水永远被 dirty 挡住）
     if let Some(q) = &upload_queue {
         let h = handle.clone();
-        q.set_success_hook(Arc::new(move |remote: &str| h.clear_dirty(remote)));
+        let peer = state.peer.lock().unwrap().clone();
+        q.set_success_hook(Arc::new(move |remote: &str| {
+            // 本地改动已经落到 NAS → 清 dirty，并让对端走事件快路径
+            let sig = h.node(remote).map(|n| (n.size, n.mtime));
+            h.clear_dirty(remote);
+            if let (Some(host), Some((size, mtime))) = (peer.as_ref(), sig) {
+                host.notify_async(remote.to_string(), size, mtime, "modified");
+            }
+        }));
     }
 
     // ★ M3：用 spawn（而不是阻塞的 mount2）—— 拿到 Notifier 才能发 inval_inode
@@ -1142,6 +1362,7 @@ fn build_views(state: &Arc<State>) -> Vec<MountView> {
                 view: Arc::new(m.handle.clone()) as Arc<dyn LocalView>,
                 upload: m.upload.clone(),
                 read_only: m.info.readonly,
+                rules: state.rules.clone(),
             });
         }
     }
@@ -1230,13 +1451,24 @@ fn spawn_poller(state: Arc<State>) {
     }
     tracing::info!("变更轮询已启动：每 {interval}s 一轮（QSYNC_POLL_INTERVAL 可调）");
     tokio::spawn(async move {
+        let mut last_run = Instant::now() - Duration::from_secs(3600);
         loop {
             let secs = *state.sync_interval.lock().unwrap();
             if secs == 0 {
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 continue;
             }
-            tokio::time::sleep(Duration::from_secs(secs.clamp(1, 3600))).await;
+            // ★ M7：正常睡到下一轮；对端事件到达时提前醒来（事件是快路径，对账是主路径）
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(secs.clamp(1, 3600))) => {}
+                _ = state.peer_wake.notified() => {
+                    let since = last_run.elapsed();
+                    if since < crate::peer_host::WAKE_DEBOUNCE {
+                        tokio::time::sleep(crate::peer_host::WAKE_DEBOUNCE - since).await;
+                    }
+                    tracing::debug!("对端事件唤醒轮询（距上轮 {:?}）", last_run.elapsed());
+                }
+            }
             if *state.sync_interval.lock().unwrap() == 0 {
                 continue;
             }
@@ -1250,6 +1482,7 @@ fn spawn_poller(state: Arc<State>) {
                     }
                 }
             }
+            last_run = Instant::now();
             match run_sync_once(&state).await {
                 Ok(r) => {
                     if r.conflicts > 0 || r.deletes_blocked > 0 || !r.errors.is_empty() {

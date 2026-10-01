@@ -24,17 +24,19 @@ pub mod error;
 pub mod ipc;
 pub mod model;
 pub mod roots;
+pub mod rules;
 pub mod status;
 pub mod store;
 pub mod sync;
 
-pub use config::{ConfigPaths, Credentials, LinkConfig};
+pub use config::{ConfigPaths, Credentials, LinkConfig, PeerConfig, PeerRegistry};
 pub use dehydrate::{Block, CacheLimit, Candidate, Policy};
 pub use delta::Signature;
 pub use encode::{build_query, encode_query_value};
 pub use error::{Error, Result};
 pub use model::{parse_listing, parse_max_log, parse_nas_uid, DirEntry, Listing, MaxLog, NasUid};
 pub use roots::{layout, normalize_roots, RootSpec, ViewLayout};
+pub use rules::{HideReason, RuleParse, Rules, TEMP_PATTERNS};
 pub use status::ServerStatus;
 pub use store::{MigrateReport, Store, DB_FILE};
 pub use sync::{

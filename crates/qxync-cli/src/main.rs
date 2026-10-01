@@ -10,7 +10,8 @@ use clap::{Parser, Subcommand};
 use qxync_client::Client;
 use qxync_core::ipc::{
     default_socket_path, CacheInfo, CursorInfo, DehydrateData, ErrorKind, GetData, LsData,
-    MountInfo, PingData, PutData, Request, RootsData, StatusData, StoreData, SyncInfo,
+    MountInfo, PeerData, PingData, PutData, Request, RootsData, RulesData, StatusData, StoreData,
+    SyncInfo,
 };
 use qxync_core::{ConfigPaths, Credentials, DirEntry, LinkConfig, HOME_ROOT};
 use qxync_fuse::{CacheMode, QxyncFs};
@@ -152,6 +153,9 @@ enum Cmd {
         /// 调整后台轮询间隔秒数（0 = 暂停）
         #[arg(long)]
         interval: Option<u64>,
+        /// 直接输出 JSON（脚本/验收用；`--once` 后 polls 等计数会变）
+        #[arg(long)]
+        json: bool,
     },
 
     /// ★ M6：远端根一览（配置的 roots + NAS 上的同步文件夹 + 可读/可写判定）
@@ -159,6 +163,22 @@ enum Cmd {
         /// 直接输出 JSON（脚本/验收用）
         #[arg(long)]
         json: bool,
+    },
+
+    /// ★ M7：选择性同步规则（exclude + 内置临时文件过滤）；`--match` 判定单条路径
+    Rules {
+        /// 判定这条远端路径会不会在挂载点里被隐藏（如 /home/qxync-test/secret）
+        #[arg(long)]
+        r#match: Option<String>,
+        /// 直接输出 JSON（脚本/验收用）
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// ★ M7：LAN 对等设备（配对 / 探活 / 事件快路径 / 直传自检）
+    Peer {
+        #[command(subcommand)]
+        action: PeerAction,
     },
 
     /// 删除远端文件/目录（M2c 脚本/测试用；挂在挂载点上 rm 走 FUSE）
@@ -217,6 +237,52 @@ enum Cmd {
 }
 
 #[derive(Subcommand, Debug)]
+enum PeerAction {
+    /// 对等主机状态：监听地址 / 身份 / 配对码 / 已配对设备 / 计数
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 已配对设备（token 掩码）
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 配对：`qsync peer pair 192.168.1.5:9840 --code 4821`
+    Pair {
+        /// 对端地址 host:port
+        addr: String,
+        /// 对方 `qsync peer status` 显示的 6 位配对码
+        #[arg(long)]
+        code: String,
+    },
+    /// 探活（地址或已配对设备名）
+    Ping {
+        target: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 最近收到的对端事件（事件快路径）
+    Events {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 手动广播一个「某路径可能变了」的事件给所有对端（脚本/验收用）
+    Notify { path: String },
+    /// 从对端直传一份内容到本地（LAN 直连自检，不经过 NAS）
+    Fetch {
+        /// 对端（已配对设备名或地址）
+        target: String,
+        /// 远端路径
+        path: String,
+        /// 本地输出文件
+        dest: PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum DaemonAction {
     /// 拉起 qxyncd（已在运行则直接报成功）
     Start,
@@ -263,6 +329,11 @@ fn resolve_link(cli: &Cli) -> Result<LinkConfig> {
             // ★ M6：未配 roots 时由 `LinkConfig::roots()` 退回家目录根
             roots: Vec::new(),
             ipv4_only: cli.ipv4,
+            // ★ M7：登录时先不定选择性同步规则（改 link JSON 后重启 daemon 生效）
+            exclude: Vec::new(),
+            filter_temp: true,
+            peer_listen: None,
+            peer_name: None,
         }),
         _ => bail!(
             "没有找到连接配置 {}，且缺少 --host/--user。\n首次使用：qsync --host <NAS> --port <端口> --insecure --user <用户> --password <口令> login",
@@ -495,8 +566,10 @@ async fn main() -> Result<()> {
         | Cmd::Sync { .. }
         | Cmd::Dehydrate { .. }
         | Cmd::Store { .. }
-        | Cmd::Roots { .. } => {
-            bail!("`pin`/`state`/`sync`/`dehydrate`/`store`/`roots` 需要 daemon：先 `qsync daemon start`（或用 --socket 指向运行中的 daemon）");
+        | Cmd::Roots { .. }
+        | Cmd::Rules { .. }
+        | Cmd::Peer { .. } => {
+            bail!("`pin`/`state`/`sync`/`dehydrate`/`store`/`roots`/`rules`/`peer` 需要 daemon：先 `qsync daemon start`（或用 --socket 指向运行中的 daemon）");
         }
         Cmd::Rm { dir, name } => {
             let (client, _) = connect(&cli, true).await?;
@@ -701,6 +774,7 @@ fn to_request(cli: &Cli) -> Option<Request> {
             force_deletes,
             max_deletes,
             interval,
+            ..
         } => Request::Sync {
             once: Some(*once),
             force_deletes: Some(*force_deletes),
@@ -712,6 +786,74 @@ fn to_request(cli: &Cli) -> Option<Request> {
             name: name.clone(),
         },
         Cmd::Roots { .. } => Request::Roots,
+        Cmd::Rules { r#match, .. } => Request::Rules {
+            match_path: r#match.clone(),
+        },
+        Cmd::Peer { action } => match action {
+            PeerAction::Status { .. } => Request::Peer {
+                action: "status".into(),
+                addr: None,
+                code: None,
+                name: None,
+                path: None,
+                dest: None,
+                limit: None,
+            },
+            PeerAction::List { .. } => Request::Peer {
+                action: "list".into(),
+                addr: None,
+                code: None,
+                name: None,
+                path: None,
+                dest: None,
+                limit: None,
+            },
+            PeerAction::Pair { addr, code } => Request::Peer {
+                action: "pair".into(),
+                addr: Some(addr.clone()),
+                code: Some(code.clone()),
+                name: None,
+                path: None,
+                dest: None,
+                limit: None,
+            },
+            PeerAction::Ping { target, .. } => Request::Peer {
+                action: "ping".into(),
+                addr: Some(target.clone()),
+                code: None,
+                name: None,
+                path: None,
+                dest: None,
+                limit: None,
+            },
+            PeerAction::Events { limit, .. } => Request::Peer {
+                action: "events".into(),
+                addr: None,
+                code: None,
+                name: None,
+                path: None,
+                dest: None,
+                limit: Some(*limit),
+            },
+            PeerAction::Notify { path } => Request::Peer {
+                action: "notify".into(),
+                addr: None,
+                code: None,
+                name: None,
+                path: Some(path.clone()),
+                dest: None,
+                limit: None,
+            },
+            PeerAction::Fetch { target, path, dest } => Request::Peer {
+                action: "fetch".into(),
+                addr: Some(target.clone()),
+                code: None,
+                name: None,
+                path: Some(path.clone()),
+                dest: Some(dest.clone()),
+                limit: None,
+            },
+        },
         Cmd::Store { integrity, .. } => Request::Store {
             integrity: Some(*integrity),
         },
@@ -875,11 +1017,57 @@ async fn route_via_daemon(
                 print_roots(&d);
             }
         }
-        Cmd::Sync { once, .. } => {
-            let info: SyncInfo = ipc_client::call(&socket, req).await?;
-            print_sync(&info);
-            if *once {
-                println!("（以上为累计计数；本轮详情见 daemon 日志）");
+        Cmd::Rules { json, .. } => {
+            let raw: serde_json::Value = ipc_client::call(&socket, req).await?;
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&raw)
+                        .map_err(|e| qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string()))?
+                );
+            } else {
+                let d: RulesData = serde_json::from_value(raw).map_err(|e| {
+                    qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string())
+                })?;
+                print_rules(&d);
+            }
+        }
+        Cmd::Peer { action } => {
+            let raw: serde_json::Value = ipc_client::call(&socket, req).await?;
+            let d: PeerData = serde_json::from_value(raw.clone()).map_err(|e| {
+                qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string())
+            })?;
+            let json = match action {
+                PeerAction::Status { json } | PeerAction::List { json } | PeerAction::Ping { json, .. } => *json,
+                PeerAction::Events { json, .. } => *json,
+                _ => false,
+            };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&raw)
+                        .map_err(|e| qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string()))?
+                );
+            } else {
+                print_peer(&d);
+            }
+        }
+        Cmd::Sync { once, json, .. } => {
+            let raw: serde_json::Value = ipc_client::call(&socket, req).await?;
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&raw)
+                        .map_err(|e| qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string()))?
+                );
+            } else {
+                let info: SyncInfo = serde_json::from_value(raw).map_err(|e| {
+                    qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string())
+                })?;
+                print_sync(&info);
+                if *once {
+                    println!("（以上为累计计数；本轮详情见 daemon 日志）");
+                }
             }
         }
         Cmd::Rm { dir, name } => {
@@ -954,6 +1142,135 @@ fn print_store(d: &StoreData) {
         println!("pin       : {} 条", d.pins.len());
         for (path, state) in &d.pins {
             println!("            {state:<12} {path}");
+        }
+    }
+}
+
+/// ★ M7：选择性同步规则。
+fn print_rules(d: &RulesData) {
+    println!("远端根    : {}", d.roots.join(", "));
+    println!("规则条数  : {}", d.patterns.len());
+    if d.patterns.is_empty() {
+        println!("排除规则  : （无 —— 全部同步）");
+    } else {
+        for p in &d.patterns {
+            println!("            {p}");
+        }
+    }
+    println!(
+        "临时文件  : {}（内置 {} 条：{}）",
+        if d.filter_temp { "开" } else { "关" },
+        d.temp_patterns.len(),
+        d.temp_patterns.join(" ")
+    );
+    if !d.bad.is_empty() {
+        println!("⚠️  无法解析: {}", d.bad.join(", "));
+    }
+    match &d.match_path {
+        None => println!("提示      : `qsync rules --match /home/xxx` 可判定单条路径"),
+        Some(p) => {
+            println!("判定路径  : {p}");
+            println!(
+                "归属根    : {}（相对路径 {}）",
+                d.match_root.as_deref().unwrap_or("（不在任何根内）"),
+                d.match_rel.as_deref().unwrap_or("-")
+            );
+            match d.match_reason.as_deref() {
+                Some("excluded") => println!("结果      : 隐藏（命中排除规则）"),
+                Some("temp") => println!("结果      : 隐藏（临时文件）"),
+                Some("outside-roots") => println!("结果      : 不在同步范围内"),
+                _ => println!("结果      : 可见"),
+            }
+        }
+    }
+}
+
+/// ★ M7：对等设备 / 事件 / 直传。
+fn print_peer(d: &PeerData) {
+    match d.action.as_str() {
+        "pair" => {
+            println!(
+                "✅ 已配对 {}（{}），token={}",
+                d.paired_name.as_deref().unwrap_or("?"),
+                d.paired_addr.as_deref().unwrap_or("?"),
+                d.paired_token_masked.as_deref().unwrap_or("?")
+            );
+            if let Some(n) = &d.note {
+                println!("⚠️  {n}");
+            }
+        }
+        "ping" => {
+            println!(
+                "✅ {} @ {}（版本 {}，{} ms，可配对={}）",
+                d.peer_name.as_deref().unwrap_or("?"),
+                d.listen.as_deref().unwrap_or("?"),
+                d.peer_version.as_deref().unwrap_or("?"),
+                d.took_ms.unwrap_or(0),
+                d.pairing_open.unwrap_or(false)
+            );
+            println!("对端根    : {}", d.peer_roots.join(", "));
+        }
+        "fetch" => {
+            println!(
+                "✅ 从 {} 直传 {} 字节 → {}（{} ms）",
+                d.fetch_from.as_deref().unwrap_or("?"),
+                d.fetch_bytes.unwrap_or(0),
+                d.fetch_dest
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+                d.took_ms.unwrap_or(0)
+            );
+        }
+        "notify" => {
+            println!("✅ {}", d.note.clone().unwrap_or_else(|| "事件已广播".into()));
+        }
+        "events" => {
+            if d.events.is_empty() {
+                println!("（还没有收到对端事件）");
+            }
+            for e in &d.events {
+                println!(
+                    "  {:>10}  {:<9} {}  ({} 字节, ts={})",
+                    e.path, e.kind, "", e.size, e.ts
+                );
+            }
+        }
+        _ => {
+            // status / list
+            println!(
+                "身份      : {}（版本 {}）",
+                d.identity,
+                d.peer_version.as_deref().unwrap_or("?")
+            );
+            println!(
+                "监听      : {}",
+                match (&d.enabled, &d.listen) {
+                    (true, Some(a)) => format!("{a}（已开启）"),
+                    _ => "未开启（link.peer_listen 为空）".to_string(),
+                }
+            );
+            println!("对外根    : {}", d.roots.join(", "));
+            if let Some(code) = &d.pairing_code {
+                println!("配对码    : {code}（对方执行 `qsync peer pair <本机地址> --code {code}`）");
+            } else {
+                println!("配对码    : （已关闭）");
+            }
+            if d.devices.is_empty() {
+                println!("已配对    : （无）");
+            } else {
+                println!("已配对    : {} 台", d.devices.len());
+                for p in &d.devices {
+                    println!("            {:<16} {:<22} {}", p.name, p.addr, p.token_masked);
+                }
+            }
+            println!(
+                "事件      : 收到 {} 条 / 发出 {} 条；被拒请求 {}",
+                d.events_in, d.events_out, d.rejected
+            );
+            if let Some(n) = &d.note {
+                println!("提示      : {n}");
+            }
         }
     }
 }

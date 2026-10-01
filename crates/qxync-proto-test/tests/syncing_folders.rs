@@ -40,6 +40,10 @@ fn env_creds() -> Option<(LinkConfig, String)> {
             // 本测试只看 NAS 上报的同步文件夹，不配置任何额外根（空 = 只用家目录）。
             roots: Vec::new(),
             ipv4_only: std::env::var("QSYNC_TEST_IPV4").is_ok(),
+            exclude: Vec::new(),
+            filter_temp: true,
+            peer_listen: None,
+            peer_name: None,
         },
         password,
     ))

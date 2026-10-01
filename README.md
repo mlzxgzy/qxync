@@ -21,7 +21,7 @@
 | **M4 GUI**（Tauri 2：登录配置 / 挂载管理 / 状态与进度 / pin 管理） | ✅ **已实现并真机验收**（`gui-matrix.sh` **41/41**，5 个 tab 真窗口截图） |
 | **M5 SQLite 元数据 + delta**（`sync.db` 承载游标/baseline/pin/队列 + librsync 兼容编解码 + 能力门控） | ✅ **已实现并真机验收**（`m5-matrix.sh` **28/28**；服务端无历史版本 → 增量走门控，见 [`M5-SQLite与delta.md`](docs/M5-SQLite与delta.md)） |
 | **M6 多根 / 共享文件夹**（link `roots` + 同步文件夹发现 + FUSE 多根视图 + 非家目录根只读保护） | ✅ **已实现并真机验收**（`m6-matrix.sh` **29/29**，含多根真挂载：两根都能按需水合、共享根写回 `EROFS`、家目录能写、共享根可脱水） |
-| M7（另行规划：选择性同步、设备配对事件快路径、LAN 直连…） | ⏳ 下一步 |
+| **M7 选择性同步 + 设备配对 / LAN 直连**（`exclude` 规则引擎贯通 FUSE/同步/脱水 + 内置临时文件过滤；qxync↔qxync 自研对等协议：配对、事件快路径、LAN 直传） | ✅ **已实现并真机验收**（`m7-matrix.sh` **42/42**；FUSE 段因沙箱无 `/dev/fuse` 跳过，见 [`docs/M7-选择性同步与LAN直连.md`](docs/M7-选择性同步与LAN直连.md)） |
 
 真机验证对象：`TS-464C` / `QTS 5.2.9` / Qsync QPKG `5.0.0.7`（build `20260723`）。
 
@@ -69,12 +69,29 @@ M1 实现说明（`crates/qxync-fuse`）：
 共享根在 FUSE 层直接回 `EROFS`，不会把含糊的服务端错误抛给用户。详见
 [`docs/M6-多根与共享文件夹.md`](docs/M6-多根与共享文件夹.md)。
 
+**M7 把「同步范围」和「传输路径」都补上**（[`docs/M7-选择性同步与LAN直连.md`](docs/M7-选择性同步与LAN直连.md)）：
+
+* **选择性同步**：link 里配 `exclude`（gitignore 风味：`/锚定`、`*.iso` 任意层级、`/cache/` 整棵子树剪枝、
+  `!反向包含`、`**`），加内置临时文件过滤（`*.crdownload`/`~$*`/`.goutputstream-*`/`.upload_cache*`/
+  `*.qsync-part`，可用 `filter_temp=false` 关掉）。规则是**根相对**的，同一条对每个根都生效；
+  匹配到就是「挂载点里不存在」（`lookup` → `ENOENT`、`readdir` 剔除），同步引擎不列它对账、
+  事件直接跳过、**脱水候选永不包含它** —— 但**已入队的上传照旧推回 NAS**（排除 ≠ 删数据，
+  远端文件也一动不动）。看规则：`qsync rules [--json] [--match /home/x/y]`。
+* **设备配对 / 事件快路径 / LAN 直连**：默认**不监听**，link 里配 `peer_listen` + `peer_name` 才开。
+  两台 qxync 之间一次 `qsync peer pair <addr> --code <配对码>` 建立**双向**信任（token 双方共用，
+  再用 `hello` 把监听地址交给对方）；之后**本地改动上传成功 → 自动广播事件 → 对端立刻跑一轮对账**
+  （事件是快路径，M2c 的三游标 + baseline 对账仍是主路径），水合区间也会**先问对端**：
+  `head` 的 `size/mtime` 与 NAS 签名一致且对端已完整水合才用（部分水合的稀疏文件里那些 0
+  绝不当数据发出去），任何失败/不一致/超时都**静默回落 NAS**。`qsync peer status|list|pair|ping|events|notify|fetch`。
+  ⚠️ 明文 TCP、只在可信局域网开；token 只授权「读已水合文件 + 提交事件」，没有任何写/删远端能力；
+  与官方 Windows 客户端的 WebSocket 二进制通道（`Auth1`/`Auth2`/`LANDownloadFile`）**不互通**（线格式未还原）。
+
 ## 目录结构
 
 ```
 crates/
 ├── qxync-core/        共享类型 + 配置布局 + **M5 状态库（store.rs，SQLite）/ delta 编解码（delta.rs）** + **M6 多根布局（roots.rs）**
-├── qxync-client/      NAS HTTP API 封装（登录 / 元数据 / 上传下载）
+├── qxync-client/      NAS HTTP API 封装（登录 / 元数据 / 上传下载）+ **M7 LAN 对等协议（peer.rs）**
 ├── qxync-fuse/        FUSE 只读 + on-demand 水合（M1：Filesystem 实现 + 挂载参数）
 ├── qxync-daemon/      二进制 `qxyncd`（M1.5：常驻进程 + unix socket JSON IPC + 持有 FUSE；
 │                       M2c：`sync.rs` 三游标轮询 + baseline 对账 + 冲突/删除保护）
@@ -158,6 +175,15 @@ qsync store --json          #   机器可读（给脚本/验收用）
 qsync roots                 # M6：远端根一览（配置的根 + NAS 同步文件夹 + 可读/可写判定）
 qsync roots --json          #   机器可读
 qsync mount ~/qsync-mnt --remote /home --remote /Public   # M6：多根挂载（共享文件夹默认只读）
+qsync rules                 # M7：选择性同步规则（exclude + 内置临时文件过滤）
+qsync rules --match /home/qxync-test/1k.bin   #   判定单条路径：visible / excluded / temp / outside-roots
+qsync rules --json          #   机器可读
+# M7：LAN 对等（要现在 link 里配 peer_listen，默认不监听）
+qsync peer status           #   身份 / 监听地址 / 配对码 / 已配对设备 / 事件计数
+qsync peer pair 192.168.1.5:9840 --code 4821  # 一次配对建立双向信任
+qsync peer ping qxync-b     #   探活（地址或已配对名字）
+qsync peer events           #   最近收到的对端事件（事件快路径）
+qsync peer fetch qxync-b /home/qxync-test/hello.txt ./hello.txt   # 从对端直传（LAN 自检）
 ```
 
 IPC 契约见 [`docs/M1.5-设计.md`](docs/M1.5-设计.md)：unix socket + **一行一个 JSON**
@@ -190,6 +216,8 @@ M1 验收矩阵（挂载 → 16 项检查 → 卸载）：
 ```bash
 xtask/tests/fuse-matrix.sh          # 快测 68 项（M1 + M2a 区间水合 + M2b 写路径 + M2c 变更发现 + M3 脱水 + M5 状态库），~12min
 xtask/tests/fuse-matrix.sh --big    # 追加 128 MiB 全量读 + 并发去重（~5min，取决于带宽）
+xtask/tests/m7-matrix.sh            # M7 验收 42 项（规则 / FUSE 过滤 / LAN 配对·事件·直传 / 真机）
+xtask/tests/m7-matrix.sh --no-nas   #   不需要 NAS：单测 + 两个真 daemon 的 loopback 配对/事件
 ```
 
 M2c 的真机引擎测试（冲突副本 / 删除保护 / 游标落盘，`#[ignore]` 手动跑）：

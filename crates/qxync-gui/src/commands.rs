@@ -144,6 +144,16 @@ struct LinkInput {
     roots: Vec<String>,
     #[serde(default)]
     ipv4_only: bool,
+    /// ★ M7：选择性同步规则（GUI 暂不编辑；保存时**保留已有值**，不能被 GUI 抹掉）
+    #[serde(default)]
+    exclude: Vec<String>,
+    #[serde(default)]
+    filter_temp: Option<bool>,
+    /// ★ M7：LAN 对等监听/身份（同上，GUI 暂不编辑）
+    #[serde(default)]
+    peer_listen: Option<String>,
+    #[serde(default)]
+    peer_name: Option<String>,
     #[serde(default)]
     password: Option<String>,
 }
@@ -179,7 +189,33 @@ impl LinkInput {
                 qxync_core::normalize_roots(&self.roots)
             },
             ipv4_only: self.ipv4_only,
+            // 前端没给就先用默认；真正保存时由 `link_with_existing` 用已有值补齐
+            exclude: self.exclude.clone(),
+            filter_temp: self.filter_temp.unwrap_or(true),
+            peer_listen: self.peer_listen.clone(),
+            peer_name: self.peer_name.clone(),
         }
+    }
+
+    /// 保存前把 GUI 不编辑的 M7 字段（exclude / filter_temp / peer_*）从已有配置里带过来，
+    /// 避免「GUI 保存一次就把规则清空」。
+    fn link_with_existing(&self, paths: &ConfigPaths) -> LinkConfig {
+        let mut link = self.link();
+        if let Ok(old) = LinkConfig::load(paths, &link.id) {
+            if self.exclude.is_empty() {
+                link.exclude = old.exclude;
+            }
+            if self.filter_temp.is_none() {
+                link.filter_temp = old.filter_temp;
+            }
+            if self.peer_listen.is_none() {
+                link.peer_listen = old.peer_listen;
+            }
+            if self.peer_name.is_none() {
+                link.peer_name = old.peer_name;
+            }
+        }
+        link
     }
 }
 
@@ -351,8 +387,8 @@ pub async fn login_flow(input: Value) -> Result<Value, String> {
         .password
         .clone()
         .ok_or_else(|| "缺少 password".to_string())?;
-    let link = li.link();
     let p = paths()?;
+    let link = li.link_with_existing(&p);
     p.ensure_dirs().map_err(|e| e.to_string())?;
     let link_path = link.save(&p).map_err(|e| e.to_string())?;
     let cred_path = Credentials {
@@ -478,6 +514,10 @@ mod tests {
             home_root: "/home".into(),
             roots: Vec::new(),
             ipv4_only: false,
+            exclude: Vec::new(),
+            filter_temp: true,
+            peer_listen: None,
+            peer_name: None,
         };
         assert!(same_link(&info, &link));
         link.user = "other".into();

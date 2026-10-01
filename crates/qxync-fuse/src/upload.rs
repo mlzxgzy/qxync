@@ -559,6 +559,10 @@ mod tests {
             home_root: "/home".into(),
             roots: Vec::new(),
             ipv4_only: false,
+            exclude: Vec::new(),
+            filter_temp: true,
+            peer_listen: None,
+            peer_name: None,
         }
     }
 

@@ -24,12 +24,15 @@ pub mod upload;
 // 脱水需要 daemon 持有 fuser 的会话/通知句柄；这里转出，避免 daemon 直接依赖 fuser。
 pub use fuser::{BackgroundSession, Notifier};
 
+use qxync_client::peer::{self, ContentSource, PeerConfig, PeerHead};
 use qxync_client::Client;
 use qxync_core::dehydrate::{Block, Candidate, Policy};
 use qxync_core::roots::RootSpec;
+use qxync_core::rules::{HideReason, Rules};
 use qxync_core::DirEntry;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -225,6 +228,10 @@ pub struct FsHandle {
     /// ★ M3：pin 状态（脱水拦截条件）。
     pins: PinMap,
     cache_mode: CacheMode,
+    /// ★ M7：选择性同步规则（脱水候选必须再过滤一遍：排除路径**永不**脱水）。
+    rules: Arc<Rules>,
+    /// ★ M7：LAN 直传统计（daemon `peer status` 汇总展示）。
+    lan_stats: Arc<LanStats>,
 }
 
 /// 缓存占用统计（`status` / 限额判定用）。
@@ -270,16 +277,37 @@ impl FsHandle {
     }
 
     /// 导出所有可脱水候选（fuse 侧事实，策略判定在 `qxync_core::dehydrate`）。
+    ///
+    /// ★ M7：被 `exclude` 隐藏的路径**永不**进入候选 —— 排除语义是「本地没有副本」，
+    /// 把它的本地内容当缓存清掉会让用户以为自己留着的文件凭空消失。
     pub fn dehydrate_candidates(&self) -> Vec<Candidate> {
         let g = self.inner.lock().unwrap();
         g.nodes
             .values()
             .filter(|n| n.attr.kind == FileType::RegularFile)
+            .filter(|n| self.rules.hides_in_roots(&self.roots, &n.remote, false).is_none())
             .map(|n| self.candidate_of(&g, n, true))
             .collect()
     }
 
+    /// ★ M7：规则是否让这条远端路径不可见（挂载点里不存在）。
+    pub fn hidden(&self, remote: &str, is_dir: bool) -> Option<HideReason> {
+        self.rules.hides_in_roots(&self.roots, remote, is_dir)
+    }
+
+    pub fn rules(&self) -> Arc<Rules> {
+        self.rules.clone()
+    }
+
+    /// ★ M7：LAN 直传统计（(尝试, 命中, 字节, 元数据不符)）。
+    pub fn lan_stats(&self) -> Arc<LanStats> {
+        self.lan_stats.clone()
+    }
+
     pub fn candidate(&self, remote: &str) -> Option<Candidate> {
+        if self.hidden(remote, false).is_some() {
+            return None;
+        }
         self.candidate_locked(remote, true)
     }
 
@@ -433,6 +461,73 @@ impl FsHandle {
         }
         tracing::info!("已脱水 {remote}（释放 {freed} 字节，先 inval_inode 再清内容）");
         DehydrateOutcome::Freed(freed)
+    }
+}
+
+/// ★ M7：挂载视图同时是 LAN 对等端的**内容源**。
+///
+/// 只服务「完整水合 + 未脏 + 无待上传 + 不在排除规则里」的文件：
+/// 部分水合的稀疏文件里那些 0 不是数据（铁则 1 的 LAN 版），脏文件的内容还没推回 NAS，
+/// 给出去会让对端拿到一份 NAS 上不存在的版本。
+impl ContentSource for FsHandle {
+    fn head(&self, path: &str) -> Option<PeerHead> {
+        let g = self.inner.lock().unwrap();
+        let ino = *g.by_remote.get(path)?;
+        let n = g.nodes.get(&ino)?;
+        if n.attr.kind != FileType::RegularFile {
+            return None; // 目录不通过 LAN 传
+        }
+        if n.dirty || !n.is_fully_hydrated() {
+            return None;
+        }
+        if self
+            .upload
+            .as_ref()
+            .map(|q| q.has_pending(path))
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        if self.rules.hides_in_roots(&self.roots, path, false).is_some() {
+            return None; // 被选择性同步排除的内容不对外服务
+        }
+        Some(PeerHead {
+            exists: true,
+            hydrated: true,
+            size: n.attr.size,
+            mtime: epoch_secs(n.attr.mtime),
+        })
+    }
+
+    fn read_at(&self, path: &str, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        let (cache, size) = {
+            let g = self.inner.lock().unwrap();
+            let ino = *g
+                .by_remote
+                .get(path)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "没有这个节点"))?;
+            let n = g
+                .nodes
+                .get(&ino)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "没有这个节点"))?;
+            (
+                n.cache
+                    .clone()
+                    .ok_or_else(|| io::Error::other("没有缓存文件（未水合）"))?,
+                n.attr.size,
+            )
+        };
+        if offset.saturating_add(len as u64) > size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("区间越界: {offset}+{len} > {size}"),
+            ));
+        }
+        read_exact_at(&cache, offset, len).map_err(|e| io::Error::other(format!("{e:?}")))
+    }
+
+    fn roots(&self) -> Vec<String> {
+        self.roots.clone()
     }
 }
 
@@ -827,6 +922,36 @@ pub struct QxyncFs {
     delete_guard: Arc<DeleteGuard>,
     /// ★ M3：缓存模式（pagecache / direct）。
     cache_mode: CacheMode,
+    /// ★ M7：选择性同步 / 临时文件过滤规则（挂载点里不可见的直接不出现）。
+    rules: Arc<Rules>,
+    /// ★ M7：已配对的对等设备（daemon 持有并热更新；水合时先试 LAN）。
+    lan_peers: Arc<Mutex<Vec<PeerConfig>>>,
+    /// ★ M7：LAN 直传统计（命中区间数 / 字节 / 尝试次数）。
+    lan_stats: Arc<LanStats>,
+}
+
+/// ★ M7：LAN 快路径计数（`status` 里能看到省了多少次 NAS 请求）。
+#[derive(Debug, Default)]
+pub struct LanStats {
+    /// 试过 LAN 的次数（有 peer 时每次水合区间 +1）。
+    pub attempts: AtomicU64,
+    /// 命中次数（区间数）。
+    pub hits: AtomicU64,
+    /// 从 LAN 拿到的字节数。
+    pub bytes: AtomicU64,
+    /// 对端元数据不一致 / 没水合而跳过的次数。
+    pub mismatches: AtomicU64,
+}
+
+impl LanStats {
+    pub fn snapshot(&self) -> (u64, u64, u64, u64) {
+        (
+            self.attempts.load(Ordering::Relaxed),
+            self.hits.load(Ordering::Relaxed),
+            self.bytes.load(Ordering::Relaxed),
+            self.mismatches.load(Ordering::Relaxed),
+        )
+    }
 }
 
 impl QxyncFs {
@@ -907,6 +1032,9 @@ impl QxyncFs {
             })),
             delete_guard: DeleteGuard::new(DEFAULT_DELETE_LIMIT, DEFAULT_DELETE_WINDOW),
             cache_mode: CacheMode::PageCache,
+            rules: Arc::new(Rules::temp_only(true)),
+            lan_peers: Arc::new(Mutex::new(Vec::new())),
+            lan_stats: Arc::new(LanStats::default()),
         })
     }
 
@@ -1026,6 +1154,9 @@ impl QxyncFs {
             })),
             delete_guard: DeleteGuard::new(DEFAULT_DELETE_LIMIT, DEFAULT_DELETE_WINDOW),
             cache_mode: CacheMode::PageCache,
+            rules: Arc::new(Rules::temp_only(true)),
+            lan_peers: Arc::new(Mutex::new(Vec::new())),
+            lan_stats: Arc::new(LanStats::default()),
         })
     }
 
@@ -1097,6 +1228,76 @@ impl QxyncFs {
             read_only: self.read_only,
             pins: self.pins.clone(),
             cache_mode: self.cache_mode,
+            rules: self.rules.clone(),
+            lan_stats: self.lan_stats.clone(),
+        }
+    }
+
+    /// ★ M7：选择性同步规则（`link.exclude` + 临时文件过滤）。
+    pub fn with_rules(mut self, rules: Arc<Rules>) -> Self {
+        self.rules = rules;
+        self
+    }
+
+    pub fn rules(&self) -> Arc<Rules> {
+        self.rules.clone()
+    }
+
+    /// ★ M7：LAN 直传统计（(尝试, 命中, 字节, 元数据不符)）。
+    pub fn lan_stats(&self) -> Arc<LanStats> {
+        self.lan_stats.clone()
+    }
+
+    /// ★ M7：已配对的对等设备（daemon 持有 `Arc<Mutex<..>>`，配对成功后热更新）。
+    pub fn with_peers(mut self, peers: Arc<Mutex<Vec<PeerConfig>>>) -> Self {
+        self.lan_peers = peers;
+        self
+    }
+
+    /// ★ M7：一次区间水合先试 LAN。返回 `None` = 没有可用对端（调用方走 NAS）。
+    ///
+    /// 判据（与 `peer::fetch_range` 一致）：对端 `head` 必须 `exists && hydrated`，
+    /// 且 `size`/`mtime` 与本节点从 NAS `stat` 拿到的签名一致 —— 只有「同一份内容」才敢用。
+    fn lan_fetch_chunk(
+        &self,
+        remote: &str,
+        offset: u64,
+        len: u64,
+        expect_size: u64,
+        expect_mtime: i64,
+    ) -> Option<Vec<u8>> {
+        if len == 0 {
+            return None;
+        }
+        let peers = {
+            let g = self.lan_peers.lock().unwrap();
+            if g.is_empty() {
+                return None;
+            }
+            g.clone()
+        };
+        self.lan_stats.attempts.fetch_add(1, Ordering::Relaxed);
+        let hit = self
+            .rt
+            .block_on(peer::fetch_range(&peers, remote, offset, len, expect_size, expect_mtime));
+        match hit {
+            Some(h) => {
+                self.lan_stats.hits.fetch_add(1, Ordering::Relaxed);
+                self.lan_stats
+                    .bytes
+                    .fetch_add(h.data.len() as u64, Ordering::Relaxed);
+                tracing::info!(
+                    "LAN 直传命中: {remote} [{offset}..{}) ← {} ({:?})",
+                    offset + len,
+                    h.peer,
+                    h.took
+                );
+                Some(h.data)
+            }
+            None => {
+                self.lan_stats.mismatches.fetch_add(1, Ordering::Relaxed);
+                None
+            }
         }
     }
 
@@ -1177,6 +1378,19 @@ impl QxyncFs {
             .join(format!("{:016x}_{}", fnv1a64(remote.as_bytes()), safe))
     }
 
+    /// ★ M7：规则判定 —— 被排除 / 是临时文件的路径在挂载点里**根本不存在**。
+    ///
+    /// 多根虚拟根（`remote == ""`）与合成目录不参与判定（它们是挂载视图本身）。
+    fn hide_reason(&self, remote: &str, is_dir: bool) -> Option<HideReason> {
+        if remote.is_empty() {
+            return None;
+        }
+        if self.multi_root && self.roots.iter().any(|r| r.remote == remote) {
+            return None; // 根目录本身是视图的一部分
+        }
+        self.rules.hides_in_roots(&self.remote_roots(), remote, is_dir)
+    }
+
     /// 在目录里查一个名字（不水合）。返回节点克隆。
     fn lookup_child(&self, parent: INodeNo, name: &str) -> Result<Node, fuser::Errno> {
         // ★ M6：虚拟根不映射任何远端路径 —— 只在节点表里找合成目录，
@@ -1199,6 +1413,10 @@ impl QxyncFs {
                 .clone()
         };
         let remote = self.join_remote(&parent_remote, name);
+        // ★ M7：名字规则能在 stat 之前判掉一部分（临时文件/无斜杠规则），先省一次 NAS 往返。
+        if self.hide_reason(&remote, false).is_some() {
+            return Err(fuser::Errno::ENOENT);
+        }
 
         if let Some(node) = self.node_by_remote(&remote) {
             return Ok(node);
@@ -1211,6 +1429,10 @@ impl QxyncFs {
                 return Err(fuser::Errno::ENOENT);
             }
         };
+        // 目录限定规则（`/cache/`）要拿到实际类型才能判
+        if self.hide_reason(&remote, entry.isfolder).is_some() {
+            return Err(fuser::Errno::ENOENT);
+        }
         Ok(self.insert_node(parent, name, &remote, &entry))
     }
 
@@ -1275,12 +1497,32 @@ impl QxyncFs {
                 return Err(fuser::Errno::EIO);
             }
         };
-        let mut out = Vec::with_capacity(entries.len());
-        for e in entries.iter().take(LIST_LIMIT) {
-            let child_remote = self.join_remote(&remote, &e.filename);
-            out.push(self.insert_node(ino, &e.filename, &child_remote, e));
+        let visible = self.filter_visible(&remote, &entries);
+        let hidden = entries.len().saturating_sub(visible.len());
+        let mut out = Vec::with_capacity(visible.len());
+        for (child_remote, e) in visible {
+            out.push(self.insert_node(ino, &e.filename, &child_remote, &e));
+        }
+        if hidden > 0 {
+            // ★ M7：排除 / 临时文件不进节点表 —— 挂载点里根本看不到它们。
+            tracing::debug!("readdir {remote}: 规则隐藏了 {hidden} 项");
         }
         Ok(out)
+    }
+
+    /// ★ M7：readdir 的过滤闸门（抽出来是为了**不挂 FUSE 也能单测**）。
+    ///
+    /// 返回 `(远端路径, 条目)`，被 `exclude` / 临时文件规则命中的直接丢掉。
+    fn filter_visible(&self, dir_remote: &str, entries: &[DirEntry]) -> Vec<(String, DirEntry)> {
+        let mut out = Vec::with_capacity(entries.len());
+        for e in entries.iter().take(LIST_LIMIT) {
+            let child_remote = self.join_remote(dir_remote, &e.filename);
+            if self.hide_reason(&child_remote, e.isfolder).is_some() {
+                continue;
+            }
+            out.push((child_remote, e.clone()));
+        }
+        out
     }
 
     /// 远端路径的目录部分。
@@ -1333,6 +1575,18 @@ impl QxyncFs {
     /// ★ **read-modify-write 的前提**：写一个还没取全的占位符文件时，未取回的区间在本地是 0，
     /// 直接写+整文件上传会把远端内容清零。所以写之前必须补齐（`skip` 可用于跳过将被整块覆盖的区间）。
     fn hydrate_all(&self, ino: INodeNo, skip: Option<(u64, u64)>) -> Result<(), fuser::Errno> {
+        // ★ M7：兜底防御 —— 排除/临时文件不该走到水合（lookup 已经 ENOENT 了）。
+        //   万一有 ino 漏进来，宁可 EACCES 也绝不去 NAS 拉内容（选择性同步的语义）。
+        let guard_remote = {
+            let g = self.inner.lock().unwrap();
+            g.nodes.get(&ino).map(|n| n.remote.clone())
+        };
+        if let Some(remote) = guard_remote {
+            if self.hide_reason(&remote, false).is_some() {
+                tracing::debug!("拒绝水合被规则隐藏的路径: {remote}");
+                return Err(fuser::Errno::EACCES);
+            }
+        }
         let (total, chunk_size, local_authoritative) = {
             let g = self.inner.lock().unwrap();
             let n = g.nodes.get(&ino).ok_or(fuser::Errno::ENOENT)?;
@@ -1607,7 +1861,7 @@ impl QxyncFs {
             return Ok(());
         }
 
-        let (remote, total, name, dest) = {
+        let (remote, total, name, dest, mtime) = {
             let g = self.inner.lock().unwrap();
             let n = g.nodes.get(&ino).ok_or(fuser::Errno::ENOENT)?;
             (
@@ -1615,8 +1869,14 @@ impl QxyncFs {
                 n.attr.size,
                 n.name.clone(),
                 n.cache.clone().ok_or(fuser::Errno::EIO)?,
+                Self::epoch_of(n.attr.mtime),
             )
         };
+        // ★ M7：规则兜底（lookup 已经挡住了，这里是纵深防御）
+        if self.hide_reason(&remote, false).is_some() {
+            self.inner.lock().unwrap().inflight_chunks.remove(&key);
+            return Err(fuser::Errno::EACCES);
+        }
         let dir = remote
             .rsplit_once('/')
             .map(|(d, _)| d.to_string())
@@ -1626,25 +1886,35 @@ impl QxyncFs {
         let end = (start + self.chunk_size).min(total) - 1; // 闭区间，末块按文件尾截断
         let want = end - start + 1;
 
-        let client = self.client.clone();
-        let (d2, n2) = (dir.clone(), name.clone());
-        let timeout = self.hydrate_timeout;
-        let res = self.rt.block_on(async move {
-            tokio::time::timeout(timeout, client.download_range(&d2, &n2, start, end)).await
-        });
+        // ★ M7：LAN 快路径 —— 先问已配对的对端有没有这份内容（元数据必须与 NAS 签名一致）。
+        //   命中就完全跳过 NAS；没命中/对端不靠谱（长度不符）就走下面的 NAS 老路。
+        let data = match self.lan_fetch_chunk(&remote, start, want, total, mtime) {
+            Some(d) => {
+                tracing::debug!("LAN 直传命中: {remote} [{start}..={start}+{want})");
+                d
+            }
+            None => {
+                let client = self.client.clone();
+                let (d2, n2) = (dir.clone(), name.clone());
+                let timeout = self.hydrate_timeout;
+                let res = self.rt.block_on(async move {
+                    tokio::time::timeout(timeout, client.download_range(&d2, &n2, start, end)).await
+                });
 
-        let data = match res {
-            Err(_) => {
-                tracing::warn!("区间水合超时({timeout:?}): {remote} [{start}..={end}]");
-                self.inner.lock().unwrap().inflight_chunks.remove(&key);
-                return Err(fuser::Errno::EIO);
+                match res {
+                    Err(_) => {
+                        tracing::warn!("区间水合超时({timeout:?}): {remote} [{start}..={end}]");
+                        self.inner.lock().unwrap().inflight_chunks.remove(&key);
+                        return Err(fuser::Errno::EIO);
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!("区间水合失败: {remote} [{start}..={end}]: {e}");
+                        self.inner.lock().unwrap().inflight_chunks.remove(&key);
+                        return Err(fuser::Errno::EIO);
+                    }
+                    Ok(Ok(d)) => d,
+                }
             }
-            Ok(Err(e)) => {
-                tracing::warn!("区间水合失败: {remote} [{start}..={end}]: {e}");
-                self.inner.lock().unwrap().inflight_chunks.remove(&key);
-                return Err(fuser::Errno::EIO);
-            }
-            Ok(Ok(d)) => d,
         };
 
         // ★ 长度校验：区间字节数必须与请求一致，否则不写进缓存（铁则 1 的源头把关）
@@ -2647,6 +2917,10 @@ mod tests {
             home_root: "/home".into(),
             roots: Vec::new(),
             ipv4_only: false,
+            exclude: Vec::new(),
+            filter_temp: true,
+            peer_listen: None,
+            peer_name: None,
         }
     }
 
@@ -2660,9 +2934,232 @@ mod tests {
         }
     }
 
+    fn m7_rules(exclude: &[&str], filter_temp: bool) -> Arc<Rules> {
+        Arc::new(
+            Rules::parse(
+                &exclude.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                filter_temp,
+            )
+            .rules,
+        )
+    }
+
+    fn m7_tmpdir(tag: &str) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "qxync-fuse-m7-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// ★ M7：排除/临时文件在挂载点里**不存在**（lookup 判定 + readdir 过滤）。
     #[test]
-    fn delete_guard_trips_and_resets() {
-        let g = DeleteGuard::new(3, Duration::from_secs(60));
+    fn m7_rules_hide_lookup_and_readdir() {
+        let dir = m7_tmpdir("hide");
+        let fs = test_fs(&dir, false).with_rules(m7_rules(&["/secret", "*.crdownload"], true));
+
+        assert_eq!(
+            fs.hide_reason("/home/secret", true),
+            Some(HideReason::Excluded)
+        );
+        assert_eq!(
+            fs.hide_reason("/home/secret/deep/file.txt", false),
+            Some(HideReason::Excluded),
+            "祖先目录被排除 → 后代一起隐藏"
+        );
+        assert_eq!(
+            fs.hide_reason("/home/qxync-test/a.crdownload", false),
+            Some(HideReason::Temp)
+        );
+        assert_eq!(fs.hide_reason("/home/qxync-test/hello.txt", false), None);
+
+        // readdir 闸门：只留下正常文件
+        let entries = vec![
+            DirEntry::local("secret", true, 0, 1),
+            DirEntry::local("hello.txt", false, 5, 2),
+            DirEntry::local("dl.crdownload", false, 9, 3),
+        ];
+        let visible = fs.filter_visible("/home", &entries);
+        let names: Vec<&str> = visible.iter().map(|(_, e)| e.filename.as_str()).collect();
+        assert_eq!(names, vec!["hello.txt"]);
+
+        // 单根默认（只有临时过滤）= M1–M6 行为：普通名字一个不少
+        let plain = test_fs(&dir.join("plain"), false);
+        assert!(plain.hide_reason("/home/secret", true).is_none());
+        assert_eq!(plain.hide_reason("/home/a.crdownload", false), Some(HideReason::Temp));
+        let off = test_fs(&dir.join("off"), false).with_rules(m7_rules(&[], false));
+        assert!(off.hide_reason("/home/a.crdownload", false).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M7：多根时每个根目录本身是「挂载视图」，绝不能被规则隐藏。
+    #[test]
+    fn m7_rules_never_hide_mount_roots() {
+        let dir = m7_tmpdir("roots");
+        let client = Arc::new(Client::new(&test_link()).unwrap());
+        let fs = QxyncFs::new_multi(
+            client,
+            vec![
+                RootSpec {
+                    remote: "/home".into(),
+                    view_name: "home".into(),
+                    writable: true,
+                },
+                RootSpec {
+                    remote: "/Public".into(),
+                    view_name: "Public".into(),
+                    writable: false,
+                },
+            ],
+            &dir,
+        )
+        .unwrap()
+        .with_rules(m7_rules(&["/tailscale.txt"], true));
+
+        assert_eq!(fs.hide_reason("/Public", true), None, "根本身不能被隐藏");
+        assert_eq!(fs.hide_reason("/home", true), None, "根本身不能被隐藏");
+        // 规则是**根相对**的：同一条规则对每个根都生效（文档 §1.2 的已知取舍）
+        assert_eq!(
+            fs.hide_reason("/Public/tailscale.txt", false),
+            Some(HideReason::Excluded),
+            "根里面的内容照常按规则隐藏"
+        );
+        assert_eq!(
+            fs.hide_reason("/home/tailscale.txt", false),
+            Some(HideReason::Excluded)
+        );
+        assert_eq!(fs.hide_reason("/home/a.txt", false), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M7：排除路径**永不**进入脱水候选（防止把用户以为还在的本地副本清掉）。
+    #[test]
+    fn m7_rules_never_dehydrate_excluded() {
+        let dir = m7_tmpdir("dehydrate");
+        let fs = test_fs(&dir, false).with_rules(m7_rules(&["/secret"], true));
+        let h = fs.handle();
+        let keep = DirEntry::local("keep.bin", false, 4096, 10);
+        let secret = DirEntry::local("secret.bin", false, 4096, 11);
+        fs.insert_node(INodeNo::ROOT, "keep.bin", "/home/keep.bin", &keep);
+        fs.insert_node(INodeNo::ROOT, "secret.bin", "/home/secret.bin", &secret);
+        let hidden_dir = DirEntry::local("secret", true, 0, 12);
+        let dnode = fs.insert_node(INodeNo::ROOT, "secret", "/home/secret", &hidden_dir);
+        let inside = DirEntry::local("x.bin", false, 4096, 13);
+        fs.insert_node(dnode.ino, "x.bin", "/home/secret/x.bin", &inside);
+
+        let paths: Vec<String> = h.dehydrate_candidates().into_iter().map(|c| c.remote).collect();
+        assert!(paths.contains(&"/home/keep.bin".to_string()));
+        assert!(
+            !paths.iter().any(|p| p.starts_with("/home/secret/")),
+            "被排除子树里的文件绝不进脱水候选: {paths:?}"
+        );
+        assert!(h.candidate("/home/secret/x.bin").is_none());
+        assert!(h.candidate("/home/keep.bin").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M7：`ensure_chunk` 先走 LAN；元数据一致就命中，不一致/没对端就回落 NAS。
+    #[test]
+    fn m7_lan_hydration_fast_path_and_fallback() {
+        use qxync_client::peer::{serve, ContentSource, DirContent, PeerServer};
+
+        // 对端内容源（独立线程里的 runtime；QxyncFs 自己 block_on，不能在 async 上下文里跑）
+        let src_dir = m7_tmpdir("lan-src");
+        std::fs::create_dir_all(src_dir.join("qxync-test")).unwrap();
+        let payload = vec![0xABu8; 4096];
+        let file = src_dir.join("qxync-test/big.bin");
+        std::fs::write(&file, &payload).unwrap();
+        let mtime = std::fs::metadata(&file)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel::<String>();
+        let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (reg_tx, _reg_rx) = tokio::sync::mpsc::unbounded_channel();
+        let source: Arc<dyn ContentSource> = Arc::new(DirContent::new(vec![(
+            "/home".to_string(),
+            src_dir.clone(),
+        )]));
+        let server = Arc::new(PeerServer::new(
+            "srv",
+            "0.0.0-test",
+            None,
+            vec!["/home".into()],
+            source,
+            ev_tx,
+            reg_tx,
+        ));
+        server.add_token("self", "tok");
+        let server2 = server.clone();
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            let listener = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            addr_tx.send(addr).unwrap();
+            rt.spawn(async move { serve(listener, server2).await });
+            rt.block_on(async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            });
+        });
+        let addr = addr_rx.recv().unwrap();
+
+        let peers = Arc::new(Mutex::new(vec![PeerConfig {
+            name: "srv".into(),
+            addr: addr.clone(),
+            token: "tok".into(),
+        }]));
+        let cache = m7_tmpdir("lan-cache");
+        let fs = test_fs(&cache, false).with_peers(peers.clone());
+        let entry = DirEntry::local("big.bin", false, payload.len() as u64, mtime);
+        let node = fs.insert_node(INodeNo::ROOT, "big.bin", "/home/qxync-test/big.bin", &entry);
+        fs.cache_file_for(node.ino).unwrap();
+
+        fs.ensure_chunk(node.ino, 0).expect("LAN 命中时应该成功");
+        assert_eq!(fs.node_state_for_test(node.ino), "hydrated");
+        let (attempts, hits, bytes, _mism) = fs.lan_stats().snapshot();
+        assert_eq!(attempts, 1);
+        assert_eq!(hits, 1, "必须走 LAN 命中");
+        assert_eq!(bytes, payload.len() as u64);
+        let got = std::fs::read(fs.cache_file_for(node.ino).unwrap()).unwrap();
+        assert_eq!(got, payload, "LAN 传回来的字节必须与源一致");
+
+        // 元数据对不上（对端那份不是 NAS 上那一版）→ 不命中，回落 NAS（nas.invalid → EIO）
+        let bad_peers = Arc::new(Mutex::new(vec![PeerConfig {
+            name: "srv".into(),
+            addr,
+            token: "tok".into(),
+        }]));
+        let cache2 = m7_tmpdir("lan-cache2");
+        let fs2 = test_fs(&cache2, false).with_peers(bad_peers);
+        let entry2 = DirEntry::local("big.bin", false, payload.len() as u64, mtime + 42);
+        let node2 = fs2.insert_node(INodeNo::ROOT, "big.bin", "/home/qxync-test/big.bin", &entry2);
+        fs2.cache_file_for(node2.ino).unwrap();
+        assert!(fs2.ensure_chunk(node2.ino, 0).is_err(), "元数据不符必须回落 NAS");
+        let (a2, h2, _, m2) = fs2.lan_stats().snapshot();
+        assert_eq!(a2, 1);
+        assert_eq!(h2, 0);
+        assert_eq!(m2, 1);
+
+        let _ = &handle;
+        let _ = std::fs::remove_dir_all(&src_dir);
+        let _ = std::fs::remove_dir_all(&cache);
+        let _ = std::fs::remove_dir_all(&cache2);
+    }
+
+    #[test]
+    fn delete_guard_trips_and_resets() {        let g = DeleteGuard::new(3, Duration::from_secs(60));
         assert!(g.allow());
         assert!(g.allow());
         assert!(g.allow());

@@ -1,6 +1,6 @@
 [package]
 name = "qxync-client"
-description = "NAS HTTP API 封装（登录 / 元数据 / 上传下载），只依赖 qxync-core"
+description = "NAS HTTP API 封装（登录 / 元数据 / 上传下载）+ M7 LAN 对等协议"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,6 +14,7 @@ tokio.workspace = true
 futures-util.workspace = true
 base64 = "0.22"
 thiserror.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

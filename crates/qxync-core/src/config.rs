@@ -49,6 +49,12 @@ impl ConfigPaths {
     pub fn credentials_file(&self) -> PathBuf {
         self.config_dir.join("credentials.json")
     }
+    /// ★ M7：LAN 对等设备（含 token，0600）—— 与 link 分开存，避免把密钥混进可分享的 link JSON。
+    pub fn peers_file(&self, link_id: &str) -> PathBuf {
+        self.config_dir
+            .join("links")
+            .join(format!("{link_id}.peers.json"))
+    }
     pub fn db_file(&self) -> PathBuf {
         self.data_dir.join("sync.db")
     }
@@ -106,6 +112,21 @@ pub struct LinkConfig {
     /// （实测遇到过：`Network is unreachable` / 传输中途 body 解码失败）。
     #[serde(default)]
     pub ipv4_only: bool,
+    /// ★ M7：选择性同步 —— 排除规则（gitignore 风味，见 [`crate::rules`]）。
+    /// 空 = 全部同步（M1–M6 行为一字不改）。
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    /// ★ M7：内置临时文件过滤（`*.crdownload` / `~$*` / `.goutputstream-*` / `.upload_cache*`
+    /// / `*.qsync-part`）。默认开：这些文件同步出去只会给对端制造垃圾。
+    #[serde(default = "yes")]
+    pub filter_temp: bool,
+    /// ★ M7：LAN 对等监听地址（`"127.0.0.1:9840"` / `"0.0.0.0:9840"`）。
+    /// **缺省不监听**（LAN 服务默认关闭，要显式打开）。
+    #[serde(default)]
+    pub peer_listen: Option<String>,
+    /// ★ M7：对等身份名（缺省用主机名）。
+    #[serde(default)]
+    pub peer_name: Option<String>,
 }
 
 fn yes() -> bool {
@@ -130,6 +151,11 @@ impl LinkConfig {
         }
     }
 
+    /// ★ M7：编译好的选择性同步规则（坏规则由调用方打日志，不静默）。
+    pub fn rules(&self) -> crate::rules::RuleParse {
+        crate::rules::Rules::parse(&self.exclude, self.filter_temp)
+    }
+
     pub fn load(paths: &ConfigPaths, link_id: &str) -> Result<Self> {
         let p = paths.link_file(link_id);
         let raw = std::fs::read(&p).map_err(|e| Error::Io(format!("读取 {}: {e}", p.display())))?;
@@ -141,6 +167,72 @@ impl LinkConfig {
         let body = serde_json::to_vec_pretty(self)?;
         std::fs::write(&p, body)?;
         Ok(p)
+    }
+}
+
+/// ★ M7：一台已配对的对等设备（qxync ↔ qxync 的 LAN 直连）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerConfig {
+    /// 对端自称的名字（`peer_name`，缺省 = 主机名）。
+    pub name: String,
+    /// `host:port`。
+    pub addr: String,
+    /// 配对时交换的共享令牌（明文 TCP 的唯一凭据）。
+    pub token: String,
+}
+
+/// ★ M7：对等设备登记表（`links/<id>.peers.json`，0600）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerRegistry {
+    #[serde(default)]
+    pub peers: Vec<PeerConfig>,
+}
+
+impl PeerRegistry {
+    pub fn load(paths: &ConfigPaths, link_id: &str) -> Result<Self> {
+        let p = paths.peers_file(link_id);
+        if !p.exists() {
+            return Ok(Self::default());
+        }
+        let raw =
+            std::fs::read(&p).map_err(|e| Error::Io(format!("读取 {}: {e}", p.display())))?;
+        serde_json::from_slice(&raw).map_err(|e| Error::Parse(format!("解析 {}: {e}", p.display())))
+    }
+
+    /// 写 0600：临时文件 + rename（和凭据一样的写法，不出现半截文件）。
+    pub fn save(&self, paths: &ConfigPaths, link_id: &str) -> Result<PathBuf> {
+        paths.ensure_dirs()?;
+        let target = paths.peers_file(link_id);
+        let tmp = target.with_extension("json.tmp");
+        let body = serde_json::to_vec_pretty(self)?;
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::File::create(&tmp)?;
+            restrict_perms(&tmp, 0o600)?;
+            f.write_all(&body)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &target)?;
+        Ok(target)
+    }
+
+    pub fn get(&self, name_or_addr: &str) -> Option<&PeerConfig> {
+        self.peers
+            .iter()
+            .find(|p| p.name == name_or_addr || p.addr == name_or_addr)
+    }
+
+    /// 同名/同地址视为同一台设备 → 覆盖（重复配对不会长出一堆僵尸 peer）。
+    pub fn upsert(&mut self, peer: PeerConfig) {
+        if let Some(slot) = self
+            .peers
+            .iter_mut()
+            .find(|p| p.name == peer.name || p.addr == peer.addr)
+        {
+            *slot = peer;
+        } else {
+            self.peers.push(peer);
+        }
     }
 }
 
@@ -200,11 +292,18 @@ mod tests {
             home_root: "/home".into(),
             roots: vec![],
             ipv4_only: false,
+            exclude: vec!["/secret".into()],
+            filter_temp: true,
+            peer_listen: Some("127.0.0.1:9849".into()),
+            peer_name: Some("unit-test".into()),
         };
         link.save(&paths).unwrap();
         let back = LinkConfig::load(&paths, "default").unwrap();
         assert_eq!(back.base_url(), "https://nas.local:9834");
         assert_eq!(back.home_root, "/home");
+        assert!(back.rules().rules.is_excluded("/secret/a", true));
+        assert_eq!(back.peer_listen.as_deref(), Some("127.0.0.1:9849"));
+        assert_eq!(back.peer_name.as_deref(), Some("unit-test"));
 
         let cred = Credentials {
             host: "nas.local".into(),
@@ -219,6 +318,61 @@ mod tests {
             assert_eq!(mode, 0o600, "凭据文件必须是 0600");
         }
         assert_eq!(Credentials::load(&paths).unwrap().password, "p@ss");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// M7 兼容性：老的 link JSON 没有新字段也必须能读，且行为与 M1–M6 一致。
+    #[test]
+    fn m7_fields_default_for_old_config() {
+        let raw = br#"{"id":"old","host":"nas","port":9834,"https":true,"insecure":false,"user":"u","home_root":"/home"}"#;
+        let link: LinkConfig = serde_json::from_slice(raw).unwrap();
+        assert!(link.exclude.is_empty());
+        assert!(link.filter_temp, "临时文件过滤默认开");
+        assert!(link.peer_listen.is_none(), "LAN 监听默认关");
+        assert_eq!(link.roots(), vec!["/home".to_string()]);
+        let parsed = link.rules();
+        assert!(parsed.rules.is_empty());
+        assert!(parsed.bad.is_empty());
+    }
+
+    /// M7：对等设备登记表 —— 0600、可达、同名覆盖（不长僵尸 peer）。
+    #[test]
+    fn peer_registry_roundtrip_and_upsert() {
+        let dir = std::env::temp_dir().join(format!("qxync-peers-{}", std::process::id()));
+        let paths = ConfigPaths {
+            config_dir: dir.join("config"),
+            data_dir: dir.join("data"),
+            state_dir: dir.join("state"),
+        };
+        paths.ensure_dirs().unwrap();
+        let mut reg = PeerRegistry::default();
+        assert!(PeerRegistry::load(&paths, "default").unwrap().peers.is_empty());
+        reg.upsert(PeerConfig {
+            name: "laptop".into(),
+            addr: "127.0.0.1:9840".into(),
+            token: "t1".into(),
+        });
+        reg.upsert(PeerConfig {
+            name: "laptop".into(),
+            addr: "127.0.0.1:9841".into(),
+            token: "t2".into(),
+        });
+        reg.upsert(PeerConfig {
+            name: "desk".into(),
+            addr: "127.0.0.1:9840".into(),
+            token: "t3".into(),
+        });
+        assert_eq!(reg.peers.len(), 2, "同名/同地址都是同一台设备");
+        assert_eq!(reg.get("laptop").unwrap().token, "t2");
+        assert_eq!(reg.get("127.0.0.1:9840").unwrap().name, "desk");
+        let p = reg.save(&paths, "default").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "peers.json 必须 0600");
+        }
+        assert_eq!(PeerRegistry::load(&paths, "default").unwrap(), reg);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

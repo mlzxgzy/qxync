@@ -120,6 +120,36 @@ pub enum Request {
     Mounts,
     /// ★ M6：远端根一览（配置的 roots + NAS 上的同步文件夹 + 可读/可写判定）。
     Roots,
+    /// ★ M7：选择性同步规则（`exclude` 编译结果 + 可选单路径判定）。
+    Rules {
+        /// 给一条远端绝对路径，返回「会不会被隐藏 / 是哪条规则」。
+        #[serde(default)]
+        match_path: Option<String>,
+    },
+    /// ★ M7：LAN 对等设备（配对 / 探活 / 事件）。
+    ///
+    /// * `action="status"` → 监听地址、身份、配对码、已配对设备、计数；
+    /// * `action="list"`   → 已配对设备（token 掩码）；
+    /// * `action="pair"`   → 用 `addr` + `code` 配对（可选 `name`）；
+    /// * `action="ping"`   → 探活 `addr`（或已配对设备名）；
+    /// * `action="events"` → 最近收到的对端事件；
+    /// * `action="notify"` → 把 `path` 当成变更广播给所有对端（测试/脚本用）；
+    /// * `action="fetch"`  → 从对端 `addr`（或设备名）直传 `path` 到 `dest`（LAN 直连自检）。
+    Peer {
+        action: String,
+        #[serde(default)]
+        addr: Option<String>,
+        #[serde(default)]
+        code: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        dest: Option<PathBuf>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
     /// ★ M2c：变更发现（三游标轮询 + baseline 对账）。
     ///
     /// * `once=true`  → 立即跑一轮，返回 [`SyncInfo`]；
@@ -192,6 +222,8 @@ impl Request {
             Request::Umount { .. } => "umount",
             Request::Mounts => "mounts",
             Request::Roots => "roots",
+            Request::Rules { .. } => "rules",
+            Request::Peer { .. } => "peer",
             Request::Sync { .. } => "sync",
             Request::Store { .. } => "store",
             Request::Rm { .. } => "rm",
@@ -209,6 +241,7 @@ impl Request {
                 | Request::Mount { .. }
                 | Request::Sync { .. }
                 | Request::Dehydrate { .. }
+                | Request::Peer { .. }
         )
     }
 }
@@ -560,6 +593,106 @@ pub struct RootsData {
     pub note: Option<String>,
 }
 
+/// ★ M7：`rules` 请求的返回（`qsync rules [--json] [--match PATH]`）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RulesData {
+    /// 生效的远端根（多根时不止一个）。
+    pub roots: Vec<String>,
+    /// link 里配的原始 `exclude`。
+    pub exclude: Vec<String>,
+    /// 编译后的规则（按生效顺序，已去掉注释/空行）。
+    pub patterns: Vec<String>,
+    /// 解析不了的规则原文（不静默）。
+    pub bad: Vec<String>,
+    pub filter_temp: bool,
+    /// 内置临时文件规则（自检/文档用）。
+    pub temp_patterns: Vec<String>,
+    /// `--match` 的输入。
+    pub match_path: Option<String>,
+    /// 命中哪个根 + 根相对路径。
+    pub match_root: Option<String>,
+    pub match_rel: Option<String>,
+    /// 判定结果：true = 挂载点里看不到。
+    pub match_hidden: Option<bool>,
+    /// `excluded` / `temp` / `visible`。
+    pub match_reason: Option<String>,
+}
+
+/// ★ M7：一台已配对设备（token 只回掩码）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PeerDeviceInfo {
+    pub name: String,
+    pub addr: String,
+    /// 形如 `ab12…ef90`，**绝不回全量 token**。
+    pub token_masked: String,
+}
+
+/// ★ M7：`peer` 请求的通用返回（按 action 填不同字段）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PeerData {
+    pub action: String,
+    /// 是否配置了 `peer_listen`（LAN 服务开关）。
+    pub enabled: bool,
+    /// 实际绑定的地址（服务起来了才有值）。
+    pub listen: Option<String>,
+    /// 本机对等身份名。
+    pub identity: String,
+    pub roots: Vec<String>,
+    /// 当前配对码（`status` 才回；配对成功后轮换）。
+    pub pairing_code: Option<String>,
+    pub devices: Vec<PeerDeviceInfo>,
+    /// 累计：发出/收到的事件、被拒请求、LAN 命中区间与字节。
+    pub events_out: u64,
+    pub events_in: u64,
+    pub rejected: u64,
+    pub lan_hits: u64,
+    pub lan_bytes: u64,
+    /// `ping` 结果。
+    pub peer_name: Option<String>,
+    pub peer_version: Option<String>,
+    pub peer_roots: Vec<String>,
+    pub pairing_open: Option<bool>,
+    pub took_ms: Option<u64>,
+    /// `pair` 结果。
+    pub paired_name: Option<String>,
+    pub paired_addr: Option<String>,
+    pub paired_token_masked: Option<String>,
+    /// `events` 结果（倒序，最新在前）。
+    pub events: Vec<PeerEventInfo>,
+    /// `fetch` 结果。
+    pub fetch_bytes: Option<u64>,
+    pub fetch_from: Option<String>,
+    pub fetch_dest: Option<PathBuf>,
+    /// 一句话说明。
+    pub note: Option<String>,
+}
+
+/// ★ M7：一条对端事件（`peer events`）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PeerEventInfo {
+    pub path: String,
+    pub size: u64,
+    pub mtime: i64,
+    pub kind: String,
+    pub ts: u64,
+    /// 从哪台设备收到（我们记的是事件里带的路径来源；名字不可用时为空）。
+    pub from: Option<String>,
+}
+
+pub fn mask_token(token: &str) -> String {
+    let n = token.chars().count();
+    if n <= 8 {
+        return "****".to_string();
+    }
+    let head: String = token.chars().take(4).collect();
+    let tail: String = token.chars().skip(n - 4).collect();
+    format!("{head}…{tail}")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoginData {
     pub sid_masked: String,
@@ -755,6 +888,72 @@ mod tests {
         assert_eq!(d.home_root, "");
         let m: MountInfo = serde_json::from_str(r#"{"mountpoint":"/m","remote":"/home","readonly":true}"#).unwrap();
         assert!(m.roots.is_empty(), "老响应没有 roots 字段也要能解析");
+    }
+
+    #[test]
+    fn m7_rules_request_round_trip() {
+        let e = RequestEnvelope::new(Request::Rules {
+            match_path: Some("/home/qxync-test/secret".into()),
+        });
+        assert_eq!(e.req.method(), "rules");
+        assert!(!e.req.is_long_running());
+        let back: RequestEnvelope = decode_line(&encode_line(&e).unwrap()).unwrap();
+        match back.req {
+            Request::Rules { match_path } => {
+                assert_eq!(match_path.as_deref(), Some("/home/qxync-test/secret"))
+            }
+            other => panic!("解析成了 {other:?}"),
+        }
+        // 省略 match_path 也要能解析（CLI 只跑 `qsync rules`）
+        let e2: RequestEnvelope =
+            serde_json::from_str(r#"{"v":1,"method":"rules"}"#).unwrap();
+        assert_eq!(e2.req, Request::Rules { match_path: None });
+        // 响应缺字段 → 默认值
+        let d: RulesData = serde_json::from_str("{}").unwrap();
+        assert!(d.patterns.is_empty() && d.match_hidden.is_none() && !d.filter_temp);
+    }
+
+    #[test]
+    fn m7_peer_request_round_trip_and_token_mask() {
+        let e = RequestEnvelope::new(Request::Peer {
+            action: "pair".into(),
+            addr: Some("127.0.0.1:9840".into()),
+            code: Some("123456".into()),
+            name: Some("laptop".into()),
+            path: None,
+            dest: None,
+            limit: None,
+        });
+        assert_eq!(e.req.method(), "peer");
+        assert!(e.req.is_long_running(), "配对/直传可能慢，给长超时");
+        let back: RequestEnvelope = decode_line(&encode_line(&e).unwrap()).unwrap();
+        match back.req {
+            Request::Peer { action, addr, code, .. } => {
+                assert_eq!(action, "pair");
+                assert_eq!(addr.as_deref(), Some("127.0.0.1:9840"));
+                assert_eq!(code.as_deref(), Some("123456"));
+            }
+            other => panic!("解析成了 {other:?}"),
+        }
+        // status 只有 action
+        let e2: RequestEnvelope = serde_json::from_str(r#"{"v":1,"method":"peer","action":"status"}"#).unwrap();
+        assert_eq!(
+            e2.req,
+            Request::Peer {
+                action: "status".into(),
+                addr: None,
+                code: None,
+                name: None,
+                path: None,
+                dest: None,
+                limit: None,
+            }
+        );
+        let d: PeerData = serde_json::from_str("{}").unwrap();
+        assert!(d.devices.is_empty() && d.events.is_empty() && d.listen.is_none());
+        assert_eq!(mask_token("abcdefghijkl"), "abcd…ijkl");
+        assert_eq!(mask_token("short"), "****");
+        assert_eq!(mask_token(""), "****");
     }
 
     #[test]

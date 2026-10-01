@@ -20,6 +20,7 @@ use qxync_core::sync::{
     Cursors, Decision, DeleteProtection, LocalSig, Sig, DEFAULT_LOG_BATCH,
 };
 use qxync_core::{Error as CoreError, MaxLog};
+use qxync_core::rules::{HideReason, Rules};
 use qxync_fuse::upload::UploadQueue;
 use qxync_fuse::LocalView;
 use std::collections::{BTreeMap, BTreeSet};
@@ -37,6 +38,20 @@ pub struct MountView {
     /// 读写挂载的上传队列：冲突解决前必须让它停下来（在途上传会把远端重新改成"本地内容"）。
     pub upload: Option<Arc<UploadQueue>>,
     pub read_only: bool,
+    /// ★ M7：选择性同步规则（排除 / 临时文件）。默认「只有临时过滤」，向后兼容。
+    pub rules: Arc<Rules>,
+}
+
+impl MountView {
+    /// ★ M7：该路径是否被规则隐藏（对账/事件都要跳过）。
+    pub fn hidden(&self, remote: &str, is_dir: bool) -> Option<HideReason> {
+        // 卷的根目录本身是挂载视图，不参与规则判定（与 FUSE 层一致）。
+        if remote == self.remote_root {
+            return None;
+        }
+        let roots = self.view.remote_roots();
+        self.rules.hides_in_roots(&roots, remote, is_dir)
+    }
 }
 
 /// 引擎参数。
@@ -449,6 +464,11 @@ async fn apply_event(
         if path == view.remote_root {
             continue;
         }
+        // ★ M7：被选择性同步排除的路径连事件都不看（它不在挂载点里，也没有 baseline）
+        if view.hidden(&path, false).is_some() {
+            report.events_skipped += 1;
+            continue;
+        }
         let remote = match stat_path(client, &path).await {
             Ok(s) => s,
             Err(e) => {
@@ -494,12 +514,12 @@ async fn reconcile_view(
     // 要对账的目录：挂载视图里已知的目录 + baseline 里出现过的目录
     let mut dirs: BTreeSet<String> = BTreeSet::new();
     for d in view.view.known_dirs() {
-        if under_root(&d) && d != root {
+        if under_root(&d) && d != root && view.hidden(&d, true).is_none() {
             dirs.insert(d);
         }
     }
     for p in baseline.entries.keys() {
-        if under_root(p) && p != &root {
+        if under_root(p) && p != &root && view.hidden(p, true).is_none() {
             dirs.insert(parent_dir(p));
         }
     }
@@ -508,12 +528,12 @@ async fn reconcile_view(
     // 候选路径：本地节点 + baseline 条目
     let mut candidates: BTreeSet<String> = BTreeSet::new();
     for n in view.view.nodes() {
-        if under_root(&n.remote) && n.remote != root {
+        if under_root(&n.remote) && n.remote != root && view.hidden(&n.remote, n.is_dir).is_none() {
             candidates.insert(n.remote);
         }
     }
     for p in baseline.entries.keys() {
-        if under_root(p) && p != &root {
+        if under_root(p) && p != &root && view.hidden(p, false).is_none() {
             candidates.insert(p.clone());
         }
     }
@@ -526,7 +546,12 @@ async fn reconcile_view(
             Ok(entries) => {
                 scanned += 1;
                 for e in &entries {
-                    remote_map.insert(join(dir, &e.filename), Sig::from_entry(e));
+                    let path = join(dir, &e.filename);
+                    // ★ M7：排除 / 临时文件不进远端签名表 —— 既不水合也不登记 baseline
+                    if view.hidden(&path, e.isfolder).is_some() {
+                        continue;
+                    }
+                    remote_map.insert(path, Sig::from_entry(e));
                 }
             }
             Err(e) if is_not_found(&e) => {
@@ -544,6 +569,21 @@ async fn reconcile_view(
             cfg.max_dirs_per_poll,
             cfg.max_dirs_per_poll
         ));
+    }
+
+    // ★ M7：规则改了之后，被排除路径的 baseline 条目直接清掉 —— 不留幽灵状态。
+    //   注意**只清状态，不动本地内容**（排除 ≠ 删除）。
+    let stale: Vec<String> = baseline
+        .entries
+        .keys()
+        .filter(|p| under_root(p) && *p != &root && view.hidden(p, false).is_some())
+        .cloned()
+        .collect();
+    if !stale.is_empty() {
+        for p in &stale {
+            remove_baseline_tree(baseline, p);
+        }
+        report.note(format!("规则排除：清理了 {} 条 baseline 记录", stale.len()));
     }
 
     let mut deletes: Vec<String> = Vec::new();
@@ -1067,6 +1107,10 @@ mod tests {
                 home_root: HOME_ROOT.to_string(),
                 roots: Vec::new(),
                 ipv4_only: std::env::var("QSYNC_TEST_IPV4").is_ok(),
+                exclude: Vec::new(),
+                filter_temp: true,
+                peer_listen: None,
+                peer_name: None,
             },
             password,
         ))
@@ -1167,6 +1211,7 @@ mod tests {
             view: view.clone(),
             upload: Some(q.clone()),
             read_only: false,
+            rules: Arc::new(Rules::temp_only(true)),
         }];
         let cfg = SyncConfig::default();
 
@@ -1332,6 +1377,41 @@ mod tests {
         }
         let _ = client.delete_entry(&fixture, "m2c").await;
         q.shutdown();
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// ★ M7：引擎侧的规则判定（**不需要 NAS**）—— 排除路径与临时文件必须被判为 hidden，
+    /// 而且卷根目录本身永远不算 hidden（它是挂载视图）。
+    #[test]
+    fn m7_mount_view_hidden_semantics() {
+        let work = tmpdir("m7-rules");
+        let view = FakeLocal::new(HOME_ROOT, work.join("stash"));
+        let rules = Rules::parse(&["/secret".to_string()], true).rules;
+        let mv = MountView {
+            mountpoint: PathBuf::from("/tmp/m7-mnt"),
+            remote_root: HOME_ROOT.to_string(),
+            view: view.clone(),
+            upload: None,
+            read_only: true,
+            rules: Arc::new(rules),
+        };
+        assert!(mv.hidden("/home/secret", true).is_some());
+        assert!(mv.hidden("/home/secret/deep/x.bin", false).is_some());
+        assert!(mv.hidden("/home/a.crdownload", false).is_some(), "临时文件");
+        assert!(mv.hidden("/home/qxync-test/hello.txt", false).is_none());
+        assert!(mv.hidden(HOME_ROOT, true).is_none(), "根目录是视图本身，不能被隐藏");
+
+        // 默认规则（只有临时过滤）= M1–M6 行为：普通路径一律不隐藏
+        let plain = MountView {
+            mountpoint: PathBuf::from("/tmp/m7-mnt2"),
+            remote_root: HOME_ROOT.to_string(),
+            view,
+            upload: None,
+            read_only: true,
+            rules: Arc::new(Rules::temp_only(true)),
+        };
+        assert!(plain.hidden("/home/secret", true).is_none());
+        assert!(plain.hidden("/home/x.crdownload", false).is_some());
         let _ = std::fs::remove_dir_all(&work);
     }
 }

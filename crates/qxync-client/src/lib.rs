@@ -31,6 +31,9 @@ pub mod write_action {
     pub const UPSERT_FILE: i64 = 14;
 }
 
+/// ★ M7：LAN 对等协议（设备配对 / 事件快路径 / 直传）。
+pub mod peer;
+
 /// 登录后拿到的会话信息。
 #[derive(Debug, Clone)]
 pub struct Session {

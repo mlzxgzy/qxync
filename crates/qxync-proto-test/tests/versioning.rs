@@ -41,6 +41,10 @@ fn env_creds() -> Option<(LinkConfig, String)> {
             home_root: HOME_ROOT.to_string(),
             roots: Vec::new(),
             ipv4_only: std::env::var("QSYNC_TEST_IPV4").is_ok(),
+            exclude: Vec::new(),
+            filter_temp: true,
+            peer_listen: None,
+            peer_name: None,
         },
         password,
     ))
