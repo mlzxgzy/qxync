@@ -20,7 +20,8 @@
 | **M3 脱水**（安全检查链 + 先 `inval_inode` 再清内容 + 闲置/限额 LRU + `--cache-mode`） | ✅ **已实现并真机验收**（矩阵 **67/67**，其中 M3 21 项） |
 | **M4 GUI**（Tauri 2：登录配置 / 挂载管理 / 状态与进度 / pin 管理） | ✅ **已实现并真机验收**（`gui-matrix.sh` **41/41**，5 个 tab 真窗口截图） |
 | **M5 SQLite 元数据 + delta**（`sync.db` 承载游标/baseline/pin/队列 + librsync 兼容编解码 + 能力门控） | ✅ **已实现并真机验收**（`m5-matrix.sh` **28/28**；服务端无历史版本 → 增量走门控，见 [`M5-SQLite与delta.md`](docs/M5-SQLite与delta.md)） |
-| M6（另行规划：共享文件夹 `auth_data` AES、选择性同步、LAN 直连…） | ⏳ 下一步 |
+| **M6 多根 / 共享文件夹**（link `roots` + 同步文件夹发现 + FUSE 多根视图 + 非家目录根只读保护） | ✅ **已实现并真机验收**（`m6-matrix.sh` **21/21**；FUSE 多根挂载项需有 `/dev/fuse` 的机器，见 [`M6-多根与共享文件夹.md`](docs/M6-多根与共享文件夹.md)） |
+| M7（另行规划：选择性同步、设备配对事件快路径、LAN 直连…） | ⏳ 下一步 |
 
 真机验证对象：`TS-464C` / `QTS 5.2.9` / Qsync QPKG `5.0.0.7`（build `20260723`）。
 
@@ -59,22 +60,32 @@ M1 实现说明（`crates/qxync-fuse`）：
 并用 `qxync-client` 的 **DeltaGate** 做能力门控：服务端可用才走增量，当前真实路径仍是整文件传输。
 详见 [`docs/M5-SQLite与delta.md`](docs/M5-SQLite与delta.md)。
 
+**M6 让同步范围走出家目录**：link 配置 `roots`（默认 `["/home"]`），挂载支持
+`--remote /home --remote /Public` —— 单根仍是**直通**（挂载点就是那个根，M1–M5 行为不变），
+多根时挂载点顶层出现每个根的名字（`home/`、`Public/`），**下面所有层（缓存/baseline/pin/xattr/
+上传队列）仍用远端路径做键**，只在挂载点这一层加了一次名字映射。NAS 侧的同步文件夹可以用
+`qbox_get_syncing_folder_list` 查到（`qsync roots` 会一并展示；本账号是空的 —— 没在 Qsync 里配对）。
+可写性按实测来：**只有家目录根可写**（普通账号向 `/Public` 上传会被服务端拒绝 `status:20`），
+共享根在 FUSE 层直接回 `EROFS`，不会把含糊的服务端错误抛给用户。详见
+[`docs/M6-多根与共享文件夹.md`](docs/M6-多根与共享文件夹.md)。
+
 ## 目录结构
 
 ```
 crates/
-├── qxync-core/        共享类型 + 配置布局 + **M5 状态库（store.rs，SQLite）与 delta 编解码（delta.rs）**
+├── qxync-core/        共享类型 + 配置布局 + **M5 状态库（store.rs，SQLite）/ delta 编解码（delta.rs）** + **M6 多根布局（roots.rs）**
 ├── qxync-client/      NAS HTTP API 封装（登录 / 元数据 / 上传下载）
 ├── qxync-fuse/        FUSE 只读 + on-demand 水合（M1：Filesystem 实现 + 挂载参数）
 ├── qxync-daemon/      二进制 `qxyncd`（M1.5：常驻进程 + unix socket JSON IPC + 持有 FUSE；
 │                       M2c：`sync.rs` 三游标轮询 + baseline 对账 + 冲突/删除保护）
-├── qxync-cli/         二进制 `qsync`（login/status/ls/stat/get/put/mkdir/mount/umount/pin/state/store/daemon）
+├── qxync-cli/         二进制 `qsync`（login/status/ls/stat/get/put/mkdir/mount/umount/roots/pin/state/store/daemon）
 ├── qxync-gui/         二进制 `qxync-gui`（M4：Tauri 2 桌面应用；`ui/` 是零依赖静态前端）
 └── qxync-proto-test/  真机集成测试（5 个协议测试 + 1 个 IPC 端到端，均 #[ignore] 手动跑）
 xtask/tests/
 ├── fuse-matrix.sh     ★ M1–M3 验收矩阵（挂载 → 67 项检查 → 卸载；--big 追加 128 MiB + 并发去重）
 ├── gui-matrix.sh      ★ M4 验收矩阵（自检 + 登录链 + 5 个 tab 真窗口截图，41 项）
-└── m5-matrix.sh       ★ M5 验收矩阵（JSON→SQLite 迁移/幂等/不双写/pin 存活/编解码单测/真机 gate，28 项）
+├── m5-matrix.sh       ★ M5 验收矩阵（JSON→SQLite 迁移/幂等/不双写/pin 存活/编解码单测/真机 gate，28 项）
+└── m6-matrix.sh       ★ M6 验收矩阵（共享文件夹读写事实/roots 配置与判定/布局单测/多根 FUSE，21 项）
 docs/
 ├── 开发规划.md             第一版（MVP）规划
 ├── M1.5-设计.md           daemon/IPC 契约、生命周期、pin 语义、验收标准
@@ -83,6 +94,7 @@ docs/
 ├── M3-脱水.md             ★ 脱水：安全检查链、inval_inode 顺序铁则、闲置/限额、cache-mode
 ├── M4-GUI.md              ★ GUI：边界（GUI 是 daemon 客户端）、命令面、5 个 tab、验收与踩坑
 ├── M5-SQLite与delta.md    ★ 状态库 schema/迁移/单事务、真机 versioning 探测、delta 格式与能力门控
+├── M6-多根与共享文件夹.md  ★ 多根布局/只读规则、真机共享文件夹探测、FUSE 虚拟根、同步与脱水按根展开
 ├── 执行方案-M0M1.md        ★ 真机验证后的修正版：实测事实 + 修正项 + 执行顺序 + 风险门
 └── 测试环境.local.md       测试 NAS 与账号（已 gitignore，禁止提交）
 report/                 逆向报告 + probe 工具（qs_probe.py / qs_fixture.py）
@@ -143,6 +155,9 @@ qsync daemon stop           # 干净退出：卸载全部挂载 + 删 socket/pid
 qsync store                 # M5：状态库快照（游标 / baseline / pin / 上传队列）
 qsync store --integrity     #   顺带 PRAGMA integrity_check（正常输出 ok）
 qsync store --json          #   机器可读（给脚本/验收用）
+qsync roots                 # M6：远端根一览（配置的根 + NAS 同步文件夹 + 可读/可写判定）
+qsync roots --json          #   机器可读
+qsync mount ~/qsync-mnt --remote /home --remote /Public   # M6：多根挂载（共享文件夹默认只读）
 ```
 
 IPC 契约见 [`docs/M1.5-设计.md`](docs/M1.5-设计.md)：unix socket + **一行一个 JSON**
@@ -276,6 +291,19 @@ cargo test -p qxync-proto-test -- --ignored --test-threads=1 --nocapture   # 协
 33. **能力探测不能当成「有端点就是支持」**：这台 NAS 的 `versioning_probe` 三个 enable 位全是 1、
     `versioning_lock` 也能拿到 lockid，但 `versioning_stat_delta` 恒 `exist:0`、`versioning_support` 全 0
     —— 真正的判据是「**有没有历史版本**」，只看端点存在会得出完全错误的结论。
+
+写 M6（多根 / 共享文件夹）时踩到的：
+
+34. **共享文件夹「能读不能写」**：只要账号有读权限，用普通 `sid` 就能列 / stat / 下载（`/Public`、
+    `/Multimedia` 实测通过），**不需要** `auth_data` AES；但上传必须是 Qsync 同步文件夹，否则服务端
+    只回一句含糊的 `status:20`。所以非家目录根一律按只读处理，写操作在 FUSE 层直接回 `EROFS`。
+35. **顶层共享列表枚举不出来**：`get_list /` 对普通用户是 `status:5`；`qbox_get_syncing_folder_list`
+    返回的是「NAS 上登记过同步的文件夹」（本账号 `total:0`，正常）→ 根只能由用户配置，
+    不能自动发现。端点 200 但空数组不是错误。
+36. **多根绝不能动单根那条路**：多根逻辑全部以 `multi_root` 为开关，`roots.rs` 里专门有一条
+    「单根必须还是 Passthrough」的断言；否则 M1–M5 的 67 项 FUSE 矩阵会整体失效。
+37. **脱水候选与 mmap 映射必须按根展开**：否则同一个文件被每个根各算一遍（`freed_bytes` 翻倍），
+    更糟的是 mmap 映射错了会让「被 mmap 的文件不脱水」这条安全检查失守 —— 直接违反脱水铁则。
 
 写 GUI（M4）时踩到的：
 

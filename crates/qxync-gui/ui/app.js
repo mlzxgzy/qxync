@@ -191,6 +191,23 @@
     return n.checked === true;
   }
 
+  /**
+   * ★ M6：把 textarea 里的「每行一个远端根」解析成字符串数组。
+   * 去掉空行与首尾空白；空数组 = 只同步家目录（老行为）。
+   */
+  function parseRootLines(textareaId) {
+    var n = $(textareaId);
+    if (!n) { return []; }
+    var raw = str(n.value).split(/\r?\n/);
+    var out = [];
+    for (var i = 0; i < raw.length; i++) {
+      var line = raw[i].trim();
+      if (!line) { continue; }
+      if (out.indexOf(line) < 0) { out.push(line); }
+    }
+    return out;
+  }
+
   // -------------------------------------------------------- 参数摘要
   function argSummary(cmd, args) {
     var a = isObj(args) ? args : {};
@@ -718,7 +735,14 @@
       (function (m) {
         var tr = el('tr');
         tr.appendChild(el('td', 'mono', str(m.mountpoint)));
-        tr.appendChild(el('td', 'mono', str(m.remote)));
+        // ★ M6：多根时显示全部根 + 徽章；老响应没有 roots 字段则退回 remote
+        var roots = (m.roots && m.roots.length) ? m.roots : (str(m.remote) ? [str(m.remote)] : []);
+        var tdRemote = el('td', 'mono', roots.join(', '));
+        if (roots.length > 1) {
+          tdRemote.appendChild(document.createTextNode(' '));
+          tdRemote.appendChild(el('span', 'badge', '多根'));
+        }
+        tr.appendChild(tdRemote);
         var mode = el('td');
         mode.appendChild(el('span', 'badge ' + (m.readonly ? 'badge-off' : 'badge-on'), m.readonly ? '只读' : '读写'));
         tr.appendChild(mode);
@@ -742,10 +766,104 @@
         logOk('umount ok: ' + mountpoint);
         refreshMountsIfVisible();
         refreshStatus(true);
+        refreshRoots();
       } else {
         logErr('umount 失败: ' + str(r.error));
       }
     });
+  }
+
+  // ====================================================== ★ M6 远端根面板
+  // roots 会真的去列 NAS 目录（贵），所以不跟着 2s 轮询刷：
+  // 只在「切到状态 tab」+「点刷新」+「挂载/卸载成功」时各拉一次。
+  var rootsInflight = null;
+
+  function renderRoots(d) {
+    var data = isObj(d) ? d : {};
+    var list = $('roots-list');
+    var folders = $('roots-folders');
+    if (!list) { return; }
+    clear(list);
+    clear(folders);
+    clear($('roots-summary-kv'));
+
+    var roots = (data.roots || []).filter(isObj);
+    setText('roots-count', roots.length ? '（' + roots.length + '）' : '');
+    show('roots-empty', roots.length === 0);
+    if (!roots.length) {
+      setText('roots-empty', '未读取到远端根（未登录时 daemon 不做可读性探测）。');
+    }
+
+    var kv = $('roots-summary-kv');
+    kvText(kv, 'home_root', optText(data.home_root) || '—');
+    var cfg = (data.configured || []);
+    kvText(kv, 'configured', cfg.length ? cfg.join(', ') : '（未配置 roots，仅家目录）');
+
+    for (var i = 0; i < roots.length; i++) {
+      var r = roots[i];
+      var readable = r.readable === true;
+      var writable = r.writable === true;
+      var li = el('li', 'root-row');
+      // ✅/❌ 按「可读」判定：不可读时下面是哪一步失败的看得见
+      li.appendChild(el('span', 'root-mark', readable ? '✅' : '❌'));
+      li.appendChild(el('span', 'root-path mono', str(r.remote)));
+      li.appendChild(el('span', 'root-view', '视图名 ' + (str(r.view_name) || '直通')));
+      li.appendChild(el('span', 'badge ' + (writable ? 'badge-on' : 'badge-off'), writable ? '可写' : '只读'));
+      li.appendChild(el('span', 'badge ' + (readable ? 'badge-on' : 'badge-err'), readable ? '可读' : '不可读'));
+      if (!readable && r.note) {
+        li.appendChild(el('span', 'root-note-sub', String(r.note)));
+      }
+      list.appendChild(li);
+    }
+
+    var note = $('roots-note');
+    if (note) {
+      note.hidden = !data.note;
+      note.textContent = data.note ? ('说明：' + String(data.note)) : '';
+    }
+
+    var sf = (data.syncing_folders || []).filter(isObj);
+    show('roots-folders-empty', sf.length === 0);
+    for (var j = 0; j < sf.length; j++) {
+      var f = sf[j];
+      var txt = str(f.folder) + ' · permission=' + str(f.permission) +
+        (f.read_deletable === true ? ' · 可删' : '');
+      folders.appendChild(el('li', null, txt));
+    }
+  }
+
+  function refreshRoots() {
+    if (rootsInflight) { return rootsInflight; }
+    var btn = $('btn-roots-refresh');
+    if (btn) { btn.disabled = true; }
+    rootsInflight = ipc({ method: 'roots' }).then(function (r) {
+      rootsInflight = null;
+      if (btn) { btn.disabled = false; }
+      if (r.ok) {
+        renderRoots(r.data);
+      } else {
+        // 失败也要给出可见反馈（错误详情在底部操作日志）
+        clear($('roots-list'));
+        clear($('roots-folders'));
+        clear($('roots-summary-kv'));
+        setText('roots-count', '');
+        show('roots-empty', true);
+        setText('roots-empty', '读取远端根失败：' + str(r.error));
+        show('roots-folders-empty', true);
+        var nt = $('roots-note');
+        if (nt) { nt.hidden = true; nt.textContent = ''; }
+      }
+      return r;
+    }, function (e) {
+      rootsInflight = null;
+      if (btn) { btn.disabled = false; }
+      throw e;
+    });
+    return rootsInflight;
+  }
+
+  function refreshRootsIfVisible() {
+    if (state.tab === 'status') { refreshRoots(); }
   }
 
   // ============================================================ Tab 2 连接
@@ -771,6 +889,15 @@
       var ht = $('f-https'); if (ht) { ht.checked = link.https !== false; }
       var ins = $('f-insecure'); if (ins) { ins.checked = link.insecure === true; }
       var v4 = $('f-ipv4-only'); if (v4) { v4.checked = link.ipv4_only === true; }
+    }
+    // ★ M6：roots 有值就每行一个；为空就留空（placeholder 提示当前家目录）
+    var rootsBox = $('f-roots');
+    if (rootsBox) {
+      var rlist = (link && link.roots && link.roots.length) ? link.roots : [];
+      var lines = [];
+      for (var ri = 0; ri < rlist.length; ri++) { lines.push(str(rlist[ri])); }
+      rootsBox.value = lines.join('\n');
+      rootsBox.placeholder = str(link && link.home_root) || '/home';
     }
     var pw = $('f-password');
     if (pw) { pw.value = ''; }
@@ -825,7 +952,9 @@
       insecure: isOn('f-insecure', false),
       user: user,
       home_root: str($('f-home-root') ? $('f-home-root').value : '/home').trim() || '/home',
-      ipv4_only: isOn('f-ipv4-only', false)
+      ipv4_only: isOn('f-ipv4-only', false),
+      // ★ M6：远端根；空数组也要传（表示清空，回到「只同步家目录」）
+      roots: parseRootLines('f-roots')
     };
     if (withPassword) {
       input.password = str($('f-password') ? $('f-password').value : '');
@@ -861,7 +990,9 @@
           ['host:port', str(d.link && d.link.host) + ':' + str(d.link && d.link.port)],
           ['user', str(d.link && d.link.user)],
           ['https', d.link && d.link.https ? '是' : '否'],
-          ['home_root', str(d.link && d.link.home_root)]
+          ['home_root', str(d.link && d.link.home_root)],
+          ['roots', (d.link && d.link.roots && d.link.roots.length)
+            ? d.link.roots.join(', ') : '（无，只同步家目录）']
         ]);
       } else {
         renderError('login-result', '保存连接配置失败', str(r.error));
@@ -897,6 +1028,7 @@
       var rows = [
         ['link 文件', str(d.link_path)],
         ['凭据文件', str(d.credential_path)],
+        ['roots', built.input.roots.length ? built.input.roots.join(', ') : '（无，只同步家目录）'],
         ['daemon 已重启', d.restarted ? '是' : '否']
       ];
       if (login && isObj(login.data)) {
@@ -913,6 +1045,7 @@
       if (ok) {
         loadConnect();
         refreshStatus(true);
+        refreshRootsIfVisible();
       }
       return r;
     });
@@ -1016,15 +1149,21 @@
   function doMount() {
     if (!requireLogin()) { return Promise.resolve(null); }
     var mp = str($('m-mountpoint') ? $('m-mountpoint').value : '').trim();
-    var remote = str($('m-remote') ? $('m-remote').value : '').trim();
+    // ★ M6：远端根每行一个；第一个是 remote（兼容字段）
+    var roots = parseRootLines('m-remote');
     if (!mp) {
       renderError('mount-result', '参数错误', '挂载点不能为空');
+      return Promise.resolve(null);
+    }
+    if (!roots.length) {
+      renderError('mount-result', '参数错误', '远端根至少填一个（每行一个，默认 /home）');
       return Promise.resolve(null);
     }
     var req = {
       method: 'mount',
       mountpoint: mp,
-      remote: remote || '/home',
+      remote: roots[0],
+      roots: roots,
       threads: num($('m-threads') ? $('m-threads').value : 4, 4),
       hydrate_timeout_secs: num($('m-hydrate-timeout') ? $('m-hydrate-timeout').value : 600, 600),
       auto_unmount: isOn('m-auto-unmount', true),
@@ -1041,12 +1180,13 @@
       if (r.ok) {
         renderResult('mount-result', true, '挂载成功', [
           ['挂载点', mp],
-          ['远端', req.remote],
+          ['远端根', roots.join(', ') + (roots.length > 1 ? '（多根）' : '')],
           ['模式', req.read_write ? '读写' : '只读'],
           ['cache_mode', req.cache_mode]
         ]);
         refreshMounts();
         refreshStatus(true);
+        refreshRoots();
       } else {
         renderError('mount-result', '挂载失败', str(r.error));
       }
@@ -1536,11 +1676,13 @@
   function refreshCurrentTab() {
     if (state.tab === 'mounts') { refreshMounts(); }
     else if (state.tab === 'connect') { loadConnect(); }
+    else if (state.tab === 'status') { refreshRoots(); }
     else if (state.tab === 'files' && !state.files.entries.length) { refreshFiles(state.files.path); }
   }
 
   // ============================================================ Tab 切换
   function switchTab(name) {
+    var prev = state.tab;
     state.tab = name;
     var tabs = document.querySelectorAll('.tab');
     for (var i = 0; i < tabs.length; i++) {
@@ -1555,7 +1697,11 @@
       else { p.classList.remove('active'); }
     }
 
-    if (name === 'status') { renderStatusPanel(state.lastStatus); }
+    if (name === 'status') {
+      renderStatusPanel(state.lastStatus);
+      // 切到这个 tab 拉一次远端根（roots 贵，不跟 2s 轮询）；重复点同一 tab 不重复拉
+      if (prev !== 'status') { refreshRoots(); }
+    }
     if (name === 'sync') { renderStatusPanel(state.lastStatus); }
     if (name === 'mounts') { refreshMounts(); }
     if (name === 'connect') { loadConnect(); }
@@ -1627,6 +1773,9 @@
     }
     on('btn-mounts-refresh', 'click', function () { refreshMounts(); });
     on('btn-status-mounts-refresh', 'click', function () { refreshMounts(); });
+
+    // 远端根面板
+    on('btn-roots-refresh', 'click', function () { refreshRoots(); });
 
     // 文件页
     var fp = $('form-path');

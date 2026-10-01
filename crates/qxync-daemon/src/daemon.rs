@@ -8,8 +8,8 @@ use qxync_core::dehydrate::{Block, CacheLimit, Policy};
 use qxync_core::ipc::{
     decode_line, encode_line, mask_sid, CacheInfo, CursorInfo, DaemonInfo, DehydrateData,
     ErrorKind, GetData, HydroStats, IpcError, LinkInfo, LoginData, LsData, MountInfo, PingData,
-    PutData, Request, RequestEnvelope, Response, ServerInfo, SessionInfo, ShutdownData, StatusData,
-    StoreData, SyncCursors, SyncInfo, IPC_VERSION,
+    PutData, Request, RequestEnvelope, Response, RootInfo, RootsData, ServerInfo, SessionInfo,
+    ShutdownData, StatusData, StoreData, SyncCursors, SyncInfo, IPC_VERSION,
 };
 use qxync_core::{ConfigPaths, Credentials, Error as CoreError, LinkConfig, HOME_ROOT};
 use qxync_fuse::upload::UploadQueue;
@@ -268,6 +268,7 @@ async fn dispatch(state: &Arc<State>, req: Request, shutdown: &mpsc::Sender<()>)
         Request::Mount {
             mountpoint,
             remote,
+            roots,
             cache_dir,
             threads,
             auto_unmount,
@@ -280,6 +281,7 @@ async fn dispatch(state: &Arc<State>, req: Request, shutdown: &mpsc::Sender<()>)
                 state,
                 mountpoint,
                 remote,
+                roots,
                 cache_dir,
                 threads.unwrap_or(4),
                 auto_unmount.unwrap_or(false),
@@ -292,6 +294,7 @@ async fn dispatch(state: &Arc<State>, req: Request, shutdown: &mpsc::Sender<()>)
         }
         Request::Umount { mountpoint } => umount(state, mountpoint).await,
         Request::Mounts => mounts(state),
+        Request::Roots => roots_cmd(state).await,
         Request::Sync {
             once,
             force_deletes,
@@ -522,6 +525,7 @@ async fn status(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
             https: state.link.https,
             user: state.link.user.clone(),
             ipv4_only: state.link.ipv4_only,
+            roots: state.link.roots(),
         },
         logged_in,
         session: session.map(|s| SessionInfo {
@@ -697,11 +701,71 @@ fn store_info(state: &Arc<State>, integrity: bool) -> Result<serde_json::Value, 
     to_value(data)
 }
 
+/// ★ M6：远端根一览（`qsync roots`）—— 配置的根 + NAS 同步文件夹 + 可读/可写判定。
+///
+/// 可写性规则：**只有家目录根可写**。实测（2026-10-01）普通账号向 `/Public` 上传会被服务端
+/// 拒绝（`status:20`：非 Qsync 同步文件夹没有写权限），而 `qbox_get_syncing_folder_list`
+/// 在该账号上返回空 —— 所以共享文件夹默认只读，写操作在 FUSE 层直接回 `EROFS`。
+async fn roots_cmd(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
+    let home_root = state.link.home_root.clone();
+    let configured = state.link.roots();
+    let layout = qxync_core::roots::layout(&configured, Some(home_root.as_str()));
+    let mut roots: Vec<RootInfo> = match &layout {
+        qxync_core::roots::ViewLayout::Passthrough { root } => vec![RootInfo {
+            remote: root.clone(),
+            view_name: String::new(),
+            writable: true,
+            readable: false,
+            note: None,
+        }],
+        qxync_core::roots::ViewLayout::Multi { entries } => entries
+            .iter()
+            .map(|e| RootInfo {
+                remote: e.remote.clone(),
+                view_name: e.view_name.clone(),
+                writable: e.writable,
+                readable: false,
+                note: None,
+            })
+            .collect(),
+    };
+
+    let logged_in = current_session(state).await.is_some();
+    let mut syncing = Vec::new();
+    if logged_in {
+        // 可读性探测：把每个根列一遍（显式命令才做；根目录通常不大）
+        for r in roots.iter_mut() {
+            match with_client!(state, |c| c.list(&r.remote)) {
+                Ok(_) => r.readable = true,
+                Err(e) => {
+                    r.readable = false;
+                    r.note = Some(e.message.clone());
+                }
+            }
+        }
+        syncing = with_client!(state, |c| c.syncing_folders()).unwrap_or_default();
+    }
+
+    let note = if logged_in {
+        "非家目录根默认只读：服务端对非 Qsync 同步文件夹的上传会拒绝（status 20）".to_string()
+    } else {
+        "未登录：未探测可读性，也没有 NAS 的同步文件夹列表".to_string()
+    };
+    to_value(RootsData {
+        home_root,
+        configured,
+        roots,
+        syncing_folders: syncing,
+        note: Some(note),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn mount(
     state: &Arc<State>,
     mountpoint: PathBuf,
     remote: Option<String>,
+    roots: Option<Vec<String>>,
     cache_dir: Option<PathBuf>,
     threads: usize,
     auto_unmount: bool,
@@ -747,16 +811,41 @@ async fn mount(
         })
         .join(host_ns);
 
+    // ★ M6：算出挂载布局。单根 = 直通（M1–M5 行为不变）；多根 = 虚拟根下每个根一个目录。
+    //   可写性：只有家目录根可写（实测普通账号向共享文件夹上传会被服务端拒绝 status:20）。
+    let want_roots: Vec<String> = match roots {
+        Some(r) if !r.is_empty() => r,
+        _ => vec![remote.clone()],
+    };
+    let writable_root = if read_write {
+        Some(state.link.home_root.clone())
+    } else {
+        None
+    };
+    let layout = qxync_core::roots::layout(&want_roots, writable_root.as_deref());
+    let remote = layout
+        .roots()
+        .first()
+        .cloned()
+        .unwrap_or_else(|| HOME_ROOT.to_string());
+
     // 给 FUSE 一个独立 Client（只带 sid），避免和 daemon 主体抢同一把锁
     let mut fuse_client = Client::new(&state.link).map_err(map_err)?;
     fuse_client.set_sid(sid);
     let counters = Arc::new(HydroCounters::default());
     let fuse_client = Arc::new(fuse_client);
-    let mut fs = QxyncFs::new(fuse_client.clone(), remote.clone(), cache.clone())
-        .map_err(|e| IpcError::new(ErrorKind::Io, e.to_string()))?
-        .with_hydrate_timeout(hydrate_timeout)
-        .with_counters(counters.clone())
-        .with_pins(state.pins.clone());
+    let mut fs = match &layout {
+        qxync_core::roots::ViewLayout::Passthrough { root } => {
+            QxyncFs::new(fuse_client.clone(), root.clone(), cache.clone())
+        }
+        qxync_core::roots::ViewLayout::Multi { entries } => {
+            QxyncFs::new_multi(fuse_client.clone(), entries.clone(), cache.clone())
+        }
+    }
+    .map_err(|e| IpcError::new(ErrorKind::Io, e.to_string()))?
+    .with_hydrate_timeout(hydrate_timeout)
+    .with_counters(counters.clone())
+    .with_pins(state.pins.clone());
     if let Some(limit) = delete_limit {
         fs = fs.with_delete_limit(limit);
     }
@@ -822,8 +911,9 @@ async fn mount(
 
     let info = MountInfo {
         mountpoint: mp.clone(),
-        remote,
+        remote: remote.clone(),
         readonly: !read_write,
+        roots: layout.roots(),
     };
     state.mounts.lock().unwrap().insert(
         mp.clone(),
@@ -838,10 +928,16 @@ async fn mount(
         },
     );
     tracing::info!(
-        "已挂载 {}（{} 线程，auto_unmount={auto_unmount}，cache_mode={}）",
+        "已挂载 {} -> {}（{} 线程，auto_unmount={auto_unmount}，cache_mode={}，{}）",
         mp.display(),
+        info.roots.join(", "),
         threads,
-        mode.as_str()
+        mode.as_str(),
+        if layout.is_multi() {
+            "多根视图"
+        } else {
+            "单根直通"
+        }
     );
     to_value(info)
 }
@@ -1027,17 +1123,29 @@ async fn engine_client(state: &Arc<State>) -> Result<Arc<Client>, IpcError> {
 }
 
 /// 当前挂载视图（同步引擎的操作对象）。
+///
+/// ★ M6：一个**多根**挂载会被展开成多个「单根视图」（同一个 handle / 挂载点，
+/// 不同的 remote_root）——这样 M2c 的对账逻辑一行不用改，天然覆盖每个根。
 fn build_views(state: &Arc<State>) -> Vec<MountView> {
     let g = state.mounts.lock().unwrap();
-    g.values()
-        .map(|m| MountView {
-            mountpoint: m.info.mountpoint.clone(),
-            remote_root: m.info.remote.clone(),
-            view: Arc::new(m.handle.clone()) as Arc<dyn LocalView>,
-            upload: m.upload.clone(),
-            read_only: m.info.readonly,
-        })
-        .collect()
+    let mut out = Vec::new();
+    for m in g.values() {
+        let roots: Vec<String> = if m.info.roots.is_empty() {
+            vec![m.info.remote.clone()]
+        } else {
+            m.info.roots.clone()
+        };
+        for root in roots {
+            out.push(MountView {
+                mountpoint: m.info.mountpoint.clone(),
+                remote_root: root,
+                view: Arc::new(m.handle.clone()) as Arc<dyn LocalView>,
+                upload: m.upload.clone(),
+                read_only: m.info.readonly,
+            });
+        }
+    }
+    out
 }
 
 /// 跑一轮同步（拉事件 + baseline 对账）。
@@ -1321,8 +1429,14 @@ fn resolve_limit(limit: Option<CacheLimit>, cache_dir: &std::path::Path) -> Opti
 }
 
 /// 扫描 `/proc/*/maps`，找出挂载点下被 mmap 的远端路径（脱水必须避开它们）。
+/// 扫 `/proc/*/maps` 找出「挂载点下被 mmap 的文件」→ 映射回远端路径。
+///
+/// ★ M6：多根视图在挂载点里多一层「视图名」（`~/mnt/Public/a`），所以要传 `view_prefix`；
+/// 单根直通传空串（行为与 M3 完全一致）。映射错了后果很严重：mmap 判定失守 →
+/// 脱水会在别人还映射着的时候清内容（铁则 2 的相关保护）。
 fn mmap_remotes(
     mountpoint: &std::path::Path,
+    view_prefix: &str,
     remote_root: &str,
 ) -> std::collections::BTreeSet<String> {
     use std::collections::BTreeSet;
@@ -1348,6 +1462,14 @@ fn mmap_remotes(
                     continue;
                 }
                 let rest = &mapped[mp.len()..];
+                let rest = if view_prefix.is_empty() {
+                    rest
+                } else {
+                    match rest.strip_prefix(&format!("/{view_prefix}")) {
+                        Some(r) if r.is_empty() || r.starts_with('/') => r,
+                        _ => continue,
+                    }
+                };
                 if rest.starts_with('/') {
                     out.insert(format!("{}{}", remote_root.trim_end_matches('/'), rest));
                 }
@@ -1382,25 +1504,37 @@ async fn run_dehydrate_with_recent(
     }
 
     // 选定挂载点
-    let targets: Vec<(PathBuf, String, FsHandle, qxync_fuse::Notifier, CacheMode)> = {
+    // ★ M6：一个挂载点可能覆盖多个根 → 每个根单独跑一轮（视图名用于 mmap 路径还原）
+    let targets: Vec<(PathBuf, String, String, FsHandle, qxync_fuse::Notifier, CacheMode)> = {
         let g = state.mounts.lock().unwrap();
-        g.values()
-            .filter(|m| {
-                opts.mountpoint
-                    .as_ref()
-                    .map(|mp| m.info.mountpoint == *mp)
-                    .unwrap_or(true)
-            })
-            .map(|m| {
-                (
+        let mut out = Vec::new();
+        for m in g.values().filter(|m| {
+            opts.mountpoint
+                .as_ref()
+                .map(|mp| m.info.mountpoint == *mp)
+                .unwrap_or(true)
+        }) {
+            let entries = match qxync_core::roots::layout(&m.info.roots, None) {
+                qxync_core::roots::ViewLayout::Passthrough { root } => {
+                    vec![(String::new(), root)]
+                }
+                qxync_core::roots::ViewLayout::Multi { entries } => entries
+                    .into_iter()
+                    .map(|e| (e.view_name, e.remote))
+                    .collect(),
+            };
+            for (view_name, remote) in entries {
+                out.push((
                     m.info.mountpoint.clone(),
-                    m.info.remote.clone(),
+                    view_name,
+                    remote,
                     m.handle.clone(),
                     m.notifier.clone(),
                     m.cache_mode,
-                )
-            })
-            .collect()
+                ));
+            }
+        }
+        out
     };
 
     let mut out = DehydrateData {
@@ -1408,7 +1542,7 @@ async fn run_dehydrate_with_recent(
         ..Default::default()
     };
     let manual_path = opts.path.clone();
-    for (mp, remote_root, handle, notifier, _mode) in &targets {
+    for (mp, view_prefix, remote_root, handle, notifier, _mode) in &targets {
         if let Some(p) = &manual_path {
             if !(p == remote_root
                 || p.starts_with(&format!("{}/", remote_root.trim_end_matches('/'))))
@@ -1419,18 +1553,24 @@ async fn run_dehydrate_with_recent(
         let cache_dir = handle.cache_dir().to_path_buf();
         let limit = resolve_limit(limit_spec, &cache_dir);
         out.limit_bytes = limit;
-        let mapped = mmap_remotes(mp, remote_root);
+        let mapped = mmap_remotes(mp, view_prefix, remote_root);
         let policy = Policy {
             idle_secs,
             cache_limit: limit,
             recent_secs,
             now,
         };
-        let cands = if let Some(p) = &manual_path {
+        let mut cands = if let Some(p) = &manual_path {
             handle.candidate(p).into_iter().collect::<Vec<_>>()
         } else {
             handle.dehydrate_candidates()
         };
+        // ★ M6：多根视图下候选是「整个挂载点的」，按当前根过滤（否则每个根都会把同一批文件算一遍）
+        if !view_prefix.is_empty() {
+            let r = remote_root.trim_end_matches('/').to_string();
+            let prefix = format!("{r}/");
+            cands.retain(|c| c.remote == r || c.remote.starts_with(&prefix));
+        }
         let plan = qxync_core::dehydrate::plan(&cands, &policy, &mapped);
         if manual_path.is_some() && plan.targets.is_empty() && plan.blocked.is_empty() {
             continue;

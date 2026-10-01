@@ -90,8 +90,12 @@ pub enum Request {
     },
     Mount {
         mountpoint: PathBuf,
+        /// 单根（M1–M5 的字段；`roots` 省略时用它）
         #[serde(default)]
         remote: Option<String>,
+        /// ★ M6：多根 / 共享文件夹（省略或空 = 用 `remote`/`home_root`）
+        #[serde(default)]
+        roots: Option<Vec<String>>,
         #[serde(default)]
         cache_dir: Option<PathBuf>,
         #[serde(default)]
@@ -114,6 +118,8 @@ pub enum Request {
         mountpoint: PathBuf,
     },
     Mounts,
+    /// ★ M6：远端根一览（配置的 roots + NAS 上的同步文件夹 + 可读/可写判定）。
+    Roots,
     /// ★ M2c：变更发现（三游标轮询 + baseline 对账）。
     ///
     /// * `once=true`  → 立即跑一轮，返回 [`SyncInfo`]；
@@ -185,6 +191,7 @@ impl Request {
             Request::Mount { .. } => "mount",
             Request::Umount { .. } => "umount",
             Request::Mounts => "mounts",
+            Request::Roots => "roots",
             Request::Sync { .. } => "sync",
             Request::Store { .. } => "store",
             Request::Rm { .. } => "rm",
@@ -337,6 +344,10 @@ pub struct LinkInfo {
     pub https: bool,
     pub user: String,
     pub ipv4_only: bool,
+    /// ★ M6：这个 link 暴露的远端根（空 = 只用 `home_root`）。
+    /// 有了它，GUI/CLI 才能判断「只改了 roots」也需要重启 daemon 才生效。
+    #[serde(default)]
+    pub roots: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -385,8 +396,12 @@ pub struct UploadInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MountInfo {
     pub mountpoint: PathBuf,
+    /// 兼容字段：单根时是那个根；多根时是第一个根。
     pub remote: String,
     pub readonly: bool,
+    /// ★ M6：这个挂载点覆盖的全部远端根。
+    #[serde(default)]
+    pub roots: Vec<String>,
 }
 
 /// 三个持久化游标（M2c；对应 Windows 版注册表里的 `QSYNC_PROCESSED_MAX_*_LOG_INDEX_64`）。
@@ -504,6 +519,47 @@ pub struct StatusData {
     pub mounts: Vec<MountInfo>,
 }
 
+/// ★ M6：一个远端根的状态（`roots` 请求）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RootInfo {
+    pub remote: String,
+    /// 多根挂载时在挂载点里的目录名（单根时为空 = 直通）。
+    pub view_name: String,
+    /// 当前是否允许写（只有家目录根默认可写；共享文件夹实测服务端拒绝写）。
+    pub writable: bool,
+    /// 探测结果：这个根是否可读（`get_list` 能否列出）。
+    pub readable: bool,
+    /// 可读性探测失败的原因（不可读时给用户看）。
+    pub note: Option<String>,
+}
+
+/// ★ M6：`qbox_get_syncing_folder_list` 的一项（NAS 侧登记的 Qsync 同步文件夹）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SyncingFolderInfo {
+    pub folder: String,
+    pub permission: i64,
+    pub read_deletable: bool,
+    pub realpath: Option<String>,
+    pub volume_id: Option<String>,
+}
+
+/// ★ M6：`roots` 请求的返回。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RootsData {
+    pub home_root: String,
+    /// link 配置里配的（或推导出的）根。
+    pub configured: Vec<String>,
+    /// 每个根的视图名 / 可写性 / 可读性。
+    pub roots: Vec<RootInfo>,
+    /// NAS 上报的 Qsync 同步文件夹（普通账号没配对时是空数组 —— 实测如此）。
+    pub syncing_folders: Vec<SyncingFolderInfo>,
+    /// 一句话解释（例如「非家目录根默认只读」或「未登录，未探测可读性」）。
+    pub note: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoginData {
     pub sid_masked: String,
@@ -589,6 +645,7 @@ mod tests {
         let e = RequestEnvelope::new(Request::Mount {
             mountpoint: "/home/me/mnt".into(),
             remote: Some("/home".into()),
+            roots: Some(vec!["/home".into(), "/Public".into()]),
             cache_dir: None,
             threads: Some(4),
             auto_unmount: Some(true),
@@ -604,6 +661,7 @@ mod tests {
                 threads,
                 hydrate_timeout_secs,
                 remote,
+                roots,
                 delete_limit,
                 cache_mode,
                 ..
@@ -611,6 +669,7 @@ mod tests {
                 assert_eq!(threads, Some(4));
                 assert_eq!(hydrate_timeout_secs, Some(600));
                 assert_eq!(remote.as_deref(), Some("/home"));
+                assert_eq!(roots, Some(vec!["/home".to_string(), "/Public".to_string()]));
                 assert_eq!(delete_limit, Some(0));
                 assert_eq!(cache_mode.as_deref(), Some("direct"));
             }
@@ -681,6 +740,21 @@ mod tests {
         assert_eq!(info.used_bytes, 0);
         let d: DehydrateData = serde_json::from_str("{}").unwrap();
         assert_eq!(d.dehydrated, 0);
+    }
+
+    #[test]
+    fn roots_request_round_trip_and_defaults() {
+        let e = RequestEnvelope::new(Request::Roots);
+        assert_eq!(e.req.method(), "roots");
+        assert!(!e.req.is_long_running());
+        let back: RequestEnvelope = decode_line(&encode_line(&e).unwrap()).unwrap();
+        assert_eq!(back.req, Request::Roots);
+        // 老客户端不看新字段、新客户端不看老字段：默认值都要能解析
+        let d: RootsData = serde_json::from_str("{}").unwrap();
+        assert!(d.roots.is_empty() && d.configured.is_empty() && d.syncing_folders.is_empty());
+        assert_eq!(d.home_root, "");
+        let m: MountInfo = serde_json::from_str(r#"{"mountpoint":"/m","remote":"/home","readonly":true}"#).unwrap();
+        assert!(m.roots.is_empty(), "老响应没有 roots 字段也要能解析");
     }
 
     #[test]

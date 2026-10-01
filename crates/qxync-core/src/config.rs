@@ -98,6 +98,10 @@ pub struct LinkConfig {
     /// Qsync 家目录根：普通用户固定 `/home`。
     #[serde(default = "default_home_root")]
     pub home_root: String,
+    /// ★ M6：要暴露 / 同步的远端根（多根挂载、共享文件夹）。
+    /// 空 = 只用 `home_root`（与 M1–M5 完全一致）。
+    #[serde(default)]
+    pub roots: Vec<String>,
     /// 强制只用 IPv4：对端同时发布 AAAA 但 IPv6 路由不通时非常有用
     /// （实测遇到过：`Network is unreachable` / 传输中途 body 解码失败）。
     #[serde(default)]
@@ -115,6 +119,15 @@ impl LinkConfig {
     pub fn base_url(&self) -> String {
         let scheme = if self.https { "https" } else { "http" };
         format!("{}://{}:{}", scheme, self.host, self.port)
+    }
+
+    /// ★ M6：实际生效的远端根（归一化 + 去重）；没配 `roots` 就退回家目录。
+    pub fn roots(&self) -> Vec<String> {
+        if self.roots.is_empty() {
+            crate::roots::normalize_roots(&[self.home_root.clone()])
+        } else {
+            crate::roots::normalize_roots(&self.roots)
+        }
     }
 
     pub fn load(paths: &ConfigPaths, link_id: &str) -> Result<Self> {
@@ -185,6 +198,7 @@ mod tests {
             insecure: true,
             user: "test1".into(),
             home_root: "/home".into(),
+            roots: vec![],
             ipv4_only: false,
         };
         link.save(&paths).unwrap();

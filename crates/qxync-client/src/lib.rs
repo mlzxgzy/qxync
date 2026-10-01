@@ -1121,6 +1121,68 @@ impl Client {
     }
 }
 
+// ------------------------------------------------------- M6 同步文件夹列表
+//
+// `GET /cgi-bin/qsync/qsyncsrv.cgi?func=qbox_get_syncing_folder_list&sid=…`（新命名空间）。
+// 真机实测（用户 test1）响应原文：
+// `{"total": 0, "client_key": "754879e7…", "folder" :[]}` —— **端点可用，但该账号没有登记
+// 任何 Qsync 同步文件夹**。所以「空列表」是正常状态，绝不报错。
+
+impl Client {
+    /// ★ M6：NAS 上报的 Qsync 同步文件夹（= 用户/设备在 Qsync 里配了同步的共享文件夹）。
+    ///
+    /// 普通账号没配对时返回空 `Vec`（实测如此），**不报错**；只有网络/HTTP、非 JSON、
+    /// 或带上非成功 `status` 时才回 `Err`。复用 core 的
+    /// [`qxync_core::ipc::SyncingFolderInfo`]，不另造类型。
+    pub async fn syncing_folders(&self) -> Result<Vec<qxync_core::ipc::SyncingFolderInfo>> {
+        let body = self.qsync_func("qbox_get_syncing_folder_list", &[]).await?;
+        let v: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|e| Error::Parse(format!("qbox_get_syncing_folder_list 非 JSON: {e}")))?;
+        // 真机正常响应里没有 `status`；一旦出现且非成功就按协议错误处理。
+        if let Some(s) = v.get("status").and_then(json_i64) {
+            if !ServerStatus(s).is_success() {
+                return Err(Error::status(s, "qbox_get_syncing_folder_list"));
+            }
+        }
+        Ok(parse_syncing_folders(&v))
+    }
+}
+
+/// 解析 `qbox_get_syncing_folder_list` 的 JSON（纯函数，便于离线单测）。
+///
+/// 容错要点（真机实测 + 报告 §4.2 的宽松字段表）：
+/// * `folder` 可能是数组，也可能**缺失 / 是 `null` / 类型不对** → 一律当**空列表**，
+///   「没配对」是正常状态，不报错；`"folder" :[]`（冒号前空格）由 `serde_json` 自行容错；
+/// * `permission` / `read_deletable` 可能是数字或字符串 → 宽松解析（`"3"` / `"1"` 都认）；
+/// * `realpath` / `volume_id`（别名 `vol_id`）的**空串当作 `None`**；
+/// * `total` 与数组长度不一致**不报错**，以数组为准（`total` 只是提示）；
+/// * 数组里的非对象条目直接跳过。
+pub fn parse_syncing_folders(raw: &serde_json::Value) -> Vec<qxync_core::ipc::SyncingFolderInfo> {
+    let Some(items) = raw.get("folder").and_then(|f| f.as_array()) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|it| {
+            let obj = it.as_object()?;
+            let s = |k: &str| -> Option<String> {
+                obj.get(k)
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            };
+            Some(qxync_core::ipc::SyncingFolderInfo {
+                folder: s("folder").unwrap_or_default(),
+                permission: obj.get("permission").and_then(json_i64).unwrap_or(0),
+                read_deletable: obj.get("read_deletable").map(json_bool).unwrap_or(false),
+                realpath: s("realpath"),
+                // 报告 §4.2 里同一字段有 `volume_id` / `vol_id` 两种拼法
+                volume_id: s("volume_id").or_else(|| s("vol_id")),
+            })
+        })
+        .collect()
+}
+
 /// 上传响应的判定：`{"status":"1","files":[{"status":"1",...}]}`。
 pub fn parse_upload_result(body: &[u8], filename: &str) -> Result<()> {
     let v: serde_json::Value = serde_json::from_slice(body)
@@ -1446,5 +1508,84 @@ mod tests {
             g4.reason().unwrap().contains("stat_delta exist=0"),
             "{g4:?}"
         );
+    }
+
+    // ------------------------- M6 同步文件夹列表
+    // 输入含真机响应原文（report/probe/probe-out/webui/chain/09_qbox_get_syncing_folder_list.http，
+    // 用户 test1）：`{"total": 0, …, "folder" :[]}`。
+
+    #[test]
+    fn syncing_folders_empty_real_response() {
+        // ★ 真机原文。注意 `"folder" :[]` 冒号前有空格 —— serde_json 本身就容错。
+        let raw = r#"{ "total": 0, "client_key": "754879e7da2632f22eef398e885d0467de50d9629cc1529b6c1dbe29cccb6999", "folder" :[]}"#;
+        let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert!(
+            parse_syncing_folders(&v).is_empty(),
+            "空 folder 是「该账号没配对」的正常状态，不是错误"
+        );
+    }
+
+    #[test]
+    fn syncing_folders_parses_full_record_leniently() {
+        let raw = r#"{"total": 1, "client_key": "ck", "folder": [{
+            "folder": "/share/Photos", "permission": 3, "read_deletable": "1",
+            "realpath": "/share/CACHEDEV1_DATA/Photos", "volume_id": "ce_cachedev1",
+            "volume_lock": 0, "volume_encrypt": 0, "capacity": 0, "capacity_unit": "GB",
+            "used_size": 0, "used_unit": "GB", "free_size": 0, "pid": 0 }]}"#;
+        let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let f = parse_syncing_folders(&v);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].folder, "/share/Photos");
+        assert_eq!(f[0].permission, 3);
+        assert!(f[0].read_deletable, "字符串 \"1\" 也必须算真");
+        assert_eq!(
+            f[0].realpath.as_deref(),
+            Some("/share/CACHEDEV1_DATA/Photos")
+        );
+        assert_eq!(f[0].volume_id.as_deref(), Some("ce_cachedev1"));
+    }
+
+    #[test]
+    fn syncing_folders_missing_null_and_mismatch_are_not_errors() {
+        // folder 缺失
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"total": 0, "client_key": "ck"}"#).unwrap();
+        assert!(parse_syncing_folders(&v).is_empty());
+        // folder 是 null
+        let v: serde_json::Value = serde_json::from_str(r#"{"total": 0, "folder": null}"#).unwrap();
+        assert!(parse_syncing_folders(&v).is_empty());
+        // folder 类型不对（对象而非数组）
+        let v: serde_json::Value = serde_json::from_str(r#"{"total": 0, "folder": {}}"#).unwrap();
+        assert!(parse_syncing_folders(&v).is_empty());
+        // total 与数组长度不一致 → 不 panic，以数组为准
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"total": 99, "folder": [{"folder": "/a"}, {"folder": "/b"}, {"folder": "/c"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(parse_syncing_folders(&v).len(), 3);
+        let v: serde_json::Value = serde_json::from_str(r#"{"total": 7, "folder": []}"#).unwrap();
+        assert!(parse_syncing_folders(&v).is_empty());
+    }
+
+    #[test]
+    fn syncing_folders_lenient_types_and_empty_strings() {
+        let raw = r#"{"folder": [
+            {"folder": "/a", "permission": "2", "read_deletable": 0, "realpath": "", "vol_id": "v9"},
+            {"folder": "/b", "permission": "abc", "read_deletable": true, "realpath": null, "volume_id": ""},
+            "垃圾条目"]}"#;
+        let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let f = parse_syncing_folders(&v);
+        assert_eq!(f.len(), 2, "数组里的非对象条目应被跳过");
+        assert_eq!(f[0].permission, 2, "字符串 \"2\" 也要能解析");
+        assert!(!f[0].read_deletable);
+        assert_eq!(f[0].realpath, None, "空串 realpath → None");
+        assert_eq!(
+            f[0].volume_id.as_deref(),
+            Some("v9"),
+            "vol_id 是 volume_id 的别名"
+        );
+        assert_eq!(f[1].permission, 0, "解析不了的 permission → 0");
+        assert!(f[1].read_deletable);
+        assert_eq!(f[1].volume_id, None, "空串 volume_id → None");
     }
 }

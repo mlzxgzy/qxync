@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 use qxync_client::Client;
 use qxync_core::ipc::{
     default_socket_path, CacheInfo, CursorInfo, DehydrateData, ErrorKind, GetData, LsData,
-    MountInfo, PingData, PutData, Request, StatusData, StoreData, SyncInfo,
+    MountInfo, PingData, PutData, Request, RootsData, StatusData, StoreData, SyncInfo,
 };
 use qxync_core::{ConfigPaths, Credentials, DirEntry, LinkConfig, HOME_ROOT};
 use qxync_fuse::{CacheMode, QxyncFs};
@@ -110,9 +110,9 @@ enum Cmd {
     Mount {
         /// 本地挂载点
         mountpoint: PathBuf,
-        /// 远端根目录（普通用户固定 /home）
-        #[arg(long, default_value = HOME_ROOT)]
-        remote: String,
+        /// 远端根（可重复：`--remote /home --remote /Public`）；默认 /home
+        #[arg(long = "remote", default_value = HOME_ROOT)]
+        remote: Vec<String>,
         /// 水合缓存目录（默认 ~/.local/share/qsync/cache）
         #[arg(long)]
         cache_dir: Option<PathBuf>,
@@ -152,6 +152,13 @@ enum Cmd {
         /// 调整后台轮询间隔秒数（0 = 暂停）
         #[arg(long)]
         interval: Option<u64>,
+    },
+
+    /// ★ M6：远端根一览（配置的 roots + NAS 上的同步文件夹 + 可读/可写判定）
+    Roots {
+        /// 直接输出 JSON（脚本/验收用）
+        #[arg(long)]
+        json: bool,
     },
 
     /// 删除远端文件/目录（M2c 脚本/测试用；挂在挂载点上 rm 走 FUSE）
@@ -253,6 +260,8 @@ fn resolve_link(cli: &Cli) -> Result<LinkConfig> {
             insecure: cli.insecure,
             user: u.clone(),
             home_root: HOME_ROOT.to_string(),
+            // ★ M6：未配 roots 时由 `LinkConfig::roots()` 退回家目录根
+            roots: Vec::new(),
             ipv4_only: cli.ipv4,
         }),
         _ => bail!(
@@ -481,8 +490,13 @@ async fn main() -> Result<()> {
             client.mkdir(parent, name).await?;
             println!("✅ 已建目录 {parent}/{name}");
         }
-        Cmd::Pin { .. } | Cmd::State { .. } | Cmd::Sync { .. } | Cmd::Dehydrate { .. } | Cmd::Store { .. } => {
-            bail!("`pin`/`state`/`sync`/`dehydrate`/`store` 需要 daemon：先 `qsync daemon start`（或用 --socket 指向运行中的 daemon）");
+        Cmd::Pin { .. }
+        | Cmd::State { .. }
+        | Cmd::Sync { .. }
+        | Cmd::Dehydrate { .. }
+        | Cmd::Store { .. }
+        | Cmd::Roots { .. } => {
+            bail!("`pin`/`state`/`sync`/`dehydrate`/`store`/`roots` 需要 daemon：先 `qsync daemon start`（或用 --socket 指向运行中的 daemon）");
         }
         Cmd::Rm { dir, name } => {
             let (client, _) = connect(&cli, true).await?;
@@ -507,6 +521,11 @@ async fn main() -> Result<()> {
             delete_limit,
             cache_mode,
         } => {
+            // 直连模式的 FUSE 进程只挂一个根；多根需要 daemon 侧合成视图。
+            if remote.len() > 1 {
+                bail!("多根挂载需要 daemon：先 `qsync daemon start`（或用 --via-daemon）");
+            }
+            let remote = remote.first().cloned().unwrap_or_else(|| HOME_ROOT.to_string());
             let (client, link) = connect(&cli, true).await?;
             let cache = cache_dir.clone().unwrap_or_else(|| {
                 paths()
@@ -660,7 +679,8 @@ fn to_request(cli: &Cli) -> Option<Request> {
             cache_mode,
         } => Request::Mount {
             mountpoint: mountpoint.clone(),
-            remote: Some(remote.clone()),
+            remote: Some(remote[0].clone()),
+            roots: Some(remote.clone()),
             cache_dir: cache_dir.clone(),
             threads: Some(*threads),
             auto_unmount: Some(*auto_unmount),
@@ -691,6 +711,7 @@ fn to_request(cli: &Cli) -> Option<Request> {
             dir: dir.clone(),
             name: name.clone(),
         },
+        Cmd::Roots { .. } => Request::Roots,
         Cmd::Store { integrity, .. } => Request::Store {
             integrity: Some(*integrity),
         },
@@ -827,12 +848,32 @@ async fn route_via_daemon(
         }
         Cmd::Mount { rw, .. } => {
             let m: MountInfo = ipc_client::call(&socket, req).await?;
+            let roots = if m.roots.is_empty() {
+                m.remote.clone()
+            } else {
+                m.roots.join(", ")
+            };
             println!(
                 "✅ 已挂载 {} -> {}（{}，daemon 持有，pid 见 `qsync daemon status`）",
                 m.mountpoint.display(),
-                m.remote,
+                roots,
                 if *rw { "读写" } else { "只读" }
             );
+        }
+        Cmd::Roots { json } => {
+            let raw: serde_json::Value = ipc_client::call(&socket, req).await?;
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&raw)
+                        .map_err(|e| qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string()))?
+                );
+            } else {
+                let d: RootsData = serde_json::from_value(raw).map_err(|e| {
+                    qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string())
+                })?;
+                print_roots(&d);
+            }
         }
         Cmd::Sync { once, .. } => {
             let info: SyncInfo = ipc_client::call(&socket, req).await?;
@@ -914,6 +955,64 @@ fn print_store(d: &StoreData) {
         for (path, state) in &d.pins {
             println!("            {state:<12} {path}");
         }
+    }
+}
+
+/// ★ M6：远端根一览（配置的 roots + NAS 同步文件夹 + 可读/可写判定）。
+fn print_roots(d: &RootsData) {
+    println!("家目录根  : {}", d.home_root);
+    println!(
+        "配置的根  : {}",
+        if d.configured.is_empty() {
+            "（无）".to_string()
+        } else {
+            d.configured.join(", ")
+        }
+    );
+    if d.roots.is_empty() {
+        println!("根列表    : （无）");
+    } else {
+        println!("根列表    :");
+        for r in &d.roots {
+            let view = if r.view_name.is_empty() {
+                "-"
+            } else {
+                r.view_name.as_str()
+            };
+            let readable = if r.readable {
+                "可读".to_string()
+            } else {
+                match &r.note {
+                    Some(n) => format!("不可读：{n}"),
+                    None => "不可读".to_string(),
+                }
+            };
+            println!(
+                "  {} {:<12} 视图名 {:<10}{}   {}",
+                if r.readable { "✅" } else { "❌" },
+                r.remote,
+                view,
+                if r.writable { "可写" } else { "只读" },
+                readable
+            );
+        }
+    }
+    if d.syncing_folders.is_empty() {
+        println!("NAS 同步文件夹 : （无 —— 该账号没有在 Qsync 里配同步文件夹）");
+    } else {
+        println!("NAS 同步文件夹 : {} 个", d.syncing_folders.len());
+        for f in &d.syncing_folders {
+            println!(
+                "  · {}  权限={}  可删除={}  realpath={}",
+                f.folder,
+                f.permission,
+                f.read_deletable,
+                f.realpath.as_deref().unwrap_or("-")
+            );
+        }
+    }
+    if let Some(note) = &d.note {
+        println!("说明      : {note}");
     }
 }
 

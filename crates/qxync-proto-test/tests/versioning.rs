@@ -39,6 +39,7 @@ fn env_creds() -> Option<(LinkConfig, String)> {
             insecure: true,
             user,
             home_root: HOME_ROOT.to_string(),
+            roots: Vec::new(),
             ipv4_only: std::env::var("QSYNC_TEST_IPV4").is_ok(),
         },
         password,

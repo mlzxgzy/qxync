@@ -102,6 +102,19 @@
     </div>
 
     <div class="card">
+      <h2>远端根 <span class="count" id="roots-count"></span>
+        <button type="button" class="mini" id="btn-roots-refresh">刷新</button>
+      </h2>
+      <dl class="kv mono" id="roots-summary-kv"></dl>
+      <ul class="root-list" id="roots-list"></ul>
+      <p class="empty-hint" id="roots-empty" hidden>尚未读取远端根（点右上「刷新」）。</p>
+      <p class="note" id="roots-note" hidden></p>
+      <h3 class="sub">NAS 同步文件夹</h3>
+      <ul class="root-list mono" id="roots-folders"></ul>
+      <p class="empty-hint" id="roots-folders-empty" hidden>NAS 未登记 Qsync 同步文件夹</p>
+    </div>
+
+    <div class="card">
       <h2>最近一次同步摘要</h2>
       <div id="sync-alerts" class="alert-stack"></div>
       <dl class="kv kv-inline" id="sync-summary-kv"></dl>
@@ -141,6 +154,10 @@
           <label>home_root（远端家目录根）
             <input type="text" id="f-home-root" placeholder="/home" spellcheck="false" class="mono">
           </label>
+          <label>远端根（roots，每行一个）
+            <textarea id="f-roots" rows="3" class="mono" spellcheck="false" placeholder="/home"></textarea>
+          </label>
+          <p class="hint">留空 = 只同步家目录 <code>/home</code>；多根时挂载点顶层会出现每个根的名字（如 <code>home/</code>、<code>Public/</code>）。共享文件夹默认只读。</p>
           <div class="btn-row">
             <button type="submit" id="btn-link-save">保存连接配置</button>
             <button type="button" id="btn-login" class="primary">保存并登录</button>
@@ -180,8 +197,8 @@
         <label>挂载点（本地目录，会被创建）
           <input type="text" id="m-mountpoint" spellcheck="false" class="mono">
         </label>
-        <label>远端路径
-          <input type="text" id="m-remote" value="/home" spellcheck="false" class="mono">
+        <label>远端根（每行一个，第一个是默认根）
+          <textarea id="m-remote" rows="3" class="mono" spellcheck="false" placeholder="/home">/home</textarea>
         </label>
         <div class="row-2">
           <label>缓存模式
