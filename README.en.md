@@ -95,7 +95,21 @@ cargo build --workspace --release # release (lto=thin is already configured; lin
 
 If you want `.deb` / AppImage packages, `crates/qxync-gui/tauri.conf.json` already sets
 `bundle.targets = ["deb", "appimage"]` — just package with the Tauri CLI.
-**The repository currently ships no prebuilt artifacts**; please build from source.
+
+**Prebuilt artifacts**: pushing a `v*` tag (or manually running the `Release` workflow) makes
+[`.github/workflows/release.yml`](.github/workflows/release.yml) build and attach them to the
+matching [Release](https://github.com/mlzxgzy/qxync/releases):
+
+| Asset | What it is |
+|---|---|
+| `qxync-<version>-x86_64-unknown-linux-gnu.tar.gz` | all three binaries + licences / disclaimer |
+| `qsync` · `qxyncd` · `qxync-gui` | the three binaries on their own, from the same build |
+| `SHA256SUMS` | checksums for the assets above |
+
+Just keep the three binaries in the **same directory**: the GUI first looks for `qxyncd` next to
+itself and only then falls back to `PATH`. Running the GUI also needs the WebKitGTK 4.1 / GTK 3
+runtime (`libwebkit2gtk-4.1-0` + `libgtk-3-0` on Debian/Ubuntu). **Building from source is still
+the recommended path** (reproducible and auditable).
 
 ### 3. First login
 

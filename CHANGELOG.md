@@ -7,6 +7,15 @@
 
 ## [未发布]
 
+### 新增
+
+- **发版产物自动化**：推 `v*` tag（或手工触发 `Release` 工作流）即构建并发布
+  `qsync` / `qxyncd` / `qxync-gui` 三个二进制 —— 一个
+  `qxync-<版本>-x86_64-unknown-linux-gnu.tar.gz`、三个裸二进制、`SHA256SUMS`，
+  全部挂到该 tag 的 Release。发版前有**版本一致性守卫**（tag 与 `Cargo.toml` /
+  `tauri.conf.json` 三处必须一致，否则拒绝发版）；打包脚本 `xtask/release/package-linux.sh`
+  可本地复跑，产物可复现（tar 内 owner/group 归零、顺序固定、gzip 不写时间戳）。
+
 ## [0.1.0] - 2026-10-02
 
 **首个公开版本。** 这不是「能跑起来」的程度：每个里程碑都在真机上跑过完整验收，

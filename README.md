@@ -90,7 +90,20 @@ cargo build --workspace --release # release（已配 lto=thin；保留行号回�
 
 如果要出 `.deb` / AppImage 安装包，`crates/qxync-gui/tauri.conf.json` 里已经配好
 `bundle.targets = ["deb", "appimage"]`，用 Tauri CLI 打包即可。
-**目前仓库不提供预编译产物**，请从源码构建。
+
+**预编译产物**：推 `v*` tag（或手工触发 `Release` 工作流）后，由
+[`.github/workflows/release.yml`](.github/workflows/release.yml) 自动构建并挂到对应
+[Release](https://github.com/mlzxgzy/qxync/releases)：
+
+| 资产 | 说明 |
+|---|---|
+| `qxync-<版本>-x86_64-unknown-linux-gnu.tar.gz` | 三个二进制 + 许可证 / 免责声明 |
+| `qsync` · `qxyncd` · `qxync-gui` | 三个裸二进制（同一份构建，供挑着下） |
+| `SHA256SUMS` | 上述资产的校验和 |
+
+三个二进制放在**同一个目录**即可：GUI 先找自己旁边的 `qxyncd`，找不到再退回 `PATH`。
+运行 GUI 还要系统里有 WebKitGTK 4.1 / GTK 3 运行时（Debian/Ubuntu 是
+`libwebkit2gtk-4.1-0` + `libgtk-3-0`）。**仍然建议优先从源码构建**（可复现、可审计）。
 
 ### 3. 首次登录
 
