@@ -179,9 +179,13 @@
             <label>本地文件夹（挂载点，绝对路径）
               <input type="text" id="t-mountpoint" class="mono" spellcheck="false">
             </label>
-            <label>NAS 文件夹（远端根，每行一个）
+            <label>NAS 上要同步的目录（每行一个）
               <textarea id="t-roots" rows="2" class="mono" spellcheck="false" placeholder="/home">/home</textarea>
             </label>
+            <p class="hint">
+              就是 NAS 上的起点目录：<code>/home</code> = 家目录。要连共享文件夹再一行写一个
+              （如 <code>/Public</code>，默认只读）；写两行以上时挂载点顶层会多出每个目录的名字。
+            </p>
             <label>水合缓存目录（留空 = 默认 <code>~/.local/share/qxync/cache</code>）
               <input type="text" id="t-cache-dir" class="mono" spellcheck="false"
                      placeholder="留空用默认；实际缓存会再拼一层 NAS 主机名">
@@ -215,7 +219,7 @@
             <p class="hint">
               保存位置 <code>~/.config/qxync/tasks/&lt;id&gt;.json</code>；**只登记参数，不动 NAS 上的任何数据**。
               冲突策略与节省空间模式已经接到后端；选择性同步（勾选子文件夹）仍是 M9 的事，
-              现在用「多任务 / 多根」近似。
+              现在用「多任务 / 每条任务配多个 NAS 目录」近似。
             </p>
             <div class="btn-row">
               <button type="submit" id="btn-task-save" class="primary">保存任务</button>
@@ -361,13 +365,34 @@
                   <label class="check"><input type="checkbox" id="f-insecure"> 自签证书：跳过 TLS 校验</label>
                   <label class="check"><input type="checkbox" id="f-ipv4-only"> 仅 IPv4</label>
                 </div>
-                <label>home_root（远端家目录根）
-                  <input type="text" id="f-home-root" placeholder="/home" spellcheck="false" class="mono">
-                </label>
-                <label>远端根（roots，每行一个）
-                  <textarea id="f-roots" rows="3" class="mono" spellcheck="false" placeholder="/home"></textarea>
-                </label>
-                <p class="hint">留空 = 只同步家目录 <code>/home</code>；多根时挂载点顶层会出现每个根的名字（如 <code>home/</code>、<code>Public/</code>）。共享文件夹默认只读。</p>
+                <!-- ★ 高级项：普通账号「只同步家目录」，这两格什么都不用填。
+                     只有「要连共享文件夹」或「家目录在 Qsync 里不叫 /home」才需要动，
+                     所以收进 <details> 默认折叠，免得普通用户对着看不懂的字段发愣。
+                     输入框在收起状态下依然可读可写（details 不会 disable 控件）。 -->
+                <details class="adv">
+                  <summary>高级：同步范围（默认只同步家目录，一般不用改）</summary>
+                  <div class="adv-body">
+                    <label>要同步哪些 NAS 目录（每行一个）
+                      <textarea id="f-roots" rows="3" class="mono" spellcheck="false" placeholder="/home"></textarea>
+                    </label>
+                    <p class="hint">
+                      留空 = 只同步家目录（<code>/home</code>）。要连共享文件夹就一行写一个
+                      （如 <code>/Public</code>）；写了两行以上时，挂载点顶层会多出每个目录的名字
+                      （<code>home/</code>、<code>Public/</code>…），而且家目录以外的目录默认只读。
+                      （配置文件里这个字段叫 <code>roots</code>。）
+                    </p>
+
+                    <label>家目录的名字
+                      <input type="text" id="f-home-root" placeholder="/home" spellcheck="false" class="mono">
+                    </label>
+                    <p class="hint">
+                      你 NAS 上家目录的真实位置是 <code>/share/homes/你的用户名</code>，
+                      Qsync 内部却把它叫 <code>/home</code> —— 这里填的就是这个「内部叫法」
+                      （配置文件里这个字段叫 <code>home_root</code>）。
+                      普通账号保持 <code>/home</code> 不用动；只有 NAS 把家目录挂在别的名字下才需要改。
+                    </p>
+                  </div>
+                </details>
                 <div class="btn-row">
                   <button type="submit" id="btn-link-save">保存连接配置</button>
                   <button type="button" id="btn-login" class="primary">保存并登录</button>
@@ -684,19 +709,19 @@
               <button type="button" class="mini" id="btn-status-mounts-refresh">刷新</button>
             </h2>
             <table class="tbl" id="tbl-status-mounts">
-              <thead><tr><th>挂载点</th><th>远端</th><th>模式</th><th class="col-act">操作</th></tr></thead>
+              <thead><tr><th>挂载点</th><th>NAS 目录</th><th>模式</th><th class="col-act">操作</th></tr></thead>
               <tbody></tbody>
             </table>
             <p class="empty-hint" id="status-mounts-empty" hidden data-state="ready" data-i18n="mounts.empty">暂无挂载。</p>
           </div>
 
           <div class="card">
-            <h2>远端根 <span class="count" id="roots-count"></span>
+            <h2>要同步的 NAS 目录 <span class="count" id="roots-count"></span>
               <button type="button" class="mini" id="btn-roots-refresh">刷新</button>
             </h2>
             <dl class="kv mono" id="roots-summary-kv"></dl>
             <ul class="root-list" id="roots-list"></ul>
-            <p class="empty-hint" id="roots-empty" hidden data-state="ready" data-i18n="roots.empty">尚未读取远端根（点右上「刷新」）。</p>
+            <p class="empty-hint" id="roots-empty" hidden data-state="ready" data-i18n="roots.empty">尚未读取要同步的 NAS 目录（点右上「刷新」）。</p>
             <p class="note" id="roots-note" hidden></p>
             <h3 class="sub">NAS 同步文件夹</h3>
             <ul class="root-list mono" id="roots-folders"></ul>
@@ -719,7 +744,7 @@
               <button type="button" class="mini" id="btn-mounts-refresh">刷新</button>
             </h2>
             <table class="tbl" id="tbl-mounts">
-              <thead><tr><th>挂载点</th><th>远端</th><th>模式</th><th class="col-act">操作</th></tr></thead>
+              <thead><tr><th>挂载点</th><th>NAS 目录</th><th>模式</th><th class="col-act">操作</th></tr></thead>
               <tbody></tbody>
             </table>
             <p class="empty-hint" id="mounts-empty" hidden data-state="ready" data-i18n="mounts.empty">暂无挂载。</p>
@@ -731,7 +756,7 @@
               <label>挂载点（本地目录，会被创建）
                 <input type="text" id="m-mountpoint" spellcheck="false" class="mono">
               </label>
-              <label>远端根（每行一个，第一个是默认根）
+              <label>NAS 上要挂载的目录（每行一个，第一个是默认）
                 <textarea id="m-remote" rows="3" class="mono" spellcheck="false" placeholder="/home">/home</textarea>
               </label>
               <div class="row-2">

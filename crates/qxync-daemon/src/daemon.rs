@@ -1221,10 +1221,11 @@ async fn roots_cmd(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
         syncing = with_client!(state, |c| c.syncing_folders()).unwrap_or_default();
     }
 
+    // ★ 措辞：用户看到的是「要同步的 NAS 目录」，「远端根」只在文档/字段名里出现。
     let note = if logged_in {
-        "非家目录根默认只读：服务端对非 Qsync 同步文件夹的上传会拒绝（status 20）".to_string()
+        "家目录以外的目录默认只读：服务端会拒绝往非 Qsync 同步文件夹上传（status 20）".to_string()
     } else {
-        "未登录：未探测可读性，也没有 NAS 的同步文件夹列表".to_string()
+        "未登录：没探测能不能读，也没有 NAS 上的同步文件夹列表".to_string()
     };
     to_value(RootsData {
         home_root,

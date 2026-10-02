@@ -802,6 +802,43 @@ table.tbl tbody tr:focus-within td { box-shadow: inset 0 -1px 0 var(--focus); }
   color: var(--fg);
 }
 
+/* ★ 连接页的「高级」收缩栏：默认折叠，把 home_root 这类平时不用动的字段收起来。
+   用原生 <details>/<summary> —— 不写 JS 就有键盘可达性与展开状态。 */
+.form details.adv {
+  border-top: 1px dashed var(--border);
+  padding-top: 7px;
+}
+
+.form details.adv > summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--fg-dim);
+  padding: 1px 0;
+  list-style: none;                       /* 自绘 ▸/▾，避免各浏览器 marker 不一致 */
+  user-select: none;
+}
+
+.form details.adv > summary::-webkit-details-marker { display: none; }
+
+.form details.adv > summary::before {
+  content: '▸';
+  display: inline-block;
+  width: 12px;
+  color: var(--fg-faint);
+}
+
+.form details.adv[open] > summary::before { content: '▾'; }
+.form details.adv > summary:hover { color: var(--fg); }
+
+.form details.adv .adv-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 0 0 12px;                  /* 缩进一档，一眼看出是从属关系 */
+  border-left: 2px solid var(--border);
+  margin: 8px 0 0 2px;
+}
+
 .row-2, .row-3, .row-checks {
   display: grid;
   gap: 8px;
