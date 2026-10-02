@@ -87,7 +87,7 @@ impl Default for SyncConfig {
     }
 }
 
-/// 一轮的统计（`qsync sync --once` 直接打印）。
+/// 一轮的统计（`qxync sync --once` 直接打印）。
 #[derive(Debug, Clone, Default)]
 pub struct SyncReport {
     pub max_log: u64,
@@ -927,7 +927,7 @@ async fn resolve_conflict(
                         Ok(()) => {
                             report.conflicts += 1;
                             report.note(format!(
-                                "{path}: 冲突等待裁决（策略：每个文件都问我）→ GUI 任务页 / `qsync conflicts`"
+                                "{path}: 冲突等待裁决（策略：每个文件都问我）→ GUI 任务页 / `qxync conflicts`"
                             ));
                         }
                         Err(e) => report.error(format!("{path} 写入待裁决队列失败: {e}")),
@@ -1130,7 +1130,7 @@ pub fn hostname() -> String {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
         })
-        .unwrap_or_else(|| "qsync-linux".to_string())
+        .unwrap_or_else(|| "qxync-linux".to_string())
 }
 
 /// `YYYY-MM-DD`（本地时区，用 libc 拆 tm）。
@@ -1337,10 +1337,10 @@ mod tests {
     // ---- 真机测试脚手架
 
     fn env_creds() -> Option<(LinkConfig, String)> {
-        let host = std::env::var("QSYNC_TEST_HOST").ok()?;
-        let user = std::env::var("QSYNC_TEST_USER").ok()?;
-        let password = std::env::var("QSYNC_TEST_PASSWORD").ok()?;
-        let port = std::env::var("QSYNC_TEST_PORT")
+        let host = std::env::var("QXNYC_TEST_HOST").ok()?;
+        let user = std::env::var("QXNYC_TEST_USER").ok()?;
+        let password = std::env::var("QXNYC_TEST_PASSWORD").ok()?;
+        let port = std::env::var("QXNYC_TEST_PORT")
             .ok()
             .and_then(|p| p.parse().ok())
             .unwrap_or(9834);
@@ -1354,7 +1354,7 @@ mod tests {
                 user,
                 home_root: HOME_ROOT.to_string(),
                 roots: Vec::new(),
-                ipv4_only: std::env::var("QSYNC_TEST_IPV4").is_ok(),
+                ipv4_only: std::env::var("QXNYC_TEST_IPV4").is_ok(),
                 exclude: Vec::new(),
                 filter_temp: true,
                 peer_listen: None,
@@ -1365,7 +1365,7 @@ mod tests {
     }
 
     fn fixture_root() -> String {
-        std::env::var("QSYNC_TEST_FIXTURE").unwrap_or_else(|_| "/home/qxync-test".to_string())
+        std::env::var("QXNYC_TEST_FIXTURE").unwrap_or_else(|_| "/home/qxync-test".to_string())
     }
 
     async fn logged_in() -> Option<Client> {
@@ -1417,7 +1417,7 @@ mod tests {
     /// ★ 真机 M2c 引擎测试：远端刷新 / 冲突副本 / baseline / 删除保护 / 游标落盘。
     ///
     /// ```bash
-    /// export QSYNC_TEST_HOST=... QSYNC_TEST_USER=... QSYNC_TEST_PASSWORD=...
+    /// export QXNYC_TEST_HOST=... QXNYC_TEST_USER=... QXNYC_TEST_PASSWORD=...
     /// cargo test -p qxync-daemon -- --ignored --nocapture
     /// ```
     // 必须是多线程运行时：上传 worker 是独立 OS 线程，用 `Handle::block_on` 驱动请求，

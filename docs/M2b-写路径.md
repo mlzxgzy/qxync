@@ -67,7 +67,7 @@ fully_covered = c_start >= write_start && c_end <= write_end
 
 ### 2.4 只读 vs 读写
 
-* 默认仍是**只读**挂载（M1 行为不变）；`qsync mount --rw` 才开写路径并创建上传队列。
+* 默认仍是**只读**挂载（M1 行为不变）；`qxync mount --rw` 才开写路径并创建上传队列。
 * 只读时任何写意图回 `EROFS`（`open` 阶段就拦）。
 * `status` 会显示上传队列：`待上传 / 完成 / 失败（重试次数、字节数）`。
 

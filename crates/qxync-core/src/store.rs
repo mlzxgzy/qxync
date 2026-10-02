@@ -153,7 +153,7 @@ pub struct DecisionRow {
 impl DecisionRow {
     /// 稳定 id：**只用路径**（同一路径只应有一条待裁决）。
     ///
-    /// 不用散列是为了让 `qsync conflicts --json` 的输出可读、可 diff；
+    /// 不用散列是为了让 `qxync conflicts --json` 的输出可读、可 diff；
     /// 路径里可能有 `/`，所以做一层转义。
     pub fn id_for(path: &str) -> String {
         path.trim_start_matches('/')

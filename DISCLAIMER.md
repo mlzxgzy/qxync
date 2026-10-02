@@ -52,7 +52,7 @@
 ### 5. 凭据
 
 本项目**不包含、不分发**任何第三方客户端凭据。所有凭据都只存在于**你自己的机器上**：
-NAS 账号口令写在 `~/.config/qsync/credentials.json`（权限 `0600`），
+NAS 账号口令写在 `~/.config/qxync/credentials.json`（权限 `0600`），
 且该文件不会被本项目上传到任何地方。
 
 ### 6. 无担保
@@ -139,7 +139,7 @@ provided to describe interoperability — and every item was verified against re
 
 This project **contains and distributes no third-party client credentials**. All credentials live
 **only on your own machine**: your NAS account password is written to
-`~/.config/qsync/credentials.json` (mode `0600`), and this project never uploads it anywhere.
+`~/.config/qxync/credentials.json` (mode `0600`), and this project never uploads it anywhere.
 
 ### 6. No warranty
 

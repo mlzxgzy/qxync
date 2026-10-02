@@ -1,4 +1,4 @@
-//! `qsync` —— QSync-Linux 前端 CLI（M0：协议打通）。
+//! `qxync` —— 前端 CLI（M0：协议打通）。
 //!
 //! 后端守护 `qxyncd` 尚未实现，本版 CLI 直接驱动 `qxync-client` 对 NAS 跑通
 //! 「登录 → 列举 → stat → 下载 → 上传 → 建目录」这条链，作为 M0 的验收工具。
@@ -22,17 +22,17 @@ use std::time::Duration;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "qsync",
+    name = "qxync",
     version,
-    about = "QSync for Linux —— on-demand 同步客户端（M0 协议版）"
+    about = "qxync —— QNAP Qsync 的 Linux on-demand 同步客户端（M0 协议版）"
 )]
 struct Cli {
-    /// 连接 id（对应 ~/.config/qsync/links/<id>.json）
+    /// 连接 id（对应 ~/.config/qxync/links/<id>.json）
     #[arg(long, global = true, default_value = "default")]
     link: String,
 
     /// 覆盖 NAS 地址（配合 --user/--password 首次登录）
-    #[arg(long, global = true, env = "QSYNC_HOST")]
+    #[arg(long, global = true, env = "QXNYC_HOST")]
     host: Option<String>,
 
     #[arg(long, global = true, default_value_t = 9834)]
@@ -51,7 +51,7 @@ struct Cli {
     ipv4: bool,
 
     /// daemon 的 IPC socket 路径（默认 $XDG_RUNTIME_DIR/qxync/qxyncd.sock）
-    #[arg(long, global = true, env = "QSYNC_SOCKET")]
+    #[arg(long, global = true, env = "QXNYC_SOCKET")]
     socket: Option<PathBuf>,
 
     /// 强制走 daemon IPC（默认：socket 可连就走 daemon）
@@ -62,11 +62,11 @@ struct Cli {
     #[arg(long, global = true)]
     direct: bool,
 
-    #[arg(long, global = true, env = "QSYNC_USER")]
+    #[arg(long, global = true, env = "QXNYC_USER")]
     user: Option<String>,
 
     /// 口令；不给则读 credentials.json，再不给则报错（避免落进 shell 历史）
-    #[arg(long, global = true, env = "QSYNC_PASSWORD", hide_env_values = true)]
+    #[arg(long, global = true, env = "QXNYC_PASSWORD", hide_env_values = true)]
     password: Option<String>,
 
     #[command(subcommand)]
@@ -75,7 +75,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// 登录并把凭据写入 ~/.config/qsync/credentials.json (0600)
+    /// 登录并把凭据写入 ~/.config/qxync/credentials.json (0600)
     Login,
     /// 会话状态 + 服务端信息（max_log / uid / 迁移状态）
     Status,
@@ -115,7 +115,7 @@ enum Cmd {
         /// 远端根（可重复：`--remote /home --remote /Public`）；默认 /home
         #[arg(long = "remote", default_value = HOME_ROOT)]
         remote: Vec<String>,
-        /// 水合缓存目录（默认 ~/.local/share/qsync/cache）
+        /// 水合缓存目录（默认 ~/.local/share/qxync/cache）
         #[arg(long)]
         cache_dir: Option<PathBuf>,
         /// FUSE 事件循环线程数（默认 4）
@@ -249,7 +249,7 @@ enum Cmd {
     /// ★ M8.4：全局设置（settings.json）—— 不带 `--set` 就是只读展示
     Settings {
         /// 点号键赋值，可重复：`--set proxy.mode=manual --set proxy.server=10.0.0.1`
-        /// （可用键见 `qsync settings --help`）
+        /// （可用键见 `qxync settings --help`）
         #[arg(long = "set", value_name = "KEY=VALUE")]
         set: Vec<String>,
         /// 开机自启要写进 autostart 桌面项的可执行文件（默认找同目录的 qxync-gui）
@@ -306,7 +306,7 @@ enum Cmd {
         json: bool,
     },
 
-    /// 查看/设置 pin：`qsync pin <远端路径> [pinned|unpinned|unspecified|excluded]`
+    /// 查看/设置 pin：`qxync pin <远端路径> [pinned|unpinned|unspecified|excluded]`
     Pin { path: String, state: Option<String> },
 
     /// 查看某路径的占位符状态（pin + 远端元数据）
@@ -319,7 +319,7 @@ enum Cmd {
     },
 }
 
-/// ★ M8.2：`qsync task` 的子命令。
+/// ★ M8.2：`qxync task` 的子命令。
 #[derive(Subcommand, Debug)]
 enum TaskAction {
     /// 列出全部任务（含「此刻是否真的挂着」）
@@ -346,13 +346,13 @@ enum TaskAction {
         #[arg(long)]
         cache_mode: Option<String>,
         /// 水合缓存目录（**父目录**；实际缓存会再拼一层 NAS 主机名）。
-        /// 不填 = 默认 ~/.local/share/qsync/cache
+        /// 不填 = 默认 ~/.local/share/qxync/cache
         #[arg(long)]
         cache_dir: Option<PathBuf>,
         /// 只登记、不挂载
         #[arg(long)]
         no_mount: bool,
-        /// ★ M8.4：冲突策略（5 个取值，见 `qsync mount --help`）
+        /// ★ M8.4：冲突策略（5 个取值，见 `qxync mount --help`）
         #[arg(long, value_name = "POLICY")]
         conflict: Option<String>,
         /// 直接输出 JSON（脚本/验收用）
@@ -397,11 +397,11 @@ enum PeerAction {
         #[arg(long)]
         json: bool,
     },
-    /// 配对：`qsync peer pair 192.168.1.5:9840 --code 4821`
+    /// 配对：`qxync peer pair 192.168.1.5:9840 --code 4821`
     Pair {
         /// 对端地址 host:port
         addr: String,
-        /// 对方 `qsync peer status` 显示的 6 位配对码
+        /// 对方 `qxync peer status` 显示的 6 位配对码
         #[arg(long)]
         code: String,
     },
@@ -485,7 +485,7 @@ fn resolve_link(cli: &Cli) -> Result<LinkConfig> {
             peer_name: None,
         }),
         _ => bail!(
-            "没有找到连接配置 {}，且缺少 --host/--user。\n首次使用：qsync --host <NAS> --port <端口> --insecure --user <用户> --password <口令> login",
+            "没有找到连接配置 {}，且缺少 --host/--user。\n首次使用：qxync --host <NAS> --port <端口> --insecure --user <用户> --password <口令> login",
             cli.link
         ),
     }
@@ -501,7 +501,7 @@ fn resolve_password(cli: &Cli, link: &LinkConfig) -> Result<String> {
             return Ok(c.password);
         }
     }
-    bail!("没有口令：用 --password / QSYNC_PASSWORD，或先跑 `qsync login --password` 写凭据")
+    bail!("没有口令：用 --password / QXNYC_PASSWORD，或先跑 `qxync login --password` 写凭据")
 }
 
 async fn connect(cli: &Cli, need_creds: bool) -> Result<(Client, LinkConfig)> {
@@ -548,7 +548,7 @@ fn print_entry(e: &DirEntry) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Rust 默认忽略 SIGPIPE → `qsync ls | head` 会在 println! 上 EPIPE panic。
+    // Rust 默认忽略 SIGPIPE → `qxync ls | head` 会在 println! 上 EPIPE panic。
     // 恢复系统默认行为（进程被 SIGPIPE 终止），这是 CLI 的惯例。
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
 
@@ -755,7 +755,7 @@ async fn main() -> Result<()> {
         | Cmd::Task { .. }
         | Cmd::Journal { .. }
         | Cmd::Peer { .. } => {
-            bail!("`pin`/`state`/`sync`/`dehydrate`/`space`/`conflicts`/`file-states`/`store`/`roots`/`rules`/`task`/`peer` 需要 daemon：先 `qsync daemon start`（或用 --socket 指向运行中的 daemon）");
+            bail!("`pin`/`state`/`sync`/`dehydrate`/`space`/`conflicts`/`file-states`/`store`/`roots`/`rules`/`task`/`peer` 需要 daemon：先 `qxync daemon start`（或用 --socket 指向运行中的 daemon）");
         }
         Cmd::Rm { dir, name } => {
             let (client, _) = connect(&cli, true).await?;
@@ -784,7 +784,7 @@ async fn main() -> Result<()> {
         } => {
             // 直连模式的 FUSE 进程只挂一个根；多根需要 daemon 侧合成视图。
             if remote.len() > 1 {
-                bail!("多根挂载需要 daemon：先 `qsync daemon start`（或用 --via-daemon）");
+                bail!("多根挂载需要 daemon：先 `qxync daemon start`（或用 --via-daemon）");
             }
             let remote = remote
                 .first()
@@ -835,7 +835,7 @@ async fn main() -> Result<()> {
                 if *rw { "读写" } else { "只读" }
             );
             println!(
-                "  卸载     : qsync umount {}  （或 fusermount3 -u）",
+                "  卸载     : qxync umount {}  （或 fusermount3 -u）",
                 mountpoint.display()
             );
             let mnt = mountpoint.clone();
@@ -956,7 +956,7 @@ fn to_request(cli: &Cli) -> Option<Request> {
             threads: Some(*threads),
             auto_unmount: Some(*auto_unmount),
             // ★ M8.2：CLI 的 `mount` 默认**不登记任务**（行为与 M7 一致）；
-            //   要登记用 `qsync task add`。
+            //   要登记用 `qxync task add`。
             task: None,
             save_task: None,
             hydrate_timeout_secs: Some(*hydrate_timeout),
@@ -1311,7 +1311,7 @@ async fn route_via_daemon(
                 m.roots.join(", ")
             };
             println!(
-                "✅ 已挂载 {} -> {}（{}，daemon 持有，pid 见 `qsync daemon status`）",
+                "✅ 已挂载 {} -> {}（{}，daemon 持有，pid 见 `qxync daemon status`）",
                 m.mountpoint.display(),
                 roots,
                 if *rw { "读写" } else { "只读" }
@@ -1529,7 +1529,7 @@ fn proxy_label(mode: &str) -> &'static str {
     }
 }
 
-/// 直连模式的设置打印（没有 daemon 时的 `qsync settings`）。
+/// 直连模式的设置打印（没有 daemon 时的 `qxync settings`）。
 fn print_settings(st: &Settings, paths: &ConfigPaths, json: bool, saved: bool) -> Result<()> {
     if json {
         let out = serde_json::json!({
@@ -1675,7 +1675,7 @@ fn print_space(d: &SpaceData, now: bool) {
         d.fs_avail_pct
     );
     if d.injected {
-        println!("⚠️         : 正在使用 QSYNC_TEST_FAKE_STATVFS 注入值（验收模式）");
+        println!("⚠️         : 正在使用 QXNYC_TEST_FAKE_STATVFS 注入值（验收模式）");
     }
     println!("缓存占用  : {}", human_size(d.cache_used_bytes));
     println!(
@@ -1829,7 +1829,7 @@ fn print_rules(d: &RulesData) {
         println!("⚠️  无法解析: {}", d.bad.join(", "));
     }
     match &d.match_path {
-        None => println!("提示      : `qsync rules --match /home/xxx` 可判定单条路径"),
+        None => println!("提示      : `qxync rules --match /home/xxx` 可判定单条路径"),
         Some(p) => {
             println!("判定路径  : {p}");
             println!(
@@ -1918,7 +1918,7 @@ fn print_peer(d: &PeerData) {
             println!("对外根    : {}", d.roots.join(", "));
             if let Some(code) = &d.pairing_code {
                 println!(
-                    "配对码    : {code}（对方执行 `qsync peer pair <本机地址> --code {code}`）"
+                    "配对码    : {code}（对方执行 `qxync peer pair <本机地址> --code {code}`）"
                 );
             } else {
                 println!("配对码    : （已关闭）");
@@ -2040,7 +2040,7 @@ fn print_cache(c: &CacheInfo) {
     }
 }
 
-/// ★ M3：`qsync dehydrate` 的结果。
+/// ★ M3：`qxync dehydrate` 的结果。
 fn print_dehydrate(d: &DehydrateData, dry_run: bool) {
     println!(
         "{}脱水 {} 个文件，释放 {}；本地缓存现 {} / 限额 {}",
@@ -2069,7 +2069,7 @@ fn print_dehydrate(d: &DehydrateData, dry_run: bool) {
     }
 }
 
-/// 变更发现状态（`qsync sync` / `status` 共用）。
+/// 变更发现状态（`qxync sync` / `status` 共用）。
 fn print_sync(s: &SyncInfo) {
     println!(
         "变更发现  : {}，每 {}s 一轮，已轮询 {} 次（上次 {}s 前）",
@@ -2100,7 +2100,7 @@ fn print_sync(s: &SyncInfo) {
         println!("  事件设备: {}", s.devices.join("  "));
     }
     if let Some(r) = &s.delete_block_reason {
-        println!("  ⚠️  {r}（`qsync sync --force-deletes` 放行）");
+        println!("  ⚠️  {r}（`qxync sync --force-deletes` 放行）");
     }
     if let Some(e) = &s.last_error {
         println!("  ⚠️  最近错误: {e}");
@@ -2134,7 +2134,7 @@ fn print_status(st: &StatusData) {
         if st.logged_in {
             "已登录"
         } else {
-            "未登录（先 `qsync login`）"
+            "未登录（先 `qxync login`）"
         }
     );
     if let Some(s) = &st.session {
@@ -2276,7 +2276,7 @@ fn parse_err(msg: String) -> qxync_core::ipc::IpcError {
     qxync_core::ipc::IpcError::new(qxync_core::ipc::ErrorKind::Parse, msg)
 }
 
-/// `qsync task …`
+/// `qxync task …`
 ///
 /// 与其它命令不同：**部分动作需要两次 IPC 调用**（`add` = 先登记再挂载），
 /// 所以这里自己发请求，而不是只用 `to_request` 生成的那一个。
@@ -2361,7 +2361,7 @@ async fn run_task_cmd(
                 println!("✅ 任务已登记：{}", task.summary());
                 if *no_mount {
                     println!(
-                        "   --no-mount：只登记未挂载；要挂载用 `qsync task mount {}`",
+                        "   --no-mount：只登记未挂载；要挂载用 `qxync task mount {}`",
                         task.id
                     );
                 } else {
@@ -2467,7 +2467,7 @@ fn print_tasks(d: &TasksData) {
     );
     if d.tasks.is_empty() {
         println!(
-            "  （空）建一个：qsync task add --id default --mountpoint ~/qsync-mnt --root /home"
+            "  （空）建一个：qxync task add --id default --mountpoint ~/qxync-mnt --root /home"
         );
     }
     for ti in &d.tasks {
@@ -2518,7 +2518,7 @@ fn print_journal(d: &qxync_core::ipc::JournalData) {
         d.entries.len()
     );
     if d.entries.is_empty() {
-        println!("  （空）挂载一个同步任务后跑一轮 `qsync sync --once` 就会产生记录（没有挂载点就没有对账）");
+        println!("  （空）挂载一个同步任务后跑一轮 `qxync sync --once` 就会产生记录（没有挂载点就没有对账）");
     }
     for e in &d.entries {
         let ts = e.ts;

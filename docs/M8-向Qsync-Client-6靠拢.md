@@ -41,7 +41,7 @@ macOS 公开版还是 **5.1.7.0923**，Mac 6.0 仅 Beta。也就是说：
 → **M2c 的「baseline 对账是主路径」被强化**；设备注册**不再实现**，GUI 的「此设备名称」降级为只读展示。
 
 **两个必须盯住的风险**：
-1. M8.1 改导航会**打断 `gui-matrix.sh` 的 41 项验收**（它按 `QSYNC_GUI_TAB=status|connect|mounts|files|sync` 逐个 tab 截图）→ 导航改造与矩阵改造必须**同一里程碑、同一 PR**。
+1. M8.1 改导航会**打断 `gui-matrix.sh` 的 41 项验收**（它按 `QXNYC_GUI_TAB=status|connect|mounts|files|sync` 逐个 tab 截图）→ 导航改造与矩阵改造必须**同一里程碑、同一 PR**。
 2. 「对齐」不得导致**已有强项退化**（筛选器子树剪枝 / 脱水 blocked 安全检查链 / `read()` 不短读）→ 每条都在验收里有独立断言（§8 风险 11）。
 
 ---
@@ -264,7 +264,7 @@ backup date / modified date / size / **来源设备**，可一键恢复或下载
 
 ```
 ┌────────────────────────────────────────────────────────────────┐
-│ QSync  QNAP 按需同步   [qxyncd:运行中][连接:…][登录:…]  启动/停止/立即登录 │
+│ qxync  QNAP 按需同步   [qxyncd:运行中][连接:…][登录:…]  启动/停止/立即登录 │
 │ daemon：pid … · uptime … · socket …                            │
 ├────────────────────────────────────────────────────────────────┤
 │ [状态/进度][连接/登录][挂载][文件/pin][同步/缓存]   ← 5 个顶部 tab      │
@@ -342,7 +342,7 @@ backup date / modified date / size / **来源设备**，可一键恢复或下载
 | 5 | 备份排除（按名称 / 扩展名，`Advanced Settings`） | ⚠️ `exclude` 规则引擎已有（M7），但**没有 GUI** | GUI | ✅ |
 | 6 | 冲突策略：**5 个选项**（见 §1.7 原文） | ⚠️ 硬编码「冲突副本」 | 配置项 + 「每个文件都问我」交互 | ✅ core 小改 + GUI 队列 |
 | 7a | **选择性同步（Selective Synchronization，勾选子文件夹）** | ⚠️ 只能靠「多根 / 多任务」近似，无勾选 UI | 概念 + GUI | 🟡 建议先做「每任务多配对文件夹」（M8.2），勾选 UI 后置 |
-| 7b | **筛选器设置（Filter settings，通配符排除）** | ⚠️ 规则引擎已有（`qsync rules`），**GUI 完全缺失** | **GUI** | ✅ |
+| 7b | **筛选器设置（Filter settings，通配符排除）** | ⚠️ 规则引擎已有（`qxync rules`），**GUI 完全缺失** | **GUI** | ✅ |
 | 8 | 立即与 NAS 同步（全扫描） | ✅ `sync --once` | GUI 已有 | ✅ |
 | 9 | 智能删除文件管理（删除的副本保留在 NAS） | ⚠️ 删除熔断（M2c），只是「挡住 + 强制放行」 | 语义 + 形态 | ✅ 降级为「待确认删除」；★ 与节省空间模式**互斥** |
 | 9b | **节省空间模式（Space-Saving Mode）三状态**：仅在线的 / 本地可用 / 始终可用 | ✅ **已有**（`placeholder` / `partial` / `hydrated` + `pin`） | **只是缺 GUI 与文案** | ✅ 纯 GUI，**本项目最划算的一项** |
@@ -364,7 +364,7 @@ backup date / modified date / size / **来源设备**，可一键恢复或下载
 | 23 | 高级：桌面通知 | ❌ | 新 | ✅ Tauri 插件 |
 | 24 | 高级：自动检查更新 | ❌ | — | 🟡 可降级为「查看版本 / 打开下载页」 |
 | 25 | 高级：LAN 同步 | ⚠️ M7 自研 `peer`（默认不监听），**GUI 完全没做** | GUI | ✅ |
-| 26 | 释放空间：`Free up space automatically`（`When space is less than` % / `By frequency`） | ⚠️ `QSYNC_DEHYDRATE_IDLE` + `QSYNC_CACHE_LIMIT`（额度式，**非剩余空间百分比**） | 条件式 | ✅ 需 `statvfs` |
+| 26 | 释放空间：`Free up space automatically`（`When space is less than` % / `By frequency`） | ⚠️ `QXNYC_DEHYDRATE_IDLE` + `QXNYC_CACHE_LIMIT`（额度式，**非剩余空间百分比**） | 条件式 | ✅ 需 `statvfs` |
 | 27 | `Free Up Space Now`（立即释放空间） | ✅ | GUI 已有 | ✅ |
 | 28 | NAS 连接：IP 指定 | ✅ | ✅ | ✅ |
 | 29 | NAS 连接：LAN 搜索 | ❌ | 新 | 🟡 需 UDP 广播/mDNS 探测 |
@@ -400,10 +400,10 @@ backup date / modified date / size / **来源设备**，可一键恢复或下载
 
 | 能力 | 落地方式 | 影响面 |
 |---|---|---|
-| **任务（Task）持久化** | 新 `~/.config/qsync/tasks/<id>.json`；`mounts` 现在是 `HashMap` **内存态**，重启即丢 → 改为任务驱动 + 启动恢复 | `qxync-daemon/daemon.rs` 挂载生命周期 |
+| **任务（Task）持久化** | 新 `~/.config/qxync/tasks/<id>.json`；`mounts` 现在是 `HashMap` **内存态**，重启即丢 → 改为任务驱动 + 启动恢复 | `qxync-daemon/daemon.rs` 挂载生命周期 |
 | **同步日志表 `journal`** | `sync.db` 新表 `journal(ts, task_id, path, action, direction, bytes, status, error)`；在 sync/upload/conflict/dehydrate 落一条；新 IPC `journal{limit,query,level}` / `journal_clear` | `qxync-core/store.rs`、`qxync-daemon/sync.rs` |
 | **失败项持久化** | 同上表 `status='error'` 视图 | 同上 |
-| **全局设置** | 新 `~/.config/qsync/settings.json` + IPC `settings` / `settings_save`（代理、通知、自启、释放空间阈值、并发、日志级别、设备名） | `qxync-core/config.rs` |
+| **全局设置** | 新 `~/.config/qxync/settings.json` + IPC `settings` / `settings_save`（代理、通知、自启、释放空间阈值、并发、日志级别、设备名） | `qxync-core/config.rs` |
 | **代理** | `reqwest::Proxy` 从 settings 读，`Client` 构造时应用 | `qxync-client/lib.rs` |
 | **进度百分比** | `SyncInfo`/`BackupInfo` 加 `finished` / `total` / `current_path` | `qxync-core/ipc.rs`、`sync.rs` |
 | **冲突策略** | 照抄 Qsync 的 **5 个选项**（§1.7 原文），映射到 `qxync-core/sync.rs` 的三向决策表：`ask`（每个文件都问我 → 写 `pending_decisions` 队列，GUI 逐个裁决）/ `rename_remote` / `rename_local` / `replace_remote` / `replace_local`；默认保持现有的「远端占原名 + 本地另存副本」 | `qxync-core/sync.rs`、`store.rs`（队列）、`ipc.rs` |
@@ -434,7 +434,7 @@ backup date / modified date / size / **来源设备**，可一键恢复或下载
 
 1. **没有「无挂载点」形态**：Qsync 靠 Windows CfAPI 让文件直接出现在 `C:\Users\...\Qsync`；
    qxync 必然有挂载点。→ 界面要**把挂载点讲清楚**（Qsync 用户不知道什么是挂载点），而不是藏起来。
-2. **xattr 占位符 / 脱水安全检查链 / 两条铁则**：这是 qxync 的数据安全护城河（`user.qsync.state`、
+2. **xattr 占位符 / 脱水安全检查链 / 两条铁则**：这是 qxync 的数据安全护城河（`user.qxync.state`、
    `inval_inode` 先于清内容、绝不短读）。UI 可以参考 Qsync 的「仅在线 / 保留在此设备」文案，
    但**不能**为了视觉一致删掉这些机制或其可观测性。
 3. **多根只读判定**：共享文件夹只读是 NAS 侧的真实约束（实测写被拒 `status:20`）。
@@ -459,7 +459,7 @@ backup date / modified date / size / **来源设备**，可一键恢复或下载
 | — | 底部操作日志（IPC 调用日志）保留在诊断页内 | 前端本地 | — |
 | — | **分享中心**：占位页，一句话说明「需 NAS 侧 Qsync Central 团队文件夹 / 分享链接，本客户端暂不支持」+ 打开 File Station 深链 | — | 分享中心（**降级为占位**） |
 
-> 「诊断」默认收起在设置页底部或导航最下方；`QSYNC_GUI_TAB` 仍可直达，保证验收矩阵可继续按原字段判定。
+> 「诊断」默认收起在设置页底部或导航最下方；`QXNYC_GUI_TAB` 仍可直达，保证验收矩阵可继续按原字段判定。
 > 分享中心做成**占位页**而不是直接不做：Qsync 用户的肌肉记忆在这里，留一个「说明 + 出口」比凭空消失更好。
 
 ### 5.2 任务模型映射
@@ -494,7 +494,7 @@ Task { id, kind: sync,                 // 备份任务已决策不做；kind 字
 ────────────────────────────────────────────────────────────────────
  ✓  所有文件均处于最新状态                        ⏸   ›
     Last synchronized: 2026-10-01 18:30:12
-    [Sync]  本地 ~/qsync-mnt  ⇄  NAS /home
+    [Sync]  本地 ~/qxync-mnt  ⇄  NAS /home
 （备份任务已决策不做 —— 主页只列同步任务；空态给「+ 添加任务」引导）
 ```
 
@@ -506,7 +506,7 @@ Task { id, kind: sync,                 // 备份任务已决策不做；kind 字
 └─────────────────────────┘       └─────────────────────────┘
 配对文件夹                                       [+ 添加配对文件夹]
 本地文件夹          | 方向 | NAS 文件夹        | 状态                  | 操作
-~/qsync-mnt         |  ⇄   | /home             | ✓ 所有文件均处于最新状态 | ⏸ ✎ 🗑
+~/qxync-mnt         |  ⇄   | /home             | ✓ 所有文件均处于最新状态 | ⏸ ✎ 🗑
 ```
 `⚙`（Setting）→ **冲突策略**（5 选项）/ **筛选器设置**（通配符规则 + 实时预览）/ 节省空间模式 / 缓存与释放空间 / 创建缩略图（灰掉并注明不支持）
 `⋮` → 立即与 NAS 同步 / 智能删除文件管理 / 删除同步任务 / 在文件管理器中打开
@@ -548,7 +548,7 @@ Task { id, kind: sync,                 // 备份任务已决策不做；kind 字
 
 * 现有 5 个 tab 的**全部字段与 id 保留**，只是移动位置 → `gui-matrix.sh` 的字段断言可复用。
 * 新增页面**必须**纳入 `gui-matrix.sh`，逐页截图 + 非空白 + 页面间 AE 差异判定（沿用 M4 的做法）。
-* `QSYNC_GUI_TAB` 的取值域从 5 个扩到 `home|tasks|files|journal|errors|settings|diag-*`，
+* `QXNYC_GUI_TAB` 的取值域从 5 个扩到 `home|tasks|files|journal|errors|settings|diag-*`，
   **旧值 `status|connect|mounts|files|sync` 必须继续可用**（映射到诊断页对应子页）。
 
 ---
@@ -598,7 +598,7 @@ Task { id, kind: sync,                 // 备份任务已决策不做；kind 字
 |---|---|---|
 | 通过项 | 41/41 | **86/86** ✅ |
 | 真窗口截图 | 5 个 tab | **9 个目的地**（home/tasks/files/journal/errors/settings + `diag:status`/`diag:mounts`/`diag:sync`），逐个断言标题/尺寸 1200x800/非空白（stddev 7333–8353 > 1500）/与主页差异（AE 15441–37235 > 4000） |
-| **旧 `QSYNC_GUI_TAB` 值兼容（§3b 新增）** | — | status→`diag:status`、mounts→`diag:mounts`、sync→`diag:sync`、connect→`settings`、files→`files`，**截图 AE 2035–2318**（只差时钟/uptime）→ 落点等价 ✅ |
+| **旧 `QXNYC_GUI_TAB` 值兼容（§3b 新增）** | — | status→`diag:status`、mounts→`diag:mounts`、sync→`diag:sync`、connect→`settings`、files→`files`，**截图 AE 2035–2318**（只差时钟/uptime）→ 落点等价 ✅ |
 
 **同时新增 `diag:<status|mounts|sync>` 寻址语法**，让验收矩阵能直达诊断子页（旧值仍走 `LEGACY_TABS` 映射）。
 
@@ -624,7 +624,7 @@ gui-matrix.sh   86/86      ← 本次改造的验收
 
 | 项 | 内容 |
 |---|---|
-| 交付物 | 新模块 `qxync-core/src/tasks.rs`（`Task` + 原子写 + 列表 + 校验，**11 项单测**）；`Request::Tasks{action,id,task}` 与 `Request::Mount{task,save_task}`；daemon 侧的登记/停用/恢复；`qsync task list\|add\|rm\|pause\|resume\|mount [--json]`；GUI「任务」页（列表 + 文件夹对设置 + 暂停/继续/挂载/删除登记）；主页任务卡改为**优先按任务展示** |
+| 交付物 | 新模块 `qxync-core/src/tasks.rs`（`Task` + 原子写 + 列表 + 校验，**11 项单测**）；`Request::Tasks{action,id,task}` 与 `Request::Mount{task,save_task}`；daemon 侧的登记/停用/恢复；`qxync task list\|add\|rm\|pause\|resume\|mount [--json]`；GUI「任务」页（列表 + 文件夹对设置 + 暂停/继续/挂载/删除登记）；主页任务卡改为**优先按任务展示** |
 | 写域 | `crates/qxync-core/src/{tasks.rs(新),ipc.rs,lib.rs}`、`crates/qxync-daemon/src/{daemon.rs,main.rs}`、`crates/qxync-cli/src/main.rs`、`crates/qxync-gui/ui/**`、新 `xtask/tests/m82-matrix.sh` |
 
 **关键设计决策（都是为了「不动同步」）**
@@ -632,8 +632,8 @@ gui-matrix.sh   86/86      ← 本次改造的验收
 | 决策 | 理由 |
 |---|---|
 | 任务层是**外壳**：只记录参数并驱动既有的 `mount()`/`umount()` | **FUSE 内部一行未改**；`mount()` 的函数体没动，只在 dispatch 分支加了「挂载成功后再落盘登记」 |
-| `mount` **默认不登记任务**（要 `task` / `save_task` 才登记） | qsync CLI 与所有验收矩阵走的就是这条路 → **M7 行为一字不变**（矩阵里专门断言了这条） |
-| daemon 恢复**默认关闭**，要 `--restore-tasks` / `QSYNC_TASK_RESTORE=1` | 恢复会「凭空挂载」；默认打开会让上次跑崩留下的挂载在重启时复活，打乱验收矩阵「开跑前环境干净」的前提 |
+| `mount` **默认不登记任务**（要 `task` / `save_task` 才登记） | qxync CLI 与所有验收矩阵走的就是这条路 → **M7 行为一字不变**（矩阵里专门断言了这条） |
+| daemon 恢复**默认关闭**，要 `--restore-tasks` / `QXNYC_TASK_RESTORE=1` | 恢复会「凭空挂载」；默认打开会让上次跑崩留下的挂载在重启时复活，打乱验收矩阵「开跑前环境干净」的前提 |
 | 「暂停」= 停用登记 + **卸载该挂载点** | 同步引擎是**账号级**的（不是按挂载点循环），做「暂停但不卸载」必须改引擎 —— 那正是本次要避开的风险。卸载后该任务不再产生本地改动，且 `umount` 会先**排空已入队的上传**（不丢改动）；其它任务完全不受影响 |
 | 验收/测试全用**私有 XDG 目录** | `m82-matrix.sh` 只碰 `.local-run/m82/`，不污染其它矩阵的状态 |
 | `Task::default()` 刻意做成**不可保存** | 它是 serde 占位值；`normalize()` 会拒掉空挂载点，单测 `default_task_is_unsavable` 守住这条 |
@@ -667,7 +667,7 @@ cargo test      all passed
 
 | 项 | 内容 |
 |---|---|
-| 交付物 | `sync.db` **schema v1 → v2**：新增 `journal` 表（3 个索引）；`JournalEntry` + `Store::{journal_add_batch, journal_list, journal_count, journal_counts, journal_clear, journal_trim}`；`Request::Journal{limit,since,query,level,clear}`；daemon 侧**内存缓冲 + 后台批量落库 + 周期轮转**；`qsync journal [--level] [--query] [--limit] [--since] [--clear] [--json]`；GUI「文件更新中心」（搜索/过滤/条数/清空）+「错误列表」（复制路径） |
+| 交付物 | `sync.db` **schema v1 → v2**：新增 `journal` 表（3 个索引）；`JournalEntry` + `Store::{journal_add_batch, journal_list, journal_count, journal_counts, journal_clear, journal_trim}`；`Request::Journal{limit,since,query,level,clear}`；daemon 侧**内存缓冲 + 后台批量落库 + 周期轮转**；`qxync journal [--level] [--query] [--limit] [--since] [--clear] [--json]`；GUI「文件更新中心」（搜索/过滤/条数/清空）+「错误列表」（复制路径） |
 | 写域 | `crates/qxync-core/src/{store.rs,ipc.rs,lib.rs}`、`crates/qxync-daemon/src/daemon.rs`、`crates/qxync-cli/src/main.rs`、`crates/qxync-gui/ui/**`、新 `xtask/tests/m83-matrix.sh`、**`xtask/tests/m5-matrix.sh`（同批改）** |
 
 **几个关键决策**
@@ -676,7 +676,7 @@ cargo test      all passed
 |---|---|
 | schema v1→v2 **不写迁移代码** | 整份 `SCHEMA_SQL` 都是 `CREATE TABLE/INDEX IF NOT EXISTS`，老库在下次 `Store::open()` 时自动补 `journal` 表；**已有表里的数据一行不动**（`m5-matrix` 与 `m83-matrix` 都有断言） |
 | 热路径**只 push 到内存**，后台每 500ms 批量落库 | 同步轮 / 脱水都在热路径上；**绝不在那里开事务写库**（方案 §8 风险 3 的硬约束） |
-| **必须有轮转**：默认 1 万条 / 30 天（`QSYNC_JOURNAL_MAX_ROWS` / `_MAX_AGE_DAYS` / `_TRIM_SECS` 可调） | 同步日志是无限增长型数据，不加约束会把 `sync.db` 撑大 |
+| **必须有轮转**：默认 1 万条 / 30 天（`QXNYC_JOURNAL_MAX_ROWS` / `_MAX_AGE_DAYS` / `_TRIM_SECS` 可调） | 同步日志是无限增长型数据，不加约束会把 `sync.db` 撑大 |
 | **只记有内容的项** | 默认 30 秒一轮 = 一天 2880 条；空轮询不写日志，否则日志被噪声淹没 |
 | 错误列表 = `journal` 里 `status='error'` 的视图 | 不另建表，避免两份数据不同步 |
 
@@ -688,7 +688,7 @@ cargo test      all passed
 | ② 有活动才有日志 | ✅ **没挂载点跑 sync → 0 条**（对账无事可做）；挂载后跑一轮 → 出现 `scan` 记录 |
 | ③ 过滤 | ✅ `--level error` 只回 error / `--level blocked` 命中脱水那条 / `--query` 同时匹配路径与说明 / `--limit` 生效 |
 | ④ `--clear` 只清日志 | ✅ **游标 435→435 不变、baseline 不变、pin 没被清掉** |
-| ⑤ 轮转 | ✅ `QSYNC_JOURNAL_MAX_ROWS=5` → 灌入 40 条后自动压回 **5 条** |
+| ⑤ 轮转 | ✅ `QXNYC_JOURNAL_MAX_ROWS=5` → 灌入 40 条后自动压回 **5 条** |
 
 **同批回归（全部绿，共 337 项）**：
 
@@ -714,13 +714,13 @@ m7-matrix 60 · m82-matrix 37 · m83-matrix 27 · cargo test all passed
 
 #### 落地形状
 
-**① 全局设置（`~/.config/qsync/settings.json`，0600，原子写）**
+**① 全局设置（`~/.config/qxync/settings.json`，0600，原子写）**
 
 ```jsonc
 {
   "version": 1,
   "proxy": { "mode": "auto|none|manual", "server": "", "port": null, "auth": false, "user": "", "password": "" },
-  "launch_at_startup": false,          // → ~/.config/autostart/qsync.desktop
+  "launch_at_startup": false,          // → ~/.config/autostart/qxync.desktop
   "desktop_notifications": true,
   "debug_log": false,
   "language": "", "region": "",        // 记录位（文案仍只有 zh-CN）
@@ -732,7 +732,7 @@ m7-matrix 60 · m82-matrix 37 · m83-matrix 27 · cargo test all passed
 * **默认值 = M8.3 的行为**：`proxy.mode=auto`（跟随 `http_proxy` 等环境变量 —— reqwest 本来就这么做）、
   不自动释放、不开机自启、`close_to_tray=true`。**没有 `settings.json` 时一切照旧**。
 * 字段全部 `#[serde(default)]`：旧文件能读、新字段不丢，加设置不用写迁移。
-* `qsync settings --set key=value`（可重复）走 `Settings::set_kv`：**未知键报错**，不静默忽略；
+* `qxync settings --set key=value`（可重复）走 `Settings::set_kv`：**未知键报错**，不静默忽略；
   多键赋值**顺序无关**（归一化只在 save 时做一次，否则「先 server 后 mode=manual」会把 server 抹掉）。
 
 **② 代理：三种模式都接到 reqwest，并且「关得掉」**
@@ -776,7 +776,7 @@ tauri 将来升到 0.26 时这行要跟着升，否则依赖图里会出现两�
 **④ 自动释放空间：低空间触发，但**走的还是 M3 的安全检查链**
 
 * `qxync-core::freespace`：`statvfs` + 纯函数判定（`below_pct` / `frequency`）。
-* daemon 后台任务（默认 60s 一次，`QSYNC_AUTO_FREE_INTERVAL` 可调）判定该不该跑，
+* daemon 后台任务（默认 60s 一次，`QXNYC_AUTO_FREE_INTERVAL` 可调）判定该不该跑，
   **判定结果翻译成一次 `run_dehydrate_with_recent`** —— 也就是与手动脱水**同一条路**：
   dirty / 待上传 / `pin=pinned` / `excluded` / 打开中 / mmap / 传输中 一律跳过并计入「被挡下」。
   方案 §8 风险 5（自动释放绕过铁则）由此**闭合**：没有任何旁路可绕。
@@ -824,7 +824,7 @@ LAN 面板显示身份/监听/配对码/已配对设备/事件计数，并支持
 | ① 代理三模式 | ✅ **假代理（`nc -l`）真的看到了 `CONNECT nas.example.com:9834`**（Auto-detect 走环境变量、Manual 走配置）；`No proxy` 时环境变量还在也**一个字节都没经过代理**且登录成功；**代理停掉后 Manual 登录失败（退出码 3）**，切回 `No proxy` 立刻恢复 |
 | ② 托盘 | ✅ 真窗口起来后 D-Bus 上出现 `org.kde.StatusNotifierItem-<pid>-1` 且 watcher 已登记；**可见性探测通过**（watcher + `IsStatusNotifierHostRegistered=true` + 本进程 item 已在列表里，日志与 `m84_info` 一致）；dbusmenu 的 4 项文案与二进制一致；`wmctrl -c` 关窗后**窗口不可见、进程仍在**（进了托盘）；`close_to_tray=false` 时关窗即退出；**负向对照**：用 `dbus-run-session` 起一根没有 watcher 的私有会话 → 托盘创建失败 → 关窗**真的退出**（不会把窗口藏起来） |
 | ③ 通知 | ✅ `dbus-monitor` 抓到 `member=Notify`（正路径）；**关掉设置后 `shown=false` 且 dbus 上一个 Notify 都没有**（负向对照） |
-| ④ 自动释放空间 | ✅ `QSYNC_TEST_FAKE_STATVFS=avail_pct=5` → 判定触发 → 普通文件自动回到**仅在线**；**`pin` 住的文件仍是始终可用且 131072 字节内容原样**（安全链挡下，没被绕过）；journal 有「自动释放空间」记录；非法注入值**报错**不静默 |
+| ④ 自动释放空间 | ✅ `QXNYC_TEST_FAKE_STATVFS=avail_pct=5` → 判定触发 → 普通文件自动回到**仅在线**；**`pin` 住的文件仍是始终可用且 131072 字节内容原样**（安全链挡下，没被绕过）；journal 有「自动释放空间」记录；非法注入值**报错**不静默 |
 | ⑤ 筛选器 | ✅ 加 `*.iso` → `rules --match` 判 `excluded`，且**真挂载点里看不到** hidden.iso、看得到 visible.txt |
 | ⑥ 冲突策略五选 | ✅ 五个取值各跑一次真挂载三向冲突：`rename_local`（远端占原名 + 副本=本地内容）、`rename_remote`（原名=本地内容 + 副本=远端内容）、`replace_remote`（远端变成本地内容、无副本）、`replace_local`（远端不变、本地被替换、无副本）、`ask`（**远端原样、本地仍是用户自己的内容**；队列 pending=1 → 裁决 `keep_local` → 下一轮远端变成本地内容 → 出队） |
 | ⑦ 节省空间模式三态 + 铁则 2 | ✅ 新建 → 仅在线；`head -c` → 本地可用；`pin` → 始终可用；释放空间 → 回到仅在线（0 字节）；**脱水后把远端改成同长度不同内容再 `cat` 拿到新内容**（`BBBB-2222`） |
@@ -833,7 +833,7 @@ LAN 面板显示身份/监听/配对码/已配对设备/事件计数，并支持
 #### 确定性冲突怎么测出来的（值得记一笔）
 
 端到端跑三向冲突本来是**测不稳**的：写路径是写穿的，「本地已改但还没上传」的窗口只有几十毫秒。
-矩阵里加了 `QSYNC_TEST_UPLOAD_HOLD_MS`（**默认 0，仅验收用**）让上传 worker 在发请求前停一会儿；
+矩阵里加了 `QXNYC_TEST_UPLOAD_HOLD_MS`（**默认 0，仅验收用**）让上传 worker 在发请求前停一会儿；
 配合上面那条「取消集合」的修复，`cancel + drain + 重新 stat` 就能稳定地把冲突判出来。
 另一个坑：每个策略跑完必须把远端文件**删掉并跑一轮 sync** 清掉 baseline，
 否则下一个策略的挂载会用陈旧 baseline 把上一个文件重新判成冲突（矩阵初版就被这个坑到，
@@ -841,7 +841,7 @@ LAN 面板显示身份/监听/配对码/已配对设备/事件计数，并支持
 
 #### 与现有验收的关系
 
-* **旧 `QSYNC_GUI_TAB` 取值一字未改**，新增 `settings:<连接|代理|同步与筛选|个人|高级|释放空间|LAN|关于>` 直达写法；
+* **旧 `QXNYC_GUI_TAB` 取值一字未改**，新增 `settings:<连接|代理|同步与筛选|个人|高级|释放空间|LAN|关于>` 直达写法；
   `gui-matrix.sh` 追加 7 个设置分区截图（每个分区与「连接」分区、与上一个分区都要 AE > 4000），
   并在自检里加了 4 条 M8.4 数据源断言（`settings` / `space` / `file_states` / `conflicts`）。
 * `m5-matrix.sh` 与 `m83-matrix.sh` 的 schema 断言随 v3 一起改（**只改了一个数字**，
@@ -933,7 +933,7 @@ LAN 面板显示身份/监听/配对码/已配对设备/事件计数，并支持
 
 | # | 风险 | 等级 | 应对 |
 |---|---|---|---|
-| 1 | 改导航打破 `gui-matrix.sh`，回归失去判据 | 🔴 | M8.1 与矩阵改造同 PR；旧 `QSYNC_GUI_TAB` 值保持可用 |
+| 1 | 改导航打破 `gui-matrix.sh`，回归失去判据 | 🔴 | M8.1 与矩阵改造同 PR；旧 `QXNYC_GUI_TAB` 值保持可用 |
 | 2 | 挂载点从内存态改为任务持久化，引入「重启后挂载状态错乱」 | 🔴 | 只加外壳不改 FUSE；新增「daemon 重启后任务恢复」专项断言；`fuse-matrix.sh` 每次回归 |
 | 3 | journal 写库拖慢热路径 / 撑大 `sync.db` | 🟠 | 异步批量落盘；条数 + 天数双重上限 + 轮转；绝不在 `read()` 路径同步写 |
 | 4 | 备份任务与双向上传队列互相挤占 | 🟠 | 队列隔离或优先级，**先定再写** |
@@ -978,7 +978,7 @@ LAN 面板显示身份/监听/配对码/已配对设备/事件计数，并支持
 | 1 | 备份任务（原 M8.5） | 🚫 **不做** | M8.5 整条移除；连带取消备份任务页、`Frequency Settings`、`Advanced Settings`、`Request::Backup`、`backup.rs`、`m8-backup-matrix.sh`、「时间点还原」链路。**首次向导里 Backup Task 卡片保留但不可用**（给出说明，让用户看懂缺什么）。工作量 19.5 → **14.5 人日** |
 | 2 | 版本还原 / 以前版本 | 🚫 **不做** | 客户端版本桶、`View previous versions`、NAS 侧 `Enable version control` re-probe **全部取消**。文件页只保留通用「在 File Station 打开」深链作为出口 |
 | 3 | `qbox_save_device_config` 设备注册 probe | ✅ **可以（做）→ 已执行完毕** | P0 探针线（§11）**只读阶段即得出结论**：假设被证伪。**未写 NAS**；设备注册不实现；GUI「此设备名称」降级为只读。M2c 的 baseline 主路径被强化 |
-| 4 | 「诊断（专家模式）」默认收起 | ✅ 采默认建议 | 默认收起，`QSYNC_DEBUG=1` 或设置里一个开关展开（写进 M8.1 验收） |
+| 4 | 「诊断（专家模式）」默认收起 | ✅ 采默认建议 | 默认收起，`QXNYC_DEBUG=1` 或设置里一个开关展开（写进 M8.1 验收） |
 
 ### 10.2 仍待决（不阻塞 M8.0 / M8.1 开工）
 
@@ -1193,9 +1193,9 @@ NAS `@Recycle` 无限增长 → 累积 baseline 让 M2c 断言偶发失败）、
 
 | | 修复前 | 修复后 |
 |---|---|---|
-| `qsync mount …` | rc=3「❌ daemon 提前关闭了连接」 | rc=5「❌ 挂载失败: Error calling mount() … EINVAL」 |
+| `qxync mount …` | rc=3「❌ daemon 提前关闭了连接」 | rc=5「❌ 挂载失败: Error calling mount() … EINVAL」 |
 | daemon 日志 panic | **1** 条 | **0** 条 |
-| 后续 `qsync daemon status` | 该连接被打死 | 正常 |
+| 后续 `qxync daemon status` | 该连接被打死 | 正常 |
 
 ---
 

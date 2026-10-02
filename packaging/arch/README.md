@@ -4,7 +4,7 @@
 
 | 文件 | 作用 |
 |---|---|
-| `PKGBUILD` | AUR 包定义：直接取 GitHub Release 上的预编译 `qxync-<版本>-x86_64-unknown-linux-gnu.tar.gz`，把 `qsync` / `qxyncd` / `qxync-gui` 装进 `/usr/bin` |
+| `PKGBUILD` | AUR 包定义：直接取 GitHub Release 上的预编译 `qxync-<版本>-x86_64-unknown-linux-gnu.tar.gz`，把 `qxync` / `qxyncd` / `qxync-gui` 装进 `/usr/bin` |
 | `.SRCINFO` | AUR 要求的元数据，由 `makepkg --printsrcinfo > .SRCINFO` 生成，**不要手写** |
 
 > ⚠️ `sha256sums` 在仓库里是**占位值**（一串 `0`）：Release 产物由 CI 在 ubuntu-22.04 上构建，

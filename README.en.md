@@ -27,7 +27,7 @@ A **Qsync client that runs on Linux**, made up of three binaries:
 
 | Binary | Role |
 |---|---|
-| `qsync` | Command line (login / list / upload & download / mount / sync / dehydrate / tasks / settings / logs / LAN peering) |
+| `qxync` | Command line (login / list / upload & download / mount / sync / dehydrate / tasks / settings / logs / LAN peering) |
 | `qxyncd` | Long-running daemon: the **only** process holding the FUSE mount and the NAS session, exposing a local unix-socket JSON IPC |
 | `qxync-gui` | Tauri 2 desktop app (dependency-free static frontend, everything goes through the daemon's IPC) |
 
@@ -104,7 +104,7 @@ matching [Release](https://github.com/mlzxgzy/qxync/releases):
 |---|---|
 | `qxync-<version>-x86_64-unknown-linux-gnu.tar.gz` | all three binaries + desktop entry / icons + licences / disclaimer |
 | `qxync-bin-<version>-1-x86_64.pkg.tar.zst` | the **Arch package** (built by CI with the real `makepkg` from the archlinux image, out of the tarball above) |
-| `qsync` · `qxyncd` · `qxync-gui` | the three binaries on their own, from the same build |
+| `qxync` · `qxyncd` · `qxync-gui` | the three binaries on their own, from the same build |
 | `SHA256SUMS` | checksums for the assets above |
 
 Just keep the three binaries in the **same directory**: the GUI first looks for `qxyncd` next to
@@ -120,9 +120,34 @@ install it with `sudo pacman -U`. The repo also carries an AUR package definitio
 [`packaging/arch/README.md`](packaging/arch/README.md) for details and the checksum bump after
 each release.
 
+### 2.5 Upgrading from 0.1.x (the rename)
+
+On 0.1.x the command line was called `qsync`, which fought the **official QNAP Qsync client**
+for the same name in `PATH`; from 0.2.0 it is `qxync`. The full list is in the
+[CHANGELOG](CHANGELOG.en.md#020---2026-10-02).
+
+On the first run after upgrading, the local directories are **migrated automatically**:
+`~/.config/qsync`, `~/.local/share/qsync` and `~/.local/state/qsync` are renamed to their
+`qxync` counterparts (falling back to a copy across filesystems), so credentials, the state
+database and logs come along — **no need to `login` again**. If both the old and the new
+directory exist (for example an early prototype's `~/.local/share/qxync`), only the entries
+**missing** from the new directory are filled in, **nothing already there is overwritten**, and a
+note prints both paths. The only things you must update are your own scripts:
+
+| Old (0.1.x) | New (0.2.0+) |
+|---|---|
+| `qsync …` | `qxync …` |
+| `QSYNC_PASSWORD` / `QSYNC_HOST` / `QSYNC_USER` / `QSYNC_SOCKET` | `QXNYC_PASSWORD` / `QXNYC_HOST` / `QXNYC_USER` / `QXNYC_SOCKET` |
+| `QSYNC_TEST_*` (acceptance matrices) | `QXNYC_TEST_*` |
+| `getfattr -n user.qsync.state` | `getfattr -n user.qxync.state` |
+
+> **Where the line is drawn**: only **our own** identifiers changed. The NAS protocol surface is
+> untouched — `cgi-bin/qsync/qsyncsrv.cgi`, `qsync_version`, `service=Qsync`,
+> `WFM_QSYNC_DISABLED` and friends are exactly as before.
+
 ### 3. First login
 
-Credentials are written to `~/.config/qsync/credentials.json` (mode `0600`).
+Credentials are written to `~/.config/qxync/credentials.json` (mode `0600`).
 
 ```bash
 cargo run -p qxync-cli -- \
@@ -131,30 +156,30 @@ cargo run -p qxync-cli -- \
 ```
 
 > `--insecure` = accept self-signed certificates. **Keep the password out of your shell history**:
-> `--password` can also be replaced by the `QSYNC_PASSWORD` environment variable.
+> `--password` can also be replaced by the `QXNYC_PASSWORD` environment variable.
 
 ### 4. Mount the on-demand sync view
 
 ```bash
 cargo run -p qxync-cli -- daemon start            # bring up qxyncd (idempotent)
-mkdir -p ~/qsync-mnt
-qsync mount ~/qsync-mnt --remote /home            # the FUSE mount is held by the daemon (read-only by default)
-qsync mount ~/qsync-mnt --remote /home --rw       # add --rw when you need writes to go back
+mkdir -p ~/qxync-mnt
+qxync mount ~/qxync-mnt --remote /home            # the FUSE mount is held by the daemon (read-only by default)
+qxync mount ~/qxync-mnt --remote /home --rw       # add --rw when you need writes to go back
 
-ls -l ~/qsync-mnt/qxync-test          # real size, nothing downloaded yet
-cat ~/qsync-mnt/qxync-test/hello.txt  # the first read triggers on-demand hydration (only the ranges needed)
-getfattr -n user.qsync.state ~/qsync-mnt/qxync-test/hello.txt   # placeholder / partial / hydrated
+ls -l ~/qxync-mnt/qxync-test          # real size, nothing downloaded yet
+cat ~/qxync-mnt/qxync-test/hello.txt  # the first read triggers on-demand hydration (only the ranges needed)
+getfattr -n user.qxync.state ~/qxync-mnt/qxync-test/hello.txt   # placeholder / partial / hydrated
 
-qsync dehydrate --path /home/qxync-test/big.bin   # dehydrate: drop the local content, keep only a placeholder
-qsync umount ~/qsync-mnt
-qsync daemon stop                                 # clean exit: unmount everything + delete socket/pid
+qxync dehydrate --path /home/qxync-test/big.bin   # dehydrate: drop the local content, keep only a placeholder
+qxync umount ~/qxync-mnt
+qxync daemon stop                                 # clean exit: unmount everything + delete socket/pid
 ```
 
 ### 5. GUI
 
 ```bash
 cargo build -p qxync-gui
-qsync daemon start
+qxync daemon start
 ./target/debug/qxync-gui
 
 # headless self-test (for scripts / CI; exit code 0 while the daemon is running)
@@ -168,32 +193,32 @@ The GUI issues no HTTP itself — **everything goes through the daemon's IPC**.
 ### 6. Common commands cheat sheet
 
 ```bash
-qsync status                     # session + server + cursors + hydration stats + mounts
-qsync ls /home                   # list a directory (auto-paginates)
-qsync store [--integrity|--json] # state-store snapshot (cursors / baseline / pin / upload queue)
-qsync roots [--json]             # overview of remote roots + read/write verdicts
-qsync rules [--match <path>]     # selective-sync rule verdict (visible / excluded / temp / outside-roots)
-qsync sync [--once]              # change-discovery status; --force-deletes releases bulk deletes
-qsync task list|add|pause|resume|rm
-qsync journal [--level error]    # sync activity log (--level error is exactly the "error list")
-qsync settings [--set k=v]       # proxy / autostart / notifications / free up space
-qsync space [--now]              # free-up-space status / free up space now
-qsync conflicts --resolve <id> --as keep_local|keep_remote|keep_both
-qsync file-states /home          # three file states: online-only / locally available / always available
-qsync peer status|pair|ping|events|fetch    # LAN peering (configure peer_listen in the link first)
+qxync status                     # session + server + cursors + hydration stats + mounts
+qxync ls /home                   # list a directory (auto-paginates)
+qxync store [--integrity|--json] # state-store snapshot (cursors / baseline / pin / upload queue)
+qxync roots [--json]             # overview of remote roots + read/write verdicts
+qxync rules [--match <path>]     # selective-sync rule verdict (visible / excluded / temp / outside-roots)
+qxync sync [--once]              # change-discovery status; --force-deletes releases bulk deletes
+qxync task list|add|pause|resume|rm
+qxync journal [--level error]    # sync activity log (--level error is exactly the "error list")
+qxync settings [--set k=v]       # proxy / autostart / notifications / free up space
+qxync space [--now]              # free-up-space status / free up space now
+qxync conflicts --resolve <id> --as keep_local|keep_remote|keep_both
+qxync file-states /home          # three file states: online-only / locally available / always available
+qxync peer status|pair|ping|events|fetch    # LAN peering (configure peer_listen in the link first)
 ```
 
-All subcommands are listed in `qsync --help`; the IPC contract (unix socket + one JSON per line) is in
+All subcommands are listed in `qxync --help`; the IPC contract (unix socket + one JSON per line) is in
 [`docs/M1.5-设计.md`](docs/M1.5-设计.md).
 
 ## Architecture
 
 **Process model**: `qxyncd` is the **only** process holding the FUSE mounts and the NAS session.
-`qsync` **routes automatically** by default — if the socket is reachable it goes over IPC
-(`--via-daemon` forces it, `--direct` skips it), so `qsync ls /home/x` is seamless for the user.
+`qxync` **routes automatically** by default — if the socket is reachable it goes over IPC
+(`--via-daemon` forces it, `--direct` skips it), so `qxync ls /home/x` is seamless for the user.
 
 ```
-qsync (CLI) ──┐
+qxync (CLI) ──┐
               ├─IPC(unix socket)──> qxyncd ──┬── FUSE mount (on-demand hydration / write-back / dehydration)
 qxync-gui ────┘                              ├── sync engine (polling + baseline reconciliation + conflict/delete protection)
                                              └── qxync-client ──HTTP──> NAS
@@ -206,7 +231,7 @@ crates/
 ├── qxync-client/      NAS HTTP API wrapper (login / metadata / upload & download) + LAN peer protocol
 ├── qxync-fuse/        FUSE layer: read-only/read-write mounts + range hydration + dehydration (incl. the upload queue)
 ├── qxync-daemon/      the qxyncd binary: long-running process + IPC server + sync engine + peer listener
-├── qxync-cli/         the qsync binary: command line
+├── qxync-cli/         the qxync binary: command line
 ├── qxync-gui/         the qxync-gui binary: Tauri 2 app (ui/ is a dependency-free static frontend)
 └── qxync-proto-test/  real-NAS integration tests (#[ignore] by default, run manually)
 xtask/tests/           8 acceptance matrix scripts (see "Acceptance & testing")
@@ -222,8 +247,8 @@ Dependency direction (only downwards allowed): `cli → core` (plus daemon acces
 
 **Metadata never rides the data path**: `ls -l` is answered straight from NAS metadata (real size,
 zero download). The cache is a sparse file whose "apparent size = file size", and only the ranges
-that are read get `pwrite`-ten into it; `user.qsync.state` exposes
-`placeholder`/`partial`/`hydrated`, and `user.qsync.chunks` exposes "ready / total".
+that are read get `pwrite`-ten into it; `user.qxync.state` exposes
+`placeholder`/`partial`/`hydrated`, and `user.qxync.chunks` exposes "ready / total".
 Cache file names use a **stable hash of the remote path** (not the ino — the same ino can map to
 different files across two mounts).
 
@@ -232,17 +257,17 @@ pin=pinned/excluded, unuploaded changes / in-flight queue entries, open fds, mma
 `/proc/*/maps`), currently hydrating, recently accessed. Only once all of them pass does it follow
 **iron rule 2**: `inval_inode(0,0)` → wipe the cached content → update the placeholder; if
 `inval_inode` fails, **nothing at all is wiped**. It does **not** dehydrate automatically by default;
-that is triggered by `QSYNC_DEHYDRATE_IDLE=600` (idle) / `QSYNC_CACHE_LIMIT=2G|25%` (quota, LRU),
-or manually with `qsync dehydrate`. `--cache-mode direct` uses `FOPEN_DIRECT_IO` to bypass the page
+that is triggered by `QXNYC_DEHYDRATE_IDLE=600` (idle) / `QXNYC_CACHE_LIMIT=2G|25%` (quota, LRU),
+or manually with `qxync dehydrate`. `--cache-mode direct` uses `FOPEN_DIRECT_IO` to bypass the page
 cache (dehydration becomes inherently safe, at the cost of no readahead and no mmap).
 
 **Change discovery treats baseline reconciliation as the main path**: the daemon runs a round of
-"three cursors + baseline reconciliation" every 30s (`QSYNC_POLL_INTERVAL` is adjustable) — taking
+"three cursors + baseline reconciliation" every 30s (`QXNYC_POLL_INTERVAL` is adjustable) — taking
 the event fast path first, then falling back to "list the known directories + baseline difference".
 A remote change → refresh metadata and **invalidate the local cache** (the next read hydrates the new
 content on demand); both sides changed → a **conflicted copy** (the remote keeps the original name,
 the local content is stored as `xxx (conflicted copy from <device> <date>).txt` and uploaded);
-bulk remote deletes → **circuit breaker** (only `qsync sync --force-deletes` lets them through).
+bulk remote deletes → **circuit breaker** (only `qxync sync --force-deletes` lets them through).
 
 **State moved into SQLite** (`qxync-core/src/store.rs`): `<data>/sync/<host>/sync.db` carries the
 three event cursors + baseline + **pin** (previously in memory only, so a daemon restart lost it →
@@ -478,9 +503,9 @@ xtask/tests/gui-matrix.sh --no-window #    machines without DISPLAY run the self
 Real-NAS integration tests (`#[ignore]`, needing your own NAS credentials):
 
 ```bash
-export QSYNC_TEST_HOST=... QSYNC_TEST_PORT=9834
-export QSYNC_TEST_USER=... QSYNC_TEST_PASSWORD='...'
-export QSYNC_TEST_FIXTURE=/home/qxync-test
+export QXNYC_TEST_HOST=... QXNYC_TEST_PORT=9834
+export QXNYC_TEST_USER=... QXNYC_TEST_PASSWORD='...'
+export QXNYC_TEST_FIXTURE=/home/qxync-test
 cargo test -p qxync-proto-test -- --ignored --test-threads=1 --nocapture  # 5 protocol items + 1 IPC end-to-end item
 cargo test -p qxync-daemon -- --ignored --test-threads=1 --nocapture     # M2c engine (conflicted copy / delete protection)
 ```
@@ -510,7 +535,7 @@ cargo test -p qxync-daemon -- --ignored --test-threads=1 --nocapture     # M2c e
 
 ## Security & privacy
 
-- **Credentials**: `~/.config/qsync/credentials.json` (`0600`); the IPC socket directory is `0700` and the socket is `0600`.
+- **Credentials**: `~/.config/qxync/credentials.json` (`0600`); the IPC socket directory is `0700` and the socket is `0600`.
 - **This project collects and reports no telemetry whatsoever**, and connects to no host other than the NAS you configured and (optionally) LAN peers.
 - **LAN peering is plaintext TCP**, so enable it only on a trusted LAN; the token authorizes only "read already-hydrated files + submit events" and has **no ability whatsoever to write to or delete from the remote**.
 - **This project contains and distributes no third-party client credentials.** The protocol probe

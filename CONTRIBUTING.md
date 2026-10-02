@@ -63,7 +63,7 @@ cargo test --workspace
 | 设置 / 代理 / 托盘 / 释放空间 | `xtask/tests/m84-matrix.sh` |
 | `ui/` 任意文件 | `xtask/tests/gui-matrix.sh`（无 DISPLAY 用 `--no-window`） |
 
-矩阵需要真机凭据（`QSYNC_TEST_HOST` / `QSYNC_TEST_USER` / `QSYNC_TEST_PASSWORD`）。
+矩阵需要真机凭据（`QXNYC_TEST_HOST` / `QXNYC_TEST_USER` / `QXNYC_TEST_PASSWORD`）。
 **如果某条你跑不了，请在 PR 里明说**，不要假装跑过 —— 这是比「测试没跑」严重得多的问题。
 
 ### 4. 两条铁则（复审必查）
@@ -167,8 +167,8 @@ cargo test --workspace
 | Settings / proxy / tray / free-up-space | `xtask/tests/m84-matrix.sh` |
 | Anything under `ui/` | `xtask/tests/gui-matrix.sh` (`--no-window` without a DISPLAY) |
 
-The matrices need real-NAS credentials (`QSYNC_TEST_HOST` / `QSYNC_TEST_USER` /
-`QSYNC_TEST_PASSWORD`). **If you could not run one, say so in the PR.** Pretending a matrix
+The matrices need real-NAS credentials (`QXNYC_TEST_HOST` / `QXNYC_TEST_USER` /
+`QXNYC_TEST_PASSWORD`). **If you could not run one, say so in the PR.** Pretending a matrix
 passed is a far more serious problem than not running it.
 
 ### 4. The two hard rules (reviewers check these)

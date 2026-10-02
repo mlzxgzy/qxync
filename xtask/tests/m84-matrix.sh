@@ -13,9 +13,9 @@
 #      而 No proxy 必须仍能登录；
 #   ② 托盘：真窗口起来后 D-Bus 上出现本进程的 `StatusNotifierItem-<pid>`；
 #      关闭窗口 → 进程还活着（进了托盘）；通知：`dbus-monitor` 抓 org.freedesktop.Notifications；
-#   ③ 自动释放空间：`QSYNC_TEST_FAKE_STATVFS` 把可用空间打到 5% → 触发脱水，
+#   ③ 自动释放空间：`QXNYC_TEST_FAKE_STATVFS` 把可用空间打到 5% → 触发脱水，
 #      并且 **pin 住的文件被安全检查链挡下**（不许为自动释放绕过铁则）；
-#   ④ 筛选器：加一条 `*.iso` → `qsync rules --match` 判定隐藏，且真挂载点里看不到；
+#   ④ 筛选器：加一条 `*.iso` → `qxync rules --match` 判定隐藏，且真挂载点里看不到；
 #   ⑤ 冲突策略 5 个取值各跑一次三向冲突，产物符合预期（ask 走待裁决队列）；
 #   ⑥ 节省空间模式三态：新建 → 仅在线；`head -c` → 本地可用；pin → 始终可用；脱水 → 仅在线，
 #      且脱水后远端改同长度不同内容再 `cat` 必须拿到新内容（铁则 2 不退化）；
@@ -24,16 +24,16 @@ set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DAEMON="$REPO/target/debug/qxyncd"
-QS="$REPO/target/debug/qsync"
+QS="$REPO/target/debug/qxync"
 GUI="$REPO/target/debug/qxync-gui"
-RUNDIR="${QSYNC_TEST_RUNDIR:-$REPO/.local-run}/m84"
+RUNDIR="${QXNYC_TEST_RUNDIR:-$REPO/.local-run}/m84"
 SOCK="$RUNDIR/s.sock"
 LOG="$RUNDIR/daemon.log"
 MNT="$RUNDIR/mnt"
 SUB="/home/qxync-test/m84"        # 远端绝对路径（daemon/CLI 用）
 RELV="/qxync-test/m84"            # 挂载点里的相对路径（单根 /home 直通）
 SUB_LOCAL="$RUNDIR/local"
-PROXY_PORT="${QSYNC_TEST_PROXY_PORT:-18484}"
+PROXY_PORT="${QXNYC_TEST_PROXY_PORT:-18484}"
 
 NO_FUSE=0; NO_GUI=0; NO_PROXY=0
 for a in "$@"; do case "$a" in
@@ -56,20 +56,20 @@ for d in "$MNT"; do
     echo "  ⚠️  清理残留挂载: $d"; fusermount3 -u "$d" 2>/dev/null || true
   fi
 done
-rm -rf "$RUNDIR"; mkdir -p "$RUNDIR/config/qsync/links" "$MNT" "$SUB_LOCAL"
-SRC_XDG="${QSYNC_SRC_XDG_CONFIG:-$REPO/.local-run/config}"
-LINK="${QSYNC_TEST_LINK:-default}"
-if [ ! -f "$SRC_XDG/qsync/links/$LINK.json" ]; then
-  echo "❌ 找不到连接配置：$SRC_XDG/qsync/links/$LINK.json"; exit 2
+rm -rf "$RUNDIR"; mkdir -p "$RUNDIR/config/qxync/links" "$MNT" "$SUB_LOCAL"
+SRC_XDG="${QXNYC_SRC_XDG_CONFIG:-$REPO/.local-run/config}"
+LINK="${QXNYC_TEST_LINK:-default}"
+if [ ! -f "$SRC_XDG/qxync/links/$LINK.json" ]; then
+  echo "❌ 找不到连接配置：$SRC_XDG/qxync/links/$LINK.json"; exit 2
 fi
-cp "$SRC_XDG/qsync/links/$LINK.json" "$RUNDIR/config/qsync/links/"
-[ -f "$SRC_XDG/qsync/credentials.json" ] && cp "$SRC_XDG/qsync/credentials.json" "$RUNDIR/config/qsync/"
+cp "$SRC_XDG/qxync/links/$LINK.json" "$RUNDIR/config/qxync/links/"
+[ -f "$SRC_XDG/qxync/credentials.json" ] && cp "$SRC_XDG/qxync/credentials.json" "$RUNDIR/config/qxync/"
 
 export XDG_CONFIG_HOME="$RUNDIR/config" XDG_DATA_HOME="$RUNDIR/data" XDG_STATE_HOME="$RUNDIR/state"
-export QSYNC_SOCKET="$SOCK" RUST_LOG="${RUST_LOG:-warn}"
+export QXNYC_SOCKET="$SOCK" RUST_LOG="${RUST_LOG:-warn}"
 DAEMON_PID=""; PROXY_PID=""; GUI_PID=""
-SETTINGS="$XDG_CONFIG_HOME/qsync/settings.json"
-AUTOSTART="$XDG_CONFIG_HOME/autostart/qsync.desktop"
+SETTINGS="$XDG_CONFIG_HOME/qxync/settings.json"
+AUTOSTART="$XDG_CONFIG_HOME/autostart/qxync.desktop"
 
 [ "$NO_FUSE" = "0" ] && [ ! -e /dev/fuse ] && { echo "  ⚠️  没有 /dev/fuse → 跳过挂载项"; NO_FUSE=1; }
 if [ "$NO_GUI" = "0" ] && { [ -z "${DISPLAY:-}" ] || ! command -v xdotool >/dev/null; }; then
@@ -80,7 +80,7 @@ fi
 Q() { "$QS" --socket "$SOCK" "$@"; }
 qj() { Q "$@" --json 2>/dev/null; }
 jqr() { jq -r "$1" 2>/dev/null; }
-# NAS 测试目录里的文件名（`qsync ls` 每行最后是文件名，前面两空格分隔）
+# NAS 测试目录里的文件名（`qxync ls` 每行最后是文件名，前面两空格分隔）
 remote_names() { Q ls "$SUB" 2>/dev/null | tail -n +2 | sed 's/.*  //'; }
 remote_body() { Q get "$SUB" "$1" --out "$RUNDIR/get-$1" >/dev/null 2>&1; cat "$RUNDIR/get-$1" 2>/dev/null; }
 copies_for() { remote_names | grep -cF "$1 (conflicted copy" || true; }
@@ -144,7 +144,7 @@ check "$([ "$(echo "$S0" | jqr .autostart_present)" = "false" ] && echo 0 || ech
 
 # 写 --set（经 daemon）：非 manual 值 + 需要校验的 manual
 Q settings --set free.auto=true --set free.below_pct=7 --set notifications=false >/dev/null 2>&1
-check $? "qsync settings --set 写入成功（经 daemon）"
+check $? "qxync settings --set 写入成功（经 daemon）"
 S1=$(qj settings)
 check "$([ "$(echo "$S1" | jqr .settings.free_space.auto)" = "true" ] && echo 0 || echo 1)" "free.auto 落盘为 true"
 check "$([ "$(echo "$S1" | jqr .settings.free_space.below_pct)" = "7" ] && echo 0 || echo 1)" "free.below_pct 落盘为 7"
@@ -237,7 +237,7 @@ else
   GUI_PID=$!
   WID=""
   for _ in $(seq 1 40); do
-    WID=$(xdotool search --name "QSync" 2>/dev/null | head -1)
+    WID=$(xdotool search --name "qxync" 2>/dev/null | head -1)
     [ -n "$WID" ] && break
     sleep 0.5
   done
@@ -261,14 +261,14 @@ else
   #   ⚠ 必须用「WM 级别的关闭请求」（wmctrl -c → _NET_CLOSE_WINDOW）；
   #     `xdotool windowclose` 是直接 XDestroyWindow，tao 会当成窗口被销毁而退出事件循环。
   if [ -n "$WID" ]; then
-    if command -v wmctrl >/dev/null; then wmctrl -c "QSync"; else xdotool windowclose "$WID"; fi
+    if command -v wmctrl >/dev/null; then wmctrl -c "qxync"; else xdotool windowclose "$WID"; fi
     sleep 2
     # ⚠ 「窗口还在不在」必须看**映射状态**：被 hide 的窗口在 X 里仍然存在，
     #    `xdotool search` 照样找得到 → 会误判。用 wmctrl -l（只列已映射）或 --onlyvisible。
     if command -v wmctrl >/dev/null; then
-      VIS=$(wmctrl -l 2>/dev/null | grep -c "QSync" || true)
+      VIS=$(wmctrl -l 2>/dev/null | grep -c "qxync" || true)
     else
-      VIS=$(xdotool search --onlyvisible --name "QSync" 2>/dev/null | wc -l)
+      VIS=$(xdotool search --onlyvisible --name "qxync" 2>/dev/null | wc -l)
     fi
     ALIVE=1; kill -0 "$GUI_PID" 2>/dev/null && ALIVE=0
     check "$([ "${VIS:-1}" = "0" ] && echo 0 || echo 1)" "关闭窗口后窗口不可见（已隐藏，剩余可见 $VIS）"
@@ -286,7 +286,7 @@ else
       "$GUI" >"$NEG_LOG" 2>&1 &
       GP=$!
       sleep 6
-      wmctrl -c "QSync" 2>/dev/null
+      wmctrl -c "qxync" 2>/dev/null
       sleep 2
       if kill -0 "$GP" 2>/dev/null; then kill "$GP" 2>/dev/null; echo ALIVE; else echo EXITED; fi
     ' > "$RUNDIR/gui-notray.result" 2>&1
@@ -344,8 +344,8 @@ printf 'TXT-CONTENT' > "$SUB_LOCAL/visible.txt"
 Q put "$SUB_LOCAL/hidden.iso" "$SUB" --name hidden.iso >/dev/null 2>&1
 Q put "$SUB_LOCAL/visible.txt" "$SUB" --name visible.txt >/dev/null 2>&1
 check $? "远端造好 hidden.iso / visible.txt"
-jq '.exclude = ["*.iso"]' "$XDG_CONFIG_HOME/qsync/links/$LINK.json" >"$RUNDIR/link.tmp" \
-  && mv "$RUNDIR/link.tmp" "$XDG_CONFIG_HOME/qsync/links/$LINK.json"
+jq '.exclude = ["*.iso"]' "$XDG_CONFIG_HOME/qxync/links/$LINK.json" >"$RUNDIR/link.tmp" \
+  && mv "$RUNDIR/link.tmp" "$XDG_CONFIG_HOME/qxync/links/$LINK.json"
 start_daemon "" ""; login
 M1=$(qj rules --match "$SUB/hidden.iso")
 M2=$(qj rules --match "$SUB/visible.txt")
@@ -364,7 +364,7 @@ else
 fi
 
 # ---------------------------------------------------------------- 5. 自动释放空间
-echo "== 5. 自动释放空间（QSYNC_TEST_FAKE_STATVFS=avail_pct=5）"
+echo "== 5. 自动释放空间（QXNYC_TEST_FAKE_STATVFS=avail_pct=5）"
 if [ "$NO_FUSE" = "1" ]; then
   skip "自动释放空间（需要真挂载，--no-fuse）"
 else
@@ -374,12 +374,12 @@ else
   Q put "$SUB_LOCAL/space-normal.bin" "$SUB" --name space-normal.bin >/dev/null 2>&1
   Q put "$SUB_LOCAL/space-pinned.bin" "$SUB" --name space-pinned.bin >/dev/null 2>&1
   # 恢复无排除规则（上一步加了 *.iso）
-  jq '.exclude = []' "$XDG_CONFIG_HOME/qsync/links/$LINK.json" >"$RUNDIR/link.tmp" \
-    && mv "$RUNDIR/link.tmp" "$XDG_CONFIG_HOME/qsync/links/$LINK.json"
+  jq '.exclude = []' "$XDG_CONFIG_HOME/qxync/links/$LINK.json" >"$RUNDIR/link.tmp" \
+    && mv "$RUNDIR/link.tmp" "$XDG_CONFIG_HOME/qxync/links/$LINK.json"
 
   # 第一步：**自动释放先关着**（settings 里 free.auto 此时为 false，见第 1 节末尾的复位），
   # 先把「水合 → 三态」这一段验干净，否则 1s 一轮的自动释放会抢在断言之前把文件脱水。
-  start_daemon "QSYNC_TEST_FAKE_STATVFS=avail_pct=5 QSYNC_AUTO_FREE_INTERVAL=1 QSYNC_AUTO_FREE_RECENT=0" ""
+  start_daemon "QXNYC_TEST_FAKE_STATVFS=avail_pct=5 QXNYC_AUTO_FREE_INTERVAL=1 QXNYC_AUTO_FREE_RECENT=0" ""
   check $? "daemon 带注入点起来（avail_pct=5 / 每 1s 扫 / 最近访问保护=0）"
   login
   Q settings --set free.auto=false >/dev/null 2>&1
@@ -419,7 +419,7 @@ else
 
   # 非法注入值必须报错（不许静默真量）
   stop_daemon
-  start_daemon "QSYNC_TEST_FAKE_STATVFS=bad-spec" ""; login
+  start_daemon "QXNYC_TEST_FAKE_STATVFS=bad-spec" ""; login
   Q space --json >/dev/null 2>&1
   check "$([ $? -ne 0 ] && echo 0 || echo 1)" "非法注入值 → space 报错（不是静默回退真 statvfs）"
   Q umount "$MNT" >/dev/null 2>&1; sleep 1
@@ -436,10 +436,10 @@ else
   purge_all
   check "$([ "$(remote_names | wc -l)" = "0" ] && echo 0 || echo 1)" "冲突段开始前 $SUB 是空目录（避免旧副本污染计数；实际剩 $(remote_names | wc -l)）"
 
-  # ★ 确定性三向冲突：用 QSYNC_TEST_UPLOAD_HOLD_MS 把上传 worker 停在「取下一个作业」之前。
+  # ★ 确定性三向冲突：用 QXNYC_TEST_UPLOAD_HOLD_MS 把上传 worker 停在「取下一个作业」之前。
   #   否则写路径是写穿的，本地改动几十毫秒就上传了，端到端根本撞不出冲突。
   stop_daemon
-  start_daemon "QSYNC_TEST_UPLOAD_HOLD_MS=2500" ""
+  start_daemon "QXNYC_TEST_UPLOAD_HOLD_MS=2500" ""
   check $? "daemon 带「上传保持 2.5s」注入点起来"
   login
 

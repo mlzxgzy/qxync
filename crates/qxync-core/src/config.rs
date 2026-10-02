@@ -1,13 +1,18 @@
 //! 本地配置布局（照报告 09 §9.6 蓝本）。
 //!
 //! ```text
-//! ~/.config/qsync/config.json             全局设置
-//! ~/.config/qsync/links/<link_id>.json    NAS 连接
-//! ~/.config/qsync/credentials.json        口令（0600，永不出现在 --password 之外的输出里）
-//! ~/.local/share/qsync/sync.db            SQLite（baseline/游标/队列，M1 起用）
-//! ~/.local/state/qsync/log/               日志
+//! ~/.config/qxync/config.json             全局设置
+//! ~/.config/qxync/links/<link_id>.json    NAS 连接
+//! ~/.config/qxync/credentials.json        口令（0600，永不出现在 --password 之外的输出里）
+//! ~/.local/share/qxync/sync.db            SQLite（baseline/游标/队列，M1 起用）
+//! ~/.local/state/qxync/log/               日志
 //! ```
 //! 目录前缀遵循 `XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XDG_STATE_HOME`。
+//!
+//! ★ 0.2.0：目录名从 `qsync` 改成 `qxync`（旧名与 QNAP 官方 Qsync 客户端撞名 ——
+//! 官方客户端的本地数据在 `~/.local/share/QNAP/Qsync`，和这里不冲突）。
+//! 改名前的老目录由 [`adopt_legacy_dir`] 搬过来：只有老目录就整体改名，
+//! 两个都在就只补缺（绝不覆盖），用户不必重新登录；见 README「从 0.1.x 升级」。
 
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -30,14 +35,128 @@ fn xdg(var: &str, fallback: PathBuf) -> PathBuf {
     std::env::var_os(var).map(PathBuf::from).unwrap_or(fallback)
 }
 
+/// ★ 0.2.0：把老目录 `<base>/qsync` 的内容搬到 `<base>/qxync`，返回新目录。
+///
+/// 三种情况，**都不丢数据、都不覆盖**：
+/// 1. 只有老目录（0.1.x 用户的常态）→ 整体 `rename`（同分区原子；跨设备退回复制 + 删老目录）。
+/// 2. 只有新目录（全新机器）→ 直接用。
+/// 3. **两个都在** → 只补缺：把老目录里新目录没有的条目搬进来，已存在的一律不动。
+///    这一支是给「0.1.0 的原型目录 `qxync/` 还留在机器上」那种情况准备的 ——
+///    0.1.0 用的就是 `qxync`，改名成 `qsync` 之后又改回来，于是两个都在。
+///    补缺而不是整体替换，是为了「活的那份永远不被旧的那份盖掉」。
+///
+/// 迁移本身失败 → 打一行 WARN 就继续用新目录：宁可让用户重新 `login` /
+/// 重新对账一轮，也不能因为迁移不了就让 CLI/daemon 起不来。
+fn adopt_legacy_dir(base: PathBuf) -> PathBuf {
+    let new = base.join("qxync");
+    let old = base.join("qsync");
+    if !old.exists() {
+        return new; // 情况 2（或全新机器）
+    }
+    if !new.exists() {
+        match std::fs::rename(&old, &new) {
+            Ok(()) => eprintln!(
+                "ℹ️  已把旧目录迁移过来：{} → {}",
+                old.display(),
+                new.display()
+            ),
+            Err(e_rename) => match copy_dir_all(&old, &new) {
+                Ok(()) => {
+                    let _ = std::fs::remove_dir_all(&old);
+                    eprintln!(
+                        "ℹ️  已把旧目录复制过来：{} → {}",
+                        old.display(),
+                        new.display()
+                    );
+                }
+                Err(e_copy) => eprintln!(
+                    "⚠️  旧目录 {} 迁移失败（rename: {e_rename}；copy: {e_copy}），\
+                     本次使用 {}；需要的话请手动搬运",
+                    old.display(),
+                    new.display()
+                ),
+            },
+        }
+        return new;
+    }
+    // 情况 3：两个都在 —— 补缺。每个进程只做一次，`discover()` 会被反复调用。
+    merge_missing_once(&old, &new);
+    new
+}
+
+/// 情况 3 的入口：同一个 `new` 每个进程只走一次，避免 `discover()` 被反复调用时重复扫盘。
+fn merge_missing_once(old: &Path, new: &Path) {
+    use std::sync::{Mutex, OnceLock};
+    static DONE: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+    let seen = DONE.get_or_init(|| Mutex::new(Vec::new()));
+    {
+        let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.iter().any(|p| p == new) {
+            return;
+        }
+        seen.push(new.to_path_buf());
+    }
+    match merge_missing(old, new) {
+        Ok(0) => {}
+        Ok(n) => eprintln!(
+            "ℹ️  检测到新旧目录并存：已把 {} 里缺的 {n} 个条目补进 {}（已有的一律没动）。\
+             核对无误后可以把老目录删掉。",
+            old.display(),
+            new.display()
+        ),
+        Err(e) => eprintln!(
+            "⚠️  {} 与 {} 并存，补缺失败：{e}；本次只用 {}，需要的话请手动搬运",
+            old.display(),
+            new.display(),
+            new.display()
+        ),
+    }
+}
+
+/// 递归补缺：只复制 `to` 里**不存在**的东西（文件按名字判存），已存在的一律不碰。
+fn merge_missing(from: &Path, to: &Path) -> std::io::Result<usize> {
+    std::fs::create_dir_all(to)?;
+    let mut copied = 0;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let src = entry.path();
+        let dst = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copied += merge_missing(&src, &dst)?;
+        } else if !dst.exists() {
+            std::fs::copy(&src, &dst)?;
+            copied += 1;
+        }
+    }
+    Ok(copied)
+}
+
+/// 递归复制（跨文件系统时 `rename` 会失败，用它兜底）。
+fn copy_dir_all(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let src = entry.path();
+        let dst = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_all(&src, &dst)?;
+        } else {
+            std::fs::copy(&src, &dst)?;
+        }
+    }
+    Ok(())
+}
+
 impl ConfigPaths {
     /// 按 XDG 约定推导（不创建目录）。
+    ///
+    /// ★ 0.2.0：顺手做 `qsync` → `qxync` 的一次性目录迁移（见 [`adopt_legacy_dir`]）。
     pub fn discover() -> Result<Self> {
         let h = home()?;
         Ok(Self {
-            config_dir: xdg("XDG_CONFIG_HOME", h.join(".config")).join("qsync"),
-            data_dir: xdg("XDG_DATA_HOME", h.join(".local/share")).join("qsync"),
-            state_dir: xdg("XDG_STATE_HOME", h.join(".local/state")).join("qsync"),
+            config_dir: adopt_legacy_dir(xdg("XDG_CONFIG_HOME", h.join(".config"))),
+            data_dir: adopt_legacy_dir(xdg("XDG_DATA_HOME", h.join(".local/share"))),
+            state_dir: adopt_legacy_dir(xdg("XDG_STATE_HOME", h.join(".local/state"))),
         })
     }
 
@@ -117,7 +236,7 @@ pub struct LinkConfig {
     #[serde(default)]
     pub exclude: Vec<String>,
     /// ★ M7：内置临时文件过滤（`*.crdownload` / `~$*` / `.goutputstream-*` / `.upload_cache*`
-    /// / `*.qsync-part`）。默认开：这些文件同步出去只会给对端制造垃圾。
+    /// / `*.qxync-part`）。默认开：这些文件同步出去只会给对端制造垃圾。
     #[serde(default = "yes")]
     pub filter_temp: bool,
     /// ★ M7：LAN 对等监听地址（`"127.0.0.1:9840"` / `"0.0.0.0:9840"`）。
@@ -271,6 +390,51 @@ impl Credentials {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ★ 0.2.0：老的 `qsync/` 目录要迁到 `qxync/`，三种情况都不丢数据、都不覆盖。
+    #[test]
+    fn legacy_dir_is_adopted_once_and_never_clobbers_new() {
+        let base = std::env::temp_dir().join(format!("qxync-adopt-{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+
+        // ① 只有老目录 → 整体改名过来，内容跟着走，老目录不再留着（否则会有两份状态）。
+        let old = base.join("qsync");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("credentials.json"), b"{\"user\":\"test1\"}").unwrap();
+        let new = adopt_legacy_dir(base.clone());
+        assert_eq!(new, base.join("qxync"));
+        assert!(new.join("credentials.json").exists(), "老凭据要跟着搬过来");
+        assert!(!old.exists(), "整体迁移后不该再有 qsync/ 目录");
+
+        // ② 两个都在（0.1.0 的原型目录 + 0.1.1 的活目录）→ **只补缺**：
+        //    老目录独有的搬进来，新目录已有的一个字都不改。
+        let old2 = base.join("qsync");
+        std::fs::create_dir_all(old2.join("sync/nas")).unwrap();
+        std::fs::write(old2.join("sync/nas/sync.db"), b"live-state").unwrap();
+        std::fs::write(old2.join("credentials.json"), b"STALE").unwrap();
+        std::fs::write(new.join("credentials.json"), b"KEEP").unwrap();
+        let again = adopt_legacy_dir(base.clone());
+        assert_eq!(again, base.join("qxync"));
+        assert_eq!(
+            std::fs::read(again.join("credentials.json")).unwrap(),
+            b"KEEP",
+            "新目录已有的文件绝不能被旧目录盖掉"
+        );
+        assert_eq!(
+            std::fs::read(again.join("sync/nas/sync.db")).unwrap(),
+            b"live-state",
+            "老目录独有的活状态要补进来"
+        );
+        assert!(
+            old2.join("sync/nas/sync.db").exists(),
+            "老目录原样留着，不删"
+        );
+
+        // ③ 可重入：再跑一次不报错、也不重复搬运。
+        assert!(adopt_legacy_dir(base.clone()).exists());
+
+        std::fs::remove_dir_all(&base).ok();
+    }
 
     #[test]
     fn link_config_roundtrip() {

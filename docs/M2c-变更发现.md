@@ -40,7 +40,7 @@ Cursors { config, notify, global_notify, max_log_seen, log_missing_count }
   3. **`max_log` 回退 → 游标归零 + 全量重扫**（`Cursors::should_reset`）。
      `status:-17` 时**不推进**，只记账（`log_missing_count`）。
 
-落盘位置：`~/.local/share/qsync/sync/<host>/{cursors.json,baseline.json}`（按 NAS 隔离）。
+落盘位置：`~/.local/share/qxync/sync/<host>/{cursors.json,baseline.json}`（按 NAS 隔离）。
 
 ---
 
@@ -99,8 +99,8 @@ baseline = **上次同步成功时远端的样子**（`path → {exists,is_dir,s
 
 | 方向 | 机制 | 阈值（默认） | 解除方式 |
 |---|---|---|---|
-| 远端大批删除 → 不要批量清本地 | 引擎一轮对账里 `DeleteLocal` 计数超限 → **整批挡住** | >50 项，或 >25%（baseline≥20 项时） | `qsync sync --force-deletes` |
-| 本地大批删除 → 不要清空远端 | FUSE `unlink/rmdir` 的滑动窗口熔断（`DeleteGuard`） | 60 秒内 >100 次 | `qsync sync --force-deletes` 或重新挂载 |
+| 远端大批删除 → 不要批量清本地 | 引擎一轮对账里 `DeleteLocal` 计数超限 → **整批挡住** | >50 项，或 >25%（baseline≥20 项时） | `qxync sync --force-deletes` |
+| 本地大批删除 → 不要清空远端 | FUSE `unlink/rmdir` 的滑动窗口熔断（`DeleteGuard`） | 60 秒内 >100 次 | `qxync sync --force-deletes` 或重新挂载 |
 
 * 远端删除判定**只认** `status 4/5/6`（不存在/无权限）；网络错误、超时**绝不**当成删除
   ——否则一次抖动就会清空本地。
@@ -132,14 +132,14 @@ baseline = **上次同步成功时远端的样子**（`path → {exists,is_dir,s
 * **引擎**（`qxync-daemon/src/sync.rs`）：`poll_once()` = ① `max_log` → ② notify 事件
   （按 `device_uid` / `user` / 挂载根过滤后逐条 `stat` + 决策）→ ③ config/global 游标 →
   ④ 对账所有挂载视图（列已知目录 + 差集）→ 删除保护 → 落盘。
-* **轮询**：守护进程后台任务，默认 30s；`QSYNC_POLL_INTERVAL=0` 暂停。
+* **轮询**：守护进程后台任务，默认 30s；`QXNYC_POLL_INTERVAL=0` 暂停。
 * **IPC**（`qxync_core::ipc`）：
   * `sync {once, force_deletes, max_deletes, interval_secs}`；
   * `rm {dir,name}`（测试/脚本用）；
   * `mount {…, delete_limit}`（本地删除熔断阈值，0 = 关闭）；
   * `status.sync` = `SyncInfo`（游标 / baseline 条目数 / 计数 / 事件设备 / 熔断原因）。
-* **CLI**：`qsync sync [--once] [--force-deletes] [--max-deletes N] [--interval S]`、
-  `qsync rm <dir> <name>`；`qsync status` / `qsync mount` 打印上述信息。
+* **CLI**：`qxync sync [--once] [--force-deletes] [--max-deletes N] [--interval S]`、
+  `qxync rm <dir> <name>`；`qxync status` / `qxync mount` 打印上述信息。
 
 ---
 
@@ -148,8 +148,8 @@ baseline = **上次同步成功时远端的样子**（`path → {exists,is_dir,s
 **真机集成测试**（`#[ignore]`，需环境变量）：
 
 ```bash
-export QSYNC_TEST_HOST=... QSYNC_TEST_USER=... QSYNC_TEST_PASSWORD=...
-export QSYNC_TEST_FIXTURE=/home/qxync-test
+export QXNYC_TEST_HOST=... QXNYC_TEST_USER=... QXNYC_TEST_PASSWORD=...
+export QXNYC_TEST_FIXTURE=/home/qxync-test
 cargo test -p qxync-daemon -- --ignored --test-threads=1 --nocapture   # 引擎：刷新/冲突/删除保护/游标
 cargo test -p qxync-proto-test -- --ignored --test-threads=1 --nocapture  # 协议：sync log / notify 端点
 ```

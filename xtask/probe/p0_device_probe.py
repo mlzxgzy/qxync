@@ -168,7 +168,7 @@ def phase_c(c, sid, user, outdir, remote_marker):
 
     print(f"""
   ---- 现在请做一次本地写操作，然后重跑 --phase c 复看 ----
-  例：qsync put <本地小文件> {remote_marker}      （或 qsync sync --once）
+  例：qxync put <本地小文件> {remote_marker}      （或 qxync sync --once）
   目标远端路径：{remote_marker}
 """)
 

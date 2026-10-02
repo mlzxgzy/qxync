@@ -6,29 +6,29 @@
 #   xtask/tests/fuse-matrix.sh --big           # 追加 128 MiB 水合 + 并发去重，~5min（取决于带宽）
 #   xtask/tests/fuse-matrix.sh --keep-mounted  # 结束后不卸载（方便手动玩）
 #
-# 依赖：已 `cargo build`（target/debug/qsync）、/dev/fuse、fusermount3。
-# 凭据：读 XDG_CONFIG_HOME 下的 qsync 配置；先用 `qsync login` 登录过一次。
+# 依赖：已 `cargo build`（target/debug/qxync）、/dev/fuse、fusermount3。
+# 凭据：读 XDG_CONFIG_HOME 下的 qxync 配置；先用 `qxync login` 登录过一次。
 #
 # 状态隔离：状态库 `$RUNDIR/fuse-data` 与日志 `$RUNDIR/fuse-state` **每次开跑前清空**，
 #   不再跟别的矩阵共用 `.local-run/data`（NAS 的 @Recycle 会随删夹具无限增长，
 #   累积 baseline 曾让 M2c 的「远端改动」断言偶发失败）。要复用别的目录：
-#   `QSYNC_TEST_DATA_HOME=... QSYNC_TEST_STATE_HOME=...`（此时不会被清空）。
+#   `QXNYC_TEST_DATA_HOME=... QXNYC_TEST_STATE_HOME=...`（此时不会被清空）。
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-QS="$REPO/target/debug/qsync"
-RUNDIR="${QSYNC_TEST_RUNDIR:-$REPO/.local-run}"
+QS="$REPO/target/debug/qxync"
+RUNDIR="${QXNYC_TEST_RUNDIR:-$REPO/.local-run}"
 MNT="$RUNDIR/mnt"
 CACHE="$RUNDIR/cache"
-FIXTURE="${QSYNC_TEST_FIXTURE:-/home/qxync-test}"     # NAS 上的路径
+FIXTURE="${QXNYC_TEST_FIXTURE:-/home/qxync-test}"     # NAS 上的路径
 # 造夹具时落盘的本地副本（由 qs_fixture.py 生成，**不在仓库里**）。
-# 默认沿用探测工具的输出目录；换机器时用 QSYNC_TEST_LOCAL_FIXTURE 指过去。
-LOCAL_FIXTURE="${QSYNC_TEST_LOCAL_FIXTURE:-$REPO/xtask/probe/probe-out/fixture/local}"
+# 默认沿用探测工具的输出目录；换机器时用 QXNYC_TEST_LOCAL_FIXTURE 指过去。
+LOCAL_FIXTURE="${QXNYC_TEST_LOCAL_FIXTURE:-$REPO/xtask/probe/probe-out/fixture/local}"
 BIG=0
 KEEP=0
 # 大文件整文件水合受带宽限制：对端 ~1.1MB/s 时 128MiB 要 ~116s，
 # 所以 --big 段单独用一个宽松的水合超时（M2 换成区间水合后就不再敏感）。
-HYD="${QSYNC_HYDRATE_TIMEOUT:-600}"
+HYD="${QXNYC_HYDRATE_TIMEOUT:-600}"
 for a in "$@"; do
   case "$a" in
     --big) BIG=1 ;;
@@ -48,11 +48,11 @@ export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$RUNDIR/config}"
 #   $RUNDIR/state，累积的状态会互相踩 —— 最明显的是 NAS 的 @Recycle 会随每次删夹具一直长，
 #   baseline 越滚越大（实测 540+ 条 @Recycle 记录 / dirs=29），M2c 的「远端改动」断言就
 #   开始偶发失败（同一场景换个干净状态必过）。独立 + 每次开跑前清空 = 可复现。
-export XDG_DATA_HOME="${QSYNC_TEST_DATA_HOME:-$RUNDIR/fuse-data}"
-export XDG_STATE_HOME="${QSYNC_TEST_STATE_HOME:-$RUNDIR/fuse-state}"
-# 默认目录每次开跑前清空；显式指定了 QSYNC_TEST_*_HOME 就尊重它、不动里面的东西
-[ -n "${QSYNC_TEST_DATA_HOME:-}" ] || rm -rf "$XDG_DATA_HOME"
-[ -n "${QSYNC_TEST_STATE_HOME:-}" ] || rm -rf "$XDG_STATE_HOME"
+export XDG_DATA_HOME="${QXNYC_TEST_DATA_HOME:-$RUNDIR/fuse-data}"
+export XDG_STATE_HOME="${QXNYC_TEST_STATE_HOME:-$RUNDIR/fuse-state}"
+# 默认目录每次开跑前清空；显式指定了 QXNYC_TEST_*_HOME 就尊重它、不动里面的东西
+[ -n "${QXNYC_TEST_DATA_HOME:-}" ] || rm -rf "$XDG_DATA_HOME"
+[ -n "${QXNYC_TEST_STATE_HOME:-}" ] || rm -rf "$XDG_STATE_HOME"
 export RUST_LOG="${RUST_LOG:-info}"
 LOG="$RUNDIR/fuse-matrix.log"
 
@@ -74,7 +74,7 @@ cleanup_stale() {
       fusermount3 -u "$mp" >/dev/null 2>&1 || "$QS" umount "$mp" >/dev/null 2>&1
     fi
   done
-  pkill -f "$REPO/target/debug/qsync mount" 2>/dev/null
+  pkill -f "$REPO/target/debug/qxync mount" 2>/dev/null
   sleep 1
 }
 # ★ 必须在 cleanup_stale 定义之后再调用（以前写在定义前，每次跑都报「未找到命令」，
@@ -92,7 +92,7 @@ unmount_retry() {
   if is_mounted "$mp"; then
     # 最后手段：杀掉本仓库里持有这个挂载点的 mount 进程（只匹配本仓库路径）
     echo "  ⚠️  $mp 卸载不掉，杀掉对应 mount 进程"
-    pkill -f "$REPO/target/debug/qsync mount $mp" 2>/dev/null
+    pkill -f "$REPO/target/debug/qxync mount $mp" 2>/dev/null
     sleep 1
     fusermount3 -u "$mp" >/dev/null 2>&1
     sleep 1
@@ -107,8 +107,8 @@ trap cleanup EXIT
 
 echo "=== 挂载（只读 + on-demand，60s 水合超时）==="
 rm -f "$CACHE"/*
-"$QS" mount "$MNT" --remote "${QSYNC_REMOTE_ROOT:-/home}" --cache-dir "$CACHE" \
-      --threads 4 --auto-unmount ${QSYNC_MOUNT_EXTRA:-} >"$LOG" 2>&1 &
+"$QS" mount "$MNT" --remote "${QXNYC_REMOTE_ROOT:-/home}" --cache-dir "$CACHE" \
+      --threads 4 --auto-unmount ${QXNYC_MOUNT_EXTRA:-} >"$LOG" 2>&1 &
 MOUNT_PID=$!
 for _ in $(seq 1 30); do is_mounted "$MNT" && break; sleep 0.5; done
 is_mounted "$MNT" || { echo "挂载失败，日志："; cat "$LOG"; exit 1; }
@@ -166,19 +166,19 @@ echo
 echo "=== xattr 可观测（M1.7）==="
 state=$(python3 -c "
 import os
-try: print(os.getxattr('$M/hello.txt','user.qsync.state').decode())
+try: print(os.getxattr('$M/hello.txt','user.qxync.state').decode())
 except OSError as e: print('ERR%d'%e.errno)
 ")
-echo "  user.qsync.state = $state"
+echo "  user.qxync.state = $state"
 check "$([ "$state" = "hydrated" ] && echo 0 || echo 1)" "读取后状态 = hydrated"
 check "$(python3 -c "
 import os,sys
 names=os.listxattr('$M/hello.txt')
-sys.exit(0 if 'user.qsync.state' in names and 'user.qsync.vsize' in names and 'user.qsync.chunks' in names else 1)
+sys.exit(0 if 'user.qxync.state' in names and 'user.qxync.vsize' in names and 'user.qxync.chunks' in names else 1)
 " && echo 0 || echo 1)" "listxattr 返回全部键（含末尾 NUL 校验）"
 chunks=$(python3 -c "
 import os
-print(os.getxattr('$M/big.bin','user.qsync.chunks').decode())
+print(os.getxattr('$M/big.bin','user.qxync.chunks').decode())
 ")
 echo "  big.bin 区间: $chunks（head -c 100 之后应是 1/1024）"
 check "$([ "$chunks" = "1/1024" ] && echo 0 || echo 1)" "区间计数 = 1/1024（M2 粒度）"
@@ -191,7 +191,7 @@ echo "=== #11 水合失败 → EIO，不挂死、不零填充 ==="
 MNT2="$RUNDIR/mnt-timeout"
 mkdir -p "$MNT2"
 rm -f "$CACHE"/*          # 别让上一个挂载的缓存把这步短路
-"$QS" mount "$MNT2" --remote "${QSYNC_REMOTE_ROOT:-/home}" --cache-dir "$CACHE" \
+"$QS" mount "$MNT2" --remote "${QXNYC_REMOTE_ROOT:-/home}" --cache-dir "$CACHE" \
       --threads 2 --auto-unmount --hydrate-timeout 0 >>"$LOG" 2>&1 &
 for _ in $(seq 1 30); do is_mounted "$MNT2" && break; sleep 0.5; done
 M2="$MNT2$( echo "$FIXTURE" | sed 's#^/home##' )"
@@ -202,7 +202,7 @@ echo "  cat 退出码=$rc 输出字节=$n  stderr=$(cat "$RUNDIR/eio.err")"
 check "$([ "$rc" = "1" ] && echo 0 || echo 1)" "返回 EIO（退出码 1，而非挂死 124）"
 check "$([ "$n" = "0" ] && echo 0 || echo 1)" "失败时不吐零填充假数据"
 check "$(ls "$M2" >/dev/null 2>&1 && echo 0 || echo 1)" "失败后文件系统仍存活"
-check "$([ -z "$(ls -A "$CACHE" | grep qsync-part)" ] && echo 0 || echo 1)" "不残留半截文件"
+check "$([ -z "$(ls -A "$CACHE" | grep qxync-part)" ] && echo 0 || echo 1)" "不残留半截文件"
 unmount_retry "$MNT2"
 
 if [ "$BIG" = "1" ]; then
@@ -210,7 +210,7 @@ if [ "$BIG" = "1" ]; then
   echo "=== 128 MiB 整文件水合 + md5（水合超时 ${HYD}s）==="
   unmount_retry "$MNT"
   rm -f "$CACHE"/*; : >"$LOG"
-  RUST_LOG=debug "$QS" mount "$MNT" --remote "${QSYNC_REMOTE_ROOT:-/home}" --cache-dir "$CACHE" \
+  RUST_LOG=debug "$QS" mount "$MNT" --remote "${QXNYC_REMOTE_ROOT:-/home}" --cache-dir "$CACHE" \
         --threads 4 --auto-unmount --hydrate-timeout "$HYD" >>"$LOG" 2>&1 &
   for _ in $(seq 1 30); do is_mounted "$MNT" && break; sleep 0.5; done
   read_big() {  # 输出 "字节数 md5"；失败输出 "0 -"
@@ -239,7 +239,7 @@ if [ "$BIG" = "1" ]; then
   # 重新挂载以清掉内核 page cache，否则读到的是内核缓存，测不出并发
   rm -f "$CACHE"/* "$RUNDIR"/dedup-*.txt
   : >"$LOG"
-  RUST_LOG=debug "$QS" mount "$MNT" --remote "${QSYNC_REMOTE_ROOT:-/home}" --cache-dir "$CACHE" \
+  RUST_LOG=debug "$QS" mount "$MNT" --remote "${QXNYC_REMOTE_ROOT:-/home}" --cache-dir "$CACHE" \
         --threads 4 --auto-unmount --hydrate-timeout "$HYD" >>"$LOG" 2>&1 &
   for _ in $(seq 1 30); do is_mounted "$MNT" && break; sleep 0.5; done
   # 注意：不能裸用 wait —— 后台还挂着 FUSE 挂载进程，wait 会一直等它。
@@ -261,7 +261,7 @@ echo
 echo "=== M2b 写路径（读写挂载：create / read-modify-write / mkdir / rename / move / unlink）==="
 MNTW="$RUNDIR/mnt-rw"; CACHEW="$RUNDIR/cache-rw"
 mkdir -p "$MNTW"; rm -rf "$CACHEW"
-"$QS" mount "$MNTW" --remote "${QSYNC_REMOTE_ROOT:-/home}" --cache-dir "$CACHEW" \
+"$QS" mount "$MNTW" --remote "${QXNYC_REMOTE_ROOT:-/home}" --cache-dir "$CACHEW" \
       --threads 4 --rw >>"$LOG" 2>&1 &
 for _ in $(seq 1 40); do is_mounted "$MNTW" && break; sleep 0.5; done
 if ! is_mounted "$MNTW"; then
@@ -358,20 +358,20 @@ echo "=== M2c 变更发现（daemon 三游标轮询 + baseline 对账 + 冲突�
 MNTC="$RUNDIR/mnt-m2c"; CACHEC="$RUNDIR/cache-m2c"
 mkdir -p "$MNTC"; rm -rf "$CACHEC"
 M2C="$FIXTURE/mx2"                       # 远端沙盒目录
-export QSYNC_POLL_INTERVAL=2             # 快轮询，验收更快
+export QXNYC_POLL_INTERVAL=2             # 快轮询，验收更快
 "$QS" daemon stop >/dev/null 2>&1
 "$QS" daemon start >/dev/null 2>&1
 "$QS" --direct mkdir "$FIXTURE" mx2 >/dev/null 2>&1
 MC="$MNTC$(echo "$FIXTURE" | sed 's#^/home##')/mx2"
 
-xattr_state() {  # $1=挂载点内路径 → 打印 user.qsync.state
+xattr_state() {  # $1=挂载点内路径 → 打印 user.qxync.state
   python3 -c "
 import os
-try: print(os.getxattr('$1','user.qsync.state').decode())
+try: print(os.getxattr('$1','user.qxync.state').decode())
 except OSError as e: print('ERR%d'%e.errno)"
 }
 
-if ! "$QS" mount "$MNTC" --remote "${QSYNC_REMOTE_ROOT:-/home}" --cache-dir "$CACHEC" \
+if ! "$QS" mount "$MNTC" --remote "${QXNYC_REMOTE_ROOT:-/home}" --cache-dir "$CACHEC" \
         --threads 4 --rw >/dev/null 2>&1; then
   bad "M2c：daemon 读写挂载失败（跳过 M2c 检查）"
 else
@@ -519,19 +519,19 @@ echo
 echo "=== M3 脱水（先 inval_inode 再清内容 + 安全检查链 + 闲置/限额 + direct 模式）==="
 MNT3="$RUNDIR/mnt-m3"; CACHE3="$RUNDIR/cache-m3"
 mkdir -p "$MNT3"; rm -rf "$CACHE3"
-unset QSYNC_CACHE_LIMIT
-export QSYNC_DEHYDRATE_IDLE=0            # 先关掉自动扫描，测试要可控
-export QSYNC_DEHYDRATE_INTERVAL=5
+unset QXNYC_CACHE_LIMIT
+export QXNYC_DEHYDRATE_IDLE=0            # 先关掉自动扫描，测试要可控
+export QXNYC_DEHYDRATE_INTERVAL=5
 "$QS" daemon stop >/dev/null 2>&1
 "$QS" daemon start >/dev/null 2>&1
 M3="$MNT3$(echo "$FIXTURE" | sed 's#^/home##')"
-DAEMONLOG=$(ls -t "$XDG_STATE_HOME"/qsync/log/qxyncd.log.* 2>/dev/null | head -1)
+DAEMONLOG=$(ls -t "$XDG_STATE_HOME"/qxync/log/qxyncd.log.* 2>/dev/null | head -1)
 
 # 注意：缓存是稀疏文件，`du -sb`（apparent size）会把 128 MiB 的稀疏缓存算成 128 MiB；
 # 这里要的是**真实磁盘占用**，所以用 --block-size=1 的默认（allocated）口径。
 cache_bytes() { du -s --block-size=1 "$1" 2>/dev/null | cut -f1; }
 
-if "$QS" mount "$MNT3" --remote "${QSYNC_REMOTE_ROOT:-/home}" --cache-dir "$CACHE3" \
+if "$QS" mount "$MNT3" --remote "${QXNYC_REMOTE_ROOT:-/home}" --cache-dir "$CACHE3" \
         --threads 4 --rw >/dev/null 2>&1; then
 
   # ---- M3-1 水合 → 脱水 → 占位符仍显示真实大小 → 再读数据正确
@@ -620,7 +620,7 @@ MPID=$!
   # ★ 用**全新文件**测后台那一路，别复用 hello.txt：它带着前面几段留下的状态/页缓存，
   #   实测后台 tick 根本不碰它 —— M3-6 会靠「`--idle-secs` 立即跑的那一趟」蒙混过关，
   #   而 M3-6b 就变成假失败。顺序：先开后台扫描（此刻它没活干）→ 造个新文件并 `cat`
-  #   水合，留给后台 tick → 最多等 20s（QSYNC_DEHYDRATE_INTERVAL=5，≥4 个 tick），
+  #   水合，留给后台 tick → 最多等 20s（QXNYC_DEHYDRATE_INTERVAL=5，≥4 个 tick），
   #   占位符与「自动脱水：」日志两个条件都满足才算过。
   "$QS" dehydrate --idle-secs 1 >/dev/null 2>&1              # 动态开启后台扫描（闲置 ≥1s）
   printf 'M3-BACKGROUND-%s\n' "$$" >"$RUNDIR/m3-bg.bin"
@@ -629,12 +629,12 @@ MPID=$!
   cat "$M3/m3-bg.txt" >/dev/null 2>&1                        # 水合 → 留给后台 tick
   for _ in $(seq 1 20); do
     [ "$(xattr_state "$M3/m3-bg.txt")" = "placeholder" ] \
-      && grep -qh '自动脱水：' "$XDG_STATE_HOME"/qsync/log/qxyncd.log.* && break
+      && grep -qh '自动脱水：' "$XDG_STATE_HOME"/qxync/log/qxyncd.log.* && break
     sleep 1
   done
   st_auto=$(xattr_state "$M3/m3-bg.txt")
   check "$([ "$st_auto" = "placeholder" ] && echo 0 || echo 1)" "M3-6 后台定时脱水生效（闲置 ≥1s 后被自动清成占位符）"
-  check "$(grep -qh '自动脱水：' "$XDG_STATE_HOME"/qsync/log/qxyncd.log.* && echo 0 || echo 1)" "M3-6b daemon 日志有自动脱水记录（本轮后台那一轮）"
+  check "$(grep -qh '自动脱水：' "$XDG_STATE_HOME"/qxync/log/qxyncd.log.* && echo 0 || echo 1)" "M3-6b daemon 日志有自动脱水记录（本轮后台那一轮）"
   "$QS" --direct rm "$FIXTURE" m3-bg.txt >/dev/null 2>&1     # 清掉这条专用夹具
   "$QS" dehydrate --idle-secs 0 >/dev/null 2>&1              # 关掉，别影响 Direct 模式测试
 
@@ -650,7 +650,7 @@ fi
 # ---- M3-8 direct 模式（绕过 page cache）：数据正确 + mmap 不可用
 MNT3D="$RUNDIR/mnt-m3-direct"; CACHE3D="$RUNDIR/cache-m3-direct"
 mkdir -p "$MNT3D"; rm -rf "$CACHE3D"
-if "$QS" mount "$MNT3D" --remote "${QSYNC_REMOTE_ROOT:-/home}" --cache-dir "$CACHE3D" \
+if "$QS" mount "$MNT3D" --remote "${QXNYC_REMOTE_ROOT:-/home}" --cache-dir "$CACHE3D" \
         --threads 2 --cache-mode direct >/dev/null 2>&1; then
   M3D="$MNT3D$(echo "$FIXTURE" | sed 's#^/home##')"
   check "$(cmp -s <(cat "$M3D/1k.bin" 2>/dev/null) "$LOCAL_FIXTURE/1k.bin" && echo 0 || echo 1)" "M3-8 direct 模式读取正确"

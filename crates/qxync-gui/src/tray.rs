@@ -4,12 +4,12 @@
 //! * **托盘只负责「转发意图」，不直接干活**。菜单里的「打开主窗口 / 立即与 NAS 同步 /
 //!   暂停」都只是往主窗口 emit 一条 `tray://action`（payload 是 `"open"|"sync"|"pause"`），
 //!   真正的动作由前端做 —— 前端才持有界面状态与 IPC 封装；如果 Rust 侧绕开前端直接发
-//!   IPC，「暂停」按钮的 UI 状态就会和 daemon 实际状态对不上（QSync 也有同样的坑）。
+//!   IPC，「暂停」按钮的 UI 状态就会和 daemon 实际状态对不上（Qsync 也有同样的坑）。
 //!   唯一的例外是「退出」：那是纯粹的进程生命周期，直接 `app.exit(0)`。
 //! * **托盘失败不能拖垮 GUI**。缺 `libayatana-appindicator3` / 没有 StatusNotifierHost /
 //!   纯 X11 环境下建托盘都会失败，但那只是「少了个图标」，登录/同步/挂载全都还能用。
 //!   所以这里把错误吞掉记日志，用一个进程级标志把结果留给 `m84_info` 如实上报。
-//! * **菜单文案用中文**：与 GUI 其余部分（zh-CN）保持一致，且照 QSync 的四项。
+//! * **菜单文案用中文**：与 GUI 其余部分（zh-CN）保持一致，且照 Qsync 的四项。
 //! * ★ **「建起来」≠「用户看得见」**。SNI 的宿主是 `org.kde.StatusNotifierWatcher`，
 //!   但**有 watcher 不等于有 host**：裸 GNOME（没装 AppIndicator 扩展）、只跑了 watcher
 //!   却没渲染托盘的面板、纯 XEmbed 桌面（IceWM/Fluxbox/老面板）都属于「名字注册成功、
@@ -27,7 +27,7 @@ use tauri::{AppHandle, Emitter};
 pub const ACTION_EVENT: &str = "tray://action";
 
 /// 托盘图标 id（仅用于日志/调试；同进程只有一个托盘）。
-const TRAY_ID: &str = "qsync-tray";
+const TRAY_ID: &str = "qxync-tray";
 const MENU_OPEN: &str = "tray-open";
 const MENU_SYNC: &str = "tray-sync";
 const MENU_PAUSE: &str = "tray-pause";
@@ -239,7 +239,7 @@ fn build(app: &AppHandle) -> tauri::Result<()> {
     let sync = MenuItemBuilder::with_id(MENU_SYNC, "立即与 NAS 同步").build(app)?;
     let pause = MenuItemBuilder::with_id(MENU_PAUSE, "暂停").build(app)?;
     let quit = MenuItemBuilder::with_id(MENU_QUIT, "退出").build(app)?;
-    // 顺序照 QSync：三项动作 + 分隔线 + 退出（退出隔开，避免误点）
+    // 顺序照 Qsync：三项动作 + 分隔线 + 退出（退出隔开，避免误点）
     let menu = MenuBuilder::new(app)
         .items(&[&open, &sync, &pause])
         .separator()
@@ -248,7 +248,7 @@ fn build(app: &AppHandle) -> tauri::Result<()> {
 
     TrayIconBuilder::with_id(TRAY_ID)
         .icon(icon)
-        .tooltip("QSync — QNAP 按需同步")
+        .tooltip("qxync — QNAP 按需同步")
         .menu(&menu)
         .on_menu_event(|app, event| match event.id().as_ref() {
             MENU_OPEN => emit_action(app, "open"),

@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "QSync",
-  "version": "0.1.1",
-  "identifier": "org.qxync.qsync-gui",
+  "productName": "qxync",
+  "version": "0.2.0",
+  "identifier": "org.qxync.qxync-gui",
   "build": {
     "frontendDist": "ui"
   },
@@ -11,7 +11,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "QSync — QNAP 按需同步",
+        "title": "qxync — QNAP 按需同步",
         "width": 1200,
         "height": 800,
         "minWidth": 960,
@@ -29,7 +29,7 @@
     "targets": ["deb", "appimage"],
     "category": "Utility",
     "shortDescription": "QNAP Qsync 按需同步客户端",
-    "longDescription": "QSync for Linux —— FUSE 按需同步 + 常驻守护 qxyncd 的桌面界面（登录配置 / 挂载管理 / 状态面板 / pin 管理）。",
+    "longDescription": "qxync —— FUSE 按需同步 + 常驻守护 qxyncd 的桌面界面（登录配置 / 挂载管理 / 状态面板 / pin 管理）。",
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.png"]
   }
 }

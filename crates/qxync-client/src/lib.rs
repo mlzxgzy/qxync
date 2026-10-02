@@ -80,7 +80,11 @@ impl Client {
             .danger_accept_invalid_certs(link.insecure)
             .timeout(Duration::from_secs(300))
             .connect_timeout(Duration::from_secs(20))
-            .user_agent("QSyncLinux/0.1 (qxync-client)");
+            .user_agent(concat!(
+                "qxync/",
+                env!("CARGO_PKG_VERSION"),
+                " (qxync-client)"
+            ));
         if let Some(p) = proxy {
             match p.resolve()? {
                 // 显式关掉：reqwest 默认会读环境变量，不显式关就关不掉
@@ -150,7 +154,7 @@ impl Client {
             ("user", user),
             ("serviceKey", "1"),
             ("client_app", "Qsync"),
-            ("client_agent", "QSyncLinux/0.1"),
+            ("client_agent", concat!("qxync/", env!("CARGO_PKG_VERSION"))),
             ("gen_client_id", "1"),
             ("remme", "1"),
             ("dont_verify_2sv_again", "0"),
@@ -525,7 +529,7 @@ impl Client {
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let tmp = std::path::PathBuf::from(format!("{}.qsync-part", dest.display()));
+        let tmp = std::path::PathBuf::from(format!("{}.qxync-part", dest.display()));
         let mut file = tokio::fs::File::create(&tmp).await?;
         let mut written: u64 = 0;
         let mut stream = resp.bytes_stream();

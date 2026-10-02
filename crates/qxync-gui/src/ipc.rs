@@ -14,9 +14,9 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-/// socket 路径：`QSYNC_SOCKET` 优先（测试/多实例），否则 `$XDG_RUNTIME_DIR/qxync/qxyncd.sock`。
+/// socket 路径：`QXNYC_SOCKET` 优先（测试/多实例），否则 `$XDG_RUNTIME_DIR/qxync/qxyncd.sock`。
 pub fn socket_path() -> PathBuf {
-    std::env::var_os("QSYNC_SOCKET")
+    std::env::var_os("QXNYC_SOCKET")
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(default_socket_path)
@@ -51,7 +51,7 @@ async fn call_inner(socket: &Path, req: Request) -> Result<Response, IpcError> {
         IpcError::new(
             ErrorKind::NotRunning,
             format!(
-                "连不上 daemon（{}）: {e}；先 `qsync daemon start`",
+                "连不上 daemon（{}）: {e}；先 `qxync daemon start`",
                 socket.display()
             ),
         )

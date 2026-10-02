@@ -7,6 +7,60 @@
 
 ## [未发布]
 
+## [0.2.0] - 2026-10-02
+
+**改名版本：命令行从 `qsync` 改成 `qxync`。** 旧名 `qsync` 会和 **QNAP 官方 Qsync 客户端**
+抢同一个 `/usr/bin/qsync`，而 `~/.config/qsync`、`QSYNC_*` 环境变量、`user.qsync.*` xattr
+其实都是同一个来历的旧名。这一版把这些**我们自己的**标识统一收进 `qxync`；
+**QNAP 侧的产品名与协议串一字未动**（边界见下）。
+
+### 变更（破坏性）
+
+- **CLI 二进制 `qsync` → `qxync`**：`/usr/bin/qsync` 不再存在，PATH 里不会再和官方
+  Qsync 客户端撞名。子命令、参数、输出格式一律不变。
+- **配置 / 数据 / 状态目录 `…/qsync` → `…/qxync`**：`~/.config/qxync`、
+  `~/.local/share/qxync`、`~/.local/state/qxync`。**首次运行自动迁移**，三种情况都不丢数据：
+  只有旧目录 → 整体改名（跨文件系统时退回复制 + 删除）；两个都在（例如 0.1.0 的原型目录
+  `qxync/` 还留着）→ **只补缺**，把旧目录里新目录没有的条目搬进来，**已有的一律不覆盖**；
+  只有新目录 → 直接用。所以凭据与状态库都跟着走，不用重新 `login`。
+- **环境变量前缀 `QSYNC_` → `QXNYC_`**：`QXNYC_HOST` / `QXNYC_USER` / `QXNYC_PASSWORD` /
+  `QXNYC_SOCKET`，以及全部 `QXNYC_*` 调参与验收开关（原 `QSYNC_*`）。旧名不再识别。
+- **FUSE xattr `user.qsync.*` → `user.qxync.*`**：`state` / `pin` / `remote` / `vsize` /
+  `chunks`；脚本里的 `getfattr -n user.qsync.state` 要跟着改。
+- **下载临时文件后缀 `*.qsync-part` → `*.qxync-part`**（`*.qsync-tmp` → `*.qxync-tmp`），
+  内置临时文件过滤规则同步更新。
+- **GUI 显示名 `QSync` → `qxync`**：`productName`、窗口标题、托盘 tooltip、通知标题、
+  自启桌面项 `Name=` 全部统一；Tauri `identifier` 随之改为 `org.qxync.qxync-gui`。
+- **日志与运行时名**：`qsync-gui.log` → `qxync-gui.log`、托盘 ID `qsync-tray` →
+  `qxync-tray`、IPC socket 目录 `$XDG_RUNTIME_DIR/qxync/qxyncd.sock`。
+- **自启项** `autostart/qsync.desktop` → `qxync.desktop`：切换「开机自启」开关时会顺手删掉
+  旧的那一个（旧文件里的 `Exec=` 其实还能用，只是 `Name=` 是旧名），
+  `autostart_present()` 也把旧文件算作「已生效」，免得界面显示错误。
+
+### 改名边界（什么**没**改）
+
+只改**我们自己的**标识；QNAP 的产品名与 NAS 协议面原样保留：
+`cgi-bin/qsync/qsyncsrv.cgi` / `qsyncsrv_login.cgi` / `upload.php`、
+`qsync_version` / `Qsync_qpkg_version` / `Qsync_client_version` 等返回字段、
+登录体里的 `client_app=Qsync`、`Qsync QPKG` / `Qsync Client 6` / `.Qsync`、
+错误码 `WFM_QSYNC_DISABLED` / `QFILE_ERROR_QSYNC_QPKG_NOT_EXIST`、
+NAS 设置名 `QSYNC_FOLDERPAIR_USE_SPACE_SAVING`、Windows 客户端注册表键
+`QSYNC_PROCESSED_MAX_*`、探测脚本的 `QSYNC` 常量与 myQNAPcloud 路径前缀 `qsync/`。
+`.desktop` 的 `GenericName=QNAP Qsync client`、crates.io 关键词里的 `qsync`
+也保留 —— 它们描述的是「跟什么互通」，不是本项目的名字。
+
+### 其它
+
+- **UA 与登录体**：`client_agent` 从硬编码的 `QSyncLinux/0.1` 改成 `qxync/<真实版本>`
+  （取自 `CARGO_PKG_VERSION`，不会再随版本漂移）。
+- 版本号固定的**历史存档**保留旧名：`docs/发布说明-v0.1.0.md`、
+  `docs/发布说明-v0.1.1.md`、`docs/发布清单-v0.1.0.md` 与 0.1.x 的条目记录的是当时
+  **真发出去**的产物，不做改写；发版清单顶部加了一段「照它操作时请自行翻译旧名」的说明。
+  同理，文档里**指向 QNAP 的外链**（教程 / 公告 / 产品页）与本仓库外的文件名一字未动。
+- 新增 `adopt_legacy_dir` 与旧 autostart 清理的单元测试（整体迁移 / 只补缺不覆盖 / 可重入 /
+  旧桌面项被清掉）。
+- 升级步骤速查见 README「从 0.1.x 升级」。
+
 ## [0.1.1] - 2026-10-02
 
 **只改了「怎么把 qxync 交到用户手里」，客户端行为与 v0.1.0 完全一致** ——

@@ -7,7 +7,7 @@
 退出码：0 = 一致；1 = 不一致或取值失败（并把各处实际值打印出来）。
 
 为什么要有这条守卫：`Cargo.toml` 的 workspace 版本是 **crate 与二进制自报的版本**
-（`qsync --version` 之类），`tauri.conf.json` 的 `version` 会进 `.deb` / 应用元数据，
+（`qxync --version` 之类），`tauri.conf.json` 的 `version` 会进 `.deb` / 应用元数据，
 `packaging/arch/PKGBUILD` 的 `pkgver` 决定 AUR 包去下哪个 Release 产物，tag 是第四处。
 任何一处漂移，用户拿到的东西就会与 tag 对不上。发版流水线里把 tag 当**唯一真值**。
 

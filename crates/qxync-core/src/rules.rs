@@ -14,15 +14,15 @@
 
 use std::fmt;
 
-/// 内置临时文件规则（报告 03 §3.7 / 12 §6；`*.qsync-part` 是我们自己的下载临时文件）。
+/// 内置临时文件规则（报告 03 §3.7 / 12 §6；`*.qxync-part` 是我们自己的下载临时文件）。
 pub const TEMP_PATTERNS: &[&str] = &[
     "*.crdownload",
     "~$*",
     ".goutputstream-*",
     ".upload_cache",
     ".upload_cache*",
-    "*.qsync-part",
-    "*.qsync-tmp",
+    "*.qxync-part",
+    "*.qxync-tmp",
 ];
 
 /// 为什么一个路径在挂载点里不可见。
@@ -164,7 +164,7 @@ fn glob_match(pat: &[u8], txt: &[u8]) -> bool {
 pub struct Rules {
     patterns: Vec<Pattern>,
     filter_temp: bool,
-    /// 解析失败的原文（不静默：`qsync rules` 会展示，调用方负责 WARN）。
+    /// 解析失败的原文（不静默：`qxync rules` 会展示，调用方负责 WARN）。
     bad: Vec<String>,
 }
 
@@ -244,7 +244,7 @@ impl Rules {
         &self.bad
     }
 
-    /// 规则原文（按生效顺序），给 `qsync rules` 回显。
+    /// 规则原文（按生效顺序），给 `qxync rules` 回显。
     pub fn pattern_list(&self) -> Vec<String> {
         self.patterns.iter().map(|p| p.raw.clone()).collect()
     }
@@ -414,7 +414,7 @@ mod tests {
             Some(HideReason::Temp)
         );
         assert_eq!(r.hides("/.upload_cache", true), Some(HideReason::Temp));
-        assert_eq!(r.hides("/a/x.qsync-part", false), Some(HideReason::Temp));
+        assert_eq!(r.hides("/a/x.qxync-part", false), Some(HideReason::Temp));
         assert_eq!(r.hides("/a/normal.txt", false), None);
 
         let off = Rules::parse(&[], false).rules;

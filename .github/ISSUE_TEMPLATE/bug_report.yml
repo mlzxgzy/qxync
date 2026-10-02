@@ -43,8 +43,8 @@ body:
       label: 复现步骤
       description: 越具体越好。能给出「第几次执行、什么参数、什么文件」最好。
       placeholder: |
-        1. qsync daemon start
-        2. qsync mount ~/mnt --remote /home --rw
+        1. qxync daemon start
+        2. qxync mount ~/mnt --remote /home --rw
         3. head -c 100 ~/mnt/qxync-test/big.bin
         4. ...
     validations:
@@ -56,7 +56,7 @@ body:
       label: 受影响的部分
       multiple: true
       options:
-        - CLI（qsync）
+        - CLI（qxync）
         - 守护进程（qxyncd）/ IPC
         - FUSE 挂载 / 按需水合
         - 写路径 / 上传队列
@@ -76,8 +76,8 @@ body:
     id: version
     attributes:
       label: 版本 / 提交
-      description: 二进制版本（`qsync --version`）或 commit hash
-      placeholder: "0.1.1 / bdd8a5a"
+      description: 二进制版本（`qxync --version`）或 commit hash
+      placeholder: "0.2.0 / <commit hash>"
     validations:
       required: true
 
@@ -103,8 +103,8 @@ body:
     attributes:
       label: 日志
       description: |
-        `daemon` 日志在 `~/.local/state/qsync/log/qxyncd.log.YYYY-MM-DD`；
-        也可以贴 `qsync status` / `qsync store` / `qsync journal --level error` 的输出。
+        `daemon` 日志在 `~/.local/state/qxync/log/qxyncd.log.YYYY-MM-DD`；
+        也可以贴 `qxync status` / `qxync store` / `qxync journal --level error` 的输出。
         **贴之前请逐行检查有没有敏感信息。**
       render: shell
     validations:

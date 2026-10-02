@@ -27,7 +27,7 @@ use tokio::sync::{mpsc, Notify};
 
 use crate::daemon::State;
 
-/// 最近保留多少条对端事件（`qsync peer events`）。
+/// 最近保留多少条对端事件（`qxync peer events`）。
 const EVENT_LOG: usize = 200;
 /// 事件触发的额外对账的最小间隔（防抖；对端连推多个文件时不要每来一条就跑一轮）。
 pub const WAKE_DEBOUNCE: Duration = Duration::from_secs(1);
@@ -279,7 +279,7 @@ impl PeerHost {
         self.server.as_ref().map(|s| s.stats.clone())
     }
 
-    /// 当前配对码（`qsync peer status` 显示，配对成功后自动轮换）。
+    /// 当前配对码（`qxync peer status` 显示，配对成功后自动轮换）。
     pub fn pairing_code(&self) -> Option<String> {
         self.server.as_ref().and_then(|s| s.pairing_code())
     }
@@ -326,7 +326,7 @@ impl PeerHost {
                 if self.listen.is_none() {
                     Some("未开启 LAN 监听（link.peer_listen 未配置）".to_string())
                 } else if self.peer_list().is_empty() {
-                    Some("还没有配对的设备：qsync peer pair <addr> --code <配对码>".to_string())
+                    Some("还没有配对的设备：qxync peer pair <addr> --code <配对码>".to_string())
                 } else {
                     None
                 }
@@ -342,7 +342,7 @@ impl PeerHost {
             .find(|p| p.name == name_or_addr || p.addr == name_or_addr)
     }
 
-    /// `qsync peer pair <addr> --code <code>`：一次配对建立**双向**信任。
+    /// `qxync peer pair <addr> --code <code>`：一次配对建立**双向**信任。
     ///
     /// 1. 向对方换 token（对方把它记成「我们可用」）；
     /// 2. 我们把 token 记进自己的入站表（我们接受对方用它调我们）；

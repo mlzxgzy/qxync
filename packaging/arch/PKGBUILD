@@ -11,14 +11,14 @@
 #   没更新就推上去，用户装的时候会直接 checksum 失败（不会静默装错东西）。
 
 pkgname=qxync-bin
-pkgver=0.1.1
+pkgver=0.2.0
 pkgrel=1
 pkgdesc='QNAP Qsync client for Linux: FUSE on-demand sync + qxyncd daemon + Tauri GUI (prebuilt)'
 arch=('x86_64')
 url='https://github.com/mlzxgzy/qxync'
 license=('MIT' 'Apache-2.0')
 # 这些是三个二进制的直接 DT_NEEDED（`readelf -d`）对应的包，不是传递依赖：
-# qsync / qxyncd 只直接链 glibc / gcc-libs，但挂载、卸载要调 `fusermount3`
+# qxync / qxyncd 只直接链 glibc / gcc-libs，但挂载、卸载要调 `fusermount3`
 # （fuser 0.17 不链接 libfuse，走的是 fuse3 包里的命令行工具）。
 depends=(
   'fuse3'
@@ -51,7 +51,7 @@ package() {
 
   # 三个二进制都装进 /usr/bin：GUI 先找「自己旁边的 qxyncd」，再退回 PATH，
   # 所以同目录安装是它最省事、也最符合预期的布局。
-  install -Dm755 "$srcdir/$stem/qsync" "$pkgdir/usr/bin/qsync"
+  install -Dm755 "$srcdir/$stem/qxync" "$pkgdir/usr/bin/qxync"
   install -Dm755 "$srcdir/$stem/qxyncd" "$pkgdir/usr/bin/qxyncd"
   install -Dm755 "$srcdir/$stem/qxync-gui" "$pkgdir/usr/bin/qxync-gui"
 

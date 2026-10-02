@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-02
+
+**The rename release: the command line is now `qxync`, not `qsync`.** The old name fought the
+**official QNAP Qsync client** for the same `/usr/bin/qsync`, and `~/.config/qsync`, the
+`QSYNC_*` environment variables and the `user.qsync.*` xattrs all came from the same place.
+This release moves every identifier that is **ours** under `qxync`; **QNAP's product names and
+the NAS protocol surface are untouched** (the boundary is spelled out below).
+
+### Changed (breaking)
+
+- **CLI binary `qsync` → `qxync`**: `/usr/bin/qsync` no longer exists, so it can't collide with
+  the official Qsync client in `PATH`. Subcommands, flags and output are unchanged.
+- **Config / data / state directories `…/qsync` → `…/qxync`**: `~/.config/qxync`,
+  `~/.local/share/qxync`, `~/.local/state/qxync`. **Migrated automatically on first run**, and no
+  case loses data: old directory only → rename (falling back to copy + delete across filesystems);
+  **both present** (e.g. a leftover `qxync/` prototype directory from 0.1.0) → **fill the gaps
+  only**, moving in entries the new directory lacks and **never overwriting what is already
+  there**; new directory only → use it. Credentials and the state database come along, so no new
+  `login` is needed.
+- **Environment variable prefix `QSYNC_` → `QXNYC_`**: `QXNYC_HOST` / `QXNYC_USER` /
+  `QXNYC_PASSWORD` / `QXNYC_SOCKET` plus every `QXNYC_*` tuning and acceptance switch
+  (formerly `QSYNC_*`). The old names are no longer read.
+- **FUSE xattrs `user.qsync.*` → `user.qxync.*`**: `state` / `pin` / `remote` / `vsize` /
+  `chunks`; scripts using `getfattr -n user.qsync.state` must be updated.
+- **Download temp suffix `*.qsync-part` → `*.qxync-part`** (`*.qsync-tmp` → `*.qxync-tmp`), and
+  the built-in temp-file filter list follows.
+- **GUI display name `QSync` → `qxync`**: `productName`, window title, tray tooltip,
+  notification titles and the autostart entry's `Name=` are all unified; the Tauri `identifier`
+  becomes `org.qxync.qxync-gui` accordingly.
+- **Logs and runtime names**: `qsync-gui.log` → `qxync-gui.log`, tray id `qsync-tray` →
+  `qxync-tray`, IPC socket directory `$XDG_RUNTIME_DIR/qxync/qxyncd.sock`.
+- **Autostart entry** `autostart/qsync.desktop` → `qxync.desktop`: toggling "launch at startup"
+  also removes the old one (its `Exec=` actually still worked — only `Name=` was stale), and
+  `autostart_present()` counts the old file as active so the UI doesn't lie.
+
+### Where the line is drawn (what did **not** change)
+
+Only **our own** identifiers were renamed; QNAP's product names and the NAS protocol surface are
+preserved verbatim: `cgi-bin/qsync/qsyncsrv.cgi` / `qsyncsrv_login.cgi` / `upload.php`, the
+`qsync_version` / `Qsync_qpkg_version` / `Qsync_client_version` response fields, `client_app=Qsync`
+in the login body, `Qsync QPKG` / `Qsync Client 6` / `.Qsync`, the error codes
+`WFM_QSYNC_DISABLED` / `QFILE_ERROR_QSYNC_QPKG_NOT_EXIST`, the NAS setting
+`QSYNC_FOLDERPAIR_USE_SPACE_SAVING`, the Windows client registry keys `QSYNC_PROCESSED_MAX_*`,
+the probes' `QSYNC` constant and the myQNAPcloud path prefix `qsync/`. The `.desktop`
+`GenericName=QNAP Qsync client` and the crates.io `qsync` keyword stay too — they describe what
+this interoperates with, not what this project is called.
+
+### Other
+
+- **User agent and login body**: `client_agent` went from the hardcoded `QSyncLinux/0.1` to
+  `qxync/<real version>` (`CARGO_PKG_VERSION`), so it can't drift again.
+- **Frozen historical records keep the old name**: `docs/发布说明-v0.1.0.md`,
+  `docs/发布说明-v0.1.1.md`, `docs/发布清单-v0.1.0.md` and the 0.1.x entries below document
+  what was **actually published** at the time and are not rewritten; the release checklist gained
+  a note saying to translate the old names when following it. Likewise, **external links to QNAP**
+  (tutorials / announcements / product pages) and filenames outside this repository are untouched.
+- Added unit tests for `adopt_legacy_dir` and the legacy-autostart cleanup (full rename / fill gaps
+  without overwriting / re-runnable / old desktop entry removed).
+- Quick upgrade table in the README ("Upgrading from 0.1.x").
+
 ## [0.1.1] - 2026-10-02
 
 **Only how qxync reaches users changed — client behaviour is identical to v0.1.0**: there are

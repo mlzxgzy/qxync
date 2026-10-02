@@ -6,26 +6,26 @@
 #   xtask/tests/m6-matrix.sh --no-nas     # 只跑本地单测
 #   xtask/tests/m6-matrix.sh --keep-mounted
 #
-# 依赖: cargo build --workspace、真机凭据（先 `qsync login`，见 docs/测试环境.local.md）、jq
+# 依赖: cargo build --workspace、真机凭据（先 `qxync login`，见 docs/测试环境.local.md）、jq
 #
 # 验的是什么:
 #   1. 真机事实：共享文件夹**能读**（列目录 / stat / 下载），但**写会被服务端拒绝**
 #      （这正是「非家目录根默认只读」的依据）；
-#   2. link 的 `roots` 配置生效（`qsync roots --json` 的 configured/roots 对得上）；
+#   2. link 的 `roots` 配置生效（`qxync roots --json` 的 configured/roots 对得上）；
 #   3. 每个根的可读性 / 可写性判定正确；
 #   4. 单根布局仍是「直通」（向后兼容），多根布局顶层出现各根名字（core 单测 + FUSE 单测）；
 #   5. 有 /dev/fuse 时真挂载多根：两个根都能读、共享根写回 EROFS、家目录能写、脱水可用。
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-QS="$REPO/target/debug/qsync"
+QS="$REPO/target/debug/qxync"
 DAEMON="$REPO/target/debug/qxyncd"
-RUNDIR="${QSYNC_TEST_RUNDIR:-$REPO/.local-run}"
+RUNDIR="${QXNYC_TEST_RUNDIR:-$REPO/.local-run}"
 M6="$RUNDIR/m6"
 SOCK="$M6/m6.sock"
 LOG="$M6/daemon.log"
-SHARE="${QSYNC_TEST_SHARE:-/Public}"          # 一个普通账号**能读**的共享文件夹
-SHARE_FILE="${QSYNC_TEST_SHARE_FILE:-tailscale.txt}"
+SHARE="${QXNYC_TEST_SHARE:-/Public}"          # 一个普通账号**能读**的共享文件夹
+SHARE_FILE="${QXNYC_TEST_SHARE_FILE:-tailscale.txt}"
 NO_NAS=0; KEEP=0
 for a in "$@"; do
   case "$a" in
@@ -73,9 +73,9 @@ echo "== 0. 前置 =="
 miss=0
 for b in "$QS" "$DAEMON"; do [ -x "$b" ] || { echo "  ❌ 缺少 $b（先 cargo build --workspace）"; miss=1; }; done
 command -v jq >/dev/null || { echo "  ❌ 需要 jq"; miss=1; }
-check "$miss" "qsync / qxyncd / jq 都在"
-LINKF="$XDG_CONFIG_HOME/qsync/links/default.json"
-[ -f "$LINKF" ] || { echo "  ❌ 没有 $LINKF —— 先 qsync login"; exit 2; }
+check "$miss" "qxync / qxyncd / jq 都在"
+LINKF="$XDG_CONFIG_HOME/qxync/links/default.json"
+[ -f "$LINKF" ] || { echo "  ❌ 没有 $LINKF —— 先 qxync login"; exit 2; }
 HOST=$(jq -r .host "$LINKF"); USER_=$(jq -r .user "$LINKF")
 ok "连接配置存在（host=$HOST user=$USER_）"
 
@@ -107,13 +107,13 @@ else
 fi
 
 # ---------------------------------------------------------------- 2. roots 配置 + roots 命令
-echo "== 2. link 的 roots 配置 → qsync roots =="
-cat >"$XDG_CONFIG_HOME/qsync/links/m6.json" <<JSON
+echo "== 2. link 的 roots 配置 → qxync roots =="
+cat >"$XDG_CONFIG_HOME/qxync/links/m6.json" <<JSON
 {"id":"m6","host":"$HOST","port":$(jq -r .port "$LINKF"),"https":$(jq -r .https "$LINKF"),
  "insecure":$(jq -r .insecure "$LINKF"),"user":"$USER_","home_root":"/home",
  "roots":["/home","$SHARE"],"ipv4_only":$(jq -r .ipv4_only "$LINKF")}
 JSON
-check $? "写好测试用 link（$XDG_CONFIG_HOME/qsync/links/m6.json，roots=[/home, $SHARE]）"
+check $? "写好测试用 link（$XDG_CONFIG_HOME/qxync/links/m6.json，roots=[/home, $SHARE]）"
 
 if [ "$NO_NAS" = "1" ]; then
   skip "roots 命令（--no-nas）"

@@ -10,13 +10,13 @@
 #   ② 挂载后跑一轮对账 → journal 里出现记录；**没挂载就不写**（没有对账，凭据见 README）；
 #   ③ `--level / --query / --limit` 三种过滤正确；
 #   ④ `--clear` **只清日志**：游标 / baseline / pin / 上传队列不受影响；
-#   ⑤ 轮转：`QSYNC_JOURNAL_MAX_ROWS` 生效，日志不会无限增长。
+#   ⑤ 轮转：`QXNYC_JOURNAL_MAX_ROWS` 生效，日志不会无限增长。
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DAEMON="$REPO/target/debug/qxyncd"
-QS="$REPO/target/debug/qsync"
-RUNDIR="${QSYNC_TEST_RUNDIR:-$REPO/.local-run}/m83"
+QS="$REPO/target/debug/qxync"
+RUNDIR="${QXNYC_TEST_RUNDIR:-$REPO/.local-run}/m83"
 SOCK="$RUNDIR/s.sock"
 LOG="$RUNDIR/daemon.log"
 MNT="$RUNDIR/mnt"
@@ -38,17 +38,17 @@ for d in "$MNT" "$RUNDIR"/*/; do
     fusermount3 -u "${d%/}" 2>/dev/null || true
   fi
 done
-rm -rf "$RUNDIR"; mkdir -p "$RUNDIR/config/qsync/links" "$MNT"
-SRC_XDG="${QSYNC_SRC_XDG_CONFIG:-$REPO/.local-run/config}"
-LINK="${QSYNC_TEST_LINK:-default}"
-if [ ! -f "$SRC_XDG/qsync/links/$LINK.json" ]; then
-  echo "❌ 找不到连接配置：$SRC_XDG/qsync/links/$LINK.json"; exit 2
+rm -rf "$RUNDIR"; mkdir -p "$RUNDIR/config/qxync/links" "$MNT"
+SRC_XDG="${QXNYC_SRC_XDG_CONFIG:-$REPO/.local-run/config}"
+LINK="${QXNYC_TEST_LINK:-default}"
+if [ ! -f "$SRC_XDG/qxync/links/$LINK.json" ]; then
+  echo "❌ 找不到连接配置：$SRC_XDG/qxync/links/$LINK.json"; exit 2
 fi
-cp "$SRC_XDG/qsync/links/$LINK.json" "$RUNDIR/config/qsync/links/"
-[ -f "$SRC_XDG/qsync/credentials.json" ] && cp "$SRC_XDG/qsync/credentials.json" "$RUNDIR/config/qsync/"
+cp "$SRC_XDG/qxync/links/$LINK.json" "$RUNDIR/config/qxync/links/"
+[ -f "$SRC_XDG/qxync/credentials.json" ] && cp "$SRC_XDG/qxync/credentials.json" "$RUNDIR/config/qxync/"
 
 export XDG_CONFIG_HOME="$RUNDIR/config" XDG_DATA_HOME="$RUNDIR/data" XDG_STATE_HOME="$RUNDIR/state"
-export QSYNC_SOCKET="$SOCK" RUST_LOG="${RUST_LOG:-warn}"
+export QXNYC_SOCKET="$SOCK" RUST_LOG="${RUST_LOG:-warn}"
 DAEMON_PID=""
 [ "$NO_FUSE" = "0" ] && [ ! -e /dev/fuse ] && { echo "  ⚠️  没有 /dev/fuse → 跳过挂载项"; NO_FUSE=1; }
 
@@ -71,9 +71,9 @@ if [ ! -x "$DAEMON" ] || [ ! -x "$QS" ]; then echo "❌ 缺少二进制，先 ca
 echo "== 0. schema v1 → v3（老库自动补表，数据不动） =="
 # 状态库路径由 **link 里的 host** 决定（和 m5-matrix.sh 一样从配置推导，
 # 不要把任何具体 NAS 地址写进脚本 —— 这既让脚本对任意用户可用，也避免泄漏）。
-DB_HOST="$(jq -r .host "$RUNDIR/config/qsync/links/$LINK.json")"
+DB_HOST="$(jq -r .host "$RUNDIR/config/qxync/links/$LINK.json")"
 [ -n "$DB_HOST" ] && [ "$DB_HOST" != "null" ] || { echo "❌ link 里读不到 host"; exit 2; }
-DB="$XDG_DATA_HOME/qsync/sync/$DB_HOST/sync.db"
+DB="$XDG_DATA_HOME/qxync/sync/$DB_HOST/sync.db"
 mkdir -p "$(dirname "$DB")"
 python3 - "$DB" <<'PY'
 import sqlite3, sys
@@ -165,10 +165,10 @@ PIN_AFTER=$(Q store 2>/dev/null | grep -c 'hello.txt' || true)
 check "$([ "${PIN_AFTER:-0}" -ge 1 ] && echo 0 || echo 1)" "★ pin 没被清掉"
 
 # ---------------------------------------------------------------- 6. 轮转
-echo "== 6. 轮转（QSYNC_JOURNAL_MAX_ROWS） =="
+echo "== 6. 轮转（QXNYC_JOURNAL_MAX_ROWS） =="
 stop_daemon
-QSYNC_JOURNAL_MAX_ROWS=5 QSYNC_JOURNAL_TRIM_SECS=1 start_daemon ""
-check $? "以 QSYNC_JOURNAL_MAX_ROWS=5 / TRIM_SECS=1 起 daemon"
+QXNYC_JOURNAL_MAX_ROWS=5 QXNYC_JOURNAL_TRIM_SECS=1 start_daemon ""
+check $? "以 QXNYC_JOURNAL_MAX_ROWS=5 / TRIM_SECS=1 起 daemon"
 Q --via-daemon login >/dev/null 2>&1
 sqlite3 "$DB" "$(python3 - <<'PY'
 rows = []

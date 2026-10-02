@@ -24,7 +24,7 @@ crates/qxync-gui (Tauri 2)
 ```
 
 * GUI **不发任何 HTTP 到 NAS**，也**不自己挂 FUSE**。所有动作都是 `Request`
-  （契约：`qxync-core/src/ipc.rs`，说明：`M1.5-设计.md`），与 CLI `qsync` 走同一条线。
+  （契约：`qxync-core/src/ipc.rs`，说明：`M1.5-设计.md`），与 CLI `qxync` 走同一条线。
 * 依赖方向仍然是「只允许向下」：`gui → core`（+ 经 IPC 访问 daemon），
   没有引入 `gui → client/fuse` 的边。
 
@@ -93,14 +93,14 @@ Tauri 2 的 `withGlobalTauri: true` 会把 `window.__TAURI__.core.invoke` 直接
 | 目的地 | 内容 | 状态 |
 |---|---|---|
 | **主页**（home） | 连接行（`user@host:port · 已连接 · Qsync 版本`）+ **任务卡片列表**（M8.2 起**优先按任务登记展示**，没有任务登记时退回挂载点）+ 最近一次同步摘要 + 快捷动作（连接设置 / 立即同步 / ＋添加任务） | ✅ M8.1/M8.2 |
-| **任务**（tasks） | ★ M8.2 已实现：同步任务列表（每张卡：状态 / 本地路径 ⇄ NAS 路径 / 只读·缓存模式·**冲突策略** / `Sync`+已挂载徽章 + 设置·管理·挂载·暂停·继续·删除登记·立即同步）+ **文件夹对设置**表单（保存到 `~/.config/qsync/tasks/<id>.json`，★ M8.4 起含**冲突策略下拉（5 选项）**/ 同步方向 / 节省空间模式 / 智能删除）+ **冲突待裁决卡片**（「每个文件都问我」的策略下逐条裁决） | ✅ M8.2 / M8.4 |
+| **任务**（tasks） | ★ M8.2 已实现：同步任务列表（每张卡：状态 / 本地路径 ⇄ NAS 路径 / 只读·缓存模式·**冲突策略** / `Sync`+已挂载徽章 + 设置·管理·挂载·暂停·继续·删除登记·立即同步）+ **文件夹对设置**表单（保存到 `~/.config/qxync/tasks/<id>.json`，★ M8.4 起含**冲突策略下拉（5 选项）**/ 同步方向 / 节省空间模式 / 智能删除）+ **冲突待裁决卡片**（「每个文件都问我」的策略下逐条裁决） | ✅ M8.2 / M8.4 |
 | **文件**（files） | 远端目录浏览 + pin；★ M8.4：**三态列**（仅在线 / 本地可用 / 始终可用，来自 `file_states`）+ **行右键菜单**（始终保留在此设备 / 取消固定 / 释放空间 / 下载 / 复制路径 / 删除） | ✅ M8.4 |
 | **更新**（journal） | ★ M8.3 已实现：同步日志表格（时间 / 活动 / 路径 / 说明 / 字节）+ 按文件名·说明搜索 + `全部/成功/失败/被挡下` 过滤 + 条数 + 清空 | ✅ M8.3 |
 | **错误**（errors） | ★ M8.3 已实现：`journal` 里 `status='error'` 的失败项，每条可「复制路径」 | ✅ M8.3 |
-| **设置**（settings） | ★ M8.4 已补齐 **8 个分区**：连接 / 代理 / 同步与筛选 / 个人 / 高级 / 释放空间 / LAN 加速 / 关于（每个分区可用 `QSYNC_GUI_TAB=settings:<分区>` 直达） | ✅ M8.4 |
+| **设置**（settings） | ★ M8.4 已补齐 **8 个分区**：连接 / 代理 / 同步与筛选 / 个人 / 高级 / 释放空间 / LAN 加速 / 关于（每个分区可用 `QXNYC_GUI_TAB=settings:<分区>` 直达） | ✅ M8.4 |
 | **诊断**（diag） | **专家模式**：原「状态 / 进度」「挂载」「同步 / 缓存」三个 tab 收纳为**子 tab**，字段与 id 全保留 | ✅ |
 
-**`QSYNC_GUI_TAB` 取值**（验收矩阵与排障用）：
+**`QXNYC_GUI_TAB` 取值**（验收矩阵与排障用）：
 新值 `home|tasks|files|journal|errors|settings|diag`，并支持 **`diag:<status|mounts|sync>`** 与
 **`settings:<connect|proxy|sync|personal|advanced|free|lan|about>`**（M8.4）直达子页/分区；
 **旧值 `status|mounts|sync|connect|files` 必须继续可用**，分别落到 `diag:status`/`diag:mounts`/`diag:sync`/`settings`/`files`
@@ -115,7 +115,7 @@ Tauri 2 的 `withGlobalTauri: true` 会把 `window.__TAURI__.core.invoke` 直接
 |---|---|
 | **状态 / 进度**（诊断 → 状态 / 进度） | 服务端信息（Qsync 版本/QPKG/build/busy_reason）、会话、三游标、水合统计、上传队列（pending/active/done/failed/retries/bytes）、缓存限额进度条、`blocked_*` 分类、挂载列表、远端根面板、最近一轮同步摘要 |
 | **连接 / 登录**（设置） | host/port/https/insecure/user/password/home_root/roots/ipv4_only 表单（打开时预填）；保存配置 / **保存并登录** / 启停 daemon；三个 XDG 目录与 socket 路径 |
-| **挂载**（诊断 → 挂载） | 当前挂载表（可卸载）+ 新建挂载（挂载点默认 `$HOME/qsync-mnt`、远端根多行、读写开关、`cache_mode`、线程数、水合超时、删除熔断阈值、auto_unmount） |
+| **挂载**（诊断 → 挂载） | 当前挂载表（可卸载）+ 新建挂载（挂载点默认 `$HOME/qxync-mnt`、远端根多行、读写开关、`cache_mode`、线程数、水合超时、删除熔断阈值、auto_unmount） |
 | **文件 / pin**（文件） | 远端目录浏览（真机 `ls`，目录优先）、每行 pin 查询/设置（`unspecified/pinned/unpinned/excluded`）、下载（`get`）、脱水（`dehydrate`）、新建目录、删除 |
 | **同步 / 缓存**（诊断 → 同步 / 缓存） | `SyncInfo` 全量（含 `devices`、`last_error`、`delete_block_reason`）+ 立即同步 / 强制放行删除 / 暂停轮询 / 设间隔；`CacheInfo` 全量 + 脱水预演 / 全部脱水 / 按限额 / 释放闲置 |
 
@@ -178,11 +178,11 @@ xtask/tests/gui-matrix.sh --keep-open  # 结束时保留窗口，手动玩
 3. `--self-test-login`：GUI 自己的「保存并登录」链路真的能把 daemon 拉起来并登录；
 4. 真窗口：9 个目的地各起一次，窗口标题正确、截图非空白（stddev > 1500）、
    与主页画面确有差异（AE > 4000 px）；
-5. ★ M8.1：旧 `QSYNC_GUI_TAB` 的 5 个取值各起一次，用截图 AE 断言**落点等价**
+5. ★ M8.1：旧 `QXNYC_GUI_TAB` 的 5 个取值各起一次，用截图 AE 断言**落点等价**
    （status→diag:status、mounts→diag:mounts、sync→diag:sync、connect→settings、files→files；
    实测 AE ≈ 2000 px，只差时钟/uptime）。
 
-> 截图落在 `$QSYNC_TEST_RUNDIR/gui-shots/`（默认 `.local-run/gui-shots/`，已 gitignore），
+> 截图落在 `$QXNYC_TEST_RUNDIR/gui-shots/`（默认 `.local-run/gui-shots/`，已 gitignore），
 > 里面还有 `self-test.json` / `self-test-login.json` 两份原始自检输出。
 
 已知环境限制：矩阵里窗口/截图项会 `export GDK_BACKEND=x11`——`xdotool`/`import`
@@ -217,7 +217,7 @@ xtask/tests/gui-matrix.sh --keep-open  # 结束时保留窗口，手动玩
 ## 7. 已知限制（首版故意不做）
 
 * **没有 GUI 侧挂载点选择对话框**（需要 `tauri-plugin-dialog`）——表单里直接填路径，
-  默认给 `$HOME/qsync-mnt`。
+  默认给 `$HOME/qxync-mnt`。
 * `pin` 沿用 daemon 现状：**内存态**（M1.5 起就只登记，重启丢），GUI 只是它的可视化。
 * 文件表格在窄窗口下横向滚动；行内 pin 的「当前值」要手动点一次「查 pin」才知道（显示「未知」）。
 * 不做托盘图标、开机自启、通知；不做多 link 切换（`daemon_start` 已支持传 `linkId`，界面暂只发默认 link）。

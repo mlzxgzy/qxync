@@ -3,11 +3,11 @@
 //! 跑法（不要把口令写进任何会提交的文件）：
 //!
 //! ```bash
-//! export QSYNC_TEST_HOST=qnap.example.com
-//! export QSYNC_TEST_PORT=9834
-//! export QSYNC_TEST_USER=test1
-//! export QSYNC_TEST_PASSWORD='...'
-//! export QSYNC_TEST_FIXTURE=/home/qxync-test      # 由 xtask/probe/qs_fixture.py 造好
+//! export QXNYC_TEST_HOST=qnap.example.com
+//! export QXNYC_TEST_PORT=9834
+//! export QXNYC_TEST_USER=test1
+//! export QXNYC_TEST_PASSWORD='...'
+//! export QXNYC_TEST_FIXTURE=/home/qxync-test      # 由 xtask/probe/qs_fixture.py 造好
 //! cargo test -p qxync-proto-test -- --ignored --test-threads=1 --nocapture
 //! ```
 //!
@@ -17,10 +17,10 @@ use qxync_client::Client;
 use qxync_core::{LinkConfig, HOME_ROOT};
 
 fn env_creds() -> Option<(LinkConfig, String)> {
-    let host = std::env::var("QSYNC_TEST_HOST").ok()?;
-    let user = std::env::var("QSYNC_TEST_USER").ok()?;
-    let password = std::env::var("QSYNC_TEST_PASSWORD").ok()?;
-    let port = std::env::var("QSYNC_TEST_PORT")
+    let host = std::env::var("QXNYC_TEST_HOST").ok()?;
+    let user = std::env::var("QXNYC_TEST_USER").ok()?;
+    let password = std::env::var("QXNYC_TEST_PASSWORD").ok()?;
+    let port = std::env::var("QXNYC_TEST_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(9834);
@@ -34,7 +34,7 @@ fn env_creds() -> Option<(LinkConfig, String)> {
             user,
             home_root: HOME_ROOT.to_string(),
             roots: Vec::new(),
-            ipv4_only: std::env::var("QSYNC_TEST_IPV4").is_ok(),
+            ipv4_only: std::env::var("QXNYC_TEST_IPV4").is_ok(),
             exclude: Vec::new(),
             filter_temp: true,
             peer_listen: None,
@@ -45,7 +45,7 @@ fn env_creds() -> Option<(LinkConfig, String)> {
 }
 
 fn fixture_root() -> String {
-    std::env::var("QSYNC_TEST_FIXTURE").unwrap_or_else(|_| "/home/qxync-test".to_string())
+    std::env::var("QXNYC_TEST_FIXTURE").unwrap_or_else(|_| "/home/qxync-test".to_string())
 }
 
 async fn logged_in() -> Option<Client> {

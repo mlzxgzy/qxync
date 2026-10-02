@@ -7,8 +7,8 @@
 #   xtask/tests/gui-matrix.sh --keep-open     # 结束时保留 GUI 窗口（手动看）
 #
 # 依赖:
-#   * cargo build --workspace（target/debug/{qxync-gui,qxyncd,qsync}）
-#   * 真机凭据：先 `qsync login`（本脚本只读 $XDG_CONFIG_HOME/qsync/ 下的 link + credentials）
+#   * cargo build --workspace（target/debug/{qxync-gui,qxyncd,qxync}）
+#   * 真机凭据：先 `qxync login`（本脚本只读 $XDG_CONFIG_HOME/qxync/ 下的 link + credentials）
 #   * 窗口项额外需要：DISPLAY + xdotool + ImageMagick（import/identify/compare）
 #
 # 验的是什么:
@@ -19,8 +19,8 @@
 #      （home/tasks/files/journal/errors/settings）+ 诊断页的 3 个子页
 #      （`diag:status` / `diag:mounts` / `diag:sync`），逐个断言窗口标题/尺寸/非空白/与主页不同；
 #   4. ★ M8.4：设置页的 **8 个分区**（连接/代理/同步与筛选/个人/高级/释放空间/LAN/关于）
-#      也能用 `settings:<分区>` 直达并逐个出图（`QSYNC_GUI_TAB=settings:proxy`）；
-#   5. ★ M8.1：**旧 `QSYNC_GUI_TAB` 取值必须继续可用且落点不变** ——
+#      也能用 `settings:<分区>` 直达并逐个出图（`QXNYC_GUI_TAB=settings:proxy`）；
+#   5. ★ M8.1：**旧 `QXNYC_GUI_TAB` 取值必须继续可用且落点不变** ——
 #      status/mounts/sync/connect/files 五个旧值各起一次，用截图 AE 证明它们
 #      落在与对应的新目的地**完全相同**的页面上（AE 很小 = 同页，落错页会极大）；
 #   6. ★ M8.6：**UI 静态合规性**（`ui_spec`，随 `--self-test` 一起产出，不用开窗口）：
@@ -35,11 +35,11 @@ set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 GUI="$REPO/target/debug/qxync-gui"
 DAEMON="$REPO/target/debug/qxyncd"
-QS="$REPO/target/debug/qsync"
-RUNDIR="${QSYNC_TEST_RUNDIR:-$REPO/.local-run}"
+QS="$REPO/target/debug/qxync"
+RUNDIR="${QXNYC_TEST_RUNDIR:-$REPO/.local-run}"
 SOCK="$RUNDIR/gui-matrix.sock"
 SHOTS="$RUNDIR/gui-shots"
-LINK="${QSYNC_TEST_LINK:-default}"
+LINK="${QXNYC_TEST_LINK:-default}"
 LOG="$RUNDIR/gui-matrix.log"
 TABS="home tasks files journal errors settings diag:status diag:mounts diag:sync"
 # ★ M8.4：设置页各分区（每个分区一张图，判据同其它目的地：非空白 + 与主页不同）
@@ -57,7 +57,7 @@ done
 export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$RUNDIR/config}"
 export XDG_DATA_HOME="${XDG_DATA_HOME:-$RUNDIR/data}"
 export XDG_STATE_HOME="${XDG_STATE_HOME:-$RUNDIR/state}"
-export QSYNC_SOCKET="$SOCK"
+export QXNYC_SOCKET="$SOCK"
 export RUST_LOG="${RUST_LOG:-warn}"
 DAEMON_PID=""; GUI_PID=""
 
@@ -88,9 +88,9 @@ miss=0
 for b in "$GUI" "$DAEMON" "$QS"; do
   [ -x "$b" ] || { echo "  ❌ 缺少可执行文件 $b（先 CARGO_HOME=\$PWD/.cargo-home cargo build --workspace）"; miss=1; }
 done
-check "$miss" "三个二进制都在（qxync-gui / qxyncd / qsync）"
-if [ ! -f "$XDG_CONFIG_HOME/qsync/links/$LINK.json" ]; then
-  echo "  ❌ 没有连接配置 $XDG_CONFIG_HOME/qsync/links/$LINK.json —— 先跑一次："
+check "$miss" "三个二进制都在（qxync-gui / qxyncd / qxync）"
+if [ ! -f "$XDG_CONFIG_HOME/qxync/links/$LINK.json" ]; then
+  echo "  ❌ 没有连接配置 $XDG_CONFIG_HOME/qxync/links/$LINK.json —— 先跑一次："
   echo "     XDG_CONFIG_HOME=$XDG_CONFIG_HOME cargo run -p qxync-cli -- --host <NAS> --port 9834 --insecure --user <用户> --password '<口令>' login"
   exit 2
 fi
@@ -171,7 +171,7 @@ if command -v node >/dev/null; then
     const fs = require("fs");
     global.window = global;
     eval(fs.readFileSync(process.argv[1], "utf8"));
-    const I = global.QSYNC_I18N;
+    const I = global.QXNYC_I18N;
     const zh = I.t("nav.home");
     I.setLocale("en");
     const en = I.t("nav.home");
@@ -215,24 +215,24 @@ DAEMON_PID=""
 # 旧的 status/mounts/sync/connect/files 在 3b 单独验「仍然可用且落点不变」。
 echo "== 3. 真窗口（$(echo $TABS | wc -w) 个目的地） =="
 
-# 起一次 GUI、等窗口、截图、做尺寸/非空白断言。$1=QSYNC_GUI_TAB 值 $2=输出 png $3=日志/文件名 slug
+# 起一次 GUI、等窗口、截图、做尺寸/非空白断言。$1=QXNYC_GUI_TAB 值 $2=输出 png $3=日志/文件名 slug
 shot_page() {
   local t="$1" out="$2" slug="$3" wid=""
   pkill -x qxync-gui 2>/dev/null; sleep 0.6
-  QSYNC_GUI_TAB="$t" "$GUI" >"$RUNDIR/gui-window-$slug.log" 2>&1 &
+  QXNYC_GUI_TAB="$t" "$GUI" >"$RUNDIR/gui-window-$slug.log" 2>&1 &
   GUI_PID=$!
   for _ in $(seq 1 40); do
-    wid=$(xdotool search --name "QSync" 2>/dev/null | head -1)
+    wid=$(xdotool search --name "qxync" 2>/dev/null | head -1)
     [ -n "$wid" ] && break
     sleep 0.5
   done
   if [ -z "$wid" ]; then
-    bad "page=$t：20s 内没找到 QSync 窗口"
+    bad "page=$t：20s 内没找到 qxync 窗口"
     kill "$GUI_PID" 2>/dev/null; GUI_PID=""
     return 1
   fi
   local title; title=$(xdotool getwindowname "$wid" 2>/dev/null)
-  case "$title" in *QSync*) ok "page=$t：窗口标题正确（$title）";; *) bad "page=$t：窗口标题异常（$title）";; esac
+  case "$title" in *qxync*) ok "page=$t：窗口标题正确（$title）";; *) bad "page=$t：窗口标题异常（$title）";; esac
   sleep 5   # 等首轮 status + 该页自己的数据（files 要打真机 ls）
   import -window "$wid" "$out" 2>/dev/null
   [ -s "$out" ]; check $? "page=$t：截图产出（$(basename "$out")）"
@@ -282,16 +282,16 @@ else
   # 3c. ★ M8.6：键盘可达性 —— Tab 一次，skip-link/焦点环必须显形（画面有变化）
   echo "== 3c. M8.6 键盘可达性（真窗口 Tab） =="
   pkill -x qxync-gui 2>/dev/null; sleep 0.6
-  QSYNC_GUI_TAB=home "$GUI" >"$RUNDIR/gui-window-kbd.log" 2>&1 &
+  QXNYC_GUI_TAB=home "$GUI" >"$RUNDIR/gui-window-kbd.log" 2>&1 &
   GUI_PID=$!
   KWID=""
   for _ in $(seq 1 40); do
-    KWID=$(xdotool search --name "QSync" 2>/dev/null | head -1)
+    KWID=$(xdotool search --name "qxync" 2>/dev/null | head -1)
     [ -n "$KWID" ] && break
     sleep 0.5
   done
   if [ -z "$KWID" ]; then
-    bad "kbd：20s 内没找到 QSync 窗口"
+    bad "kbd：20s 内没找到 qxync 窗口"
   else
     sleep 5
     import -window "$KWID" "$SHOTS/kbd-before.png" 2>/dev/null
@@ -311,9 +311,9 @@ else
     kill "$GUI_PID" 2>/dev/null; wait "$GUI_PID" 2>/dev/null; GUI_PID=""
   fi
 
-  # 3b. ★ M8.1：旧的 QSYNC_GUI_TAB 取值必须继续可用，而且落到**同一个目的地**
+  # 3b. ★ M8.1：旧的 QXNYC_GUI_TAB 取值必须继续可用，而且落到**同一个目的地**
   #     判据 = 截图 AE 很小（同一目的地）而不是极大（落错页）。
-  echo "== 3b. 旧 QSYNC_GUI_TAB 值兼容（落点等价性） =="
+  echo "== 3b. 旧 QXNYC_GUI_TAB 值兼容（落点等价性） =="
   for pair in "status:diag-status" "mounts:diag-mounts" "sync:diag-sync" "connect:settings" "files:files"; do
     old="${pair%%:*}"; want="${pair##*:}"
     ref="$SHOTS/tab-$want.png"

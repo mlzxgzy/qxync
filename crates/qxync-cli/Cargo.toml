@@ -1,6 +1,6 @@
 [package]
 name = "qxync-cli"
-description = "qsync command-line interface · qsync 命令行（login/ls/stat/get/put/mount/sync/dehydrate/task/settings…）"
+description = "qxync command-line interface · qxync 命令行（login/ls/stat/get/put/mount/sync/dehydrate/task/settings…）"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,7 +11,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [[bin]]
-name = "qsync"
+name = "qxync"
 path = "src/main.rs"
 
 [dependencies]

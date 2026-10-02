@@ -6,16 +6,16 @@
 #   xtask/tests/m82-matrix.sh --no-fuse       # 跳过真挂载项（只验登记/校验/CLI/JSON）
 #
 # 依赖:
-#   * cargo build --workspace（target/debug/{qxyncd,qsync}）
+#   * cargo build --workspace（target/debug/{qxyncd,qxync}）
 #   * /dev/fuse（真挂载项）；没有时自动跳过并说明
-#   * 真机凭据：$XDG_CONFIG_HOME/qsync/{links/<id>.json,credentials.json}
+#   * 真机凭据：$XDG_CONFIG_HOME/qxync/{links/<id>.json,credentials.json}
 #
 # 验的是什么（对应 docs/M8-向Qsync-Client-6靠拢.md 的 M8.2 验收 ①–④）:
 #   ① 迁移/兼容：**不带 task 参数的挂载不登记任务**（= M7 行为一字不变）；
 #   ② daemon 重启后 `--restore-tasks` 能把启用任务自动恢复挂载；
 #      负向对照：**不开 flag 时不恢复**（默认关是刻意的，防止旧挂载复活）；
 #   ③ 暂停一个任务只影响它自己：t1 卸载、t2 仍然挂着；
-#   ④ `qsync task list/add/rm/pause/resume/mount --json` 全可用；
+#   ④ `qxync task list/add/rm/pause/resume/mount --json` 全可用；
 #   ⑤ 安全：非法 id（`../x`）被拒；`rm` 只删登记、不动挂载点里的数据。
 #
 # 本矩阵**只用自己私有的 XDG 目录**（$RUNDIR/m82），不碰其它矩阵的状态。
@@ -23,8 +23,8 @@ set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DAEMON="$REPO/target/debug/qxyncd"
-QS="$REPO/target/debug/qsync"
-RUNDIR="${QSYNC_TEST_RUNDIR:-$REPO/.local-run}/m82"
+QS="$REPO/target/debug/qxync"
+RUNDIR="${QXNYC_TEST_RUNDIR:-$REPO/.local-run}/m82"
 SOCK="$RUNDIR/s.sock"
 LOG="$RUNDIR/daemon.log"
 MNT1="$RUNDIR/mnt1"
@@ -45,22 +45,22 @@ check(){ if [ "$1" = "0" ]; then ok "$2"; else bad "$2"; fi; }
 skip() { echo "  ⏭️  $1"; }
 
 rm -rf "$RUNDIR"
-mkdir -p "$RUNDIR/config/qsync/links" "$MNT1" "$MNT2"
+mkdir -p "$RUNDIR/config/qxync/links" "$MNT1" "$MNT2"
 
 # 凭据从默认 XDG 目录借（不改动它）
-SRC_XDG="${QSYNC_SRC_XDG_CONFIG:-$REPO/.local-run/config}"
-if [ ! -f "$SRC_XDG/qsync/links/${QSYNC_TEST_LINK:-default}.json" ]; then
-  echo "❌ 找不到连接配置：$SRC_XDG/qsync/links/${QSYNC_TEST_LINK:-default}.json"
+SRC_XDG="${QXNYC_SRC_XDG_CONFIG:-$REPO/.local-run/config}"
+if [ ! -f "$SRC_XDG/qxync/links/${QXNYC_TEST_LINK:-default}.json" ]; then
+  echo "❌ 找不到连接配置：$SRC_XDG/qxync/links/${QXNYC_TEST_LINK:-default}.json"
   echo "   先跑一次：XDG_CONFIG_HOME=$SRC_XDG cargo run -p qxync-cli -- --host <NAS> ... login"
   exit 2
 fi
-cp "$SRC_XDG/qsync/links/${QSYNC_TEST_LINK:-default}.json" "$RUNDIR/config/qsync/links/"
-[ -f "$SRC_XDG/qsync/credentials.json" ] && cp "$SRC_XDG/qsync/credentials.json" "$RUNDIR/config/qsync/"
+cp "$SRC_XDG/qxync/links/${QXNYC_TEST_LINK:-default}.json" "$RUNDIR/config/qxync/links/"
+[ -f "$SRC_XDG/qxync/credentials.json" ] && cp "$SRC_XDG/qxync/credentials.json" "$RUNDIR/config/qxync/"
 
 export XDG_CONFIG_HOME="$RUNDIR/config"
 export XDG_DATA_HOME="$RUNDIR/data"
 export XDG_STATE_HOME="$RUNDIR/state"
-export QSYNC_SOCKET="$SOCK"
+export QXNYC_SOCKET="$SOCK"
 export RUST_LOG="${RUST_LOG:-warn}"
 DAEMON_PID=""
 
@@ -73,7 +73,7 @@ jqv() { jq -r "$1" 2>/dev/null; }
 start_daemon() {  # $1: 额外参数（如 --restore-tasks / --auto-login）
   pkill -x qxyncd 2>/dev/null; sleep 0.4; rm -f "$SOCK"
   # shellcheck disable=SC2086
-  "$DAEMON" --link "${QSYNC_TEST_LINK:-default}" --socket "$SOCK" --foreground $1 >>"$LOG" 2>&1 &
+  "$DAEMON" --link "${QXNYC_TEST_LINK:-default}" --socket "$SOCK" --foreground $1 >>"$LOG" 2>&1 &
   DAEMON_PID=$!
   for _ in $(seq 1 60); do [ -S "$SOCK" ] && return 0; sleep 0.25; done
   return 1
@@ -106,7 +106,7 @@ if [ "$NO_FUSE" = "1" ]; then
 else
   ADD=$(Q task add --id t1 --mountpoint "$MNT1" --root /home --json 2>/dev/null)
   check $? "task add 成功"
-  check "$([ -f "$XDG_CONFIG_HOME/qsync/tasks/t1.json" ] && echo 0 || echo 1)" "任务文件落盘 tasks/t1.json"
+  check "$([ -f "$XDG_CONFIG_HOME/qxync/tasks/t1.json" ] && echo 0 || echo 1)" "任务文件落盘 tasks/t1.json"
   check "$([ "$(echo "$ADD" | jqv '.saved.saved')" = "true" ] && echo 0 || echo 1)" "响应 saved=true"
   ENTRY=$(ls "$MNT1" 2>/dev/null | head -1)
   check "$([ -n "$ENTRY" ] && echo 0 || echo 1)" "挂载点可读（看到 $ENTRY）"
@@ -129,7 +129,7 @@ if [ "$NO_FUSE" = "1" ]; then
 else
   Q mount "$M3" --remote /home >/dev/null 2>&1
   check $? "普通 mount（不带 task）成功"
-  BEFORE=$(ls "$XDG_CONFIG_HOME/qsync/tasks/" 2>/dev/null | wc -l)
+  BEFORE=$(ls "$XDG_CONFIG_HOME/qxync/tasks/" 2>/dev/null | wc -l)
   check "$([ "$BEFORE" = "1" ] && echo 0 || echo 1)" "任务文件仍是 1 个（普通 mount **不登记**任务）"
   Q umount "$M3" >/dev/null 2>&1
 fi
@@ -230,7 +230,7 @@ echo "== 10. 缓存目录（--cache-dir） =="
 MYCACHE="$RUNDIR/mycache"; mkdir -p "$MYCACHE"
 Q task add --id c1 --mountpoint "$RUNDIR/mntc" --root /home --cache-dir "$MYCACHE" --no-mount >/dev/null 2>&1
 check $? "task add --cache-dir 成功"
-CD=$(jq -r '.cache_dir // "null"' "$XDG_CONFIG_HOME/qsync/tasks/c1.json" 2>/dev/null)
+CD=$(jq -r '.cache_dir // "null"' "$XDG_CONFIG_HOME/qxync/tasks/c1.json" 2>/dev/null)
 check "$([ "$CD" = "$MYCACHE" ] && echo 0 || echo 1)" "缓存目录落进任务文件（$CD）"
 # 相对路径必须被拒
 Q task add --id bad --mountpoint "$RUNDIR/mntb" --cache-dir "relative/cache" --no-mount >/dev/null 2>&1

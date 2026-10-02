@@ -36,20 +36,20 @@ use crate::sync::{self, MountView, SyncConfig, SyncState, SyncStats};
 /// ★ M8.3：journal 的保留上限（**必须有**：同步日志是无限增长型数据，
 /// 不加约束会把 `sync.db` 撑大）。默认 1 万条 / 30 天，环境变量可调。
 fn journal_max_rows() -> i64 {
-    std::env::var("QSYNC_JOURNAL_MAX_ROWS")
+    std::env::var("QXNYC_JOURNAL_MAX_ROWS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(10_000)
 }
 fn journal_max_age_days() -> i64 {
-    std::env::var("QSYNC_JOURNAL_MAX_AGE_DAYS")
+    std::env::var("QXNYC_JOURNAL_MAX_AGE_DAYS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(30)
 }
 /// 轮转间隔秒数（默认 300；验收里调成 1 用来快速观察）。
 fn journal_trim_secs() -> u64 {
-    std::env::var("QSYNC_JOURNAL_TRIM_SECS")
+    std::env::var("QXNYC_JOURNAL_TRIM_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(300)
@@ -60,7 +60,7 @@ pub struct Options {
     pub link_id: String,
     pub socket: PathBuf,
     pub auto_login: bool,
-    /// ★ M8.2：启动时恢复 `enabled=true` 的任务（显式开启，见 `--restore-tasks` / `QSYNC_TASK_RESTORE`）。
+    /// ★ M8.2：启动时恢复 `enabled=true` 的任务（显式开启，见 `--restore-tasks` / `QXNYC_TASK_RESTORE`）。
     ///
     /// **默认关闭**是刻意的：任务恢复会「凭空挂载」，如果默认打开，
     /// 上一次跑崩留下的挂载会在下一次 daemon 启动时复活，把验收矩阵的前提打乱
@@ -92,7 +92,7 @@ pub(crate) struct State {
     pub(crate) link: LinkConfig,
     client: Mutex<Client>,
     session: Mutex<Option<Session>>,
-    /// 远端路径 → pin 状态（与 FUSE 实例共享，`getfattr -n user.qsync.pin` 能看到）。
+    /// 远端路径 → pin 状态（与 FUSE 实例共享，`getfattr -n user.qxync.pin` 能看到）。
     pins: PinMap,
     pub(crate) mounts: StdMutex<HashMap<PathBuf, MountEntry>>,
     /// ★ M2c：引擎专用的 HTTP 客户端（不抢 `client` 的锁，长轮询不阻塞 IPC 命令）。
@@ -110,7 +110,7 @@ pub(crate) struct State {
     dehydrate_stats: Arc<DehydrateStats>,
     /// ★ M7：选择性同步规则（`link.exclude` + 临时文件过滤）；挂载时注入 FUSE 与同步引擎。
     rules: Arc<Rules>,
-    /// ★ M7：解析失败的规则原文（`qsync rules` 要显示，不静默）。
+    /// ★ M7：解析失败的规则原文（`qxync rules` 要显示，不静默）。
     rules_bad: Vec<String>,
     /// ★ M7：已配对的对等设备（与 FUSE 共享：水合时先试 LAN）。
     peers: Arc<StdMutex<Vec<PeerConfig>>>,
@@ -137,7 +137,7 @@ pub async fn run(opts: Options) -> Result<()> {
     let paths = ConfigPaths::discover()?;
     paths.ensure_dirs()?;
     let link = LinkConfig::load(&paths, &opts.link_id)
-        .with_context(|| format!("读取连接配置失败（先 `qsync --host ... login`）"))?;
+        .with_context(|| format!("读取连接配置失败（先 `qxync --host ... login`）"))?;
 
     if let Some(dir) = opts.socket.parent() {
         std::fs::create_dir_all(dir)?;
@@ -211,7 +211,7 @@ pub async fn run(opts: Options) -> Result<()> {
     if !pins_seed.is_empty() {
         tracing::info!("从状态库恢复 {} 条 pin", pins_seed.len());
     }
-    let sync_interval: u64 = std::env::var("QSYNC_POLL_INTERVAL")
+    let sync_interval: u64 = std::env::var("QXNYC_POLL_INTERVAL")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(qxync_core::sync::DEFAULT_POLL_INTERVAL_SECS);
@@ -290,7 +290,7 @@ pub async fn run(opts: Options) -> Result<()> {
     if opts.auto_login {
         match login_internal(&state, None, None).await {
             Ok(s) => tracing::info!("自动登录成功 user={} sid={}", s.username, mask_sid(&s.sid)),
-            Err(e) => tracing::warn!("自动登录失败（可稍后 `qsync login`）: {}", e.message),
+            Err(e) => tracing::warn!("自动登录失败（可稍后 `qxync login`）: {}", e.message),
         }
     }
 
@@ -313,9 +313,9 @@ pub async fn run(opts: Options) -> Result<()> {
         });
     }
 
-    // ★ M2c：后台轮询（三游标 + baseline 对账）；QSYNC_POLL_INTERVAL=0 可暂停
+    // ★ M2c：后台轮询（三游标 + baseline 对账）；QXNYC_POLL_INTERVAL=0 可暂停
     spawn_poller(state.clone());
-    // ★ M3：后台脱水（闲置 + 缓存限额）；QSYNC_DEHYDRATE_IDLE / QSYNC_CACHE_LIMIT 开启
+    // ★ M3：后台脱水（闲置 + 缓存限额）；QXNYC_DEHYDRATE_IDLE / QXNYC_CACHE_LIMIT 开启
     spawn_dehydrator(state.clone());
     // ★ M8.4：自动释放空间（设置里的 `free_space`；默认关 → 不改变 M8.3 行为）
     spawn_auto_free(state.clone());
@@ -442,7 +442,7 @@ async fn dispatch(state: &Arc<State>, req: Request, shutdown: &mpsc::Sender<()>)
             conflict,
         } => {
             // ★ M8.2：只有显式要求（`task` 或 `save_task`）才登记任务；
-            //   默认不登记 → qsync CLI / 验收矩阵的行为与 M7 **一字不变**。
+            //   默认不登记 → qxync CLI / 验收矩阵的行为与 M7 **一字不变**。
             let want_task = save_task.unwrap_or(false) || task.is_some();
             let reg = if want_task {
                 // ★ 缓存目录也要落进任务登记，否则「任务方式挂载」改不了缓存位置
@@ -642,7 +642,7 @@ async fn require_sid(state: &State) -> Result<String, IpcError> {
     guard.sid().map(|s| s.to_string()).ok_or_else(|| {
         IpcError::new(
             ErrorKind::NotLoggedIn,
-            "尚未登录（先 `qsync --via-daemon login`）",
+            "尚未登录（先 `qxync --via-daemon login`）",
         )
     })
 }
@@ -663,7 +663,7 @@ async fn login_internal(
         .ok_or_else(|| {
             IpcError::new(
                 ErrorKind::Auth,
-                "没有口令：用 `qsync login --password <口令>` 或先在 CLI 登录一次",
+                "没有口令：用 `qxync login --password <口令>` 或先在 CLI 登录一次",
             )
         })?;
 
@@ -910,7 +910,7 @@ fn pin_cmd(
     }
 }
 
-/// ★ M5：本地状态库快照（`qsync store [--integrity]`）。
+/// ★ M5：本地状态库快照（`qxync store [--integrity]`）。
 ///
 /// 一次性把「同步正确性的核心状态」摊开给脚本看：游标、baseline 行数、pin、未完成上传。
 fn store_info(state: &Arc<State>, integrity: bool) -> Result<serde_json::Value, IpcError> {
@@ -952,7 +952,7 @@ fn store_info(state: &Arc<State>, integrity: bool) -> Result<serde_json::Value, 
     to_value(data)
 }
 
-/// ★ M6：远端根一览（`qsync roots`）—— 配置的根 + NAS 同步文件夹 + 可读/可写判定。
+/// ★ M6：远端根一览（`qxync roots`）—— 配置的根 + NAS 同步文件夹 + 可读/可写判定。
 ///
 /// 可写性规则：**只有家目录根可写**。实测（2026-10-01）普通账号向 `/Public` 上传会被服务端
 /// 拒绝（`status:20`：非 Qsync 同步文件夹没有写权限），而 `qbox_get_syncing_folder_list`
@@ -1011,7 +1011,7 @@ async fn roots_cmd(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
     })
 }
 
-/// ★ M7：`qsync rules [--match PATH]` —— 选择性同步规则一览 + 单路径判定。
+/// ★ M7：`qxync rules [--match PATH]` —— 选择性同步规则一览 + 单路径判定。
 fn rules_cmd(
     state: &Arc<State>,
     match_path: Option<String>,
@@ -1051,7 +1051,7 @@ fn rules_cmd(
     to_value(data)
 }
 
-/// ★ M7：`qsync peer <action>` —— 设备配对 / 探活 / 事件 / LAN 直传自检。
+/// ★ M7：`qxync peer <action>` —— 设备配对 / 探活 / 事件 / LAN 直传自检。
 #[allow(clippy::too_many_arguments)]
 async fn peer_cmd(
     state: &Arc<State>,
@@ -1598,7 +1598,7 @@ async fn run_sync_once(state: &Arc<State>) -> Result<sync::SyncReport, IpcError>
     Ok(report)
 }
 
-/// `qsync sync`：查看/触发/调参同步引擎。
+/// `qxync sync`：查看/触发/调参同步引擎。
 async fn sync_cmd(
     state: &Arc<State>,
     once: bool,
@@ -1650,10 +1650,10 @@ async fn sync_cmd(
 fn spawn_poller(state: Arc<State>) {
     let interval = *state.sync_interval.lock().unwrap();
     if interval == 0 {
-        tracing::info!("变更轮询已禁用（QSYNC_POLL_INTERVAL=0）");
+        tracing::info!("变更轮询已禁用（QXNYC_POLL_INTERVAL=0）");
         return;
     }
-    tracing::info!("变更轮询已启动：每 {interval}s 一轮（QSYNC_POLL_INTERVAL 可调）");
+    tracing::info!("变更轮询已启动：每 {interval}s 一轮（QXNYC_POLL_INTERVAL 可调）");
     tokio::spawn(async move {
         let mut last_run = Instant::now() - Duration::from_secs(3600);
         loop {
@@ -1707,7 +1707,7 @@ fn spawn_poller(state: Arc<State>) {
     });
 }
 
-/// `qsync rm <dir> <name>`：删远端条目（脚本/测试用；FUSE 的 unlink 走同一方法）。
+/// `qxync rm <dir> <name>`：删远端条目（脚本/测试用；FUSE 的 unlink 走同一方法）。
 async fn rm(state: &Arc<State>, dir: String, name: String) -> Result<serde_json::Value, IpcError> {
     ensure_session(state).await?;
     let d = dir.clone();
@@ -1736,14 +1736,14 @@ struct DehydrateCfg {
 
 impl DehydrateCfg {
     fn from_env() -> Self {
-        let idle = std::env::var("QSYNC_DEHYDRATE_IDLE")
+        let idle = std::env::var("QXNYC_DEHYDRATE_IDLE")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0u64);
-        let limit = std::env::var("QSYNC_CACHE_LIMIT")
+        let limit = std::env::var("QXNYC_CACHE_LIMIT")
             .ok()
             .and_then(|v| CacheLimit::parse(&v));
-        let interval = std::env::var("QSYNC_DEHYDRATE_INTERVAL")
+        let interval = std::env::var("QXNYC_DEHYDRATE_INTERVAL")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(60u64);
@@ -1772,7 +1772,7 @@ struct DehydrateStats {
     last_error: StdMutex<Option<String>>,
 }
 
-/// `qsync dehydrate` 的参数。
+/// `qxync dehydrate` 的参数。
 struct DehydrateOpts {
     path: Option<String>,
     all: bool,
@@ -1916,7 +1916,7 @@ fn mmap_remotes(
     out
 }
 
-/// 执行一次脱水（`qsync dehydrate` 与后台扫描共用）。
+/// 执行一次脱水（`qxync dehydrate` 与后台扫描共用）。
 async fn run_dehydrate(state: &Arc<State>, opts: DehydrateOpts) -> DehydrateData {
     let recent = if opts.force { 0 } else { 300 };
     run_dehydrate_with_recent(state, opts, recent).await
@@ -2075,7 +2075,7 @@ fn record_block(stats: &Arc<DehydrateStats>, b: Block) {
     c.fetch_add(1, Ordering::Relaxed);
 }
 
-/// `qsync dehydrate`：IPC 入口。
+/// `qxync dehydrate`：IPC 入口。
 async fn dehydrate_cmd(
     state: &Arc<State>,
     mut opts: DehydrateOpts,
@@ -2103,7 +2103,7 @@ async fn dehydrate_cmd(
     to_value(out)
 }
 
-/// 后台脱水：按 `QSYNC_DEHYDRATE_INTERVAL` 周期扫「闲置 + 限额」。
+/// 后台脱水：按 `QXNYC_DEHYDRATE_INTERVAL` 周期扫「闲置 + 限额」。
 fn spawn_dehydrator(state: Arc<State>) {
     let cfg = state.dehydrate_cfg.lock().unwrap().clone();
     if cfg.enabled() {
@@ -2115,8 +2115,8 @@ fn spawn_dehydrator(state: Arc<State>) {
         );
     } else {
         tracing::info!(
-            "自动脱水未启用（QSYNC_DEHYDRATE_IDLE=0 且未设 QSYNC_CACHE_LIMIT）；\
-             手动 `qsync dehydrate` 可用，`qsync dehydrate --idle-secs N` 可动态开启"
+            "自动脱水未启用（QXNYC_DEHYDRATE_IDLE=0 且未设 QXNYC_CACHE_LIMIT）；\
+             手动 `qxync dehydrate` 可用，`qxync dehydrate --idle-secs N` 可动态开启"
         );
     }
     tokio::spawn(async move {
@@ -2222,7 +2222,7 @@ async fn mount_task(state: &Arc<State>, t: &Task) -> Result<serde_json::Value, I
         t.mountpoint.clone(),
         remote,
         roots,
-        // ★ 任务里的缓存目录（None = 默认 $XDG_DATA_HOME/qsync/cache）
+        // ★ 任务里的缓存目录（None = 默认 $XDG_DATA_HOME/qxync/cache）
         t.cache_dir.clone(),
         t.threads.unwrap_or(4),
         t.auto_unmount,
@@ -2259,7 +2259,7 @@ async fn tasks_cmd(
                 note: Some(if empty {
                     "还没有登记过任务；`mount` 时带 task/save_task 即可登记".into()
                 } else {
-                    "任务登记在 ~/.config/qsync/tasks/<id>.json；删除登记不会动挂载点里的数据"
+                    "任务登记在 ~/.config/qxync/tasks/<id>.json；删除登记不会动挂载点里的数据"
                         .into()
                 }),
             };
@@ -2343,7 +2343,7 @@ async fn tasks_cmd(
 
 /// ★ M8.2：daemon 启动时恢复 `enabled=true` 的任务。
 ///
-/// **只有显式开启才跑**（`--restore-tasks` / `QSYNC_TASK_RESTORE=1`）：
+/// **只有显式开启才跑**（`--restore-tasks` / `QXNYC_TASK_RESTORE=1`）：
 /// 任务恢复会「凭空挂载」，默认打开会让上一次跑崩留下的挂载在重启时复活，
 /// 把验收矩阵的前提（开跑前环境干净）打乱。
 pub(crate) async fn restore_tasks_on_start(state: &Arc<State>, link_id: &str) {
@@ -2456,7 +2456,7 @@ fn journal_record_sync(state: &Arc<State>, r: &sync::SyncReport) {
                 "delete",
                 "",
                 format!(
-                    "{} 项删除被熔断挡住（`qsync sync --once --force-deletes` 可放行一轮）",
+                    "{} 项删除被熔断挡住（`qxync sync --once --force-deletes` 可放行一轮）",
                     r.deletes_blocked
                 ),
             ),
@@ -2506,7 +2506,7 @@ fn spawn_journal_flusher(state: Arc<State>) {
                     tracing::warn!("journal 落库失败（丢弃 {} 条）: {e}", batch.len());
                 }
             }
-            // 周期性轮转（默认 300s，QSYNC_JOURNAL_TRIM_SECS 可调）
+            // 周期性轮转（默认 300s，QXNYC_JOURNAL_TRIM_SECS 可调）
             if last_trim.elapsed() >= Duration::from_secs(trim_secs) {
                 last_trim = Instant::now();
                 let g = state.sync_store.lock().unwrap();
@@ -2563,7 +2563,7 @@ fn journal_cmd(
         limit_rows: max_rows,
         max_age_days: max_age,
         note: Some(format!(
-            "日志只保留最近 {max_rows} 条 / {max_age} 天（QSYNC_JOURNAL_MAX_ROWS / _MAX_AGE_DAYS 可调）；清空日志不影响同步状态"
+            "日志只保留最近 {max_rows} 条 / {max_age} 天（QXNYC_JOURNAL_MAX_ROWS / _MAX_AGE_DAYS 可调）；清空日志不影响同步状态"
         )),
     })
 }
@@ -2862,9 +2862,9 @@ fn space_probe_path(dir: &std::path::Path) -> PathBuf {
     }
 }
 
-/// 自动释放的「刚访问过」保护窗口秒数（默认 300；`QSYNC_AUTO_FREE_RECENT` 只在验收里调）。
+/// 自动释放的「刚访问过」保护窗口秒数（默认 300；`QXNYC_AUTO_FREE_RECENT` 只在验收里调）。
 fn auto_free_recent_secs() -> u64 {
-    std::env::var("QSYNC_AUTO_FREE_RECENT")
+    std::env::var("QXNYC_AUTO_FREE_RECENT")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(300)
@@ -2876,7 +2876,7 @@ fn auto_free_recent_secs() -> u64 {
 /// （dirty / pending / pinned / excluded / open / mapped / in-flight）一个都没绕过。
 /// 本函数只负责：量空间 → 判定该不该跑 → 把判定翻译成一次脱水调用。
 fn spawn_auto_free(state: Arc<State>) {
-    let interval = std::env::var("QSYNC_AUTO_FREE_INTERVAL")
+    let interval = std::env::var("QXNYC_AUTO_FREE_INTERVAL")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(60)
@@ -2912,7 +2912,7 @@ fn spawn_auto_free(state: Arc<State>) {
                 d.avail_pct
             );
             // 「刚访问过」保护窗口：默认 300s（M3 既有行为）；
-            // 验收可以用 QSYNC_AUTO_FREE_RECENT=0 把它关掉，观察低空间触发（**只是测试旋钮**）。
+            // 验收可以用 QXNYC_AUTO_FREE_RECENT=0 把它关掉，观察低空间触发（**只是测试旋钮**）。
             let recent = if d.idle_secs > 0 {
                 0
             } else {
@@ -2966,7 +2966,7 @@ fn spawn_auto_free(state: Arc<State>) {
 async fn space_cmd(state: &Arc<State>, now: bool) -> Result<serde_json::Value, IpcError> {
     let cfg = state.settings.lock().unwrap().free_space.clone();
     let dir = space_probe_path(&first_cache_dir(state));
-    let injected = std::env::var("QSYNC_TEST_FAKE_STATVFS")
+    let injected = std::env::var("QXNYC_TEST_FAKE_STATVFS")
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false);
     let space = qxync_core::freespace::probe(&dir).map_err(core_err)?;
@@ -3041,7 +3041,7 @@ async fn space_cmd(state: &Arc<State>, now: bool) -> Result<serde_json::Value, I
     }
 
     data.note = Some(if injected {
-        "⚠ 正在使用 QSYNC_TEST_FAKE_STATVFS 注入的剩余空间（验收模式）".into()
+        "⚠ 正在使用 QXNYC_TEST_FAKE_STATVFS 注入的剩余空间（验收模式）".into()
     } else {
         "脱水永远走 M3 的安全检查链：dirty / 待上传 / pinned / excluded / 打开中 / mmap / 传输中 一律跳过".into()
     });

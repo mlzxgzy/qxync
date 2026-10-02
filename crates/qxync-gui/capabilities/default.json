@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "QSync GUI 默认能力：只放行核心窗口/事件 API；业务命令（ipc_call/link_save/...）是本应用自定义命令，不受插件权限系统管辖。",
+  "description": "qxync GUI 默认能力：只放行核心窗口/事件 API；业务命令（ipc_call/link_save/...）是本应用自定义命令，不受插件权限系统管辖。",
   "windows": ["main"],
   "permissions": ["core:default"]
 }

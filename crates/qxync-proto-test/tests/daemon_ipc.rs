@@ -1,10 +1,10 @@
 //! qxyncd 的 IPC 端到端测试：**真的起进程、真的走 unix socket**。
 //!
 //! ```bash
-//! export QSYNC_TEST_HOST=... QSYNC_TEST_USER=... QSYNC_TEST_PASSWORD='...'
+//! export QXNYC_TEST_HOST=... QXNYC_TEST_USER=... QXNYC_TEST_PASSWORD='...'
 //! cargo test -p qxync-proto-test --test daemon_ipc -- --ignored --nocapture
 //! ```
-//! 没设 `QSYNC_TEST_HOST` 时直接返回（视为跳过）。ping/status/shutdown 不需要 NAS。
+//! 没设 `QXNYC_TEST_HOST` 时直接返回（视为跳过）。ping/status/shutdown 不需要 NAS。
 
 use qxync_core::ipc::{
     decode_line, encode_line, DaemonInfo, LsData, PingData, Request, RequestEnvelope, Response,
@@ -17,7 +17,7 @@ use tokio::net::UnixStream;
 
 /// 定位 `qxyncd`：优先环境变量，其次 workspace 根的 `target/debug/`。
 fn daemon_bin() -> PathBuf {
-    if let Ok(p) = std::env::var("QSYNC_TEST_DAEMON_BIN") {
+    if let Ok(p) = std::env::var("QXNYC_TEST_DAEMON_BIN") {
         return PathBuf::from(p);
     }
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/qxyncd")
@@ -50,17 +50,17 @@ async fn wait_socket(socket: &Path, secs: u64) -> bool {
 #[tokio::test]
 #[ignore = "会拉起 qxyncd 进程（需要 NAS 才能测 login/ls）"]
 async fn daemon_ipc_round_trip() {
-    let Some(host) = std::env::var("QSYNC_TEST_HOST").ok() else {
-        eprintln!("跳过：未设置 QSYNC_TEST_HOST");
+    let Some(host) = std::env::var("QXNYC_TEST_HOST").ok() else {
+        eprintln!("跳过：未设置 QXNYC_TEST_HOST");
         return;
     };
-    let user = std::env::var("QSYNC_TEST_USER").unwrap_or_else(|_| "test1".into());
-    let port = std::env::var("QSYNC_TEST_PORT")
+    let user = std::env::var("QXNYC_TEST_USER").unwrap_or_else(|_| "test1".into());
+    let port = std::env::var("QXNYC_TEST_PORT")
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(9834);
-    let password = std::env::var("QSYNC_TEST_PASSWORD").ok();
-    let fixture = std::env::var("QSYNC_TEST_FIXTURE").unwrap_or_else(|_| "/home/qxync-test".into());
+    let password = std::env::var("QXNYC_TEST_PASSWORD").ok();
+    let fixture = std::env::var("QXNYC_TEST_FIXTURE").unwrap_or_else(|_| "/home/qxync-test".into());
 
     let bin = daemon_bin();
     if !bin.exists() {
@@ -74,9 +74,9 @@ async fn daemon_ipc_round_trip() {
     // 独立的 XDG 目录，避免污染真实配置
     let root = std::env::temp_dir().join(format!("qxync-ipc-test-{}", std::process::id()));
     let (cfg, run, state) = (root.join("config"), root.join("run"), root.join("state"));
-    std::fs::create_dir_all(cfg.join("qsync/links")).unwrap();
+    std::fs::create_dir_all(cfg.join("qxync/links")).unwrap();
     std::fs::write(
-        cfg.join("qsync/links/default.json"),
+        cfg.join("qxync/links/default.json"),
         serde_json::json!({
             "id":"default","host":host,"port":port,"https":true,"insecure":true,
             "user":user,"home_root":"/home","ipv4_only": true
@@ -86,14 +86,14 @@ async fn daemon_ipc_round_trip() {
     .unwrap();
     if let Some(pw) = &password {
         std::fs::write(
-            cfg.join("qsync/credentials.json"),
+            cfg.join("qxync/credentials.json"),
             serde_json::json!({"host":host,"user":user,"password":pw}).to_string(),
         )
         .unwrap();
     }
     std::fs::create_dir_all(&run).unwrap();
     std::fs::create_dir_all(&state).unwrap();
-    let socket = run.join("qsync/qxyncd.sock");
+    let socket = run.join("qxync/qxyncd.sock");
     std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
 
     let mut child = std::process::Command::new(&bin)
@@ -157,7 +157,7 @@ async fn daemon_ipc_round_trip() {
         );
         println!("login+ls ok: {} 项", ls.total);
     } else {
-        println!("跳过 login/ls（未设置 QSYNC_TEST_PASSWORD）");
+        println!("跳过 login/ls（未设置 QXNYC_TEST_PASSWORD）");
     }
 
     // 4) shutdown → socket 消失、pid 文件消失
@@ -172,7 +172,7 @@ async fn daemon_ipc_round_trip() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(!socket.exists(), "shutdown 后 socket 应被删除");
-    let pid_file = state.join("qsync/qxyncd.pid");
+    let pid_file = state.join("qxync/qxyncd.pid");
     assert!(!pid_file.exists(), "shutdown 后 pid 文件应被删除");
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&root);

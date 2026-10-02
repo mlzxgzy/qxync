@@ -19,9 +19,9 @@
 import argparse, base64, hashlib, json, os, re, ssl, sys, time, urllib.error, urllib.parse, urllib.request, uuid
 
 # 连接目标一律从环境变量取（默认值是占位符，指不到任何真实设备）。
-#   export QSYNC_TEST_HOST=your-nas.example.com
-HOST = os.environ.get("QSYNC_TEST_HOST", "nas.example.com")
-PORT = int(os.environ.get("QSYNC_TEST_PORT", "9834"))
+#   export QXNYC_TEST_HOST=your-nas.example.com
+HOST = os.environ.get("QXNYC_TEST_HOST", "nas.example.com")
+PORT = int(os.environ.get("QXNYC_TEST_PORT", "9834"))
 USER = "test1"
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 ROOT = "/home/qxync-test"

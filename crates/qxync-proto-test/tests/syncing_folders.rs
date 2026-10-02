@@ -3,10 +3,10 @@
 //! **默认 `#[ignore]`**（需要一台真实 NAS 与账号）。跑法：
 //!
 //! ```bash
-//! export QSYNC_TEST_HOST=qnap.example.com
-//! export QSYNC_TEST_PORT=9834
-//! export QSYNC_TEST_USER=test1
-//! export QSYNC_TEST_PASSWORD='...'
+//! export QXNYC_TEST_HOST=qnap.example.com
+//! export QXNYC_TEST_PORT=9834
+//! export QXNYC_TEST_USER=test1
+//! export QXNYC_TEST_PASSWORD='...'
 //! cargo test -p qxync-proto-test --test syncing_folders -- --ignored --nocapture
 //! ```
 //!
@@ -21,10 +21,10 @@ use qxync_client::Client;
 use qxync_core::{LinkConfig, HOME_ROOT};
 
 fn env_creds() -> Option<(LinkConfig, String)> {
-    let host = std::env::var("QSYNC_TEST_HOST").ok()?;
-    let user = std::env::var("QSYNC_TEST_USER").ok()?;
-    let password = std::env::var("QSYNC_TEST_PASSWORD").ok()?;
-    let port = std::env::var("QSYNC_TEST_PORT")
+    let host = std::env::var("QXNYC_TEST_HOST").ok()?;
+    let user = std::env::var("QXNYC_TEST_USER").ok()?;
+    let password = std::env::var("QXNYC_TEST_PASSWORD").ok()?;
+    let port = std::env::var("QXNYC_TEST_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(9834);
@@ -39,7 +39,7 @@ fn env_creds() -> Option<(LinkConfig, String)> {
             home_root: HOME_ROOT.to_string(),
             // 本测试只看 NAS 上报的同步文件夹，不配置任何额外根（空 = 只用家目录）。
             roots: Vec::new(),
-            ipv4_only: std::env::var("QSYNC_TEST_IPV4").is_ok(),
+            ipv4_only: std::env::var("QXNYC_TEST_IPV4").is_ok(),
             exclude: Vec::new(),
             filter_temp: true,
             peer_listen: None,

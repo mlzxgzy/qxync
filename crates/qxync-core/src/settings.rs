@@ -5,8 +5,8 @@
 //! 本模块提供那份全局设置：
 //!
 //! ```text
-//! ~/.config/qsync/settings.json          全局设置（0600，可能含代路口令）
-//! ~/.config/autostart/qsync.desktop      开机自启（XDG autostart 规范）
+//! ~/.config/qxync/settings.json          全局设置（0600，可能含代路口令）
+//! ~/.config/autostart/qxync.desktop      开机自启（XDG autostart 规范）
 //! ```
 //!
 //! 设计约束（与 `tasks.rs` 同一套）：
@@ -235,7 +235,7 @@ pub struct Settings {
     #[serde(default)]
     pub proxy: ProxySettings,
     /// `Launch Qsync at startup` —— 记录开关状态；
-    /// 真正写 `~/.config/autostart/qsync.desktop` 的是 [`Settings::apply_autostart`]。
+    /// 真正写 `~/.config/autostart/qxync.desktop` 的是 [`Settings::apply_autostart`]。
     #[serde(default)]
     pub launch_at_startup: bool,
     /// `Show desktop notifications`（默认开：同步出错要让人看见）。
@@ -282,14 +282,26 @@ impl Settings {
         paths.config_dir.join("settings.json")
     }
 
-    /// XDG autostart 目录里的桌面项（`$XDG_CONFIG_HOME/autostart/qsync.desktop`）。
+    /// XDG autostart 目录里的桌面项（`$XDG_CONFIG_HOME/autostart/qxync.desktop`）。
     pub fn autostart_file(paths: &ConfigPaths) -> PathBuf {
+        Self::autostart_dir(paths).join("qxync.desktop")
+    }
+
+    /// ★ 0.2.0：改名前的老桌面项（`autostart/qsync.desktop`）。
+    ///
+    /// 0.1.x 写下的那个文件里的 `Exec=` 指向 `qxync-gui`（**名字没变**），所以它其实
+    /// 还能用，只是 `Name=` 是旧名。这里留着只为「切换开关时顺手清掉」，不做静默删除。
+    fn legacy_autostart_file(paths: &ConfigPaths) -> PathBuf {
+        Self::autostart_dir(paths).join("qsync.desktop")
+    }
+
+    fn autostart_dir(paths: &ConfigPaths) -> PathBuf {
         let base = paths
             .config_dir
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| paths.config_dir.clone());
-        base.join("autostart").join("qsync.desktop")
+        base.join("autostart")
     }
 
     pub fn normalize(&mut self) {
@@ -340,7 +352,7 @@ impl Settings {
         format!(
             "[Desktop Entry]\n\
              Type=Application\n\
-             Name=QSync\n\
+             Name=qxync\n\
              Comment={comment}\n\
              Exec={exe}\n\
              Terminal=false\n\
@@ -352,6 +364,8 @@ impl Settings {
     /// 按 `launch_at_startup` 落盘/删除 autostart 项。返回实际路径。
     ///
     /// ⚠ 只改这一个桌面项文件，**不动任何同步状态**。
+    /// ★ 0.2.0：无论开还是关，都顺手清掉改名前留下的 `qsync.desktop`
+    /// （开着的时候留着它，用户会在菜单里看到两个自启项）。
     pub fn apply_autostart(&self, paths: &ConfigPaths, exe: &Path) -> Result<PathBuf> {
         let target = Self::autostart_file(paths);
         if self.launch_at_startup {
@@ -365,15 +379,22 @@ impl Settings {
         } else if target.exists() {
             std::fs::remove_file(&target)?;
         }
+        let legacy = Self::legacy_autostart_file(paths);
+        if legacy.exists() {
+            std::fs::remove_file(&legacy)?;
+        }
         Ok(target)
     }
 
     /// autostart 项此刻是否真的存在（用来在 UI 里显示「已生效 / 未生效」）。
+    ///
+    /// ★ 0.2.0：老的 `qsync.desktop` 也算「已生效」—— 它确实还在开机拉起 GUI，
+    /// 只是名字是旧名。下一次切换开关时会被 [`Self::apply_autostart`] 清掉。
     pub fn autostart_present(paths: &ConfigPaths) -> bool {
-        Self::autostart_file(paths).exists()
+        Self::autostart_file(paths).exists() || Self::legacy_autostart_file(paths).exists()
     }
 
-    /// 点号键赋值（CLI `qsync settings --set key=value`）。
+    /// 点号键赋值（CLI `qxync settings --set key=value`）。
     ///
     /// **未知键直接报错**，不静默忽略 —— 脚本里拼错一个键却「看起来成功了」，
     /// 比报错危险得多。布尔值接受 `true/false/1/0/on/off/yes/no`。
@@ -481,9 +502,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("qxync-settings-{tag}-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         let paths = ConfigPaths {
-            config_dir: dir.join("config").join("qsync"),
-            data_dir: dir.join("data").join("qsync"),
-            state_dir: dir.join("state").join("qsync"),
+            config_dir: dir.join("config").join("qxync"),
+            data_dir: dir.join("data").join("qxync"),
+            state_dir: dir.join("state").join("qxync"),
         };
         paths.ensure_dirs().unwrap();
         (paths, dir)
@@ -626,7 +647,7 @@ mod tests {
         let (paths, dir) = paths_for("autostart");
         let t = Settings::autostart_file(&paths);
         assert!(
-            t.ends_with("autostart/qsync.desktop"),
+            t.ends_with("autostart/qxync.desktop"),
             "路径: {}",
             t.display()
         );
@@ -646,6 +667,24 @@ mod tests {
         s.apply_autostart(&paths, Path::new("/usr/bin/qxync-gui"))
             .unwrap();
         assert!(!t.exists(), "关掉自启要把桌面项删掉");
+
+        // ★ 0.2.0：改名前留下的 `autostart/qsync.desktop` 也要被顺手清掉，
+        // 而且在那之前要算作「已生效」（它确实还在开机拉起 GUI）。
+        let legacy = Settings::legacy_autostart_file(&paths);
+        std::fs::write(&legacy, "老的桌面项").unwrap();
+        assert!(Settings::autostart_present(&paths), "旧名桌面项也算已生效");
+
+        s.launch_at_startup = true;
+        s.apply_autostart(&paths, Path::new("/usr/bin/qxync-gui"))
+            .unwrap();
+        assert!(!legacy.exists(), "开自启时要把旧名桌面项清掉");
+        assert!(t.exists());
+
+        s.launch_at_startup = false;
+        s.apply_autostart(&paths, Path::new("/usr/bin/qxync-gui"))
+            .unwrap();
+        assert!(!t.exists() && !legacy.exists());
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }
