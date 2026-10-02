@@ -1,0 +1,43 @@
+# qxync 的常驻同步守护（qxyncd）—— **user 单元**，不是 system 单元。
+#
+# 为什么是 user 单元：qxyncd 是「某个用户的同步客户端」—— 它用 $HOME / $XDG_RUNTIME_DIR，
+# 挂出来的 FUSE 挂载点也属于当前用户，还得能读写用户的 ~/.config/qxync 与
+# ~/.local/share/qxync。放进 system 单元反而要手工映射用户、家目录与运行目录。
+#
+# 用法（普通用户即可，**不需要 root**）：
+#     systemctl --user enable --now qxyncd     # 登录即启动 + 现在就启动
+#     systemctl --user status qxyncd
+#     journalctl --user -u qxyncd -f           # 跟日志（daemon 的 stderr 进 journald）
+#     systemctl --user stop qxyncd             # 优雅停止（卸载 FUSE 挂载 + 删 socket/pid）
+#     systemctl --user restart qxyncd
+#
+# 想让它**不登录也常驻**（开机就起、注销也不停）：
+#     sudo loginctl enable-linger "$USER"
+#
+# ⚠ 装了本单元之后，就**别再用** `qxync daemon start` / `qxync daemon stop` 管它：
+#   那条路是给「没有 systemd 单元」的用法准备的。`qxync daemon stop` 走 IPC 让进程自己退出，
+#   systemd 会看到主进程消失 —— 两边同时用只会互相打架（日志里会出现反复重启）。
+#
+# ⚠ 没有连接配置时 qxyncd 会「空转待命」（不做事但一直活着），所以这里**不需要**等网络、
+#   也不需要等登录 —— 配好连接之后它会自己转入同步，不用重启本服务。
+
+[Unit]
+Description=qxync 常驻同步守护（qxyncd）
+Documentation=https://github.com/mlzxgzy/qxync
+# 没配连接也能起来（空转待命），所以只依赖最基础的目标
+After=default.target
+
+[Service]
+# 前台运行：进程由 systemd 管，**不要**让 daemon 自己 fork（那样 systemd 就看不到它了）
+ExecStart=/usr/bin/qxyncd --foreground
+# 崩溃/被 OOM 杀掉才拉起；`systemctl stop` 是干净退出（exit 0）→ 不重启
+Restart=on-failure
+RestartSec=3
+# qxyncd 收到 SIGTERM 会卸载全部 FUSE 挂载点并删 socket/pid —— 给足时间做完这些，
+# 别到点就 SIGKILL（挂载点会留在 /proc/mounts 里）。
+TimeoutStopSec=30
+# SIGTERM 只发给主进程，超时后 cgroup 里剩下的才 SIGKILL
+KillMode=mixed
+
+[Install]
+WantedBy=default.target

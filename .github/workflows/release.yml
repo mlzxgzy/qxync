@@ -117,6 +117,7 @@ jobs:
           bsdtar -xOf "${pkgs[0]}" .PKGINFO | grep -qx "pkgver = ${want}"
           for f in usr/bin/qxync usr/bin/qxyncd usr/bin/qxync-gui \
                    usr/share/applications/qxync.desktop \
+                   usr/lib/systemd/user/qxyncd.service \
                    usr/share/icons/hicolor/512x512/apps/qxync.png; do
             bsdtar -tf "${pkgs[0]}" | grep -qx "$f" || { echo "❌ 包里缺 $f"; exit 1; }
           done

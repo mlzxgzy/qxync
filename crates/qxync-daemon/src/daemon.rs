@@ -186,6 +186,7 @@ async fn idle_until_configured(paths: &ConfigPaths, opts: &Options) -> Result<Id
     let started = Instant::now();
     let (tx, mut rx) = mpsc::channel::<()>(1);
     let mut tick = tokio::time::interval(Duration::from_secs(2));
+    let mut sigterm = terminate_signal();
     tracing::info!(
         "qxyncd 空转待命 pid={} socket={} —— 只服务 ping/status/shutdown 与设置读写",
         std::process::id(),
@@ -201,6 +202,11 @@ async fn idle_until_configured(paths: &ConfigPaths, opts: &Options) -> Result<Id
             _ = tokio::signal::ctrl_c() => {
                 cleanup_idle(&socket, &pid_path);
                 tracing::info!("收到 SIGINT（空转待命）");
+                return Ok(IdleExit::Shutdown);
+            }
+            _ = wait_sigterm(&mut sigterm) => {
+                cleanup_idle(&socket, &pid_path);
+                tracing::info!("收到 SIGTERM（空转待命）");
                 return Ok(IdleExit::Shutdown);
             }
             _ = tick.tick() => {
@@ -234,6 +240,32 @@ async fn idle_until_configured(paths: &ConfigPaths, opts: &Options) -> Result<Id
 fn cleanup_idle(socket: &Path, pid_path: &Path) {
     let _ = std::fs::remove_file(socket);
     let _ = std::fs::remove_file(pid_path);
+}
+
+/// SIGTERM 的监听器 —— **`systemd --user stop/restart` 发的就是它**。
+///
+/// 不处理的话默认动作是立刻终止：FUSE 挂载点会留在那儿、socket/pid 也不删。
+///
+/// 注册失败就退化成「永不触发」而**不是** panic：daemon 化之后 stderr 指向 `/dev/null`，
+/// panic 信息会彻底丢掉，不如让它照常跑、只少一条优雅退出路径。
+fn terminate_signal() -> Option<tokio::signal::unix::Signal> {
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!("注册 SIGTERM 处理器失败（{e}）：`systemctl stop` 会退化为直接终止");
+            None
+        }
+    }
+}
+
+/// `select!` 用的「等 SIGTERM」future：没有监听器就永远挂起。
+async fn wait_sigterm(sig: &mut Option<tokio::signal::unix::Signal>) {
+    match sig {
+        Some(s) => {
+            s.recv().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
 }
 
 /// 空转待命时的连接处理：放行 `Ping` / `Status` / `Shutdown`，以及**纯本地文件**的
@@ -508,6 +540,7 @@ pub async fn run(opts: Options) -> Result<()> {
     spawn_auto_free(state.clone());
 
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+    let mut sigterm = terminate_signal();
     loop {
         tokio::select! {
             _ = shutdown_rx.recv() => {
@@ -516,6 +549,10 @@ pub async fn run(opts: Options) -> Result<()> {
             }
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("收到 SIGINT");
+                break;
+            }
+            _ = wait_sigterm(&mut sigterm) => {
+                tracing::info!("收到 SIGTERM");
                 break;
             }
             accepted = listener.accept() => {

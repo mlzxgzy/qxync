@@ -7,7 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-02
+
+**The daemon now ships a systemd user unit**, plus a fix for a bug that left FUSE mounts behind
+on `systemctl stop`.
+
+### Added
+
+- **systemd user unit `qxyncd.service`** (`packaging/systemd/qxyncd.service`, installed into
+  `/usr/lib/systemd/user/`): `systemctl --user enable --now qxyncd` means "start at login and
+  start now", and `Restart=on-failure` brings it back after a crash; use
+  `sudo loginctl enable-linger "$USER"` to keep it running without an active login.
+  It is deliberately a **user** unit rather than a system one: qxyncd is *one user's* sync client
+  (it uses `$HOME` / `$XDG_RUNTIME_DIR`, and its FUSE mounts belong to that user), so the package
+  will **not** enable it — a `qxync-bin.install` hook prints how to enable it and warns not to mix
+  `qxync daemon start/stop` with it.
+- **The Arch package and the release tarball both carry the unit**; CI's package content check
+  now requires it too.
+
+### Fixed
+
+- **`qxyncd` now handles SIGTERM.** That is what `systemctl --user stop/restart` (and
+  systemd-logind on logout) sends; previously it was unhandled, so the default action **killed the
+  process outright** — leaving FUSE mounts in `/proc/mounts` and the socket/pid files behind. Now
+  SIGTERM takes the same graceful path as SIGINT and the IPC `shutdown` request (unmount
+  everything → remove socket/pid), and the unit sets `TimeoutStopSec=30` to give that time.
+  If registering the handler fails it does **not** panic (a daemonised panic would vanish into
+  `/dev/null`) — it logs a warning and simply loses that exit path.
+
+### Changed
+
+- Version → 0.2.2; release notes renamed to `docs/发布说明-v0.2.2.md`.
+
 ## [0.2.1] - 2026-10-02
+
+> **This version was never released either** (no tag). The first actual release is **0.2.2**.
 
 **The daemon can now keep running with no NAS configured at all.** `qxyncd` used to require a
 link config (`~/.config/qxync/links/<id>.json`) at startup and **exit outright** when it was
@@ -42,7 +76,7 @@ directly contradicts running it permanently in the background. The GUI even poin
 ## [0.2.0] - 2026-10-02
 
 > **This version was never released on its own** (no tag was pushed). The first actual release is
-> **0.2.1**, which contains all of the rename work below — the section is kept because the rename
+> **0.2.2**, which contains all of the rename work below — the section is kept because the rename
 > deserves its own entry.
 
 **The rename release: the command line is now `qxync`, not `qsync`.** The old name fought the
