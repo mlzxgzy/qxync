@@ -650,7 +650,6 @@ mod tests {
             insecure: true,
             user: "test1".into(),
             home_root: "/home".into(),
-            roots: Vec::new(),
             ipv4_only: false,
             exclude: Vec::new(),
             filter_temp: true,

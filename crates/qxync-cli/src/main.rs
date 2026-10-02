@@ -112,9 +112,9 @@ enum Cmd {
     Mount {
         /// 本地挂载点
         mountpoint: PathBuf,
-        /// 远端根（可重复：`--remote /home --remote /Public`）；默认 /home
+        /// 这一个 NAS 文件夹（一对一）；默认 /home
         #[arg(long = "remote", default_value = HOME_ROOT)]
-        remote: Vec<String>,
+        remote: String,
         /// 水合缓存目录（默认 ~/.local/share/qxync/cache）
         #[arg(long)]
         cache_dir: Option<PathBuf>,
@@ -336,10 +336,10 @@ enum TaskAction {
         /// 本地挂载点（绝对路径，不存在会被创建）
         #[arg(long)]
         mountpoint: PathBuf,
-        /// NAS 目录（★ 一对一：任务只接受**一个**；不填 = 用 link 的 home_root。
-        /// 要同步多个目录请分建多个任务；多根挂载用 `qxync mount --remote A --remote B`）
+        /// 这一个 NAS 文件夹（一对一）；不填 = 用 link 的 home_root。
+        /// 要同步多个 NAS 文件夹请分建多个任务。
         #[arg(long = "root")]
-        roots: Vec<String>,
+        root: Option<String>,
         /// 读写挂载（默认只读）
         #[arg(long)]
         read_write: bool,
@@ -477,7 +477,6 @@ fn resolve_link(cli: &Cli) -> Result<LinkConfig> {
             user: u.clone(),
             home_root: HOME_ROOT.to_string(),
             // ★ M6：未配 roots 时由 `LinkConfig::roots()` 退回家目录根
-            roots: Vec::new(),
             ipv4_only: cli.ipv4,
             // ★ M7：登录时先不定选择性同步规则（改 link JSON 后重启 daemon 生效）
             exclude: Vec::new(),
@@ -783,14 +782,12 @@ async fn main() -> Result<()> {
             // ★ M8.4：直连模式不接冲突策略（引擎在 daemon 侧）
             conflict: _,
         } => {
-            // 直连模式的 FUSE 进程只挂一个根；多根需要 daemon 侧合成视图。
-            if remote.len() > 1 {
-                bail!("多根挂载需要 daemon：先 `qxync daemon start`（或用 --via-daemon）");
-            }
-            let remote = remote
-                .first()
-                .cloned()
-                .unwrap_or_else(|| HOME_ROOT.to_string());
+            // 直连模式（进程内 FUSE）：一对一，就挂这一个 NAS 文件夹
+            let remote = if remote.trim().is_empty() {
+                HOME_ROOT.to_string()
+            } else {
+                remote.clone()
+            };
             let (client, link) = connect(&cli, true).await?;
             let cache = cache_dir.clone().unwrap_or_else(|| {
                 paths()
@@ -951,8 +948,7 @@ fn to_request(cli: &Cli) -> Option<Request> {
             conflict,
         } => Request::Mount {
             mountpoint: mountpoint.clone(),
-            remote: Some(remote[0].clone()),
-            roots: Some(remote.clone()),
+            remote: Some(remote.clone()),
             cache_dir: cache_dir.clone(),
             threads: Some(*threads),
             auto_unmount: Some(*auto_unmount),
@@ -1055,7 +1051,7 @@ fn to_request(cli: &Cli) -> Option<Request> {
             TaskAction::Add {
                 id,
                 mountpoint,
-                roots,
+                root,
                 read_write,
                 cache_mode,
                 conflict,
@@ -1068,7 +1064,7 @@ fn to_request(cli: &Cli) -> Option<Request> {
                         qxync_core::tasks::Task::from_mount(
                             Some(id.clone()),
                             mountpoint.clone(),
-                            roots.clone(),
+                            root.clone(),
                             *read_write,
                             cache_mode.clone(),
                             None,
@@ -1306,15 +1302,10 @@ async fn route_via_daemon(
         }
         Cmd::Mount { rw, .. } => {
             let m: MountInfo = ipc_client::call(&socket, req).await?;
-            let roots = if m.roots.is_empty() {
-                m.remote.clone()
-            } else {
-                m.roots.join(", ")
-            };
             println!(
                 "✅ 已挂载 {} -> {}（{}，daemon 持有，pid 见 `qxync daemon status`）",
                 m.mountpoint.display(),
-                roots,
+                m.remote,
                 if *rw { "读写" } else { "只读" }
             );
         }
@@ -1946,45 +1937,9 @@ fn print_peer(d: &PeerData) {
     }
 }
 
-/// ★ M6：远端根一览（配置的 roots + NAS 同步文件夹 + 可读/可写判定）。
+/// NAS 目录一览（家目录根 + NAS 上登记的同步文件夹）。
 fn print_roots(d: &RootsData) {
     println!("家目录根  : {}", d.home_root);
-    println!(
-        "配置的根  : {}",
-        if d.configured.is_empty() {
-            "（无）".to_string()
-        } else {
-            d.configured.join(", ")
-        }
-    );
-    if d.roots.is_empty() {
-        println!("根列表    : （无）");
-    } else {
-        println!("根列表    :");
-        for r in &d.roots {
-            let view = if r.view_name.is_empty() {
-                "-"
-            } else {
-                r.view_name.as_str()
-            };
-            let readable = if r.readable {
-                "可读".to_string()
-            } else {
-                match &r.note {
-                    Some(n) => format!("不可读：{n}"),
-                    None => "不可读".to_string(),
-                }
-            };
-            println!(
-                "  {} {:<12} 视图名 {:<10}{}   {}",
-                if r.readable { "✅" } else { "❌" },
-                r.remote,
-                view,
-                if r.writable { "可写" } else { "只读" },
-                readable
-            );
-        }
-    }
     if d.syncing_folders.is_empty() {
         println!("NAS 同步文件夹 : （无 —— 该账号没有在 Qsync 里配同步文件夹）");
     } else {
@@ -2370,7 +2325,7 @@ async fn run_task_cmd(
         TaskAction::Add {
             id,
             mountpoint,
-            roots,
+            root,
             read_write,
             cache_mode,
             cache_dir,
@@ -2381,7 +2336,7 @@ async fn run_task_cmd(
             let task = qxync_core::tasks::Task::from_mount(
                 Some(id.clone()),
                 mountpoint.clone(),
-                roots.clone(),
+                root.clone(),
                 *read_write,
                 cache_mode.clone(),
                 None,
@@ -2539,11 +2494,7 @@ fn print_tasks(d: &TasksData) {
             t.id,
             if ti.mounted { "已挂载" } else { "未挂载" },
             t.mountpoint.display(),
-            if t.roots.is_empty() {
-                "(link home_root)".to_string()
-            } else {
-                t.roots.join(",")
-            }
+            t.root.clone().unwrap_or_else(|| "(link home_root)".to_string())
         );
         println!(
             "       模式={} 方向={} 节省空间={} 智能删除={} 排除规则={} 选择性={}",

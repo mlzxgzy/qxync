@@ -48,7 +48,7 @@ NAS 上的文件在本地只是一个「占位符」，`ls -l` 显示真实大�
 | **变更发现** | 三游标轮询 + baseline 三向对账；冲突生成**冲突副本**，远端批量删除有**熔断**保护 | [M2c](docs/M2c-变更发现.md) |
 | **脱水（释放空间）** | 完整安全检查链（pin / 未上传改动 / 打开的 fd / 被 mmap / 正在水合 / 刚访问过）后才清本地内容 | [M3](docs/M3-脱水.md) |
 | **本地状态库** | SQLite 承载游标 / baseline / pin / 上传队列，**同一事务**落盘；librsync 兼容的 delta 编解码 + 能力门控 | [M5](docs/M5-SQLite与delta.md) |
-| **多根 / 共享文件夹** | `roots` 配置多根；家目录可读写，非家目录根在 FUSE 层直接 `EROFS` | [M6](docs/M6-多根与共享文件夹.md) |
+| **共享文件夹（只读）** | NAS 文件夹**一对一**配到本地；家目录可读写，非家目录（共享文件夹）只能只读挂载 | [M6](docs/M6-多根与共享文件夹.md) · [CHANGELOG](CHANGELOG.md) |
 | **选择性同步** | gitignore 风味的 `exclude` 规则（锚定 / `**` / 反向包含 / 子树剪枝）+ 内置临时文件过滤 | [M7](docs/M7-选择性同步与LAN直连.md) |
 | **LAN 直连** | qxync↔qxync 自研对等协议：设备配对、事件快路径、本地区间直传（失败一律静默回落 NAS） | [M7](docs/M7-选择性同步与LAN直连.md) |
 | **同步任务** | `tasks/<id>.json` 持久化的挂载登记，逐任务暂停/继续，重启可 `--restore-tasks` 恢复 | [M8](docs/M8-向Qsync-Client-6靠拢.md) |
@@ -239,7 +239,7 @@ qxync-gui ────┘                              ├── 同步引擎（
 
 ```
 crates/
-├── qxync-core/        共享类型 + 配置布局 + 状态库（SQLite）+ delta 编解码 + 多根布局 + 规则引擎
+├── qxync-core/        共享类型 + 配置布局 + 状态库（SQLite）+ delta 编解码 + 单根归一化 + 规则引擎
 ├── qxync-client/      NAS HTTP API 封装（登录 / 元数据 / 上传下载）+ LAN 对等协议
 ├── qxync-fuse/        FUSE 层：只读/读写挂载 + 区间水合 + 脱水（含上传队列）
 ├── qxync-daemon/      二进制 qxyncd：常驻进程 + IPC 服务端 + 同步引擎 + 对端监听
@@ -281,14 +281,14 @@ pin=pinned/excluded、未上传改动/队列在途、打开的 fd、被 mmap（�
 「游标推了、baseline 没推」。老 `cursors.json`/`baseline.json` 首次启动自动迁移并归档成
 `*.json.migrated`（保留备份、幂等）。
 
-**多根只在挂载点这一层加名字映射**：link 配置 `roots`（默认 `["/home"]`），
-多根时挂载点顶层出现每个根的名字（`home/`、`Public/`），**下面所有层（缓存/baseline/pin/xattr/
-上传队列）仍用远端路径做键**。单根是**直通**（挂载点就是那个根），M1–M5 的行为一字不改 ——
-`roots.rs` 里专门有一条「单根必须还是 Passthrough」的断言守着这件事。
+**一对一：一个挂载点 = 一个 NAS 文件夹**。挂载点里**直接**就是那个文件夹的内容
+（配 `/home` 就看到家目录，不会多出 `home/` 这一层）。缓存 / baseline / pin / xattr / 上传队列
+全都以远端路径为键，link 的 `home_root` 只是「没写 NAS 文件夹时」的默认值。
 
-> ★ 「配对文件夹」（GUI 任务 / `qxync task`）**是一对一**的：一个本地文件夹 ⇄ 一个 NAS 目录，
-> 挂载点里**直接**就是那个 NAS 目录（不会多出 `home/` 这一层）。多根挂载只活在
-> `qxync mount --remote A --remote B` 这条路上，**不登记任务**；要同步多个 NAS 目录就建多个任务。
+> ★ 2026-10-02：**一对多（多根挂载）已整体删除**（`roots` 配置、`--remote A --remote B`、
+> FUSE 虚拟根、旧任务里的多根 `roots` 数组都不再存在）。要同步多个 NAS 文件夹就建多个任务
+> —— 一个任务 = 一个本地文件夹 + 一个 NAS 文件夹。旧文件里单个 `roots` 自动迁移成 `root`，
+> 多个 `roots` 会在任务列表里报成坏文件（提示拆成多个任务），不会静默缩小同步范围。
 
 ## 已知限制
 
@@ -403,20 +403,21 @@ pin=pinned/excluded、未上传改动/队列在途、打开的 fd、被 mmap（�
     `versioning_support` 全 0 —— 真正的判据是「**有没有历史版本**」，
     只看端点存在会得出完全错误的结论。
 
-**多根 / 共享文件夹**
+**共享文件夹 / NAS 目录**
 
 30. **共享文件夹「能读不能写」**：只要账号有读权限，用普通 `sid` 就能列 / stat / 下载
     （`/Public`、`/Multimedia` 实测通过），**不需要** `auth_data` AES；但上传必须是 Qsync
-    同步文件夹，否则服务端只回一句含糊的 `status:20`。所以非家目录根一律按只读处理，
-    写操作在 FUSE 层直接回 `EROFS`。
+    同步文件夹，否则服务端只回一句含糊的 `status:20`。所以**非家目录一律只读**：
+    配对到共享文件夹的任务会被强制按只读挂载（`daemon::mount()` 里判 `remote != home_root`）。
 31. **顶层共享列表枚举不出来**：`get_list /` 对普通用户是 `status:5`；
-    `qbox_get_syncing_folder_list` 返回的是「NAS 上登记过同步的文件夹」
-    → 根只能由用户配置，不能自动发现。端点 200 但空数组不是错误。
-32. **多根绝不能动单根那条路**：多根逻辑全部以 `multi_root` 为开关；
-    否则 M1–M5 的 FUSE 矩阵会整体失效。
-33. **脱水候选与 mmap 映射必须按根展开**：否则同一个文件被每个根各算一遍
-    （`freed_bytes` 翻倍），更糟的是 mmap 映射错了会让「被 mmap 的文件不脱水」
-    这条安全检查失守 —— 直接违反脱水铁则。
+    能列举的只有 `qbox_get_syncing_folder_list`（NAS 上登记过同步的文件夹）
+    → 「NAS 文件夹」要**让用户选**（下拉 + `ls` 逐层浏览 + 手输兜底），不能自动发现。
+    端点 200 但空数组不是错误。
+32. **一对一**：一个挂载点 = 一个 NAS 文件夹。「一对多」在 2026-10-02 **整体删除**
+    （`roots` 配置、多根虚拟根、旧任务的多根数组），原因与影响见 CHANGELOG。
+33. **NAS 上报字段必须按真机解析**：`qbox_get_syncing_folder_list` 真机返回的是
+    `name` / `path` / `privilege`，不是早期照着想象的 `folder` / `permission` ——
+    按错的字段读，会把「能列举」判成「列不出来」，功能就在那里却用不上。
 
 **GUI**
 
@@ -457,11 +458,10 @@ cargo test --workspace                                   # 单测 + 文档测试
 xtask/tests/fuse-matrix.sh            # 68 项：区间水合 / 写路径 / 变更发现 / 脱水 / 状态库（~12min）
 xtask/tests/fuse-matrix.sh --big      #    追加 128 MiB 全量读 + 并发去重
 xtask/tests/m5-matrix.sh              # 30 项
-xtask/tests/m6-matrix.sh              # 29 项（多根真挂载）
 xtask/tests/m7-matrix.sh              # 60 项（规则 / FUSE 过滤 / LAN 配对·事件·直传）
 xtask/tests/m7-matrix.sh --no-nas     #    不需要 NAS：单测 + 两个真 daemon 的 loopback
 xtask/tests/m82-matrix.sh             # 37 项（任务登记 / 重启恢复）
-xtask/tests/pair-1to1.sh              # 15 项（一对一配对 + 目的地冲突；不需要 NAS）
+xtask/tests/pair-1to1.sh              # 17 项（一对一配对 + 目的地冲突；不需要 NAS）
 xtask/tests/m83-matrix.sh             # 27 项（日志 schema 迁移 / 过滤 / 轮转）
 xtask/tests/m84-matrix.sh             # 92 项（设置 / 代理 / 托盘 / 释放空间 / 冲突策略）
 xtask/tests/gui-matrix.sh             # 148 项（9 个目的地真窗口截图 + ui_spec 静态自检）
@@ -496,7 +496,7 @@ cargo test -p qxync-daemon -- --ignored --test-threads=1 --nocapture     # M2c �
 | [`docs/M3-脱水.md`](docs/M3-脱水.md) | 安全检查链、`inval_inode` 顺序铁则、闲置/限额、cache-mode |
 | [`docs/M4-GUI.md`](docs/M4-GUI.md) | GUI 边界、命令面、页面结构、验收与踩坑 |
 | [`docs/M5-SQLite与delta.md`](docs/M5-SQLite与delta.md) | 状态库 schema/迁移/单事务、真机 versioning 探测、delta 能力门控 |
-| [`docs/M6-多根与共享文件夹.md`](docs/M6-多根与共享文件夹.md) | 多根布局/只读规则、真机共享文件夹探测、FUSE 虚拟根 |
+| [`docs/M6-多根与共享文件夹.md`](docs/M6-多根与共享文件夹.md) | **历史文档**：多根布局（已删除）、只读规则、真机共享文件夹探测 |
 | [`docs/M7-选择性同步与LAN直连.md`](docs/M7-选择性同步与LAN直连.md) | exclude 规则引擎、对等协议线格式、事件快路径、直传 |
 | [`docs/M8-向Qsync-Client-6靠拢.md`](docs/M8-向Qsync-Client-6靠拢.md) | GUI 改造研究 + M8.1–M8.6 执行方案与决策记录 |
 | [`docs/验收记录.md`](docs/验收记录.md) | 里程碑级验收结论（跑了什么、结果是什么） |

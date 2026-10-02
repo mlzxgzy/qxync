@@ -10,11 +10,11 @@
 #     link 是一份指向 `nas.invalid` 的假配置 —— `tasks save` 不碰 NAS。
 #
 # 验的是什么（对应 2026-10-02 的用户反馈 + CHANGELOG「未发布」）:
-#   ① 一对一：一个任务只接受**一个** NAS 目录，多根被拒且**不落盘**；
+#   ① 一对一：一个任务只接受**一个** NAS 文件夹（CLI 层 `--root` 只能给一次）；
 #   ② 目的地冲突（本地文件夹相同 / 互相嵌套）→ 提交即拒，错误里点名冲突任务；
 #   ③ 同一个 NAS 目录被别的任务用了 → **只警告不拦**（只读挂同一目录是合法用法，
 #      `m82-matrix.sh` 的 t1/t2 就靠这条）；
-#   ④ 旧的多根任务文件仍能读、仍能列（升级不会把已有任务变成坏文件）。
+#   ④ 旧的多根任务文件：单个根自动迁移；多个根报成 bad_file（不静默缩小同步范围）。
 #
 # 本矩阵**只用自己私有的 XDG 目录**（$RUNDIR），不碰其它矩阵与用户的真实配置。
 set -uo pipefail
@@ -44,7 +44,7 @@ export XDG_DATA_HOME="$RUNDIR/data"
 # ⚠️ 假 link：daemon 要有 link 才进「同步模式」（没 link 时它空转待命，只服务 ping/status）。
 cat > "$XDG_CONFIG_HOME/qxync/links/default.json" <<'JSON'
 {"id":"default","host":"nas.invalid","port":9834,"https":true,"insecure":true,
- "user":"test1","home_root":"/home","roots":["/home"]}
+ "user":"test1","home_root":"/home"}
 JSON
 
 "$DAEMON" --socket "$SOCK" --foreground >"$LOG" 2>&1 &
@@ -62,15 +62,16 @@ taskadd() { "$QS" --socket "$SOCK" task add "$@" --json 2>&1; }
 echo "== 1. 一对一：正常登记 =="
 OUT="$(taskadd --id t1 --mountpoint "$RUNDIR/m1" --root /home --no-mount)"
 check $? "t1 登记成功"
-echo "$OUT" | jq -e '.saved.saved == true and (.saved.task.roots == ["/home"])' >/dev/null
-check $? "roots 落盘为单元素 [\"/home\"]"
+echo "$OUT" | jq -e '.saved.saved == true and (.saved.task.root == "/home")' >/dev/null
+check $? "root 落盘为单个 \"/home\""
 
-echo "== 2. 一对一：多根被拒（且不落盘） =="
-OUT="$(taskadd --id tmany --mountpoint "$RUNDIR/mmany" --root /home --root /Public --no-mount)"
+echo "== 2. 一对多：CLI 根本表达不出来（--root 只能给一次） =="
+OUT="$("$QS" --socket "$SOCK" task add --id tmany --mountpoint "$RUNDIR/mmany" \
+  --root /home --root /Public --no-mount --json 2>&1)"
 RC=$?
-check "$([ "$RC" -ne 0 ] && echo 0 || echo 1)" "多根登记被拒（rc=$RC）"
-echo "$OUT" | grep -q "只能有一个 NAS 目录"
-check $? "错误信息说明「只能有一个 NAS 目录」"
+check "$([ "$RC" -ne 0 ] && echo 0 || echo 1)" "给两个 --root 直接被 clap 拒（rc=$RC）"
+echo "$OUT" | grep -qi "cannot be used multiple times\|只能给一次\|multiple"
+check $? "错误说明参数不能重复"
 [ ! -f "$XDG_CONFIG_HOME/qxync/tasks/tmany.json" ]
 check $? "被拒后没有落盘 tmany.json"
 
@@ -98,16 +99,24 @@ check $? "响应里带 warnings"
 echo "$OUT" | jq -r '.saved.warnings[0]' | grep -q "t1"
 check $? "warnings 里点名 t1"
 
-echo "== 6. 旧的多根任务文件：仍可读（不变成坏文件） =="
+echo "== 6. 旧的多根任务文件：单个根迁移、多个根报错（不静默缩小范围） =="
 mkdir -p "$XDG_CONFIG_HOME/qxync/tasks"
-cat > "$XDG_CONFIG_HOME/qxync/tasks/legacy.json" <<'JSON'
-{"id":"legacy","name":"legacy","enabled":false,"mountpoint":"/tmp/qxync-legacy-mnt","roots":["/home","/Public"]}
+cat > "$XDG_CONFIG_HOME/qxync/tasks/legacy1.json" <<'JSON'
+{"id":"legacy1","name":"legacy1","enabled":false,"mountpoint":"/tmp/qxync-legacy-mnt","roots":["/home/"]}
+JSON
+cat > "$XDG_CONFIG_HOME/qxync/tasks/legacy2.json" <<'JSON'
+{"id":"legacy2","name":"legacy2","enabled":false,"mountpoint":"/tmp/qxync-legacy2-mnt","roots":["/home","/Public"]}
 JSON
 OUT="$("$QS" --socket "$SOCK" task list --json 2>&1)"
-echo "$OUT" | jq -e '.tasks[] | select(.task.id=="legacy") | .task.roots == ["/home","/Public"]' >/dev/null
-check $? "legacy 多根任务仍能列出、roots 原样保留"
-echo "$OUT" | jq -e '.bad_files | length == 0' >/dev/null
-check $? "legacy 没有被算成 bad_files"
+echo "$OUT" | jq -e '.tasks[] | select(.task.id=="legacy1") | .task.root == "/home"' >/dev/null
+check $? "旧文件里单个 roots → 自动迁移成 root"
+KEPT=$(ls "$XDG_CONFIG_HOME/qxync/tasks/" | tr '\n' ' ')
+echo "$KEPT" | grep -q "legacy1.json"
+check $? "迁移后的文件还在（$KEPT）"
+echo "$OUT" | jq -e '[.bad_files[] | select(.[0] | contains("legacy2.json"))] | length == 1' >/dev/null
+check $? "旧文件里多个 roots → 报成 bad_file（说明要拆成多个任务）"
+echo "$OUT" | jq -r '.bad_files[0][1]' | grep -q "旧的多根格式"
+check $? "错误信息说明「旧的多根格式」"
 
 echo
 echo "结果：通过 $PASS / 失败 $FAIL"

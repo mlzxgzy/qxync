@@ -38,7 +38,6 @@ fn env_creds() -> Option<(LinkConfig, String)> {
             user,
             home_root: HOME_ROOT.to_string(),
             // 本测试只看 NAS 上报的同步文件夹，不配置任何额外根（空 = 只用家目录）。
-            roots: Vec::new(),
             ipv4_only: std::env::var("QXNYC_TEST_IPV4").is_ok(),
             exclude: Vec::new(),
             filter_temp: true,

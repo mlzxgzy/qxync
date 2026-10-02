@@ -7,30 +7,47 @@
 
 ## [未发布]
 
-**「配对文件夹」终于是一对一了**：一个本地文件夹 ⇄ 一个 NAS 文件夹，挂载点里**直接**
-就是那个 NAS 目录（不再多套一层 `home/`）；NAS 侧改成下拉选择（候选来自 NAS 上登记的
-Qsync 同步文件夹 + 已配置的 NAS 目录），选不到还能逐层浏览或手输。提交时会检查目的地冲突。
+**一对多整体删除，只留一对一**：一个挂载点 = 一个 NAS 文件夹，挂载点里**直接**就是那个
+文件夹的内容（配 `/home` 就看到家目录，不再多套一层 `home/`）。NAS 侧改成下拉选择
+（候选 = NAS 上登记的 Qsync 同步文件夹 + 家目录），选不到还能逐层浏览或手输；
+提交时会检查目的地冲突。**不保留任何兼容**：旧的 `roots` 配置、多根挂载、多根任务数组
+都不再存在（见下）。
+
+### 删除（破坏性）
+
+- **一对多（多根）能力整体移除**，涉及这些曾经存在的入口：
+  * link 配置里的 `roots`（连接页「高级：同步范围」那一格没有了，只留 `home_root`）；
+  * `qxync mount --remote A --remote B` —— 现在 `--remote` 只能给一次，`--root` 同理；
+  * FUSE 的**虚拟根**（`ViewLayout::Multi` / `RootSpec` / `QxyncFs::new_multi` /
+    `multi_root` 分支）与 `MountInfo.roots`、`RootsData.configured` / `roots`；
+  * 任务里的 `roots: Vec<String>` → `root: Option<String>`（一个任务一个 NAS 文件夹）。
+- **旧的多根任务文件**：没有兼容保留。文件里只有一个 `roots` 条目 → 自动迁移成 `root`；
+  有多个条目 → 在任务列表里报成 `bad_file`（错误信息写明「旧的多根格式，请为每个 NAS
+  文件夹各建一个任务」）。**不会静默缩小同步范围**。
+- `xtask/tests/m6-matrix.sh`（29 项多根矩阵）随功能删除；`docs/M6-多根与共享文件夹.md`
+  标注为历史文档（仍有效的结论「共享文件夹能读不能写」保留在 README §踩坑 30–33）。
 
 ### 新增
 
 - **「NAS 文件夹」下拉 + 「浏览…」选择器**。以前是一格 textarea（每行一个 NAS 目录），
   既看不出 NAS 上有哪些目录、也不该让人手打路径。现在：
-  * 候选一：NAS 上登记的 Qsync 同步文件夹（`qbox_get_syncing_folder_list&detail=1`），
-    并把共享路径映射成客户端路径（`/share/homes/<user>/x` → `/home/x`，真机 HAR 有直接证据）；
-  * 候选二：连接页「高级：同步范围」里已配置的 NAS 目录；
+  * 候选：NAS 上登记的 Qsync 同步文件夹（`qbox_get_syncing_folder_list&detail=1`），
+    并把共享路径映射成客户端路径（`/share/homes/<user>/x` → `/home/x`，真机 HAR 有直接证据）
+    + 家目录；
   * 「浏览…」= 逐层点目录挑（复用文件页的 `ls`），「手动输入」兜底任意路径。
 - **GUI 静态合规性单测**（`cargo test -p qxync-gui` 的 `ui_spec_is_green`）：文案键齐全 /
   无 HTML 拼接 / 无障碍与四态标记，改界面忘了补 i18n 会直接测试失败。
-- **`xtask/tests/pair-1to1.sh`（15 项，不需要 NAS / 不需要 FUSE）**：起一个私有 daemon
-  （假 link，只走 `tasks save`）验一对一拒绝多根、目的地冲突拦/提示的分工、旧多根任务仍可读。
+- **`xtask/tests/pair-1to1.sh`（17 项，不需要 NAS / 不需要 FUSE）**：起一个私有 daemon
+  （假 link，只走 `tasks save`）验一对一登记、`--root` 重复被拒、目的地冲突拦/提示的分工、
+  旧文件单个 `roots` 迁移 / 多个 `roots` 报错。
 
 ### 变更
 
-- **配对文件夹 = 一对一映射**。任务只接受**一个** NAS 目录；多根挂载（`qxync mount
-  --remote /home --remote /Public`，M6）仍然可用，但**不再登记成任务** —— 任务层只表达
-  「一个本地文件夹 ⇄ 一个 NAS 目录」。旧的多根任务文件照样能读、能挂、能暂停（升级不会
-  把已有任务变成坏文件），但界面会给出提示，编辑保存一次即收敛成一个目录。
-- `qxync roots` 的「NAS 同步文件夹」一行现在打印**客户端路径**（`client_path`），
+- **非家目录一律强制只读**：一对多删掉之后，单个根也可能是共享文件夹，所以
+  `daemon::mount()` 里按「是不是 `home_root`」判定可写性（实测服务端会拒绝往非 Qsync
+  同步文件夹上传，`status:20`），请求 `--rw` 也会被降级成只读并记一条 warn。
+- `qxync roots` 现在只列「家目录 + NAS 上登记的同步文件夹」（不再逐根探测可读性，也不再有
+  「配置的根」）；`qxync roots` 的「NAS 同步文件夹」一行打印**客户端路径**（`client_path`），
   映射不出来时显示共享路径并标注。
 
 ### 修复
@@ -40,12 +57,13 @@ Qsync 同步文件夹 + 已配置的 NAS 目录），选不到还能逐层浏览
   去读 —— 于是只要 NAS 上真登记了同步文件夹，界面就会显示成「空名字 + 0 权限」，
   把「能列举」误判成「列不出来」。现在两种拼法都认（真机字段优先），并补了 HAR 原文的
   回归测试（`syncing_folders_real_machine_response_is_not_lost`）。
-- **任务 `roots` 留空时挂的其实不是 link 的 `home_root`**。GUI 结果行与 `Task` 的注释都写
+- **任务的默认 NAS 文件夹以前不是 link 的 `home_root`**。GUI 结果行与 `Task` 的注释都写
   「由 link 决定」，但 daemon 落的是编译期常量 `/home`（`mount()` 的默认值）；改过
-  `home_root` 的用户会静默挂到 `/home`。现在真的用 `link.home_root`。
+  `home_root` 的用户会静默挂到 `/home`。现在统一走 `Task::effective_root(link.home_root)`。
 - **提交时检查目的地冲突**：本地文件夹与别的任务重复或互相嵌套 → **拒绝保存**并说明是哪个
-  任务（嵌套挂载会互相遮挡）；同一个 NAS 目录被别的任务用了 → **只提示**（只读挂同一目录是
-  合法用法，`m82-matrix.sh` 的 t1/t2 就靠它），两个任务都读写时会明确写出「双向写会打架」。
+  任务（嵌套挂载会互相遮挡）；同一个 NAS 文件夹被别的任务用了 → **只提示**（只读挂同一个
+  文件夹是合法用法，`m82-matrix.sh` 的 t1/t2 就靠它），两个任务都读写时会明确写出
+  「双向写会打架」。
 
 ## [0.2.3] - 2026-10-02
 

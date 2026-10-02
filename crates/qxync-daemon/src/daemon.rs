@@ -10,7 +10,7 @@ use qxync_core::ipc::{
     decode_line, encode_line, mask_sid, mask_token, CacheInfo, CursorInfo, DaemonInfo,
     DecisionInfo, DecisionsData, DehydrateData, ErrorKind, FileStateInfo, FileStatesData, GetData,
     HydroStats, IpcError, JournalData, LinkInfo, LoginData, LsData, MountInfo, PeerData, PingData,
-    PutData, Request, RequestEnvelope, Response, RootInfo, RootsData, RulesData, ServerInfo,
+    PutData, Request, RequestEnvelope, Response, RootsData, RulesData, ServerInfo,
     SessionInfo, SettingsData, ShutdownData, SpaceData, StatusData, StoreData, SyncCursors,
     SyncInfo, TaskInfo, TasksData, IPC_VERSION,
 };
@@ -18,7 +18,7 @@ use qxync_core::rules::Rules;
 use qxync_core::settings::{ProxySpec, Settings};
 use qxync_core::store::JournalEntry;
 use qxync_core::tasks::{conflict_label, has_any_task, Task, CONFLICT_RENAME_LOCAL};
-use qxync_core::{ConfigPaths, Credentials, Error as CoreError, LinkConfig, PeerConfig, HOME_ROOT};
+use qxync_core::{ConfigPaths, Credentials, Error as CoreError, LinkConfig, PeerConfig};
 use qxync_fuse::upload::UploadQueue;
 use qxync_fuse::{CacheMode, FsHandle, HydroCounters, LocalView, MountHandle, PinMap, QxyncFs};
 use std::collections::HashMap;
@@ -653,7 +653,6 @@ async fn dispatch(state: &Arc<State>, req: Request, shutdown: &mpsc::Sender<()>)
         Request::Mount {
             mountpoint,
             remote,
-            roots,
             cache_dir,
             threads,
             auto_unmount,
@@ -674,7 +673,10 @@ async fn dispatch(state: &Arc<State>, req: Request, shutdown: &mpsc::Sender<()>)
                     Task::from_mount(
                         task.clone(),
                         mountpoint.clone(),
-                        roots.clone().unwrap_or_default(),
+                        remote
+                            .clone()
+                            .filter(|r| !r.trim().is_empty())
+                            .map(|r| qxync_core::normalize_root(&r)),
                         read_write.unwrap_or(false),
                         cache_mode.clone(),
                         threads,
@@ -689,23 +691,10 @@ async fn dispatch(state: &Arc<State>, req: Request, shutdown: &mpsc::Sender<()>)
             } else {
                 None
             };
-            // ★ 一对一：`mount --remote A --remote B` 照挂（M6 多根视图保留），
-            //   但**不再登记成任务** —— 任务层只表达「一个本地文件夹 ⇄ 一个 NAS 文件夹」。
-            let reg = match reg {
-                Some(t) => match t.ensure_one_root() {
-                    Ok(()) => Some(t),
-                    Err(e) => {
-                        tracing::warn!("不登记任务（挂载本身不受影响）：{e}");
-                        None
-                    }
-                },
-                None => None,
-            };
             let out = mount(
                 state,
                 mountpoint,
                 remote,
-                roots,
                 cache_dir,
                 threads.unwrap_or(4),
                 auto_unmount.unwrap_or(false),
@@ -1003,7 +992,7 @@ async fn status(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
             https: state.link.https,
             user: state.link.user.clone(),
             ipv4_only: state.link.ipv4_only,
-            roots: state.link.roots(),
+            home_root: state.link.root(),
         }),
         logged_in,
         session: session.map(|s| SessionInfo {
@@ -1188,61 +1177,30 @@ fn store_info(state: &Arc<State>, integrity: bool) -> Result<serde_json::Value, 
     to_value(data)
 }
 
-/// ★ M6：远端根一览（`qxync roots`）—— 配置的根 + NAS 同步文件夹 + 可读/可写判定。
+/// `qxync roots` / GUI 的「NAS 目录」面板：**家目录根 + NAS 上登记的同步文件夹**。
 ///
-/// 可写性规则：**只有家目录根可写**。实测（2026-10-01）普通账号向 `/Public` 上传会被服务端
-/// 拒绝（`status:20`：非 Qsync 同步文件夹没有写权限），而 `qbox_get_syncing_folder_list`
-/// 在该账号上返回空 —— 所以共享文件夹默认只读，写操作在 FUSE 层直接回 `EROFS`。
+/// 这就是一对一配对时能选的 NAS 文件夹来源。这里**不再**做「把每个根列一遍」的可读性探测
+/// —— 那会真的把整个目录列出来（贵），而且一对多删掉之后也没有「多个根」要探了。
+/// 选中某个文件夹之后，`ls` 会如实告诉你能不能读。
+///
+/// 可写性规则（保留自 M6 的实测结论）：**只有家目录根可写** —— 普通账号往非 Qsync
+/// 同步文件夹上传会被服务端拒绝（`status:20`）。
 async fn roots_cmd(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
-    let home_root = state.link.home_root.clone();
-    let configured = state.link.roots();
-    let layout = qxync_core::roots::layout(&configured, Some(home_root.as_str()));
-    let mut roots: Vec<RootInfo> = match &layout {
-        qxync_core::roots::ViewLayout::Passthrough { root } => vec![RootInfo {
-            remote: root.clone(),
-            view_name: String::new(),
-            writable: true,
-            readable: false,
-            note: None,
-        }],
-        qxync_core::roots::ViewLayout::Multi { entries } => entries
-            .iter()
-            .map(|e| RootInfo {
-                remote: e.remote.clone(),
-                view_name: e.view_name.clone(),
-                writable: e.writable,
-                readable: false,
-                note: None,
-            })
-            .collect(),
-    };
-
+    let home_root = state.link.root();
     let logged_in = current_session(state).await.is_some();
-    let mut syncing = Vec::new();
-    if logged_in {
-        // 可读性探测：把每个根列一遍（显式命令才做；根目录通常不大）
-        for r in roots.iter_mut() {
-            match with_client!(state, |c| c.list(&r.remote)) {
-                Ok(_) => r.readable = true,
-                Err(e) => {
-                    r.readable = false;
-                    r.note = Some(e.message.clone());
-                }
-            }
-        }
-        syncing = with_client!(state, |c| c.syncing_folders()).unwrap_or_default();
-    }
-
-    // ★ 措辞：用户看到的是「要同步的 NAS 目录」，「远端根」只在文档/字段名里出现。
-    let note = if logged_in {
-        "家目录以外的目录默认只读：服务端会拒绝往非 Qsync 同步文件夹上传（status 20）".to_string()
+    let syncing = if logged_in {
+        with_client!(state, |c| c.syncing_folders()).unwrap_or_default()
     } else {
-        "未登录：没探测能不能读，也没有 NAS 上的同步文件夹列表".to_string()
+        Vec::new()
+    };
+    let note = if logged_in {
+        "「家目录」以外的 NAS 文件夹默认只读：服务端会拒绝往非 Qsync 同步文件夹上传（status 20）"
+            .to_string()
+    } else {
+        "未登录：拿不到 NAS 上登记的同步文件夹列表，只能手输或用「浏览…」".to_string()
     };
     to_value(RootsData {
         home_root,
-        configured,
-        roots,
         syncing_folders: syncing,
         note: Some(note),
     })
@@ -1254,7 +1212,8 @@ fn rules_cmd(
     match_path: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
     let rules = &state.rules;
-    let roots = state.link.roots();
+    // 一对一：这里只有一个远端根（link 的 home_root）
+    let roots = vec![state.link.root()];
     let mut data = RulesData {
         roots: roots.clone(),
         exclude: state.link.exclude.clone(),
@@ -1399,7 +1358,6 @@ async fn mount(
     state: &Arc<State>,
     mountpoint: PathBuf,
     remote: Option<String>,
-    roots: Option<Vec<String>>,
     cache_dir: Option<PathBuf>,
     threads: usize,
     auto_unmount: bool,
@@ -1424,7 +1382,21 @@ async fn mount(
         ));
     }
 
-    let remote = remote.unwrap_or_else(|| HOME_ROOT.to_string());
+    // 这一个挂载点对应的 NAS 文件夹：显式给了就用它，否则用 link 的 home_root
+    let home_root = state.link.root();
+    let remote = qxync_core::normalize_root(&remote.unwrap_or_else(|| home_root.clone()));
+    // ★ M6 实测结论保留：只有家目录根可写（普通账号往 /Public 上传会被服务端拒 status 20）。
+    //   一对多删掉之后，单根也可能是共享文件夹 —— 所以这里按「是不是 home_root」判可写。
+    let read_write = if read_write && remote != home_root {
+        tracing::warn!(
+            "{} 不是家目录根（{}）：强制只读（实测服务端会拒绝往非 Qsync 同步文件夹上传，status 20）",
+            remote,
+            home_root
+        );
+        false
+    } else {
+        read_write
+    };
     // 缓存按「主机」隔离：不同 NAS 上的同名路径不能共用缓存文件
     let host_ns: String = state
         .link
@@ -1446,24 +1418,6 @@ async fn mount(
         })
         .join(host_ns);
 
-    // ★ M6：算出挂载布局。单根 = 直通（M1–M5 行为不变）；多根 = 虚拟根下每个根一个目录。
-    //   可写性：只有家目录根可写（实测普通账号向共享文件夹上传会被服务端拒绝 status:20）。
-    let want_roots: Vec<String> = match roots {
-        Some(r) if !r.is_empty() => r,
-        _ => vec![remote.clone()],
-    };
-    let writable_root = if read_write {
-        Some(state.link.home_root.clone())
-    } else {
-        None
-    };
-    let layout = qxync_core::roots::layout(&want_roots, writable_root.as_deref());
-    let remote = layout
-        .roots()
-        .first()
-        .cloned()
-        .unwrap_or_else(|| HOME_ROOT.to_string());
-
     // 给 FUSE 一个独立 Client（只带 sid），避免和 daemon 主体抢同一把锁
     // ★ M8.4：FUSE 的客户端也要走设置里的代理（否则挂载后水合直连、绕开代理）
     let mut fuse_client =
@@ -1472,15 +1426,8 @@ async fn mount(
     fuse_client.set_sid(sid);
     let counters = Arc::new(HydroCounters::default());
     let fuse_client = Arc::new(fuse_client);
-    let mut fs = match &layout {
-        qxync_core::roots::ViewLayout::Passthrough { root } => {
-            QxyncFs::new(fuse_client.clone(), root.clone(), cache.clone())
-        }
-        qxync_core::roots::ViewLayout::Multi { entries } => {
-            QxyncFs::new_multi(fuse_client.clone(), entries.clone(), cache.clone())
-        }
-    }
-    .map_err(|e| IpcError::new(ErrorKind::Io, e.to_string()))?
+    let mut fs = QxyncFs::new(fuse_client.clone(), remote.clone(), cache.clone())
+        .map_err(|e| IpcError::new(ErrorKind::Io, e.to_string()))?
     .with_hydrate_timeout(hydrate_timeout)
     .with_counters(counters.clone())
     .with_pins(state.pins.clone())
@@ -1562,7 +1509,6 @@ async fn mount(
         mountpoint: mp.clone(),
         remote: remote.clone(),
         readonly: !read_write,
-        roots: layout.roots(),
     };
     // ★ M8.4：冲突策略（未知值落回默认；与 Task::normalize 同一套判定）
     let conflict = conflict
@@ -1584,15 +1530,11 @@ async fn mount(
     tracing::info!(
         "已挂载 {} -> {}（{} 线程，auto_unmount={auto_unmount}，cache_mode={}，冲突策略={}，{}）",
         mp.display(),
-        info.roots.join(", "),
+        info.remote,
         threads,
         mode.as_str(),
         conflict_label(&conflict),
-        if layout.is_multi() {
-            "多根视图"
-        } else {
-            "单根直通"
-        }
+        if read_write { "读写" } else { "只读" }
     );
     to_value(info)
 }
@@ -1781,28 +1723,20 @@ async fn engine_client(state: &Arc<State>) -> Result<Arc<Client>, IpcError> {
 
 /// 当前挂载视图（同步引擎的操作对象）。
 ///
-/// ★ M6：一个**多根**挂载会被展开成多个「单根视图」（同一个 handle / 挂载点，
-/// 不同的 remote_root）——这样 M2c 的对账逻辑一行不用改，天然覆盖每个根。
+/// 一对一：**一个挂载点 = 一个远端根**，所以一个挂载就是一个视图。
 fn build_views(state: &Arc<State>) -> Vec<MountView> {
     let g = state.mounts.lock().unwrap();
     let mut out = Vec::new();
     for m in g.values() {
-        let roots: Vec<String> = if m.info.roots.is_empty() {
-            vec![m.info.remote.clone()]
-        } else {
-            m.info.roots.clone()
-        };
-        for root in roots {
-            out.push(MountView {
-                mountpoint: m.info.mountpoint.clone(),
-                remote_root: root,
-                view: Arc::new(m.handle.clone()) as Arc<dyn LocalView>,
-                upload: m.upload.clone(),
-                read_only: m.info.readonly,
-                rules: state.rules.clone(),
-                conflict: m.conflict.clone(),
-            });
-        }
+        out.push(MountView {
+            mountpoint: m.info.mountpoint.clone(),
+            remote_root: m.info.remote.clone(),
+            view: Arc::new(m.handle.clone()) as Arc<dyn LocalView>,
+            upload: m.upload.clone(),
+            read_only: m.info.readonly,
+            rules: state.rules.clone(),
+            conflict: m.conflict.clone(),
+        });
     }
     out
 }
@@ -2177,8 +2111,7 @@ async fn run_dehydrate_with_recent(
         return d;
     }
 
-    // 选定挂载点
-    // ★ M6：一个挂载点可能覆盖多个根 → 每个根单独跑一轮（视图名用于 mmap 路径还原）
+    // 选定挂载点（一对一：一个挂载点 = 一个远端根，所以每个挂载只有一轮）
     let targets: Vec<(
         PathBuf,
         String,
@@ -2195,25 +2128,14 @@ async fn run_dehydrate_with_recent(
                 .map(|mp| m.info.mountpoint == *mp)
                 .unwrap_or(true)
         }) {
-            let entries = match qxync_core::roots::layout(&m.info.roots, None) {
-                qxync_core::roots::ViewLayout::Passthrough { root } => {
-                    vec![(String::new(), root)]
-                }
-                qxync_core::roots::ViewLayout::Multi { entries } => entries
-                    .into_iter()
-                    .map(|e| (e.view_name, e.remote))
-                    .collect(),
-            };
-            for (view_name, remote) in entries {
-                out.push((
-                    m.info.mountpoint.clone(),
-                    view_name,
-                    remote,
-                    m.handle.clone(),
-                    m.notifier.clone(),
-                    m.cache_mode,
-                ));
-            }
+            out.push((
+                m.info.mountpoint.clone(),
+                String::new(),
+                m.info.remote.clone(),
+                m.handle.clone(),
+                m.notifier.clone(),
+                m.cache_mode,
+            ));
         }
         out
     };
@@ -2446,36 +2368,16 @@ fn disable_task_by_mountpoint(mp: &Path) -> Result<(), String> {
 
 /// 按任务登记的参数挂载（**复用既有 `mount()` 路径，不改 FUSE**）。
 ///
-/// ★ 一对一：任务只该有一个 NAS 目录。旧的多根任务文件仍**照挂**（多根视图 =
-/// 挂载点顶层多一层视图名目录），但那正是用户反馈的「本地文件夹里又冒出一个
-/// `home/`」；编辑保存一次就会收敛成单目录。
+/// 一对一：任务里的 NAS 文件夹就是挂载点对应**唯一**的那个根；没写就跟 link 的
+/// `home_root`（`Task::effective_root`）。
 async fn mount_task(state: &Arc<State>, t: &Task) -> Result<serde_json::Value, IpcError> {
     std::fs::create_dir_all(&t.mountpoint)
         .map_err(|e| core_err(format!("建挂载点 {} 失败: {e}", t.mountpoint.display())))?;
-    if t.roots.len() > 1 {
-        tracing::warn!(
-            "任务 {} 登记了多个 NAS 目录（{:?}）：这是 M6 的旧多根格式，\
-             挂载点顶层会多出视图名目录；请编辑任务收敛成一个 NAS 目录（一对一）",
-            t.id,
-            t.roots
-        );
-    }
-    let roots = if t.roots.is_empty() {
-        None
-    } else {
-        Some(t.roots.clone())
-    };
-    // ★ 空 roots 的语义是「由 link 的 home_root 决定」—— 以前这里落的是编译期常量
-    //   `/home`（daemon.rs 的 `mount()` 默认值），用户改过 home_root 就会静默挂错。
-    let remote = roots
-        .as_ref()
-        .and_then(|r| r.first().cloned())
-        .or_else(|| Some(state.link.home_root.clone()));
+    let remote = t.effective_root(&state.link.root());
     mount(
         state,
         t.mountpoint.clone(),
-        remote,
-        roots,
+        Some(remote),
         // ★ 任务里的缓存目录（None = 默认 $XDG_DATA_HOME/qxync/cache）
         t.cache_dir.clone(),
         t.threads.unwrap_or(4),
@@ -2527,12 +2429,10 @@ async fn tasks_cmd(
         "save" => {
             let mut t = task.ok_or_else(|| bad_req("save 需要 task"))?;
             t.normalize().map_err(core_err)?;
-            // ★ 一对一：一个配对文件夹只能有一个 NAS 目录（多根请分建任务）
-            t.ensure_one_root().map_err(core_err)?;
             // ★ 提交前的「目的地冲突」检查：本地文件夹重复 / 嵌套 → 直接拒；
-            //   NAS 目录重复 → 只作为 warnings 回给界面（只读挂同一目录是合法用法）。
+            //   NAS 文件夹重复 → 只作为 warnings 回给界面（只读挂同一个是合法用法）。
             let (others, _bad) = Task::list(&paths);
-            let (errors, warnings) = t.conflict_report(&others);
+            let (errors, warnings) = t.conflict_report(&others, &state.link.root());
             if !errors.is_empty() {
                 return Err(IpcError::new(
                     ErrorKind::BadRequest,
@@ -3091,18 +2991,12 @@ async fn file_states_cmd(state: &Arc<State>, path: String) -> Result<serde_json:
     let hit = {
         let g = state.mounts.lock().unwrap();
         g.values().find_map(|m| {
-            let roots: Vec<String> = if m.info.roots.is_empty() {
-                vec![m.info.remote.clone()]
+            let r = m.info.remote.trim_end_matches('/');
+            if path == r || path.starts_with(&format!("{r}/")) {
+                Some((m.handle.clone(), r.to_string(), m.info.mountpoint.clone()))
             } else {
-                m.info.roots.clone()
-            };
-            roots
-                .iter()
-                .find(|r| {
-                    let r = r.trim_end_matches('/');
-                    path == r || path.starts_with(&format!("{r}/"))
-                })
-                .map(|r| (m.handle.clone(), r.clone(), m.info.mountpoint.clone()))
+                None
+            }
         })
     };
     let Some((handle, root, mp)) = hit else {

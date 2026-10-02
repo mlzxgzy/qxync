@@ -76,7 +76,7 @@ impl ContentSource for DaemonContent {
     fn roots(&self) -> Vec<String> {
         self.state
             .upgrade()
-            .map(|st| st.link.roots())
+            .map(|st| vec![st.link.root()])
             .unwrap_or_default()
     }
 }
@@ -129,7 +129,8 @@ impl PeerHost {
             .clone()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(crate::sync::hostname);
-        let roots = link.roots();
+        // 一对一：对外声明的可服务路径就是这个 link 的根
+        let roots = vec![link.root()];
         let events_in: Arc<StdMutex<VecDeque<PeerEventInfo>>> =
             Arc::new(StdMutex::new(VecDeque::new()));
 

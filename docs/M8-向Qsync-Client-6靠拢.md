@@ -612,7 +612,7 @@ Task { id, kind: sync,                 // 备份任务已决策不做；kind 字
 ```
 fuse-matrix.sh  68/68      ← M1–M5 挂载/水合/写路径/变更发现/脱水/状态库
 m5-matrix.sh    28/28      ← SQLite 状态库 + delta 编解码 + 能力门控
-m6-matrix.sh    29/29      ← 多根 / 共享文件夹
+m6-matrix.sh    29/29      ← 多根 / 共享文件夹（**该脚本已随一对多删除**）
 m7-matrix.sh    60/60      ← 选择性同步 + LAN 配对/事件/直传
 gui-matrix.sh   86/86      ← 本次改造的验收
 ```
@@ -698,7 +698,7 @@ cargo test      all passed
 **同批回归（全部绿，共 337 项）**：
 
 ```
-fuse-matrix 68 · gui-matrix 86 · m5-matrix 30 · m6-matrix 29
+fuse-matrix 68 · gui-matrix 86 · m5-matrix 30 · m6-matrix 29（m6 已删除）
 m7-matrix 60 · m82-matrix 37 · m83-matrix 27 · cargo test all passed
 ```
 
@@ -920,7 +920,7 @@ LAN 面板显示身份/监听/配对码/已配对设备/事件计数，并支持
 | `xtask/tests/fuse-matrix.sh` | 68/68 | ✅ **保持 68/68**（M8.2–M8.4 每次都复跑；M8.4 触碰了上传队列的取消语义，也在此回归里；**M8.6 后按全量口径实测 68/68**） |
 | `xtask/tests/gui-matrix.sh` | 41/41（5 tab 截图） | ✅ **M8.1 后 86/86**（9 个目的地 + 旧 tab 落点等价）；**M8.4 后 131/131**（+7 个设置分区截图、两两 AE 差异 + 4 条 M8.4 数据源断言）；**M8.6 后 148/148**（+15 条 2c 静态合规性断言（`ui_spec` + 文案表运行时回落）、+2 条 3c 真窗口键盘断言；截图项一条未减） |
 | `xtask/tests/m5-matrix.sh` | 28/28 | ✅ **30/30**（+schema 补表断言，M8.4 起断言 v3） |
-| `xtask/tests/m6-matrix.sh` | 29/29 | 不变（多根语义不动；**M8.6 后实测 29/29，含多根真挂载**） |
+| `xtask/tests/m6-matrix.sh` | 29/29（历史） | **2026-10-02 起该脚本随「一对多删除」一起移除**；多根挂载不再存在 |
 | `xtask/tests/m7-matrix.sh` | 60/60 | ✅ **保持 60/60**（后端规则一行未改；GUI 侧的规则编辑面板复用同一批命令） |
 | `xtask/tests/m82-matrix.sh` | — | ✅ **新增 37/37**（M8.2：登记/兼容/重启恢复/暂停隔离/安全/缓存目录） |
 | `xtask/tests/m83-matrix.sh` | — | ✅ **新增 27/27**（M8.3：schema 迁移/过滤/clear 隔离/轮转；M8.4 把 schema 断言改到 v3） |
@@ -996,7 +996,9 @@ LAN 面板显示身份/监听/配对码/已配对设备/事件计数，并支持
    > Qsync 的语义回到**一对一**（一个本地文件夹 ⇄ 一个 NAS 目录，挂载点直接就是 NAS 目录）；
    > 多目录 = 多任务。理由：先是用户实测反馈「本地 `/home/user/qsync` 配 NAS `/home` 之后
    > 里面又冒出一层 `home/`」（那是 M6 多根视图），再来是「一个本地对多个 NAS 目录」在概念上
-   > 就不对。多根挂载本身留着（`mount --remote A --remote B`，M6 矩阵不动），只是不再进任务层。
+   > 就不对。**后续（同日）又进一步**：用户要求「一对多直接删除、只留一对一、不考虑兼容」，
+   > 于是连 `mount --remote A --remote B`、link 的 `roots`、FUSE 虚拟根一起删干净了
+   > （`m6-matrix.sh` 随之移除）。见 `CHANGELOG.md` 的「未发布」。
 4. **对齐到哪一版？** 建议：**以 Windows 6.1 的界面与术语为准**（唯一完整的 6.x 实现），
    但**不承诺任何 Qsync Central 侧能力**（团队文件夹 / 分享链接 / 版本还原 / QID）。
    同时在 README 里写清「macOS 官方仍是 5.1.x、Ubuntu 仍是 1.0.x」这一事实 —— 这本身就是 qxync 的存在理由。
