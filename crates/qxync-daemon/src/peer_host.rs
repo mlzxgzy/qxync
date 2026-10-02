@@ -371,14 +371,8 @@ impl PeerHost {
         }
         let mut note = None;
         if let Some(my_addr) = &self.listen {
-            if let Err(e) = PeerClient::hello(
-                &peer_addr,
-                &token,
-                &self.name,
-                my_addr,
-                self.roots.clone(),
-            )
-            .await
+            if let Err(e) =
+                PeerClient::hello(&peer_addr, &token, &self.name, my_addr, self.roots.clone()).await
             {
                 note = Some(format!(
                     "已配对（单向）：对方登记失败（{e}）；对方要主动推事件需要它能连到 {my_addr}"

@@ -50,7 +50,10 @@ async fn call_inner(socket: &Path, req: Request) -> Result<Response, IpcError> {
     let stream = UnixStream::connect(socket).await.map_err(|e| {
         IpcError::new(
             ErrorKind::NotRunning,
-            format!("连不上 daemon（{}）: {e}；先 `qsync daemon start`", socket.display()),
+            format!(
+                "连不上 daemon（{}）: {e}；先 `qsync daemon start`",
+                socket.display()
+            ),
         )
     })?;
     let (rd, mut wr) = stream.into_split();
@@ -77,9 +80,8 @@ async fn call_inner(socket: &Path, req: Request) -> Result<Response, IpcError> {
 /// 发一个请求，**永远返回响应信封**（连不上也包装成 `ok:false`）。
 pub async fn call(socket: &Path, req: Request) -> Value {
     match call_inner(socket, req).await {
-        Ok(resp) => serde_json::to_value(resp).unwrap_or_else(|e| {
-            err_response(ErrorKind::Parse, format!("序列化响应失败: {e}"))
-        }),
+        Ok(resp) => serde_json::to_value(resp)
+            .unwrap_or_else(|e| err_response(ErrorKind::Parse, format!("序列化响应失败: {e}"))),
         Err(e) => err_response(e.kind, e.message),
     }
 }

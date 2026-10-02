@@ -431,7 +431,10 @@ impl PeerServer {
 
     /// 预置一个 token（重启后从 `peers.json` 恢复，避免重新配对）。
     pub fn add_token(&self, name: impl Into<String>, token: impl Into<String>) {
-        self.tokens.lock().unwrap().insert(name.into(), token.into());
+        self.tokens
+            .lock()
+            .unwrap()
+            .insert(name.into(), token.into());
     }
 
     pub fn token_for(&self, name: &str) -> Option<String> {
@@ -627,11 +630,7 @@ impl PeerServer {
                         (r, Some(data))
                     }
                     Ok(data) => (
-                        PeerReply::err(format!(
-                            "短读：要 {} 字节只拿到 {}",
-                            req.len,
-                            data.len()
-                        )),
+                        PeerReply::err(format!("短读：要 {} 字节只拿到 {}", req.len, data.len())),
                         None,
                     ),
                     Err(e) => (PeerReply::err(format!("读失败: {e}")), None),
@@ -649,7 +648,11 @@ async fn read_line_limited<R: AsyncBufReadExt + Unpin>(r: &mut R) -> io::Result<
         let mut byte = [0u8; 1];
         let n = r.read(&mut byte).await?;
         if n == 0 {
-            return if buf.is_empty() { Ok(None) } else { Ok(Some(String::from_utf8_lossy(&buf).into_owned())) };
+            return if buf.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+            };
         }
         if byte[0] == b'\n' {
             return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
@@ -748,16 +751,17 @@ async fn roundtrip(
         stream.set_nodelay(true).ok();
         let (rd, mut wr) = stream.into_split();
         let mut rd = BufReader::new(rd);
-        let mut line = serde_json::to_vec(req)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let mut line =
+            serde_json::to_vec(req).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         line.push(b'\n');
         wr.write_all(&line).await?;
         wr.flush().await?;
         let head = read_line_limited(&mut rd)
             .await?
             .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "对端没有回复"))?;
-        let reply: PeerReply = serde_json::from_str(&head)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("回复解析失败: {e}")))?;
+        let reply: PeerReply = serde_json::from_str(&head).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("回复解析失败: {e}"))
+        })?;
         let mut body = None;
         if reply.ok && req.op == "get" {
             let n = reply.len.unwrap_or(0) as usize;
@@ -803,12 +807,8 @@ impl PeerClient {
         name: &str,
         roots: Vec<String>,
     ) -> io::Result<(String, PeerIdentity)> {
-        let (r, _, _) = roundtrip(
-            addr,
-            &PeerRequest::pair(code, name, roots),
-            PAIR_TIMEOUT,
-        )
-        .await?;
+        let (r, _, _) =
+            roundtrip(addr, &PeerRequest::pair(code, name, roots), PAIR_TIMEOUT).await?;
         if !r.ok {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -870,7 +870,12 @@ impl PeerClient {
     }
 
     /// 取一段字节；返回（数据, 对端耗时）。
-    pub async fn get_range(&self, path: &str, offset: u64, len: u64) -> io::Result<(Vec<u8>, Duration)> {
+    pub async fn get_range(
+        &self,
+        path: &str,
+        offset: u64,
+        len: u64,
+    ) -> io::Result<(Vec<u8>, Duration)> {
         let (r, body, took) = roundtrip(
             &self.addr,
             &PeerRequest::get(path, offset, len).with_token(Some(&self.token)),
@@ -883,9 +888,8 @@ impl PeerClient {
                 r.error.unwrap_or_else(|| "get 失败".into()),
             ));
         }
-        let data = body.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::UnexpectedEof, "get 回复缺少数据体")
-        })?;
+        let data =
+            body.ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "get 回复缺少数据体"))?;
         Ok((data, took))
     }
 
@@ -1032,7 +1036,8 @@ mod tests {
         std::fs::create_dir_all(d.join("qxync-test")).unwrap();
         std::fs::write(d.join("qxync-test/hello.txt"), b"hello lan").unwrap();
         std::fs::write(d.join("qxync-test/big.bin"), vec![7u8; 4096]).unwrap();
-        let src: Arc<dyn ContentSource> = Arc::new(DirContent::new(vec![("/home".into(), d.clone())]));
+        let src: Arc<dyn ContentSource> =
+            Arc::new(DirContent::new(vec![("/home".into(), d.clone())]));
         (src, d)
     }
 
@@ -1049,7 +1054,9 @@ mod tests {
         assert!(id.pairing_open);
 
         // 错码 → 拒绝
-        assert!(PeerClient::pair(&addr, "000000", "cli", vec![]).await.is_err());
+        assert!(PeerClient::pair(&addr, "000000", "cli", vec![])
+            .await
+            .is_err());
         // 正确配对码 → 拿 token，且配对码轮换（旧的作废）
         let (token, peer) = PeerClient::pair(&addr, &code, "cli", vec!["/home".into()])
             .await
@@ -1058,7 +1065,9 @@ mod tests {
         assert_eq!(peer.name, "srv");
         let code2 = srv.pairing_code().unwrap();
         assert_ne!(code, code2, "配对成功后必须轮换配对码");
-        assert!(PeerClient::pair(&addr, &code, "cli2", vec![]).await.is_err());
+        assert!(PeerClient::pair(&addr, &code, "cli2", vec![])
+            .await
+            .is_err());
 
         // 错 token → 拒绝
         let bogus = PeerClient::new(&addr, "cli", "deadbeef");
@@ -1070,9 +1079,15 @@ mod tests {
         assert_eq!(h.size, 9);
 
         // 全量 + Range
-        let (all, _) = c.get_range("/home/qxync-test/big.bin", 0, 4096).await.unwrap();
+        let (all, _) = c
+            .get_range("/home/qxync-test/big.bin", 0, 4096)
+            .await
+            .unwrap();
         assert_eq!(all, vec![7u8; 4096]);
-        let (part, _) = c.get_range("/home/qxync-test/big.bin", 1024, 128).await.unwrap();
+        let (part, _) = c
+            .get_range("/home/qxync-test/big.bin", 1024, 128)
+            .await
+            .unwrap();
         assert_eq!(part, vec![7u8; 128]);
 
         // 路径越权
@@ -1086,7 +1101,12 @@ mod tests {
 
         // 事件
         assert!(c
-            .send_event(PeerEvent::new("/home/qxync-test/hello.txt", 9, 1, "modified"))
+            .send_event(PeerEvent::new(
+                "/home/qxync-test/hello.txt",
+                9,
+                1,
+                "modified"
+            ))
             .await
             .unwrap());
         let got = rx.recv().await.unwrap();
@@ -1118,9 +1138,11 @@ mod tests {
             .await
             .unwrap();
         // 错 token 不能登记
-        assert!(PeerClient::hello(&addr, "nope", "cli", "10.0.0.9:9840", vec![])
-            .await
-            .is_err());
+        assert!(
+            PeerClient::hello(&addr, "nope", "cli", "10.0.0.9:9840", vec![])
+                .await
+                .is_err()
+        );
         // 正确 token → 服务端把登记转发给 daemon
         let back = PeerClient::hello(&addr, &token, "cli", "10.0.0.9:9840", vec!["/home".into()])
             .await
@@ -1219,7 +1241,10 @@ mod tests {
         let h = c.head("/home/x.bin").await.unwrap();
         assert!(!h.exists && !h.hydrated);
         // len 超上限 / 为 0 都被拒
-        assert!(c.get_range("/home/x.bin", 0, MAX_GET_LEN + 1).await.is_err());
+        assert!(c
+            .get_range("/home/x.bin", 0, MAX_GET_LEN + 1)
+            .await
+            .is_err());
         assert!(c.get_range("/home/x.bin", 0, 0).await.is_err());
     }
 

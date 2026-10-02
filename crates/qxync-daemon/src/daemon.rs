@@ -7,12 +7,12 @@ use qxync_client::peer::PeerEvent;
 use qxync_client::{Client, Session};
 use qxync_core::dehydrate::{Block, CacheLimit, Policy};
 use qxync_core::ipc::{
-    decode_line, encode_line, mask_sid, mask_token, CacheInfo, CursorInfo, DaemonInfo, DehydrateData,
-    DecisionsData, DecisionInfo, ErrorKind, FileStateInfo, FileStatesData, GetData, HydroStats,
-    IpcError, LinkInfo, LoginData, LsData, MountInfo, PeerData,
-    PingData, PutData, Request, RequestEnvelope, Response, RootInfo, RootsData, RulesData,
-    JournalData, ServerInfo, SessionInfo, SettingsData, ShutdownData, StatusData, StoreData,
-    SpaceData, SyncCursors, SyncInfo, TaskInfo, TasksData, IPC_VERSION,
+    decode_line, encode_line, mask_sid, mask_token, CacheInfo, CursorInfo, DaemonInfo,
+    DecisionInfo, DecisionsData, DehydrateData, ErrorKind, FileStateInfo, FileStatesData, GetData,
+    HydroStats, IpcError, JournalData, LinkInfo, LoginData, LsData, MountInfo, PeerData, PingData,
+    PutData, Request, RequestEnvelope, Response, RootInfo, RootsData, RulesData, ServerInfo,
+    SessionInfo, SettingsData, ShutdownData, SpaceData, StatusData, StoreData, SyncCursors,
+    SyncInfo, TaskInfo, TasksData, IPC_VERSION,
 };
 use qxync_core::rules::Rules;
 use qxync_core::settings::{ProxySpec, Settings};
@@ -36,14 +36,24 @@ use crate::sync::{self, MountView, SyncConfig, SyncState, SyncStats};
 /// ★ M8.3：journal 的保留上限（**必须有**：同步日志是无限增长型数据，
 /// 不加约束会把 `sync.db` 撑大）。默认 1 万条 / 30 天，环境变量可调。
 fn journal_max_rows() -> i64 {
-    std::env::var("QSYNC_JOURNAL_MAX_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(10_000)
+    std::env::var("QSYNC_JOURNAL_MAX_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000)
 }
 fn journal_max_age_days() -> i64 {
-    std::env::var("QSYNC_JOURNAL_MAX_AGE_DAYS").ok().and_then(|v| v.parse().ok()).unwrap_or(30)
+    std::env::var("QSYNC_JOURNAL_MAX_AGE_DAYS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30)
 }
 /// 轮转间隔秒数（默认 300；验收里调成 1 用来快速观察）。
 fn journal_trim_secs() -> u64 {
-    std::env::var("QSYNC_JOURNAL_TRIM_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(300).max(1)
+    std::env::var("QSYNC_JOURNAL_TRIM_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300)
+        .max(1)
 }
 
 pub struct Options {
@@ -192,7 +202,12 @@ pub async fn run(opts: Options) -> Result<()> {
     );
     // ★ M5：pin 以前只在内存里 —— daemon 一重启就全丢，M3 的脱水安全检查
     //   （pinned/excluded 不脱水）会静默失守。现在从状态库加载、写穿回去。
-    let pins_seed: HashMap<String, String> = sync_store.store.pins().unwrap_or_default().into_iter().collect();
+    let pins_seed: HashMap<String, String> = sync_store
+        .store
+        .pins()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
     if !pins_seed.is_empty() {
         tracing::info!("从状态库恢复 {} 条 pin", pins_seed.len());
     }
@@ -494,16 +509,23 @@ async fn dispatch(state: &Arc<State>, req: Request, shutdown: &mpsc::Sender<()>)
         Request::Roots => roots_cmd(state).await,
         Request::Rules { match_path } => rules_cmd(state, match_path),
         Request::Tasks { action, id, task } => tasks_cmd(state, &action, id, task).await,
-        Request::Journal { limit, since, query, level, clear } => {
-            journal_cmd(state, limit, since, query, level, clear)
-        }
+        Request::Journal {
+            limit,
+            since,
+            query,
+            level,
+            clear,
+        } => journal_cmd(state, limit, since, query, level, clear),
         Request::Settings => settings_cmd(state),
-        Request::SettingsSave { settings, autostart_exe } => {
-            settings_save_cmd(state, settings, autostart_exe)
-        }
-        Request::Decisions { action, id, resolution } => {
-            decisions_cmd(state, &action, id, resolution)
-        }
+        Request::SettingsSave {
+            settings,
+            autostart_exe,
+        } => settings_save_cmd(state, settings, autostart_exe),
+        Request::Decisions {
+            action,
+            id,
+            resolution,
+        } => decisions_cmd(state, &action, id, resolution),
         Request::FileStates { path } => file_states_cmd(state, path).await,
         Request::Space { now } => space_cmd(state, now.unwrap_or(false)).await,
         Request::Peer {
@@ -828,7 +850,12 @@ async fn put(
     }
     // ★ M7：事件快路径 —— 已配对的对端立刻知道这个路径变了（失败只记日志）
     if let Some(host) = state.peer.lock().unwrap().clone() {
-        host.notify_async(format!("{dest}/{target}"), bytes.len() as u64, mtime, "modified");
+        host.notify_async(
+            format!("{dest}/{target}"),
+            bytes.len() as u64,
+            mtime,
+            "modified",
+        );
     }
     to_value(PutData {
         bytes: bytes.len() as u64,
@@ -985,7 +1012,10 @@ async fn roots_cmd(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
 }
 
 /// ★ M7：`qsync rules [--match PATH]` —— 选择性同步规则一览 + 单路径判定。
-fn rules_cmd(state: &Arc<State>, match_path: Option<String>) -> Result<serde_json::Value, IpcError> {
+fn rules_cmd(
+    state: &Arc<State>,
+    match_path: Option<String>,
+) -> Result<serde_json::Value, IpcError> {
     let rules = &state.rules;
     let roots = state.link.roots();
     let mut data = RulesData {
@@ -1078,7 +1108,10 @@ async fn peer_cmd(
         "pair" => {
             let addr = addr.ok_or_else(|| bad("pair 需要 addr".into()))?;
             let code = code.ok_or_else(|| bad("pair 需要 code（配对码）".into()))?;
-            host.pair(&addr, &code).await.map_err(bad).and_then(to_value)
+            host.pair(&addr, &code)
+                .await
+                .map_err(bad)
+                .and_then(to_value)
         }
         "ping" => {
             let target = addr
@@ -1117,7 +1150,9 @@ async fn peer_cmd(
         }
         other => Err(IpcError::new(
             ErrorKind::BadRequest,
-            format!("未知 peer action {other:?}（可用：status/list/pair/ping/events/notify/fetch）"),
+            format!(
+                "未知 peer action {other:?}（可用：status/list/pair/ping/events/notify/fetch）"
+            ),
         )),
     }
 }
@@ -1194,8 +1229,9 @@ async fn mount(
 
     // 给 FUSE 一个独立 Client（只带 sid），避免和 daemon 主体抢同一把锁
     // ★ M8.4：FUSE 的客户端也要走设置里的代理（否则挂载后水合直连、绕开代理）
-    let mut fuse_client = Client::new_with_proxy(&state.link, Some(&state.settings.lock().unwrap().proxy))
-        .map_err(map_err)?;
+    let mut fuse_client =
+        Client::new_with_proxy(&state.link, Some(&state.settings.lock().unwrap().proxy))
+            .map_err(map_err)?;
     fuse_client.set_sid(sid);
     let counters = Arc::new(HydroCounters::default());
     let fuse_client = Arc::new(fuse_client);
@@ -1497,8 +1533,9 @@ async fn engine_client(state: &Arc<State>) -> Result<Arc<Client>, IpcError> {
         .map(|c| c.sid() != Some(sid.as_str()))
         .unwrap_or(true);
     if stale {
-        let mut c = Client::new_with_proxy(&state.link, Some(&state.settings.lock().unwrap().proxy))
-            .map_err(map_err)?;
+        let mut c =
+            Client::new_with_proxy(&state.link, Some(&state.settings.lock().unwrap().proxy))
+                .map_err(map_err)?;
         c.set_sid(sid);
         *g = Some(Arc::new(c));
     }
@@ -1905,7 +1942,14 @@ async fn run_dehydrate_with_recent(
 
     // 选定挂载点
     // ★ M6：一个挂载点可能覆盖多个根 → 每个根单独跑一轮（视图名用于 mmap 路径还原）
-    let targets: Vec<(PathBuf, String, String, FsHandle, qxync_fuse::Notifier, CacheMode)> = {
+    let targets: Vec<(
+        PathBuf,
+        String,
+        String,
+        FsHandle,
+        qxync_fuse::Notifier,
+        CacheMode,
+    )> = {
         let g = state.mounts.lock().unwrap();
         let mut out = Vec::new();
         for m in g.values().filter(|m| {
@@ -2112,7 +2156,10 @@ fn spawn_dehydrator(state: Arc<State>) {
                     JournalEntry::ok(
                         "dehydrate",
                         "",
-                        format!("自动释放空间：脱水 {} 个文件 / 释放 {} 字节", out.dehydrated, out.freed_bytes),
+                        format!(
+                            "自动释放空间：脱水 {} 个文件 / 释放 {} 字节",
+                            out.dehydrated, out.freed_bytes
+                        ),
                     )
                     .with_bytes(out.freed_bytes as i64),
                 );
@@ -2212,7 +2259,8 @@ async fn tasks_cmd(
                 note: Some(if empty {
                     "还没有登记过任务；`mount` 时带 task/save_task 即可登记".into()
                 } else {
-                    "任务登记在 ~/.config/qsync/tasks/<id>.json；删除登记不会动挂载点里的数据".into()
+                    "任务登记在 ~/.config/qsync/tasks/<id>.json；删除登记不会动挂载点里的数据"
+                        .into()
                 }),
             };
             to_value(data)
@@ -2250,9 +2298,11 @@ async fn tasks_cmd(
             // 语义（见 docs/M8 §M8.2）：暂停 = 停用登记 + **卸载该挂载点**。
             // 已入队的上传在 umount 里会被排空（不丢改动）；其它任务完全不受影响。
             let mp = t.mountpoint.clone();
-            let mounted = state.mounts.lock().unwrap().contains_key(
-                &std::fs::canonicalize(&mp).unwrap_or_else(|_| mp.clone()),
-            );
+            let mounted = state
+                .mounts
+                .lock()
+                .unwrap()
+                .contains_key(&std::fs::canonicalize(&mp).unwrap_or_else(|_| mp.clone()));
             let mut unmounted = false;
             if mounted {
                 umount(state, mp.clone()).await?;
@@ -2345,34 +2395,72 @@ fn journal_log(state: &Arc<State>, e: JournalEntry) {
 fn journal_record_sync(state: &Arc<State>, r: &sync::SyncReport) {
     let mut n = 0usize;
     if r.events > 0 {
-        journal_log(state, JournalEntry::ok(
-            "remote_change", "", format!("拉到 {} 条事件（跳过 {} 条）", r.events, r.events_skipped)));
+        journal_log(
+            state,
+            JournalEntry::ok(
+                "remote_change",
+                "",
+                format!("拉到 {} 条事件（跳过 {} 条）", r.events, r.events_skipped),
+            ),
+        );
         n += 1;
     }
     if r.refreshed > 0 {
-        journal_log(state, JournalEntry::ok(
-            "remote_change", "", format!("远端改动刷新本地元数据 {} 项", r.refreshed)));
+        journal_log(
+            state,
+            JournalEntry::ok(
+                "remote_change",
+                "",
+                format!("远端改动刷新本地元数据 {} 项", r.refreshed),
+            ),
+        );
         n += 1;
     }
     if r.uploaded > 0 {
-        journal_log(state, JournalEntry::ok(
-            "upload", "", format!("本地改动上传回 NAS {} 项", r.uploaded)));
+        journal_log(
+            state,
+            JournalEntry::ok(
+                "upload",
+                "",
+                format!("本地改动上传回 NAS {} 项", r.uploaded),
+            ),
+        );
         n += 1;
     }
     if r.conflicts > 0 {
-        journal_log(state, JournalEntry::ok(
-            "conflict", "", format!("双方都改 → 生成 {} 个冲突副本", r.conflicts)));
+        journal_log(
+            state,
+            JournalEntry::ok(
+                "conflict",
+                "",
+                format!("双方都改 → 生成 {} 个冲突副本", r.conflicts),
+            ),
+        );
         n += 1;
     }
     if r.deleted > 0 {
-        journal_log(state, JournalEntry::ok(
-            "delete", "", format!("按对账结果删除本地/远端条目 {} 项", r.deleted)));
+        journal_log(
+            state,
+            JournalEntry::ok(
+                "delete",
+                "",
+                format!("按对账结果删除本地/远端条目 {} 项", r.deleted),
+            ),
+        );
         n += 1;
     }
     if r.deletes_blocked > 0 {
-        journal_log(state, JournalEntry::blocked(
-            "delete", "", format!("{} 项删除被熔断挡住（`qsync sync --once --force-deletes` 可放行一轮）",
-                r.deletes_blocked)));
+        journal_log(
+            state,
+            JournalEntry::blocked(
+                "delete",
+                "",
+                format!(
+                    "{} 项删除被熔断挡住（`qsync sync --once --force-deletes` 可放行一轮）",
+                    r.deletes_blocked
+                ),
+            ),
+        );
         n += 1;
     }
     for e in &r.errors {
@@ -2381,8 +2469,14 @@ fn journal_record_sync(state: &Arc<State>, r: &sync::SyncReport) {
     }
     if n == 0 && r.dirs_scanned > 0 {
         // 扫过但没变化：记一条很轻的，方便「更新中心」看出引擎活着
-        journal_log(state, JournalEntry::ok(
-            "scan", "", format!("对账完成：扫描 {} 个目录，无变化", r.dirs_scanned)));
+        journal_log(
+            state,
+            JournalEntry::ok(
+                "scan",
+                "",
+                format!("对账完成：扫描 {} 个目录，无变化", r.dirs_scanned),
+            ),
+        );
     }
 }
 
@@ -2400,7 +2494,11 @@ fn spawn_journal_flusher(state: Arc<State>) {
             tokio::time::sleep(Duration::from_millis(500)).await;
             let batch: Vec<JournalEntry> = {
                 let mut b = state.journal_buf.lock().unwrap();
-                if b.is_empty() { Vec::new() } else { std::mem::take(&mut *b) }
+                if b.is_empty() {
+                    Vec::new()
+                } else {
+                    std::mem::take(&mut *b)
+                }
             };
             if !batch.is_empty() {
                 let g = state.sync_store.lock().unwrap();
@@ -2447,7 +2545,11 @@ fn journal_cmd(
             limit.unwrap_or(200),
             since,
             query.as_deref(),
-            if lvl == "all" { None } else { Some(lvl.as_str()) },
+            if lvl == "all" {
+                None
+            } else {
+                Some(lvl.as_str())
+            },
         )
         .map_err(core_err)?;
     let total = g.store.journal_count().map_err(core_err)?;
@@ -2483,7 +2585,10 @@ fn settings_data(state: &Arc<State>, saved: bool, note: Option<String>) -> Setti
             .as_ref()
             .map(|p| Settings::autostart_file(p).display().to_string())
             .unwrap_or_default(),
-        autostart_present: paths.as_ref().map(Settings::autostart_present).unwrap_or(false),
+        autostart_present: paths
+            .as_ref()
+            .map(Settings::autostart_present)
+            .unwrap_or(false),
         saved,
         proxy_env: Settings::proxy_env(),
         proxy_url: match &proxy {
@@ -2518,7 +2623,11 @@ fn settings_save_cmd(
     // 开机自启：只有真要用的时候才需要可执行文件路径
     let mut autostart_written = false;
     if s.launch_at_startup || autostart_exe.is_some() {
-        let exe = match autostart_exe.clone().map(PathBuf::from).or_else(default_gui_exe) {
+        let exe = match autostart_exe
+            .clone()
+            .map(PathBuf::from)
+            .or_else(default_gui_exe)
+        {
             Some(e) => e,
             None => {
                 return Err(bad_req(
@@ -2531,7 +2640,8 @@ fn settings_save_cmd(
         autostart_written = s.launch_at_startup;
     } else {
         // 关掉自启：把桌面项删掉（不存在也算成功）
-        s.apply_autostart(&paths, &PathBuf::from("qxync-gui")).map_err(core_err)?;
+        s.apply_autostart(&paths, &PathBuf::from("qxync-gui"))
+            .map_err(core_err)?;
     }
     let saved_path = s.save(&paths).map_err(core_err)?;
     *state.settings.lock().unwrap() = s.clone();
@@ -2546,7 +2656,11 @@ fn settings_save_cmd(
                 s.proxy.mode,
                 if s.free_space.auto { "开" } else { "关" },
                 if s.launch_at_startup { "开" } else { "关" },
-                if s.desktop_notifications { "开" } else { "关" }
+                if s.desktop_notifications {
+                    "开"
+                } else {
+                    "关"
+                }
             ),
         ),
     );
@@ -2557,7 +2671,8 @@ fn settings_save_cmd(
         Some(if autostart_written {
             "开机自启已写入 autostart 桌面项；代理改动手动模式后，已在跑的水合客户端要等下次挂载才生效".into()
         } else {
-            "设置已落盘（代理改动对手动建立的连接要等下次挂载；LAN 监听地址改动要重启 daemon）".into()
+            "设置已落盘（代理改动对手动建立的连接要等下次挂载；LAN 监听地址改动要重启 daemon）"
+                .into()
         }),
     ))
 }
@@ -2589,19 +2704,34 @@ fn decisions_cmd(
                         "resolution 只能是 keep_local / keep_remote / keep_both，收到 {res:?}"
                     )));
                 }
-                if !g.store.decision_resolve(&id, Some(&res)).map_err(core_err)? {
-                    return Err(IpcError::new(ErrorKind::BadRequest, format!("没有这条待裁决：{id}")));
+                if !g
+                    .store
+                    .decision_resolve(&id, Some(&res))
+                    .map_err(core_err)?
+                {
+                    return Err(IpcError::new(
+                        ErrorKind::BadRequest,
+                        format!("没有这条待裁决：{id}"),
+                    ));
                 }
                 journal_log(
                     state,
-                    JournalEntry::ok("conflict", "", format!("用户裁决冲突 {id} → {res}（下一轮同步执行）")),
+                    JournalEntry::ok(
+                        "conflict",
+                        "",
+                        format!("用户裁决冲突 {id} → {res}（下一轮同步执行）"),
+                    ),
                 );
             }
             "clear" => {
                 removed = g.store.decisions_clear().map_err(core_err)?;
                 journal_log(
                     state,
-                    JournalEntry::ok("conflict", "", format!("清空冲突待裁决队列（{removed} 条，未动文件）")),
+                    JournalEntry::ok(
+                        "conflict",
+                        "",
+                        format!("清空冲突待裁决队列（{removed} 条，未动文件）"),
+                    ),
                 );
             }
             other => return Err(bad_req(format!("未知 action {other:?}"))),
@@ -2698,7 +2828,9 @@ async fn file_states_cmd(state: &Arc<State>, path: String) -> Result<serde_json:
             state: state_str.to_string(),
             pin,
             dirty,
-            hidden: handle.hidden(&format!("{}/{}", dir, e.filename), e.isfolder).is_some(),
+            hidden: handle
+                .hidden(&format!("{}/{}", dir, e.filename), e.isfolder)
+                .is_some(),
         });
     }
     to_value(FileStatesData {
@@ -2781,7 +2913,11 @@ fn spawn_auto_free(state: Arc<State>) {
             );
             // 「刚访问过」保护窗口：默认 300s（M3 既有行为）；
             // 验收可以用 QSYNC_AUTO_FREE_RECENT=0 把它关掉，观察低空间触发（**只是测试旋钮**）。
-            let recent = if d.idle_secs > 0 { 0 } else { auto_free_recent_secs() };
+            let recent = if d.idle_secs > 0 {
+                0
+            } else {
+                auto_free_recent_secs()
+            };
             // ⚠ 限额 0 的语义是「能清多少清多少」，但 `CacheLimit::parse("0")` 会判为无效写法
             //   而让整轮变成**空操作**（踩过）。所以这里夹到最小 1 字节 —— 与「腾不出那么多」等价。
             let limit = d.cache_limit_bytes.map(|b| b.max(1).to_string());

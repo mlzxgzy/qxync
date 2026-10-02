@@ -716,7 +716,11 @@ async fn main() -> Result<()> {
         }
         // ★ M8.4：设置不依赖 daemon（就是读写 settings.json + autostart 桌面项）；
         //   但**跑着的 daemon 不会自动重读**，所以这里提示一句。
-        Cmd::Settings { set, autostart_exe, json } => {
+        Cmd::Settings {
+            set,
+            autostart_exe,
+            json,
+        } => {
             let paths = paths()?;
             let mut st = Settings::load(&paths)?;
             let mut saved = false;
@@ -727,10 +731,11 @@ async fn main() -> Result<()> {
                         .ok_or_else(|| anyhow::anyhow!("--set 需要 key=value，收到 {kv:?}"))?;
                     st.set_kv(k.trim(), v)?;
                 }
-                let exe = autostart_exe
-                    .clone()
-                    .or_else(|| default_gui_exe_from_cli());
-                st.apply_autostart(&paths, exe.as_deref().unwrap_or(std::path::Path::new("qxync-gui")))?;
+                let exe = autostart_exe.clone().or_else(|| default_gui_exe_from_cli());
+                st.apply_autostart(
+                    &paths,
+                    exe.as_deref().unwrap_or(std::path::Path::new("qxync-gui")),
+                )?;
                 st.save(&paths)?;
                 saved = true;
                 eprintln!("⚠️ 直连模式：设置已写入文件；正在运行的 daemon 要重启才会读到代理/释放空间的新值");
@@ -781,7 +786,10 @@ async fn main() -> Result<()> {
             if remote.len() > 1 {
                 bail!("多根挂载需要 daemon：先 `qsync daemon start`（或用 --via-daemon）");
             }
-            let remote = remote.first().cloned().unwrap_or_else(|| HOME_ROOT.to_string());
+            let remote = remote
+                .first()
+                .cloned()
+                .unwrap_or_else(|| HOME_ROOT.to_string());
             let (client, link) = connect(&cli, true).await?;
             let cache = cache_dir.clone().unwrap_or_else(|| {
                 paths()
@@ -981,13 +989,16 @@ fn to_request(cli: &Cli) -> Option<Request> {
             name: name.clone(),
         },
         Cmd::Roots { .. } => Request::Roots,
-        Cmd::Settings { set, autostart_exe, .. } => {
+        Cmd::Settings {
+            set, autostart_exe, ..
+        } => {
             // 不带 --set = 只读；带了就是「读-改-写」：先把当前设置取回来，
             // 逐键改，再整体回写（**顺序无关**，见 Settings::set_kv）。
             if set.is_empty() {
                 Request::Settings
             } else {
-                let mut want = local_settings().unwrap_or_else(|e| fatal(&format!("读取设置失败: {e}")));
+                let mut want =
+                    local_settings().unwrap_or_else(|e| fatal(&format!("读取设置失败: {e}")));
                 for kv in set {
                     let Some((k, v)) = kv.split_once('=') else {
                         fatal(&format!("--set 需要 key=value，收到 {kv:?}"));
@@ -1003,7 +1014,12 @@ fn to_request(cli: &Cli) -> Option<Request> {
             }
         }
         Cmd::Space { now, .. } => Request::Space { now: Some(*now) },
-        Cmd::Conflicts { resolve, resolution, clear, .. } => Request::Decisions {
+        Cmd::Conflicts {
+            resolve,
+            resolution,
+            clear,
+            ..
+        } => Request::Decisions {
             action: if *clear {
                 "clear".to_string()
             } else if resolve.is_some() {
@@ -1015,7 +1031,14 @@ fn to_request(cli: &Cli) -> Option<Request> {
             resolution: resolution.clone(),
         },
         Cmd::FileStates { path, .. } => Request::FileStates { path: path.clone() },
-        Cmd::Journal { limit, since, query, level, clear, .. } => Request::Journal {
+        Cmd::Journal {
+            limit,
+            since,
+            query,
+            level,
+            clear,
+            ..
+        } => Request::Journal {
             limit: *limit,
             since: *since,
             query: query.clone(),
@@ -1023,8 +1046,20 @@ fn to_request(cli: &Cli) -> Option<Request> {
             clear: Some(*clear),
         },
         Cmd::Task { action } => match action {
-            TaskAction::List { .. } => Request::Tasks { action: "list".into(), id: None, task: None },
-            TaskAction::Add { id, mountpoint, roots, read_write, cache_mode, conflict, .. } => {
+            TaskAction::List { .. } => Request::Tasks {
+                action: "list".into(),
+                id: None,
+                task: None,
+            },
+            TaskAction::Add {
+                id,
+                mountpoint,
+                roots,
+                read_write,
+                cache_mode,
+                conflict,
+                ..
+            } => {
                 Request::Tasks {
                     action: "save".into(),
                     id: None,
@@ -1045,10 +1080,26 @@ fn to_request(cli: &Cli) -> Option<Request> {
                     ),
                 }
             }
-            TaskAction::Rm { id, .. } => Request::Tasks { action: "delete".into(), id: Some(id.clone()), task: None },
-            TaskAction::Pause { id, .. } => Request::Tasks { action: "pause".into(), id: Some(id.clone()), task: None },
-            TaskAction::Resume { id, .. } => Request::Tasks { action: "resume".into(), id: Some(id.clone()), task: None },
-            TaskAction::Mount { id, .. } => Request::Tasks { action: "mount".into(), id: Some(id.clone()), task: None },
+            TaskAction::Rm { id, .. } => Request::Tasks {
+                action: "delete".into(),
+                id: Some(id.clone()),
+                task: None,
+            },
+            TaskAction::Pause { id, .. } => Request::Tasks {
+                action: "pause".into(),
+                id: Some(id.clone()),
+                task: None,
+            },
+            TaskAction::Resume { id, .. } => Request::Tasks {
+                action: "resume".into(),
+                id: Some(id.clone()),
+                task: None,
+            },
+            TaskAction::Mount { id, .. } => Request::Tasks {
+                action: "mount".into(),
+                id: Some(id.clone()),
+                task: None,
+            },
         },
         Cmd::Rules { r#match, .. } => Request::Rules {
             match_path: r#match.clone(),
@@ -1272,7 +1323,10 @@ async fn route_via_daemon(
         Cmd::Journal { json, .. } => {
             let d: qxync_core::ipc::JournalData = ipc_client::call(&socket, req).await?;
             if *json {
-                println!("{}", serde_json::to_string_pretty(&d).unwrap_or_else(|_| "{}".into()));
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&d).unwrap_or_else(|_| "{}".into())
+                );
             } else {
                 print_journal(&d);
             }
@@ -1282,8 +1336,9 @@ async fn route_via_daemon(
             if *json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&d)
-                        .map_err(|e| qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string()))?
+                    serde_json::to_string_pretty(&d).map_err(
+                        |e| qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string())
+                    )?
                 );
             } else {
                 print_settings_data(&d);
@@ -1297,8 +1352,9 @@ async fn route_via_daemon(
             if *json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&d)
-                        .map_err(|e| qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string()))?
+                    serde_json::to_string_pretty(&d).map_err(
+                        |e| qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string())
+                    )?
                 );
             } else {
                 print_space(&d, *now);
@@ -1309,8 +1365,9 @@ async fn route_via_daemon(
             if *json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&d)
-                        .map_err(|e| qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string()))?
+                    serde_json::to_string_pretty(&d).map_err(
+                        |e| qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string())
+                    )?
                 );
             } else {
                 print_decisions(&d);
@@ -1321,8 +1378,9 @@ async fn route_via_daemon(
             if *json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&d)
-                        .map_err(|e| qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string()))?
+                    serde_json::to_string_pretty(&d).map_err(
+                        |e| qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string())
+                    )?
                 );
             } else {
                 print_file_states(&d);
@@ -1333,13 +1391,13 @@ async fn route_via_daemon(
             if *json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&raw)
-                        .map_err(|e| qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string()))?
+                    serde_json::to_string_pretty(&raw).map_err(|e| {
+                        qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string())
+                    })?
                 );
             } else {
-                let d: RootsData = serde_json::from_value(raw).map_err(|e| {
-                    qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string())
-                })?;
+                let d: RootsData = serde_json::from_value(raw)
+                    .map_err(|e| qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string()))?;
                 print_roots(&d);
             }
         }
@@ -1348,31 +1406,33 @@ async fn route_via_daemon(
             if *json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&raw)
-                        .map_err(|e| qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string()))?
+                    serde_json::to_string_pretty(&raw).map_err(|e| {
+                        qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string())
+                    })?
                 );
             } else {
-                let d: RulesData = serde_json::from_value(raw).map_err(|e| {
-                    qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string())
-                })?;
+                let d: RulesData = serde_json::from_value(raw)
+                    .map_err(|e| qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string()))?;
                 print_rules(&d);
             }
         }
         Cmd::Peer { action } => {
             let raw: serde_json::Value = ipc_client::call(&socket, req).await?;
-            let d: PeerData = serde_json::from_value(raw.clone()).map_err(|e| {
-                qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string())
-            })?;
+            let d: PeerData = serde_json::from_value(raw.clone())
+                .map_err(|e| qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string()))?;
             let json = match action {
-                PeerAction::Status { json } | PeerAction::List { json } | PeerAction::Ping { json, .. } => *json,
+                PeerAction::Status { json }
+                | PeerAction::List { json }
+                | PeerAction::Ping { json, .. } => *json,
                 PeerAction::Events { json, .. } => *json,
                 _ => false,
             };
             if json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&raw)
-                        .map_err(|e| qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string()))?
+                    serde_json::to_string_pretty(&raw).map_err(|e| {
+                        qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string())
+                    })?
                 );
             } else {
                 print_peer(&d);
@@ -1383,13 +1443,13 @@ async fn route_via_daemon(
             if *json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&raw)
-                        .map_err(|e| qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string()))?
+                    serde_json::to_string_pretty(&raw).map_err(|e| {
+                        qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string())
+                    })?
                 );
             } else {
-                let info: SyncInfo = serde_json::from_value(raw).map_err(|e| {
-                    qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string())
-                })?;
+                let info: SyncInfo = serde_json::from_value(raw)
+                    .map_err(|e| qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string()))?;
                 print_sync(&info);
                 if *once {
                     println!("（以上为累计计数；本轮详情见 daemon 日志）");
@@ -1409,13 +1469,13 @@ async fn route_via_daemon(
             if *json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&raw)
-                        .map_err(|e| qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string()))?
+                    serde_json::to_string_pretty(&raw).map_err(|e| {
+                        qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string())
+                    })?
                 );
             } else {
-                let d: StoreData = serde_json::from_value(raw).map_err(|e| {
-                    qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string())
-                })?;
+                let d: StoreData = serde_json::from_value(raw)
+                    .map_err(|e| qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string()))?;
                 print_store(&d);
             }
         }
@@ -1488,9 +1548,20 @@ fn print_settings(st: &Settings, paths: &ConfigPaths, json: bool, saved: bool) -
     if st.proxy.mode == PROXY_MANUAL {
         println!(
             "            服务器 {}:{}  认证 {}",
-            if st.proxy.server.is_empty() { "-" } else { &st.proxy.server },
-            st.proxy.port.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
-            if st.proxy.auth { format!("开（{}）", st.proxy.user) } else { "关".into() }
+            if st.proxy.server.is_empty() {
+                "-"
+            } else {
+                &st.proxy.server
+            },
+            st.proxy
+                .port
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "-".into()),
+            if st.proxy.auth {
+                format!("开（{}）", st.proxy.user)
+            } else {
+                "关".into()
+            }
         );
     }
     let env = Settings::proxy_env();
@@ -1504,17 +1575,29 @@ fn print_settings(st: &Settings, paths: &ConfigPaths, json: bool, saved: bool) -
     println!(
         "开机自启  : {}（桌面项 {}）",
         if st.launch_at_startup { "开" } else { "关" },
-        if Settings::autostart_present(paths) { "存在" } else { "不存在" }
+        if Settings::autostart_present(paths) {
+            "存在"
+        } else {
+            "不存在"
+        }
     );
     println!(
         "桌面通知  : {}   调试日志: {}   关闭进托盘: {}",
-        if st.desktop_notifications { "开" } else { "关" },
+        if st.desktop_notifications {
+            "开"
+        } else {
+            "关"
+        },
         if st.debug_log { "开" } else { "关" },
         if st.close_to_tray { "开" } else { "关" }
     );
     println!(
         "释放空间  : {}（{}{}）",
-        if st.free_space.auto { "自动" } else { "不自动" },
+        if st.free_space.auto {
+            "自动"
+        } else {
+            "不自动"
+        },
         if st.free_space.mode == "frequency" {
             format!("按频率 每 {} 小时", st.free_space.every_hours)
         } else {
@@ -1528,7 +1611,11 @@ fn print_settings(st: &Settings, paths: &ConfigPaths, json: bool, saved: bool) -
 /// 经 daemon 的设置打印。
 fn print_settings_data(d: &SettingsData) {
     let st = &d.settings;
-    println!("设置文件  : {}{}", d.path, if d.saved { "（本次已写入）" } else { "" });
+    println!(
+        "设置文件  : {}{}",
+        d.path,
+        if d.saved { "（本次已写入）" } else { "" }
+    );
     println!("代理      : {}", proxy_label(&st.proxy.mode));
     if let Some(u) = &d.proxy_url {
         println!("            URL {u}");
@@ -1544,17 +1631,29 @@ fn print_settings_data(d: &SettingsData) {
         "开机自启  : {}（桌面项 {}：{}）",
         if st.launch_at_startup { "开" } else { "关" },
         d.autostart_path,
-        if d.autostart_present { "存在" } else { "不存在" }
+        if d.autostart_present {
+            "存在"
+        } else {
+            "不存在"
+        }
     );
     println!(
         "桌面通知  : {}   调试日志: {}   关闭进托盘: {}",
-        if st.desktop_notifications { "开" } else { "关" },
+        if st.desktop_notifications {
+            "开"
+        } else {
+            "关"
+        },
         if st.debug_log { "开" } else { "关" },
         if st.close_to_tray { "开" } else { "关" }
     );
     println!(
         "释放空间  : {}（{}）",
-        if st.free_space.auto { "自动" } else { "不自动" },
+        if st.free_space.auto {
+            "自动"
+        } else {
+            "不自动"
+        },
         if st.free_space.mode == "frequency" {
             format!("按频率 每 {} 小时", st.free_space.every_hours)
         } else {
@@ -1590,7 +1689,11 @@ fn print_space(d: &SpaceData, now: bool) {
     );
     println!(
         "本轮判定  : {} —— {}",
-        if d.would_run { "会触发" } else { "不触发" },
+        if d.would_run {
+            "会触发"
+        } else {
+            "不触发"
+        },
         d.reason
     );
     if d.last_run_unix > 0 {
@@ -1666,7 +1769,11 @@ fn print_file_states(d: &FileStatesData) {
             human_size(e.size),
             e.pin,
             e.name,
-            if e.dirty { "（有未上传改动）" } else { "" }
+            if e.dirty {
+                "（有未上传改动）"
+            } else {
+                ""
+            }
         );
     }
     if let Some(n) = &d.note {
@@ -1778,7 +1885,10 @@ fn print_peer(d: &PeerData) {
             );
         }
         "notify" => {
-            println!("✅ {}", d.note.clone().unwrap_or_else(|| "事件已广播".into()));
+            println!(
+                "✅ {}",
+                d.note.clone().unwrap_or_else(|| "事件已广播".into())
+            );
         }
         "events" => {
             if d.events.is_empty() {
@@ -1807,7 +1917,9 @@ fn print_peer(d: &PeerData) {
             );
             println!("对外根    : {}", d.roots.join(", "));
             if let Some(code) = &d.pairing_code {
-                println!("配对码    : {code}（对方执行 `qsync peer pair <本机地址> --code {code}`）");
+                println!(
+                    "配对码    : {code}（对方执行 `qsync peer pair <本机地址> --code {code}`）"
+                );
             } else {
                 println!("配对码    : （已关闭）");
             }
@@ -1816,7 +1928,10 @@ fn print_peer(d: &PeerData) {
             } else {
                 println!("已配对    : {} 台", d.devices.len());
                 for p in &d.devices {
-                    println!("            {:<16} {:<22} {}", p.name, p.addr, p.token_masked);
+                    println!(
+                        "            {:<16} {:<22} {}",
+                        p.name, p.addr, p.token_masked
+                    );
                 }
             }
             println!(
@@ -2174,9 +2289,15 @@ async fn run_task_cmd(
     };
     match action {
         TaskAction::List { json } => {
-            let raw: serde_json::Value =
-                ipc_client::call(socket, Request::Tasks { action: "list".into(), id: None, task: None })
-                    .await?;
+            let raw: serde_json::Value = ipc_client::call(
+                socket,
+                Request::Tasks {
+                    action: "list".into(),
+                    id: None,
+                    task: None,
+                },
+            )
+            .await?;
             if *json {
                 println!("{}", dumps(&raw)?);
                 return Ok(());
@@ -2185,7 +2306,17 @@ async fn run_task_cmd(
                 .map_err(|e| parse_err(format!("解析 tasks 响应失败: {e}（daemon 版本过旧？）")))?;
             print_tasks(&d);
         }
-        TaskAction::Add { id, mountpoint, roots, read_write, cache_mode, cache_dir, no_mount, json, conflict } => {
+        TaskAction::Add {
+            id,
+            mountpoint,
+            roots,
+            read_write,
+            cache_mode,
+            cache_dir,
+            no_mount,
+            json,
+            conflict,
+        } => {
             let task = qxync_core::tasks::Task::from_mount(
                 Some(id.clone()),
                 mountpoint.clone(),
@@ -2202,23 +2333,37 @@ async fn run_task_cmd(
             .with_conflict(conflict.clone());
             let saved: serde_json::Value = ipc_client::call(
                 socket,
-                Request::Tasks { action: "save".into(), id: None, task: Some(task.clone()) },
+                Request::Tasks {
+                    action: "save".into(),
+                    id: None,
+                    task: Some(task.clone()),
+                },
             )
             .await?;
             let mut mounted = serde_json::Value::Null;
             if !*no_mount {
                 mounted = ipc_client::call(
                     socket,
-                    Request::Tasks { action: "resume".into(), id: Some(task.id.clone()), task: None },
+                    Request::Tasks {
+                        action: "resume".into(),
+                        id: Some(task.id.clone()),
+                        task: None,
+                    },
                 )
                 .await?;
             }
             if *json {
-                println!("{}", dumps(&serde_json::json!({ "saved": saved, "mount": mounted }))?);
+                println!(
+                    "{}",
+                    dumps(&serde_json::json!({ "saved": saved, "mount": mounted }))?
+                );
             } else {
                 println!("✅ 任务已登记：{}", task.summary());
                 if *no_mount {
-                    println!("   --no-mount：只登记未挂载；要挂载用 `qsync task mount {}`", task.id);
+                    println!(
+                        "   --no-mount：只登记未挂载；要挂载用 `qsync task mount {}`",
+                        task.id
+                    );
                 } else {
                     println!("   ✅ 已挂载");
                 }
@@ -2227,12 +2372,20 @@ async fn run_task_cmd(
         TaskAction::Rm { id, json } => {
             let raw: serde_json::Value = ipc_client::call(
                 socket,
-                Request::Tasks { action: "delete".into(), id: Some(id.clone()), task: None },
+                Request::Tasks {
+                    action: "delete".into(),
+                    id: Some(id.clone()),
+                    task: None,
+                },
             )
             .await?;
             if *json {
                 println!("{}", dumps(&raw)?);
-            } else if raw.get("deleted").and_then(|v| v.as_bool()).unwrap_or(false) {
+            } else if raw
+                .get("deleted")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
                 println!("✅ 已删除任务登记：{id}（挂载点里的数据未改动）");
             } else {
                 println!("ℹ️  没有这个任务：{id}");
@@ -2241,23 +2394,38 @@ async fn run_task_cmd(
         TaskAction::Pause { id, json } => {
             let raw: serde_json::Value = ipc_client::call(
                 socket,
-                Request::Tasks { action: "pause".into(), id: Some(id.clone()), task: None },
+                Request::Tasks {
+                    action: "pause".into(),
+                    id: Some(id.clone()),
+                    task: None,
+                },
             )
             .await?;
             if *json {
                 println!("{}", dumps(&raw)?);
             } else {
-                let un = raw.get("unmounted").and_then(|v| v.as_bool()).unwrap_or(false);
+                let un = raw
+                    .get("unmounted")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 println!(
                     "⏸  已暂停任务：{id}（停用登记{}；已入队的上传会先排空）",
-                    if un { "并卸载" } else { "，未在挂载中" }
+                    if un {
+                        "并卸载"
+                    } else {
+                        "，未在挂载中"
+                    }
                 );
             }
         }
         TaskAction::Resume { id, json } => {
             let raw: serde_json::Value = ipc_client::call(
                 socket,
-                Request::Tasks { action: "resume".into(), id: Some(id.clone()), task: None },
+                Request::Tasks {
+                    action: "resume".into(),
+                    id: Some(id.clone()),
+                    task: None,
+                },
             )
             .await?;
             if *json {
@@ -2269,7 +2437,11 @@ async fn run_task_cmd(
         TaskAction::Mount { id, json } => {
             let raw: serde_json::Value = ipc_client::call(
                 socket,
-                Request::Tasks { action: "mount".into(), id: Some(id.clone()), task: None },
+                Request::Tasks {
+                    action: "mount".into(),
+                    id: Some(id.clone()),
+                    task: None,
+                },
             )
             .await?;
             if *json {
@@ -2287,10 +2459,16 @@ fn print_tasks(d: &TasksData) {
         "任务 {} 个（启用 {}）{}",
         d.count(),
         d.enabled_count(),
-        if d.empty { "· 还没有登记过任务" } else { "" }
+        if d.empty {
+            "· 还没有登记过任务"
+        } else {
+            ""
+        }
     );
     if d.tasks.is_empty() {
-        println!("  （空）建一个：qsync task add --id default --mountpoint ~/qsync-mnt --root /home");
+        println!(
+            "  （空）建一个：qsync task add --id default --mountpoint ~/qsync-mnt --root /home"
+        );
     }
     for ti in &d.tasks {
         let t = &ti.task;
@@ -2333,7 +2511,11 @@ fn print_journal(d: &qxync_core::ipc::JournalData) {
     let blk = d.counts.get("blocked").copied().unwrap_or(0);
     println!(
         "同步日志：共 {} 条（ok {} / error {} / blocked {}）· 本次返回 {} 条",
-        d.total, ok, err, blk, d.entries.len()
+        d.total,
+        ok,
+        err,
+        blk,
+        d.entries.len()
     );
     if d.entries.is_empty() {
         println!("  （空）挂载一个同步任务后跑一轮 `qsync sync --once` 就会产生记录（没有挂载点就没有对账）");
@@ -2345,8 +2527,16 @@ fn print_journal(d: &qxync_core::ipc::JournalData) {
             "blocked" => "⛔",
             _ => "✅",
         };
-        let p = if e.path.is_empty() { String::new() } else { format!(" {}", e.path) };
-        let b = if e.bytes > 0 { format!(" [{} B]", e.bytes) } else { String::new() };
+        let p = if e.path.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", e.path)
+        };
+        let b = if e.bytes > 0 {
+            format!(" [{} B]", e.bytes)
+        } else {
+            String::new()
+        };
         println!("  {mark} {ts}  {:<14}{}{}  {}", e.kind, p, b, e.detail);
     }
     if let Some(n) = &d.note {

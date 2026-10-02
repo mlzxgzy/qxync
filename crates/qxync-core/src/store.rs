@@ -193,7 +193,12 @@ fn journal_ok() -> String {
 }
 
 impl JournalEntry {
-    pub fn new(kind: &str, path: impl Into<String>, detail: impl Into<String>, status: &str) -> Self {
+    pub fn new(
+        kind: &str,
+        path: impl Into<String>,
+        detail: impl Into<String>,
+        status: &str,
+    ) -> Self {
         Self {
             ts: now_unix(),
             task_id: String::new(),
@@ -523,9 +528,7 @@ impl Store {
             .prepare("SELECT status, COUNT(*) FROM journal GROUP BY status")
             .map_err(Error::from)?;
         let rows = stmt
-            .query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-            })
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
             .map_err(Error::from)?;
         let mut m = std::collections::BTreeMap::new();
         for row in rows {
@@ -537,7 +540,10 @@ impl Store {
 
     /// 清空日志（**只清日志，不碰游标/baseline/pin/队列**）。
     pub fn journal_clear(&self) -> Result<usize> {
-        let n = self.conn().execute("DELETE FROM journal", []).map_err(Error::from)?;
+        let n = self
+            .conn()
+            .execute("DELETE FROM journal", [])
+            .map_err(Error::from)?;
         Ok(n)
     }
 
@@ -551,7 +557,10 @@ impl Store {
             let cutoff = crate::store::now_unix() - max_age_days * 86_400;
             n += self
                 .conn()
-                .execute("DELETE FROM journal WHERE ts < ?1", rusqlite::params![cutoff])
+                .execute(
+                    "DELETE FROM journal WHERE ts < ?1",
+                    rusqlite::params![cutoff],
+                )
                 .map_err(Error::from)?;
         }
         if max_rows > 0 {
@@ -571,9 +580,11 @@ impl Store {
 
     pub fn pin(&self, path: &str) -> Result<Option<String>> {
         self.conn()
-            .query_row("SELECT state FROM pins WHERE path = ?1", params![path], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT state FROM pins WHERE path = ?1",
+                params![path],
+                |r| r.get(0),
+            )
             .optional()
             .map_err(Error::from)
     }
@@ -678,21 +689,22 @@ impl Store {
                    FROM decisions WHERE path = ?1",
             )
             .map_err(Error::from)?;
-        let mut rows = stmt.query_map(params![path], |r| {
-            Ok(DecisionRow {
-                id: r.get(0)?,
-                path: r.get(1)?,
-                task_id: r.get(2)?,
-                is_dir: r.get::<_, i64>(3)? != 0,
-                local_size: r.get::<_, i64>(4)? as u64,
-                local_mtime: r.get(5)?,
-                remote_size: r.get::<_, i64>(6)? as u64,
-                remote_mtime: r.get(7)?,
-                created_unix: r.get(8)?,
-                resolution: r.get(9)?,
+        let mut rows = stmt
+            .query_map(params![path], |r| {
+                Ok(DecisionRow {
+                    id: r.get(0)?,
+                    path: r.get(1)?,
+                    task_id: r.get(2)?,
+                    is_dir: r.get::<_, i64>(3)? != 0,
+                    local_size: r.get::<_, i64>(4)? as u64,
+                    local_mtime: r.get(5)?,
+                    remote_size: r.get::<_, i64>(6)? as u64,
+                    remote_mtime: r.get(7)?,
+                    created_unix: r.get(8)?,
+                    resolution: r.get(9)?,
+                })
             })
-        })
-        .map_err(Error::from)?;
+            .map_err(Error::from)?;
         match rows.next() {
             Some(r) => Ok(Some(r.map_err(Error::from)?)),
             None => Ok(None),
@@ -901,7 +913,9 @@ fn write_baseline(conn: &Connection, b: &Baseline) -> Result<()> {
         .map_err(Error::from)?;
     {
         let mut stmt = conn
-            .prepare("INSERT INTO baseline(path, present, is_dir, size, mtime) VALUES(?1,?2,?3,?4,?5)")
+            .prepare(
+                "INSERT INTO baseline(path, present, is_dir, size, mtime) VALUES(?1,?2,?3,?4,?5)",
+            )
             .map_err(Error::from)?;
         for (path, sig) in &b.entries {
             stmt.execute(params![
@@ -978,7 +992,10 @@ mod tests {
         b2.put("/home/a.txt", Sig::file(2048, 333));
         s.save_baseline(&b2).unwrap();
         assert_eq!(s.baseline_len().unwrap(), 1);
-        assert_eq!(s.baseline().unwrap().get("/home/a.txt"), Sig::file(2048, 333));
+        assert_eq!(
+            s.baseline().unwrap().get("/home/a.txt"),
+            Sig::file(2048, 333)
+        );
     }
 
     #[test]
@@ -1004,12 +1021,18 @@ mod tests {
             s.set_pin("/home/keep.bin", "pinned").unwrap();
             s.set_pin("/home/skip.bin", "excluded").unwrap();
             s.set_pin("/home/keep.bin", "unpinned").unwrap(); // 覆盖
-            assert_eq!(s.pin("/home/keep.bin").unwrap().as_deref(), Some("unpinned"));
+            assert_eq!(
+                s.pin("/home/keep.bin").unwrap().as_deref(),
+                Some("unpinned")
+            );
         }
         let s = Store::open(&db).unwrap();
         let m = s.pins().unwrap();
         assert_eq!(m.len(), 2);
-        assert_eq!(m.get("/home/skip.bin").map(String::as_str), Some("excluded"));
+        assert_eq!(
+            m.get("/home/skip.bin").map(String::as_str),
+            Some("excluded")
+        );
         assert!(s.remove_pin("/home/keep.bin").unwrap());
         assert!(!s.remove_pin("/home/keep.bin").unwrap());
         assert_eq!(s.pins().unwrap().len(), 1);
@@ -1019,14 +1042,28 @@ mod tests {
     #[test]
     fn journal_batch_insert_list_filter_and_trim() {
         let s = Store::open_in_memory().unwrap();
-        assert_eq!(s.schema_version().unwrap(), SCHEMA_VERSION, "v3 schema（M8.4 加 decisions 表）");
+        assert_eq!(
+            s.schema_version().unwrap(),
+            SCHEMA_VERSION,
+            "v3 schema（M8.4 加 decisions 表）"
+        );
 
         let mut rows = Vec::new();
         for i in 0..10 {
-            rows.push(JournalEntry::ok("upload", format!("/home/f{i}.txt"), "上传完成").with_bytes(i));
+            rows.push(
+                JournalEntry::ok("upload", format!("/home/f{i}.txt"), "上传完成").with_bytes(i),
+            );
         }
-        rows.push(JournalEntry::error("upload", "/home/fail.txt", "上传失败：连接重置"));
-        rows.push(JournalEntry::blocked("dehydrate", "/home/pin.bin", "被 pin 挡下"));
+        rows.push(JournalEntry::error(
+            "upload",
+            "/home/fail.txt",
+            "上传失败：连接重置",
+        ));
+        rows.push(JournalEntry::blocked(
+            "dehydrate",
+            "/home/pin.bin",
+            "被 pin 挡下",
+        ));
         assert_eq!(s.journal_add_batch(&rows).unwrap(), 12);
         assert_eq!(s.journal_add_batch(&[]).unwrap(), 0, "空批次是 no-op");
         assert_eq!(s.journal_count().unwrap(), 12);
@@ -1044,8 +1081,18 @@ mod tests {
         assert_eq!(blk.len(), 1);
 
         // 子串查询（path 与 detail 都匹配）
-        assert_eq!(s.journal_list(100, None, Some("f3.txt"), None).unwrap().len(), 1);
-        assert_eq!(s.journal_list(100, None, Some("连接重置"), None).unwrap().len(), 1);
+        assert_eq!(
+            s.journal_list(100, None, Some("f3.txt"), None)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            s.journal_list(100, None, Some("连接重置"), None)
+                .unwrap()
+                .len(),
+            1
+        );
 
         // limit
         assert_eq!(s.journal_list(3, None, None, None).unwrap().len(), 3);
@@ -1059,8 +1106,15 @@ mod tests {
         let removed = s.journal_trim(5, 0).unwrap();
         assert_eq!(removed, 7);
         assert_eq!(s.journal_count().unwrap(), 5);
-        assert!(s.journal_list(100, None, None, None).unwrap().iter().all(|e| e.kind != "upload" || e.path == "/home/f9.txt" || e.path.starts_with("/home/f")),
-            "留下的应该是最新的那些");
+        assert!(
+            s.journal_list(100, None, None, None)
+                .unwrap()
+                .iter()
+                .all(|e| e.kind != "upload"
+                    || e.path == "/home/f9.txt"
+                    || e.path.starts_with("/home/f")),
+            "留下的应该是最新的那些"
+        );
 
         // 清空只清 journal
         assert_eq!(s.journal_clear().unwrap(), 5);
@@ -1073,7 +1127,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "qxync-store-v1-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("sync.db");
@@ -1083,15 +1140,26 @@ mod tests {
                 "CREATE TABLE IF NOT EXISTS pins (path TEXT PRIMARY KEY, state TEXT NOT NULL);",
             )
             .unwrap();
-            conn.execute("INSERT INTO pins (path, state) VALUES ('/home/x', 'pinned')", [])
-                .unwrap();
+            conn.execute(
+                "INSERT INTO pins (path, state) VALUES ('/home/x', 'pinned')",
+                [],
+            )
+            .unwrap();
             conn.pragma_update(None, "user_version", 1i64).unwrap();
         }
         let s = Store::open(&db).unwrap();
         assert_eq!(s.schema_version().unwrap(), SCHEMA_VERSION, "打开时升到 v3");
-        assert_eq!(s.pin("/home/x").unwrap().as_deref(), Some("pinned"), "老数据必须原样保留");
+        assert_eq!(
+            s.pin("/home/x").unwrap().as_deref(),
+            Some("pinned"),
+            "老数据必须原样保留"
+        );
         assert_eq!(s.journal_count().unwrap(), 0, "新表是空的");
-        assert_eq!(s.journal_add_batch(&[JournalEntry::ok("scan", "/", "一轮")]).unwrap(), 1);
+        assert_eq!(
+            s.journal_add_batch(&[JournalEntry::ok("scan", "/", "一轮")])
+                .unwrap(),
+            1
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

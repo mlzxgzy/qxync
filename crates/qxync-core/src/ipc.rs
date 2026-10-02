@@ -1122,7 +1122,10 @@ mod tests {
                 assert_eq!(threads, Some(4));
                 assert_eq!(hydrate_timeout_secs, Some(600));
                 assert_eq!(remote.as_deref(), Some("/home"));
-                assert_eq!(roots, Some(vec!["/home".to_string(), "/Public".to_string()]));
+                assert_eq!(
+                    roots,
+                    Some(vec!["/home".to_string(), "/Public".to_string()])
+                );
                 assert_eq!(delete_limit, Some(0));
                 assert_eq!(cache_mode.as_deref(), Some("direct"));
             }
@@ -1206,7 +1209,9 @@ mod tests {
         let d: RootsData = serde_json::from_str("{}").unwrap();
         assert!(d.roots.is_empty() && d.configured.is_empty() && d.syncing_folders.is_empty());
         assert_eq!(d.home_root, "");
-        let m: MountInfo = serde_json::from_str(r#"{"mountpoint":"/m","remote":"/home","readonly":true}"#).unwrap();
+        let m: MountInfo =
+            serde_json::from_str(r#"{"mountpoint":"/m","remote":"/home","readonly":true}"#)
+                .unwrap();
         assert!(m.roots.is_empty(), "老响应没有 roots 字段也要能解析");
     }
 
@@ -1225,8 +1230,7 @@ mod tests {
             other => panic!("解析成了 {other:?}"),
         }
         // 省略 match_path 也要能解析（CLI 只跑 `qsync rules`）
-        let e2: RequestEnvelope =
-            serde_json::from_str(r#"{"v":1,"method":"rules"}"#).unwrap();
+        let e2: RequestEnvelope = serde_json::from_str(r#"{"v":1,"method":"rules"}"#).unwrap();
         assert_eq!(e2.req, Request::Rules { match_path: None });
         // 响应缺字段 → 默认值
         let d: RulesData = serde_json::from_str("{}").unwrap();
@@ -1248,7 +1252,9 @@ mod tests {
         assert!(e.req.is_long_running(), "配对/直传可能慢，给长超时");
         let back: RequestEnvelope = decode_line(&encode_line(&e).unwrap()).unwrap();
         match back.req {
-            Request::Peer { action, addr, code, .. } => {
+            Request::Peer {
+                action, addr, code, ..
+            } => {
                 assert_eq!(action, "pair");
                 assert_eq!(addr.as_deref(), Some("127.0.0.1:9840"));
                 assert_eq!(code.as_deref(), Some("123456"));
@@ -1256,7 +1262,8 @@ mod tests {
             other => panic!("解析成了 {other:?}"),
         }
         // status 只有 action
-        let e2: RequestEnvelope = serde_json::from_str(r#"{"v":1,"method":"peer","action":"status"}"#).unwrap();
+        let e2: RequestEnvelope =
+            serde_json::from_str(r#"{"v":1,"method":"peer","action":"status"}"#).unwrap();
         assert_eq!(
             e2.req,
             Request::Peer {

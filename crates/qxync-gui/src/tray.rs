@@ -49,7 +49,8 @@ pub struct TrayState {
     pub watcher: String,
 }
 
-static TRAY_STATE: LazyLock<StdMutex<TrayState>> = LazyLock::new(|| StdMutex::new(TrayState::default()));
+static TRAY_STATE: LazyLock<StdMutex<TrayState>> =
+    LazyLock::new(|| StdMutex::new(TrayState::default()));
 
 fn state() -> TrayState {
     TRAY_STATE.lock().unwrap().clone()
@@ -122,7 +123,10 @@ fn probe_visibility() {
     const TRIES: u32 = 8;
     const RETRY_MS: u64 = 250;
 
-    let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
         Ok(rt) => rt,
         Err(e) => {
             finish(false, "", format!("建探测运行时失败: {e}"));

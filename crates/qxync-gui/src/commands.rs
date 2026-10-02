@@ -173,7 +173,11 @@ fn default_home_root() -> String {
 impl LinkInput {
     fn link(&self) -> LinkConfig {
         LinkConfig {
-            id: self.id.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| "default".into()),
+            id: self
+                .id
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "default".into()),
             host: self.host.trim().to_string(),
             port: self.port,
             https: self.https,
@@ -300,11 +304,17 @@ pub async fn ipc_call(req: Value) -> Value {
 #[tauri::command]
 pub async fn link_read(link_id: Option<String>) -> Result<Value, String> {
     let p = paths()?;
-    let id = link_id.filter(|s| !s.is_empty()).unwrap_or_else(|| "default".into());
+    let id = link_id
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "default".into());
     let path = p.link_file(&id);
     match LinkConfig::load(&p, &id) {
-        Ok(link) => Ok(json!({"exists": true, "id": id, "path": path.display().to_string(), "link": link})),
-        Err(_) => Ok(json!({"exists": false, "id": id, "path": path.display().to_string(), "link": Value::Null})),
+        Ok(link) => {
+            Ok(json!({"exists": true, "id": id, "path": path.display().to_string(), "link": link}))
+        }
+        Err(_) => Ok(
+            json!({"exists": false, "id": id, "path": path.display().to_string(), "link": Value::Null}),
+        ),
     }
 }
 
@@ -345,7 +355,9 @@ pub async fn credential_save(input: Value) -> Result<Value, String> {
 pub async fn credential_present() -> Result<Value, String> {
     let p = paths()?;
     match Credentials::load(&p) {
-        Ok(c) => Ok(json!({"present": true, "host": c.host, "user": c.user, "path": p.credentials_file().display().to_string()})),
+        Ok(c) => Ok(
+            json!({"present": true, "host": c.host, "user": c.user, "path": p.credentials_file().display().to_string()}),
+        ),
         Err(_) => Ok(json!({"present": false, "path": p.credentials_file().display().to_string()})),
     }
 }
@@ -353,7 +365,9 @@ pub async fn credential_present() -> Result<Value, String> {
 /// 拉起 daemon（已在跑就返回 already）。
 #[tauri::command]
 pub async fn daemon_start(link_id: Option<String>) -> Result<Value, String> {
-    let id = link_id.filter(|s| !s.is_empty()).unwrap_or_else(|| "default".into());
+    let id = link_id
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "default".into());
     // 没配置就直说，省得 daemon 起来又立刻退出
     let p = paths()?;
     if LinkConfig::load(&p, &id).is_err() {
@@ -374,7 +388,9 @@ pub async fn daemon_stop() -> Result<Value, String> {
     }
     let resp = ipc::call(&socket, Request::Shutdown).await;
     let gone = wait_gone(&socket).await;
-    Ok(json!({"stopped": gone, "already": false, "socket": socket.display().to_string(), "response": resp}))
+    Ok(
+        json!({"stopped": gone, "already": false, "socket": socket.display().to_string(), "response": resp}),
+    )
 }
 
 /// 「保存连接 + 登录」一条龙：
@@ -404,8 +420,13 @@ pub async fn login_flow(input: Value) -> Result<Value, String> {
     let socket = ipc::socket_path();
     let mut restarted = false;
     if ipc::available(&socket).await {
-        let current = ipc::call_typed::<StatusData>(&socket, Request::Status).await.ok();
-        let same = current.as_ref().map(|s| same_link(&s.link, &link)).unwrap_or(false);
+        let current = ipc::call_typed::<StatusData>(&socket, Request::Status)
+            .await
+            .ok();
+        let same = current
+            .as_ref()
+            .map(|s| same_link(&s.link, &link))
+            .unwrap_or(false);
         if !same {
             // 换 NAS / 换账号：daemon 需要重启才会读新的 link
             let _ = ipc::call(&socket, Request::Shutdown).await;
@@ -429,7 +450,9 @@ pub async fn login_flow(input: Value) -> Result<Value, String> {
         }
     } else {
         let started = start_daemon(&link.id).await;
-        if !started["started"].as_bool().unwrap_or(false) && !started["already"].as_bool().unwrap_or(false) {
+        if !started["started"].as_bool().unwrap_or(false)
+            && !started["already"].as_bool().unwrap_or(false)
+        {
             return Ok(json!({
                 "ok": false, "link_path": link_path.display().to_string(),
                 "credential_path": cred_path.display().to_string(), "restarted": false,
@@ -535,7 +558,11 @@ pub fn notifications_enabled() -> bool {
 }
 
 #[tauri::command]
-pub async fn notify_show(app: tauri::AppHandle, title: String, body: String) -> Result<Value, String> {
+pub async fn notify_show(
+    app: tauri::AppHandle,
+    title: String,
+    body: String,
+) -> Result<Value, String> {
     let enabled = notifications_enabled();
     if !enabled {
         return Ok(json!({"ok": true, "shown": false, "reason": "桌面通知已关闭"}));
@@ -571,7 +598,10 @@ async fn pick_with(
     use tauri_plugin_dialog::DialogExt as _;
     let (tx, rx) = tokio::sync::oneshot::channel::<Option<PathBuf>>();
     let mut builder = app.dialog().file();
-    if let Some(t) = title.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) {
+    if let Some(t) = title
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+    {
         builder = builder.set_title(t);
     }
     // 回调在 GTK 主线程/插件的 worker 上执行，`tx` 只是把结果送回这里。
@@ -715,11 +745,15 @@ mod tests {
             "roots": [" /home/ ", "Public", "/home", ""]
         }))
         .unwrap();
-        assert_eq!(li.link().roots, vec!["/home".to_string(), "/Public".to_string()]);
+        assert_eq!(
+            li.link().roots,
+            vec!["/home".to_string(), "/Public".to_string()]
+        );
         // 没传（或全是空白）= 空 = 只用 home_root，行为与 M5 之前一致
-        let li2: LinkInput =
-            serde_json::from_value(json!({"host": "nas.local", "user": "test1", "roots": ["  ", ""]}))
-                .unwrap();
+        let li2: LinkInput = serde_json::from_value(
+            json!({"host": "nas.local", "user": "test1", "roots": ["  ", ""]}),
+        )
+        .unwrap();
         assert!(li2.link().roots.is_empty());
     }
 

@@ -339,7 +339,10 @@ mod tests {
         let s = probe(Path::new("/")).unwrap();
         assert_eq!(s.avail_pct(), 3);
         std::env::set_var(key, "bad-spec");
-        assert!(probe(Path::new("/")).is_err(), "坏注入值必须报错而不是静默真量");
+        assert!(
+            probe(Path::new("/")).is_err(),
+            "坏注入值必须报错而不是静默真量"
+        );
         match old {
             Some(v) => std::env::set_var(key, v),
             None => std::env::remove_var(key),

@@ -621,7 +621,11 @@ mod tests {
             })),
             "/home/ok.txt",
         );
-        assert_eq!(called.load(Ordering::Relaxed), 2, "回调 panic 不能中断调用点");
+        assert_eq!(
+            called.load(Ordering::Relaxed),
+            2,
+            "回调 panic 不能中断调用点"
+        );
         // 没有回调也不能有事
         invoke_success_hook(None, "/home/none.txt");
     }
