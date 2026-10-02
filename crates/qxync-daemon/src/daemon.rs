@@ -10,9 +10,9 @@ use qxync_core::ipc::{
     decode_line, encode_line, mask_sid, mask_token, CacheInfo, CursorInfo, DaemonInfo,
     DecisionInfo, DecisionsData, DehydrateData, ErrorKind, FileStateInfo, FileStatesData, GetData,
     HydroStats, IpcError, JournalData, LinkInfo, LoginData, LsData, MountInfo, PeerData, PingData,
-    PutData, Request, RequestEnvelope, Response, RootsData, RulesData, ServerInfo,
-    SessionInfo, SettingsData, ShutdownData, SpaceData, StatusData, StoreData, SyncCursors,
-    SyncInfo, TaskInfo, TasksData, IPC_VERSION,
+    PutData, Request, RequestEnvelope, Response, RootsData, RulesData, ServerInfo, SessionInfo,
+    SettingsData, ShutdownData, SpaceData, StatusData, StoreData, SyncCursors, SyncInfo, TaskInfo,
+    TasksData, IPC_VERSION,
 };
 use qxync_core::rules::Rules;
 use qxync_core::settings::{ProxySpec, Settings};
@@ -1420,12 +1420,12 @@ async fn mount(
     let fuse_client = Arc::new(fuse_client);
     let mut fs = QxyncFs::new(fuse_client.clone(), remote.clone(), cache.clone())
         .map_err(|e| IpcError::new(ErrorKind::Io, e.to_string()))?
-    .with_hydrate_timeout(hydrate_timeout)
-    .with_counters(counters.clone())
-    .with_pins(state.pins.clone())
-    // ★ M7：选择性同步规则 + LAN 对端（水合时先试 LAN，失败回落 NAS）
-    .with_rules(state.rules.clone())
-    .with_peers(state.peers.clone());
+        .with_hydrate_timeout(hydrate_timeout)
+        .with_counters(counters.clone())
+        .with_pins(state.pins.clone())
+        // ★ M7：选择性同步规则 + LAN 对端（水合时先试 LAN，失败回落 NAS）
+        .with_rules(state.rules.clone())
+        .with_peers(state.peers.clone());
     if let Some(limit) = delete_limit {
         fs = fs.with_delete_limit(limit);
     }

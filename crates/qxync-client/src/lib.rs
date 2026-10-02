@@ -1256,9 +1256,11 @@ pub fn parse_syncing_folders(raw: &serde_json::Value) -> Vec<qxync_core::ipc::Sy
                 realpath: s("realpath"),
                 // 报告 §4.2 里同一字段有 `volume_id` / `vol_id` 两种拼法；
                 // ★ 真机是**数字** `1`（卷 id），所以要再兜一层数字→字符串
-                volume_id: s("volume_id")
-                    .or_else(|| s("vol_id"))
-                    .or_else(|| i("volume_id").or_else(|| i("vol_id")).map(|n| n.to_string())),
+                volume_id: s("volume_id").or_else(|| s("vol_id")).or_else(|| {
+                    i("volume_id")
+                        .or_else(|| i("vol_id"))
+                        .map(|n| n.to_string())
+                }),
             })
         })
         .collect()
@@ -1649,7 +1651,11 @@ mod tests {
             f[0].realpath.as_deref(),
             Some("/share/CACHEDEV1_DATA/homes/test1/.Qsync")
         );
-        assert_eq!(f[0].volume_id.as_deref(), Some("1"), "数字型 volume_id 也认");
+        assert_eq!(
+            f[0].volume_id.as_deref(),
+            Some("1"),
+            "数字型 volume_id 也认"
+        );
     }
 
     #[test]
