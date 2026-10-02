@@ -7,7 +7,7 @@
 //! export QSYNC_TEST_PORT=9834
 //! export QSYNC_TEST_USER=test1
 //! export QSYNC_TEST_PASSWORD='...'
-//! export QSYNC_TEST_FIXTURE=/home/qxync-test      # 由 report/probe/qs_fixture.py 造好
+//! export QSYNC_TEST_FIXTURE=/home/qxync-test      # 由 xtask/probe/qs_fixture.py 造好
 //! cargo test -p qxync-proto-test -- --ignored --test-threads=1 --nocapture
 //! ```
 //!

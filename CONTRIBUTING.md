@@ -5,7 +5,7 @@
 先读这两个：
 
 - **[`README.md`](README.md) 的「两条铁则」** —— 整个项目不许违反，改动 FUSE 读路径或脱水路径时尤其注意。
-- **[`report/DISCLAIMER.md`](report/DISCLAIMER.md)** —— 本项目的性质与法律边界。
+- **[`DISCLAIMER.md`](DISCLAIMER.md)** —— 本项目的性质与法律边界。
 
 ---
 
@@ -16,7 +16,7 @@
 **欢迎**：
 
 - 🐛 **Bug 报告**：请用 [Bug 报告模板](.github/ISSUE_TEMPLATE/bug_report.yml)，把复现步骤、日志、环境写全。
-- 📄 **协议事实更正**：你在**你自己拥有或已获授权**的 NAS 上实测出与 `report/` 或 README
+- 📄 **协议事实更正**：你在**你自己拥有或已获授权**的 NAS 上实测出与 README 或代码注释
   不符的行为 —— 这类 Issue 价值最高，请附上**原始响应**（记得先掩码你的域名 / 账号 / sid）。
 - 🔧 **代码 PR**：修 bug、补测试、改进文档、增加发行版适配。
 - 🌍 **翻译**：`ui/i18n.js` 里预留了 `en` 空表；把界面文案补齐是很好的切入点。
@@ -78,7 +78,7 @@ cargo test --workspace
 - **面向读者的长文档用「双文件」**：`X.md`（中文，权威）+ `X.en.md`（英文镜像），
   两者必须同步更新 —— 改了中文忘了英文，PR 会被要求补上。
 - **短小的政策类文档用「单文件双语」**：像本文件与 `SECURITY.md`，以及既有的
-  `report/DISCLAIMER.md`。
+  `DISCLAIMER.md`。
 - **`docs/` 下的设计与执行文档目前只有中文**，这是有意的（它们是开发过程记录）；
   新增这类文档也按中文写即可。
 - **代码注释用中文**，与现有风格保持一致。
@@ -116,7 +116,7 @@ CI 里的 `fmt` 任务是**非阻断**的。我们**不希望**在一个功能 P
 - 🐛 **Bug reports** — use the [Bug report template](.github/ISSUE_TEMPLATE/bug_report.yml)
   and include reproduction steps, logs, and environment.
 - 📄 **Protocol corrections** — a behaviour you measured on a NAS **you own or are authorized to
-  administer** that differs from `report/` or the README. These are the most valuable issues:
+  administer** that differs from the README or the code comments. These are the most valuable issues:
   attach the **raw response** (mask your hostname / account / sid first).
 - 🔧 **Code PRs** — bug fixes, tests, docs, distro packaging.
 - 🌍 **Translations** — `ui/i18n.js` ships an empty `en` table; filling in the UI strings is a
@@ -187,7 +187,7 @@ is safe.
   (English mirror). They must be updated together — a PR that updates only one will be asked to
   add the other.
 - **Short policy docs use one bilingual file**: like this one, `SECURITY.md`, and the existing
-  `report/DISCLAIMER.md`.
+  `DISCLAIMER.md`.
 - **Design/execution docs under `docs/` are Chinese-only on purpose** (they are development
   logs); new ones can follow that.
 - **Code comments are in Chinese**, matching the existing style.

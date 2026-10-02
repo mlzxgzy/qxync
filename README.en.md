@@ -5,7 +5,7 @@
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](Cargo.toml)
 [![Platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](#quick-start)
 
-[中文](README.md) · **English** · [Disclaimer](report/DISCLAIMER.md) · [Changelog](CHANGELOG.md) · [Acceptance log](docs/验收记录.md)
+[中文](README.md) · **English** · [Disclaimer](DISCLAIMER.md) · [Changelog](CHANGELOG.md) · [Acceptance log](docs/验收记录.md)
 
 A **third-party QNAP Qsync client for Linux**, written in Rust + FUSE, whose core is
 **on-demand sync**: a file on the NAS is merely a "placeholder" locally — `ls -l` shows its
@@ -17,7 +17,7 @@ usage stays under your control at all times.
 > This project **does not distribute** any QNAP binary, installer, or decompiled artifact, and
 > **does not circumvent** any licensing or technical protection measure. It is
 > **in no way affiliated with QNAP Systems, Inc.** See the
-> **[Disclaimer](report/DISCLAIMER.md)** for the full terms.
+> **[Disclaimer](DISCLAIMER.md)** for the full terms.
 
 ---
 
@@ -33,12 +33,12 @@ A **Qsync client that runs on Linux**, made up of three binaries:
 
 **What it is**: an **interoperability implementation** of the behaviour exhibited by QNAP's
 official client — the protocol details come from static reverse engineering of
-**Qsync for Windows v6.1.0.0831** ([`report/`](report/)), and every conclusion was verified
+**Qsync for Windows v6.1.0.0831**, and every conclusion was verified
 against a real NAS.
 
 **What it is not** (the scope, stated explicitly):
 
-- ❌ **Not** the official client, and it does not represent QNAP's position ([Disclaimer](report/DISCLAIMER.md))
+- ❌ **Not** the official client, and it does not represent QNAP's position ([Disclaimer](DISCLAIMER.md))
 - ❌ Does **not** implement cloud account / QID / myQNAPcloud login: the one and only supported path is "a local account talking straight to the NAS"
 - ❌ Does **not** interoperate with the official client's binary WebSocket channel (its wire format was not recovered), so LAN acceleration is qxync's own qxync↔qxync protocol
 - ❌ Does **not** write the NAS device list, does no device registration, and modifies no NAS-side configuration whatsoever
@@ -187,8 +187,9 @@ crates/
 ├── qxync-gui/         the qxync-gui binary: Tauri 2 app (ui/ is a dependency-free static frontend)
 └── qxync-proto-test/  real-NAS integration tests (#[ignore] by default, run manually)
 xtask/tests/           8 acceptance matrix scripts (see "Acceptance & testing")
+xtask/probe/           protocol probe tools (qs_probe / qs_fixture / nas_manifest / p0_device_probe)
 docs/                  design and execution documents
-report/                reverse-engineering reports + probe tools (see the DISCLAIMER in there)
+DISCLAIMER.md          disclaimer and legal boundaries
 ```
 
 Dependency direction (only downwards allowed): `cli → core` (plus daemon access over IPC);
@@ -482,7 +483,6 @@ cargo test -p qxync-daemon -- --ignored --test-threads=1 --nocapture     # M2c e
 | [`docs/M8-向Qsync-Client-6靠拢.md`](docs/M8-向Qsync-Client-6靠拢.md) | GUI rework research + M8.1–M8.6 execution plan and decision log |
 | [`docs/验收记录.md`](docs/验收记录.md) | Milestone-level acceptance conclusions (what was run, what the result was) |
 | [`docs/发布清单-v0.1.0.md`](docs/发布清单-v0.1.0.md) | Pre-release checklist (for maintainers) |
-| [`report/`](report/) | Reverse-engineering reports + probe tools ([`DISCLAIMER.md`](report/DISCLAIMER.md)) |
 | [`CHANGELOG.md`](CHANGELOG.md) | Changelog |
 
 ## Security & privacy
@@ -490,9 +490,9 @@ cargo test -p qxync-daemon -- --ignored --test-threads=1 --nocapture     # M2c e
 - **Credentials**: `~/.config/qsync/credentials.json` (`0600`); the IPC socket directory is `0700` and the socket is `0600`.
 - **This project collects and reports no telemetry whatsoever**, and connects to no host other than the NAS you configured and (optionally) LAN peers.
 - **LAN peering is plaintext TCP**, so enable it only on a trusted LAN; the token authorizes only "read already-hydrated files + submit events" and has **no ability whatsoever to write to or delete from the remote**.
-- **Third-party credentials in the reports are masked**: the repository does not spread QNAP client credentials; when you need them, use
-  [`report/tools/reveal-credentials.sh`](report/tools/reveal-credentials.sh)
-  to extract them from an installation copy **that you obtained lawfully**.
+- **This project contains and distributes no third-party client credentials.** The protocol probe
+  tools ([`xtask/probe/`](xtask/probe/)) use **your own** NAS account only, and raw responses land in
+  `xtask/probe/probe-out/` (gitignored — **they contain sids and account names, never commit them**).
 - **The repository contains no real host names, accounts or device fingerprints** (a unified scrub was done before release, see
   [`docs/发布清单-v0.1.0.md`](docs/发布清单-v0.1.0.md)).
 
@@ -512,7 +512,7 @@ The **original code** of this project is released under **MIT OR Apache-2.0**, a
 
 **That license covers only the original parts of this repository.** QNAP, Qsync, myQNAPcloud, QID and
 other names and marks are trademarks or registered trademarks of QNAP Systems, Inc.; all rights in the
-analysed software belong to it and its licensors — see [`report/DISCLAIMER.md`](report/DISCLAIMER.md)
+analysed software belong to it and its licensors — see [`DISCLAIMER.md`](DISCLAIMER.md)
 for details.
 
 Third-party dependencies follow their own licenses (inspectable with `cargo metadata` / `cargo deny`).

@@ -720,7 +720,7 @@ impl Client {
 
 // ------------------------------------------------- M5 版本化 / 增量 delta
 //
-// 真机探测原文见 `report/probe/probe-out/m5-versioning/`（只读参考）。要点：
+// 真机探测原文见 `xtask/probe/probe-out/m5-versioning/`（只读参考）。要点：
 // * **只有新命名空间 `cgi-bin/qsync/qsyncsrv.cgi` 认 `versioning_*`**；
 //   旧命名空间 `cgi-bin/filemanager/utilRequest.cgi` 对全部 `versioning_*` 回 `status:20`（未知 func）。
 // * `versioning_lock&create_version=1` 真机可用（回 `lockid` + `version_id`），
@@ -1378,7 +1378,7 @@ mod tests {
         assert!(qxync_core::sync::is_log_missing(&e), "{e}");
     }
 
-    // ---- M5 版本化 / 增量 delta：输入全部是 `report/probe/probe-out/m5-versioning/` 的真机响应原文
+    // ---- M5 版本化 / 增量 delta：输入全部是 `xtask/probe/probe-out/m5-versioning/` 的真机响应原文
 
     #[test]
     fn versioning_probe_parses_real_response() {
@@ -1548,7 +1548,7 @@ mod tests {
     }
 
     // ------------------------- M6 同步文件夹列表
-    // 输入含真机响应原文（report/probe/probe-out/webui/chain/09_qbox_get_syncing_folder_list.http，
+    // 输入含真机响应原文（xtask/probe/probe-out/webui/chain/09_qbox_get_syncing_folder_list.http，
     // 用户 test1）：`{"total": 0, …, "folder" :[]}`。
 
     #[test]

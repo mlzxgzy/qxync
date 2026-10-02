@@ -996,8 +996,8 @@ LAN 面板显示身份/监听/配对码/已配对设备/事件计数，并支持
 ## 11. P0 探针线：设备注册 —— **已执行，假设被证伪（2026-10-01）**
 
 > 状态：**✅ 已完成（只读阶段即得出结论，未对 NAS 做任何写操作）**。
-> 工具：`report/probe/p0_device_probe.py`（新增，复用 `qs_probe.py` 的登录链）。
-> 原始响应：`report/probe/probe-out/p0-*/`（已 gitignore）。
+> 工具：`xtask/probe/p0_device_probe.py`（新增，复用 `qs_probe.py` 的登录链）。
+> 原始响应：`xtask/probe/probe-out/p0-*/`（已 gitignore）。
 
 ### 11.1 原本的假设
 
@@ -1047,7 +1047,7 @@ M2c 的实测结论是「我们自己的 CGI 写操作不产生 sync log 事件�
 ### 11.5 复现方式
 
 ```bash
-cd report/probe
+cd xtask/probe
 # P0.1 只读侦察（设备列表 / nas_uid / max_log / qbox_info）
 python3 p0_device_probe.py --host nas.example.com --port 9834 --https --insecure \
         --user test1 --password '***' --phase a
@@ -1066,7 +1066,7 @@ python3 p0_device_probe.py --host nas.example.com --port 9834 --https --insecure
 
 ### 12.1 工具
 
-`report/probe/nas_manifest.py`（新增，**只读**）：
+`xtask/probe/nas_manifest.py`（新增，**只读**）：
 
 ```bash
 # 立基线（递归列 /home 全树：路径 + 大小 + mtime + 类型）
@@ -1213,6 +1213,6 @@ NAS `@Recycle` 无限增长 → 累积 baseline 让 M2c 断言偶发失败）、
 * 筛选器不匹配文件夹名（**用户报告，未证实**）：[QNAP Community: folder filter support](https://community.qnap.com/t/qsync-adding-folder-filter-support/5080)
 * 现状：`README.md`、`docs/M4-GUI.md`、`docs/开发规划.md`、`crates/qxync-gui/**`、`crates/qxync-core/src/ipc.rs`
 * 协议与能力边界：`docs/M5-SQLite与delta.md`（NAS 无历史版本）、`docs/M6-多根与共享文件夹.md`（共享根只读）、`docs/M7-选择性同步与LAN直连.md`（自研 LAN 协议、不做官方通道互通）
-* 设备注册端点规格与探针结论：`report/out/api_endpoints.json` #121 `qbox_save_device_config`（**已探针，决策不实现**）、
-  `report/probe/p0_device_probe.py`（P0 探针工具）、`report/probe/probe-out/p0-*/`（原始响应，gitignore）
+* 设备注册端点 `qbox_save_device_config`：**已探针，决策不实现**（探针工具 `xtask/probe/p0_device_probe.py`，
+  原始响应 `xtask/probe/probe-out/p0-*/`，gitignore）
 * 补充调研留档（含原始 HTML / 正文提取件 / 44 张截图）：`.research/qsync-client-6-UI调研报告.md`、`.research/art.txt`、`.research/en.txt`、`.research/img/`

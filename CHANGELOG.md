@@ -19,7 +19,7 @@
 
 - **协议客户端与 CLI（M0）**：登录 / 列举 / stat / 下载 / 上传 / 建目录五条路全部对真机跑通；
   二进制 `qsync` 提供 `login · status · ls · stat · get · put · mkdir`。
-  协议结论来自对 Qsync for Windows v6.1.0.0831 的静态逆向（[`report/`](report/)）。
+  协议结论来自对 Qsync for Windows v6.1.0.0831 的静态逆向，且每一条都在真机上复验过。
 - **只读 FUSE + on-demand 按需水合（M1）**：`ls -l` 显示真实大小却零下载，首次 `read()` 才取数据；
   `user.qsync.*` xattr 暴露占位符状态；读不满即 `EIO`，绝不短读。
 - **守护进程与本地 IPC（M1.5）**：二进制 `qxyncd` 成为**唯一**持有 FUSE 与 NAS 会话的进程；

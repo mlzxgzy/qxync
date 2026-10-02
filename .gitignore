@@ -7,8 +7,8 @@ credentials*.json
 .env
 .env.*
 
-# ===== probe 输出（含 sid / 响应原文）=====
-report/probe/probe-out/
+# ===== probe 输出（含 sid / 账号 / 响应原文，绝不提交）=====
+xtask/probe/probe-out/
 
 # ===== Rust =====
 target/
@@ -18,7 +18,7 @@ target/
 # 「同一份源码 → 同一份依赖 → 可复现的构建」。
 # （2026-10 发版准备时从 .gitignore 移除，见 docs/发布清单-v0.1.0.md）
 
-# ===== Python（report/ 与 report/probe 的逆向/探测脚本）=====
+# ===== Python（xtask/probe 的探测脚本）=====
 __pycache__/
 *.py[cod]
 .venv/
