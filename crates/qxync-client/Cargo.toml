@@ -1,9 +1,14 @@
 [package]
 name = "qxync-client"
-description = "NAS HTTP API 封装（登录 / 元数据 / 上传下载）+ M7 LAN 对等协议"
+description = "QNAP Qsync NAS HTTP API client + qxync-to-qxync LAN peer protocol · NAS HTTP API 封装（登录/元数据/上传下载）+ LAN 对等协议"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 qxync-core = { path = "../qxync-core" }

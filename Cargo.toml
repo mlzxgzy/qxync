@@ -15,6 +15,14 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 
+# 双许可：MIT 或 Apache-2.0 任选其一（Rust 生态惯例）。
+# ⚠️ 该许可只覆盖本仓库的原创代码；被逆向分析的 QNAP 软件不在此列，见 report/DISCLAIMER.md。
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/mlzxgzy/qxync"
+authors = ["Kami <mlzxgzy@gmail.com>"]
+keywords = ["qnap", "qsync", "fuse", "on-demand", "sync"]
+categories = ["command-line-utilities", "filesystem", "network-programming"]
+
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -32,3 +40,12 @@ clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# 发版用 release profile。
+# 注意：**故意不设** `panic = "abort"` —— daemon 与 FUSE 回调里的 panic 需要能展开成
+# 带行号的回溯才好定位（本项目修过「挂载失败把 worker 打成 panic」那类问题）；
+# `debug = "line-tables-only"` 就是为了让用户报 bug 时贴出来的回溯是可读的。
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"
