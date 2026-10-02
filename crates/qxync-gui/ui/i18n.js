@@ -37,7 +37,7 @@
     'nav.diag': '诊断',
     'nav.home_title': '主页（任务状态）',
     'nav.tasks_title': '任务（同步任务列表）',
-    'nav.files_title': '文件（远端浏览 / 节省空间模式）',
+    'nav.files_title': '文件（浏览 NAS / 节省空间模式）',
     'nav.journal_title': '文件更新中心（同步日志）',
     'nav.errors_title': '错误列表（失败项）',
     'nav.settings_title': '设置（连接 / 同步 / 缓存 / 网络 / 通知）',
@@ -153,7 +153,7 @@
     'list.error_daemon': '读不到数据：daemon 未运行（先在顶部点「启动 daemon」）',
 
     // ---- 各列表的空态 / 加载态
-    'files.loading': '正在读取远端目录…',
+    'files.loading': '正在读取 NAS 上的目录…',
     'files.empty': '目录为空，或尚未加载。',
     'journal.loading': '正在读取同步日志…',
     'journal.empty': '没有日志。挂载一个同步任务后点「立即同步」，或有实际同步活动时就会出现记录。',
@@ -204,8 +204,8 @@
     'menu.unpin': '☐ 取消固定',
     'menu.free': '⤓ 释放空间（Free up space）',
     'menu.get': '下载到本地…',
-    'menu.copy': '复制远端路径',
-    'menu.rm': '删除（远端）'
+    'menu.copy': '复制 NAS 路径',
+    'menu.rm': '删除（NAS 上的）'
   };
 
   // ---------------------------------------------------------------- en（预留）
