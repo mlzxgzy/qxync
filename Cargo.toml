@@ -16,7 +16,7 @@ edition = "2021"
 rust-version = "1.85"
 
 # 双许可：MIT 或 Apache-2.0 任选其一（Rust 生态惯例）。
-# ⚠️ 该许可只覆盖本仓库的原创代码；被逆向分析的 QNAP 软件不在此列，见 report/DISCLAIMER.md。
+# ⚠️ 该许可只覆盖本仓库的原创代码；被逆向分析的 QNAP 软件不在此列，见 DISCLAIMER.md。
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/mlzxgzy/qxync"
 authors = ["Kami <mlzxgzy@gmail.com>"]

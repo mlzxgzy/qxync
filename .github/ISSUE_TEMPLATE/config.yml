@@ -6,6 +6,6 @@ contact_links:
   - name: 📖 先读 README（两条铁则 / 它不是什么 / 已知限制）
     url: https://github.com/mlzxgzy/qxync/blob/master/README.md
     about: 很多问题在 README 的「已知限制」里已经写清楚了。
-  - name: 📄 协议与逆向结论（report/）
-    url: https://github.com/mlzxgzy/qxync/tree/master/report
-    about: 协议细节、证据与免责声明都在这里。
+  - name: ⚖️ 免责声明与法律边界
+    url: https://github.com/mlzxgzy/qxync/blob/master/DISCLAIMER.md
+    about: 本项目的性质、与 QNAP 的关系、以及使用者责任。

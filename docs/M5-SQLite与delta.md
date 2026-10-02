@@ -72,7 +72,7 @@ CREATE TABLE meta     (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
 ### 3.1 真机探测结论（QTS 5.2.9 / Qsync QPKG build 20260723，用户 `test1`）
 
-原始响应存 `report/probe/probe-out/m5-versioning/`（已 gitignore）。
+原始响应存 `xtask/probe/probe-out/m5-versioning/`（已 gitignore）。
 
 | 端点 | 结果 | 判定 |
 |---|---|---|

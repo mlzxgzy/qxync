@@ -175,7 +175,7 @@ cargo test -p qxync-proto-test -- --ignored --test-threads=1 --nocapture  # 协�
 ## 9. 已知限制（留给后续）
 
 * **我们的写操作不产生事件** —— 原因**不是**「本机没做设备配对」，而是「账号下没有已登记的同步文件夹」。
-  **2026-10-01 真机复核（P0 探针，`report/probe/p0_device_probe.py`）推翻了旧结论**：
+  **2026-10-01 真机复核（P0 探针，`xtask/probe/p0_device_probe.py`）推翻了旧结论**：
   1. NAS 上**确有一台已注册设备** `win-pc`（`qbox_get_device_config_list` 可见，`modify_time`=2026-09-30 11:46，
      `device_uid=01234567…567`）—— 那是**官方 Qsync 客户端**之前注册的，不是 qxync；
   2. 但这台设备的配置是**空的**（`qbox_get_device_config` → `total: 0, config: []`），

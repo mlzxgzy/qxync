@@ -5,7 +5,7 @@
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](Cargo.toml)
 [![Platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](#快速开始)
 
-**中文** · [English](README.en.md) · [免责声明](report/DISCLAIMER.md) · [变更日志](CHANGELOG.md) · [验收记录](docs/验收记录.md)
+**中文** · [English](README.en.md) · [免责声明](DISCLAIMER.md) · [变更日志](CHANGELOG.md) · [验收记录](docs/验收记录.md)
 
 用 Rust + FUSE 写的**第三方 QNAP Qsync Linux 客户端**，核心是 **on-demand 按需同步**：
 NAS 上的文件在本地只是一个「占位符」，`ls -l` 显示真实大小却**零下载**，读到哪一块才取哪一块；
@@ -13,7 +13,7 @@ NAS 上的文件在本地只是一个「占位符」，`ls -l` 显示真实大�
 
 > ⚠️ **只用于你自己拥有、或已获明确授权的 QNAP NAS。**
 > 本项目**不分发**任何 QNAP 二进制/安装包/反编译产物，**不绕过**任何授权或技术保护措施，
-> 与 **QNAP Systems, Inc. 无任何关联**。完整条款见 **[免责声明](report/DISCLAIMER.md)**。
+> 与 **QNAP Systems, Inc. 无任何关联**。完整条款见 **[免责声明](DISCLAIMER.md)**。
 
 ---
 
@@ -28,12 +28,12 @@ NAS 上的文件在本地只是一个「占位符」，`ls -l` 显示真实大�
 | `qxync-gui` | Tauri 2 桌面应用（零依赖静态前端，全部经 daemon 的 IPC） |
 
 **它是什么**：对 QNAP 官方客户端所做行为的**互操作性实现** —— 协议细节来自对
-**Qsync for Windows v6.1.0.0831** 的静态逆向分析（[`report/`](report/)），
+**Qsync for Windows v6.1.0.0831** 的静态逆向分析，
 每一处结论都对真机验证过。
 
 **它不是什么**（明确的能力边界）：
 
-- ❌ **不是**官方客户端，也不代表 QNAP 的立场（[免责声明](report/DISCLAIMER.md)）
+- ❌ **不是**官方客户端，也不代表 QNAP 的立场（[免责声明](DISCLAIMER.md)）
 - ❌ **不实现云账号 / QID / myQNAPcloud 登录**：只做「直连 NAS 的本地账号」这一条路
 - ❌ **不与官方客户端的 WebSocket 二进制通道互通**（线格式未还原），LAN 加速是 qxync↔qxync 自研协议
 - ❌ **不写 NAS 的设备列表**、不做设备注册，也不修改 NAS 侧任何配置
@@ -181,8 +181,9 @@ crates/
 ├── qxync-gui/         二进制 qxync-gui：Tauri 2 应用（ui/ 为零依赖静态前端）
 └── qxync-proto-test/  真机集成测试（默认 #[ignore]，手动跑）
 xtask/tests/           8 个验收矩阵脚本（见「验收与测试」）
+xtask/probe/           协议探测工具（qs_probe / qs_fixture / nas_manifest / p0_device_probe）
 docs/                  设计与执行文档
-report/                逆向分析报告 + probe 工具（见其中的 DISCLAIMER）
+DISCLAIMER.md          免责声明与法律边界
 ```
 
 依赖方向（只允许向下）：`cli → core`（+ 经 IPC 访问 daemon）；`daemon → fuse/client → core`。
@@ -429,7 +430,6 @@ cargo test -p qxync-daemon -- --ignored --test-threads=1 --nocapture     # M2c �
 | [`docs/M8-向Qsync-Client-6靠拢.md`](docs/M8-向Qsync-Client-6靠拢.md) | GUI 改造研究 + M8.1–M8.6 执行方案与决策记录 |
 | [`docs/验收记录.md`](docs/验收记录.md) | 里程碑级验收结论（跑了什么、结果是什么） |
 | [`docs/发布清单-v0.1.0.md`](docs/发布清单-v0.1.0.md) | 发版前检查清单（维护者用） |
-| [`report/`](report/) | 逆向分析报告 + probe 工具（[`DISCLAIMER.md`](report/DISCLAIMER.md)） |
 | [`CHANGELOG.md`](CHANGELOG.md) | 变更日志 |
 
 ## 安全与隐私
@@ -438,9 +438,9 @@ cargo test -p qxync-daemon -- --ignored --test-threads=1 --nocapture     # M2c �
 - **本项目不采集、不上报任何遥测数据**，也不连接除你配置的 NAS 与（可选的）LAN 对端以外的任何主机。
 - **LAN 对等是明文 TCP**，只在可信局域网开启即可；token 只授权「读已水合文件 + 提交事件」，
   **没有任何写/删远端的能力**。
-- **报告里的第三方凭据已做掩码**：仓库不散布 QNAP 的客户端凭据；需要时用
-  [`report/tools/reveal-credentials.sh`](report/tools/reveal-credentials.sh)
-  从**你自己合法获得**的安装副本中提取。
+- **本项目不包含、不分发任何第三方客户端凭据**。协议探测工具
+  （[`xtask/probe/`](xtask/probe/)）只使用**你自己**的 NAS 账号，
+  原始响应落在 `xtask/probe/probe-out/`（已 gitignore，**含 sid 与账号，绝不提交**）。
 - **仓库不含任何真实主机名、账号或设备指纹**（发版前已做统一清洗，见
   [`docs/发布清单-v0.1.0.md`](docs/发布清单-v0.1.0.md)）。
 
@@ -460,6 +460,6 @@ cargo test -p qxync-daemon -- --ignored --test-threads=1 --nocapture     # M2c �
 
 **该许可只覆盖本仓库的原创部分。** QNAP、Qsync、myQNAPcloud、QID 等名称与标识是
 QNAP Systems, Inc. 的商标或注册商标；被分析软件的全部权利归其及许可方所有 ——
-详见 [`report/DISCLAIMER.md`](report/DISCLAIMER.md)。
+详见 [`DISCLAIMER.md`](DISCLAIMER.md)。
 
 第三方依赖各自遵循其自身许可（`cargo metadata` / `cargo deny` 可查）。

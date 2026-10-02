@@ -21,7 +21,7 @@ Verified on **QNAP TS-464C / QTS 5.2.9 / Qsync QPKG 5.0.0.7 (build 20260723)**.
 - **Protocol client and CLI (M0)**: login / list / stat / download / upload / mkdir all verified
   against a real NAS; the `qsync` binary exposes
   `login · status · ls · stat · get · put · mkdir`. Protocol findings come from static
-  reverse engineering of Qsync for Windows v6.1.0.0831 ([`report/`](report/)).
+  reverse engineering of Qsync for Windows v6.1.0.0831, each finding re-verified against real hardware.
 - **Read-only FUSE + on-demand hydration (M1)**: `ls -l` shows real sizes with zero download; data
   is fetched on the first `read()`; `user.qsync.*` xattrs expose placeholder state; an
   incomplete read returns `EIO` — never a short read.

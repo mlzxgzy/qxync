@@ -17,7 +17,6 @@
 *.ico  binary
 *.webp binary
 
-# GitHub 语言统计：逆向分析报告与设计文档不计入「代码」占比
+# GitHub 语言统计：设计文档不计入「代码」占比
 # （本项目的代码主体是 crates/ 下的 Rust 与 crates/qxync-gui/ui 下的前端三件套）
-report/** linguist-documentation
-docs/**   linguist-documentation
+docs/** linguist-documentation

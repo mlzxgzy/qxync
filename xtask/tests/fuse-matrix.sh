@@ -21,7 +21,9 @@ RUNDIR="${QSYNC_TEST_RUNDIR:-$REPO/.local-run}"
 MNT="$RUNDIR/mnt"
 CACHE="$RUNDIR/cache"
 FIXTURE="${QSYNC_TEST_FIXTURE:-/home/qxync-test}"     # NAS 上的路径
-LOCAL_FIXTURE="$REPO/report/probe/probe-out/fixture/local"
+# 造夹具时落盘的本地副本（由 qs_fixture.py 生成，**不在仓库里**）。
+# 默认沿用探测工具的输出目录；换机器时用 QSYNC_TEST_LOCAL_FIXTURE 指过去。
+LOCAL_FIXTURE="${QSYNC_TEST_LOCAL_FIXTURE:-$REPO/xtask/probe/probe-out/fixture/local}"
 BIG=0
 KEEP=0
 # 大文件整文件水合受带宽限制：对端 ~1.1MB/s 时 128MiB 要 ~116s，
