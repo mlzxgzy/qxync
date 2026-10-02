@@ -10,13 +10,15 @@
 **一对多整体删除，只留一对一**：一个挂载点 = 一个 NAS 文件夹，挂载点里**直接**就是那个
 文件夹的内容（配 `/home` 就看到家目录，不再多套一层 `home/`）。NAS 侧改成下拉选择
 （候选 = NAS 上登记的 Qsync 同步文件夹 + 家目录），选不到还能逐层浏览或手输；
-提交时会检查目的地冲突。**不保留任何兼容**：旧的 `roots` 配置、多根挂载、多根任务数组
-都不再存在（见下）。
+提交时会检查目的地冲突。**连接页的「高级」栏整个删掉了**：`roots` 与 `home_root` 两个
+字段都不再存在。**不保留任何兼容**。
 
 ### 删除（破坏性）
 
 - **一对多（多根）能力整体移除**，涉及这些曾经存在的入口：
-  * link 配置里的 `roots`（连接页「高级：同步范围」那一格没有了，只留 `home_root`）；
+  * link 配置里的 `roots` **和 `home_root`**（连接页「高级」栏整个删除，表单只剩
+    host / port / user / password / https / insecure / ipv4-only）；家目录在 Qsync 协议里
+    固定叫 `/home`（`qxync_core::HOME_ROOT`），不是配置项；
   * `qxync mount --remote A --remote B` —— 现在 `--remote` 只能给一次，`--root` 同理；
   * FUSE 的**虚拟根**（`ViewLayout::Multi` / `RootSpec` / `QxyncFs::new_multi` /
     `multi_root` 分支）与 `MountInfo.roots`、`RootsData.configured` / `roots`；
@@ -59,9 +61,10 @@
   去读 —— 于是只要 NAS 上真登记了同步文件夹，界面就会显示成「空名字 + 0 权限」，
   把「能列举」误判成「列不出来」。现在两种拼法都认（真机字段优先），并补了 HAR 原文的
   回归测试（`syncing_folders_real_machine_response_is_not_lost`）。
-- **任务的默认 NAS 文件夹以前不是 link 的 `home_root`**。GUI 结果行与 `Task` 的注释都写
-  「由 link 决定」，但 daemon 落的是编译期常量 `/home`（`mount()` 的默认值）；改过
-  `home_root` 的用户会静默挂到 `/home`。现在统一走 `Task::effective_root(link.home_root)`。
+- **「没写 NAS 文件夹」的默认值统一了**。以前 GUI 结果行与 `Task` 的注释都写「由 link 的
+  `home_root` 决定」，但 daemon 落的是编译期常量 `/home`（`mount()` 的默认值）—— 改过
+  `home_root` 的用户会静默挂到 `/home`。现在两边都走 `Task::effective_root()` =
+  协议常量 `/home`（`home_root` 字段本身也删掉了）。
 - **提交时检查目的地冲突**：本地文件夹与别的任务重复或互相嵌套 → **拒绝保存**并说明是哪个
   任务（嵌套挂载会互相遮挡）；同一个 NAS 文件夹被别的任务用了 → **只提示**（只读挂同一个
   文件夹是合法用法，`m82-matrix.sh` 的 t1/t2 就靠它），两个任务都读写时会明确写出

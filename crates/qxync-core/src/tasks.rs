@@ -121,7 +121,7 @@ pub struct Task {
     #[serde(default)]
     pub cache_dir: Option<PathBuf>,
     /// ★ 这一个任务的 NAS 文件夹（一对一）：`/home`、`/Public`…
-    /// `None` = 没指定 → 用 link 的 `home_root`。
+    /// `None` = 没指定 → 用 Qsync 家目录（[`crate::HOME_ROOT`]）。
     #[serde(default)]
     pub root: Option<String>,
     /// ⚠️ **只读的旧格式探测**：多根时代文件里的 `roots` 数组。
@@ -331,7 +331,7 @@ impl Task {
             // 迁移是一次性的：读进来处理完就丢掉（`skip_serializing` 也保证不写回）
             self.legacy_roots.clear();
         }
-        // 归一化这一个根：补前导 /、去尾斜杠；空 = 没指定（用 link 的 home_root）
+        // 归一化这一个根：补前导 /、去尾斜杠；空 = 没指定（用 Qsync 家目录 /home）
         self.root = self
             .root
             .take()
@@ -347,12 +347,12 @@ impl Task {
     // 按「一对多直接删除、只留一对一」的要求，任务层现在只有**一个** NAS 文件夹，
     // 挂载点里直接就是它；`mount --remote A --remote B` 这种多根挂载也一并删掉了。
 
-    /// 这一个任务实际生效的 NAS 文件夹：没写 → link 的 `home_root`。
-    pub fn effective_root(&self, home_root: &str) -> String {
-        match &self.root {
-            Some(r) => crate::roots::normalize_root(r),
-            None => crate::roots::normalize_root(home_root),
-        }
+    /// 这一个任务实际生效的 NAS 文件夹：没写 → Qsync 家目录（[`crate::HOME_ROOT`]）。
+    pub fn effective_root(&self) -> String {
+        self.root
+            .as_deref()
+            .map(crate::roots::normalize_root)
+            .unwrap_or_else(|| crate::HOME_ROOT.to_string())
     }
 
     /// 本地文件夹的**比较键**：只做词法规范化（`.`/`..`/多余分隔符），
@@ -397,13 +397,13 @@ impl Task {
     /// 为什么不当错误：只读地把同一个 NAS 文件夹挂到两个本地文件夹是完全合理的用法
     /// （`xtask/tests/m82-matrix.sh` 就靠这个建 t1/t2）。真正的风险是**两边都读写**，
     /// 那由调用方决定怎么呈现；core 只负责把事实说清楚。
-    pub fn nas_overlaps_with(&self, other: &Task, home_root: &str) -> Vec<String> {
+    pub fn nas_overlaps_with(&self, other: &Task) -> Vec<String> {
         let mut out = Vec::new();
         if other.id == self.id {
             return out;
         }
-        let mine = self.effective_root(home_root);
-        let theirs = other.effective_root(home_root);
+        let mine = self.effective_root();
+        let theirs = other.effective_root();
         if mine == theirs {
             out.push(format!(
                 "NAS 文件夹 {mine} 也配给了任务「{}」{}",
@@ -421,12 +421,12 @@ impl Task {
     /// 与一组已有任务比对：返回（**会拦保存的错误**，**只提示的警告**）。
     ///
     /// 调用方负责把「自己」从 `others` 里排除，或依赖 id 去重（同 id 直接跳过）。
-    pub fn conflict_report(&self, others: &[Task], home_root: &str) -> (Vec<String>, Vec<String>) {
+    pub fn conflict_report(&self, others: &[Task]) -> (Vec<String>, Vec<String>) {
         let mut errors = Vec::new();
         let mut warnings = Vec::new();
         for o in others {
             errors.extend(self.destination_conflicts_with(o));
-            warnings.extend(self.nas_overlaps_with(o, home_root));
+            warnings.extend(self.nas_overlaps_with(o));
         }
         (errors, warnings)
     }
@@ -513,7 +513,7 @@ impl Task {
             enabled: false,
             mountpoint: PathBuf::new(),
             cache_dir: None,
-            // 没显式写 NAS 文件夹 → 用 link 的 home_root（由调用方算 effective_root）
+            // 没显式写 NAS 文件夹 → 用 Qsync 家目录 /home（见 effective_root）
             root: None,
             legacy_roots: Vec::new(),
             read_write: false,
@@ -540,7 +540,7 @@ impl Task {
             self.mountpoint.display(),
             match &self.root {
                 Some(r) => r.clone(),
-                None => "(跟 link 的 home_root)".to_string(),
+                None => "(默认：Qsync 家目录 /home)".to_string(),
             },
             self.cache_mode
         ) + &match &self.cache_dir {
@@ -775,7 +775,7 @@ mod tests {
         t.normalize().unwrap();
         assert_eq!(t.root.as_deref(), Some("/Public"));
 
-        // 不写 NAS 文件夹 → 跟 link 的 home_root
+        // 不写 NAS 文件夹 → 用默认的 /home
         let mut none = Task::from_mount(
             None,
             PathBuf::from("/mnt"),
@@ -789,8 +789,8 @@ mod tests {
         );
         none.normalize().unwrap();
         assert!(none.root.is_none());
-        assert_eq!(none.effective_root("/home"), "/home");
-        assert_eq!(none.effective_root("/home/test1/"), "/home/test1");
+        assert_eq!(none.effective_root(), "/home");
+        
     }
 
     // ------------------------------------------------------------ ★ 一对一 + 目的地冲突
@@ -860,7 +860,7 @@ mod tests {
         // ③ NAS 目录相同 → **只警告不拦**（m82 矩阵靠它建 t1/t2；只读挂载合法）
         let same_remote = mk("b", "/home/user/other", "/home");
         assert!(mine.destination_conflicts_with(&same_remote).is_empty());
-        let w = mine.nas_overlaps_with(&same_remote, "/home");
+        let w = mine.nas_overlaps_with(&same_remote);
         assert_eq!(w.len(), 1, "{w:?}");
         assert!(w[0].contains("NAS 文件夹 /home") && w[0].contains("「b」"), "{w:?}");
 
@@ -870,45 +870,44 @@ mod tests {
         let mut me_rw = mine.clone();
         me_rw.read_write = true;
         assert!(
-            me_rw.nas_overlaps_with(&rw, "/home")[0].contains("双向写"),
+            me_rw.nas_overlaps_with(&rw)[0].contains("双向写"),
             "{w:?}"
         );
         // 一读一写 → 只提示，不提双写
-        assert!(me_rw.nas_overlaps_with(&same_remote, "/home")[0].contains("只读挂载"));
+        assert!(me_rw.nas_overlaps_with(&same_remote)[0].contains("只读挂载"));
 
         // 自己跟自己不算冲突（编辑保存时最常见）
         assert!(mine.destination_conflicts_with(&mine).is_empty());
-        assert!(mine.nas_overlaps_with(&mine, "/home").is_empty());
+        assert!(mine.nas_overlaps_with(&mine).is_empty());
         let (e, w2) =
-            mine.conflict_report(&[mine.clone(), same_local.clone(), same_remote.clone()], "/home");
+            mine.conflict_report(&[mine.clone(), same_local.clone(), same_remote.clone()]);
         assert_eq!(e.len(), 1, "两两比：只有 same_local 是硬冲突：{e:?}");
         assert_eq!(w2.len(), 1, "只有 same_remote 是警告：{w2:?}");
 
         // 互不打扰的另一个任务 → 干净
         let ok = mk("c", "/home/user/other", "/Public");
-        let (e, w) = mine.conflict_report(&[ok], "/home");
+        let (e, w) = mine.conflict_report(&[ok]);
         assert!(e.is_empty() && w.is_empty(), "{e:?} {w:?}");
     }
 
     #[test]
-    fn destination_conflicts_handle_dots_and_home_root_default() {
+    fn destination_conflicts_handle_dots_and_default_home() {
         // `/mnt/./x/..` 与 `/mnt` 是同一个文件夹（词法规范化，不碰文件系统）
         let a = mk("a", "/mnt", "/home");
         let b = mk("b", "/mnt/./x/..", "/Public");
         let c = a.destination_conflicts_with(&b);
         assert_eq!(c.len(), 1, "{c:?}");
 
-        // 没写 NAS 文件夹（`root = None`）= link 的 home_root → 与显式 /home 重叠
+        // 没写 NAS 文件夹（`root = None`）= /home → 与显式 /home 重叠
         let mut implicit = mk("b", "/srv/other", "/Public");
         implicit.root = None;
-        let (e, w) = a.conflict_report(&[implicit], "/home");
+        let (e, w) = a.conflict_report(&[implicit]);
         assert!(e.is_empty(), "挂载点不嵌套 → 没有目的地冲突：{e:?}");
-        assert_eq!(w.len(), 1, "没写 NAS 文件夹时语义是 home_root，必须提示：{w:?}");
+        assert_eq!(w.len(), 1, "没写 NAS 文件夹时语义是 /home，必须提示：{w:?}");
 
-        // home_root 变了，隐式根跟着变 → 不再与 /home 重叠
-        let mut implicit2 = mk("b", "/srv/other", "/Public");
-        implicit2.root = None;
-        let (e, w) = a.conflict_report(&[implicit2], "/home/test1");
+        // 显式配了别的 NAS 文件夹 → 与 /home 不重叠
+        let explicit = mk("b", "/srv/other", "/Public");
+        let (e, w) = a.conflict_report(&[explicit]);
         assert!(e.is_empty() && w.is_empty(), "{e:?} {w:?}");
     }
 
@@ -946,7 +945,6 @@ mod tests {
             https: true,
             insecure: true,
             user: "u".into(),
-            home_root: "/home".into(),
             ipv4_only: false,
             exclude: vec!["*.iso".into()],
             filter_temp: true,
@@ -956,8 +954,8 @@ mod tests {
         let t = Task::legacy_from_link(&link);
         assert_eq!(t.id, "default");
         assert!(!t.enabled, "推导出来的任务必须是停用的，不能凭空触发挂载");
-        assert!(t.root.is_none(), "没显式 NAS 文件夹 → 跟 link 的 home_root");
-        assert_eq!(t.effective_root(&link.home_root), "/home");
+        assert!(t.root.is_none(), "没显式 NAS 文件夹 → 用默认 /home");
+        assert_eq!(t.effective_root(), "/home");
         assert_eq!(t.exclude, vec!["*.iso".to_string()]);
     }
 

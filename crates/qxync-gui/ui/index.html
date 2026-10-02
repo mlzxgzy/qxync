@@ -378,24 +378,6 @@
                   <label class="check"><input type="checkbox" id="f-insecure"> 自签证书：跳过 TLS 校验</label>
                   <label class="check"><input type="checkbox" id="f-ipv4-only"> 仅 IPv4</label>
                 </div>
-                <!-- ★ 高级项：普通账号「只同步家目录」，这两格什么都不用填。
-                     只有「要连共享文件夹」或「家目录在 Qsync 里不叫 /home」才需要动，
-                     所以收进 <details> 默认折叠，免得普通用户对着看不懂的字段发愣。
-                     输入框在收起状态下依然可读可写（details 不会 disable 控件）。 -->
-                <details class="adv">
-                  <summary>高级：家目录的名字（默认 /home，一般不用改）</summary>
-                  <div class="adv-body">
-                    <label>家目录的名字
-                      <input type="text" id="f-home-root" placeholder="/home" spellcheck="false" class="mono">
-                    </label>
-                    <p class="hint">
-                      你 NAS 上家目录的真实位置是 <code>/share/homes/你的用户名</code>，
-                      Qsync 内部却把它叫 <code>/home</code> —— 这里填的就是这个「内部叫法」
-                      （配置文件里这个字段叫 <code>home_root</code>）。
-                      普通账号保持 <code>/home</code> 不用动；只有 NAS 把家目录挂在别的名字下才需要改。
-                    </p>
-                  </div>
-                </details>
                 <div class="btn-row">
                   <button type="submit" id="btn-link-save">保存连接配置</button>
                   <button type="button" id="btn-login" class="primary">保存并登录</button>

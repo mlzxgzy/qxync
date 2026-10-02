@@ -220,9 +220,6 @@ pub struct LinkConfig {
     #[serde(default)]
     pub insecure: bool,
     pub user: String,
-    /// Qsync 家目录根：普通用户固定 `/home`。也是「没指定 NAS 文件夹」时的默认根。
-    #[serde(default = "default_home_root")]
-    pub home_root: String,
     /// 强制只用 IPv4：对端同时发布 AAAA 但 IPv6 路由不通时非常有用
     /// （实测遇到过：`Network is unreachable` / 传输中途 body 解码失败）。
     #[serde(default)]
@@ -247,22 +244,10 @@ pub struct LinkConfig {
 fn yes() -> bool {
     true
 }
-fn default_home_root() -> String {
-    crate::HOME_ROOT.to_string()
-}
-
 impl LinkConfig {
     pub fn base_url(&self) -> String {
         let scheme = if self.https { "https" } else { "http" };
         format!("{}://{}:{}", scheme, self.host, self.port)
-    }
-
-    /// ★ 唯一的 NAS 起点：`home_root` 归一化后的单根（默认 `/home`）。
-    ///
-    /// 一对多是删除过的：一个挂载点/任务只对应**一个** NAS 文件夹，所以 link 层不再有
-    /// `roots` 列表 —— 只留这一个默认值，给「没写 NAS 文件夹」的 `mount` 兜底。
-    pub fn root(&self) -> String {
-        crate::roots::normalize_root(&self.home_root)
     }
 
     /// ★ M7：编译好的选择性同步规则（坏规则由调用方打日志，不静默）。
@@ -447,7 +432,6 @@ mod tests {
             https: true,
             insecure: true,
             user: "test1".into(),
-            home_root: "/home".into(),
             ipv4_only: false,
             exclude: vec!["/secret".into()],
             filter_temp: true,
@@ -457,7 +441,6 @@ mod tests {
         link.save(&paths).unwrap();
         let back = LinkConfig::load(&paths, "default").unwrap();
         assert_eq!(back.base_url(), "https://nas.local:9834");
-        assert_eq!(back.home_root, "/home");
         assert!(back.rules().rules.is_excluded("/secret/a", true));
         assert_eq!(back.peer_listen.as_deref(), Some("127.0.0.1:9849"));
         assert_eq!(back.peer_name.as_deref(), Some("unit-test"));
@@ -478,15 +461,14 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// M7 兼容性：老的 link JSON 没有新字段也必须能读，且行为与 M1–M6 一致。
+    /// 兼容性：老的 link JSON（含已删除的 `home_root` / `roots`）也必须能读。
     #[test]
     fn m7_fields_default_for_old_config() {
-        let raw = br#"{"id":"old","host":"nas","port":9834,"https":true,"insecure":false,"user":"u","home_root":"/home"}"#;
+        let raw = br#"{"id":"old","host":"nas","port":9834,"https":true,"insecure":false,"user":"u","home_root":"/home","roots":["/home"]}"#;
         let link: LinkConfig = serde_json::from_slice(raw).unwrap();
         assert!(link.exclude.is_empty());
         assert!(link.filter_temp, "临时文件过滤默认开");
         assert!(link.peer_listen.is_none(), "LAN 监听默认关");
-        assert_eq!(link.root(), "/home");
         let parsed = link.rules();
         assert!(parsed.rules.is_empty());
         assert!(parsed.bad.is_empty());

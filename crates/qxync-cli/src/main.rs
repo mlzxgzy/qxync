@@ -475,7 +475,6 @@ fn resolve_link(cli: &Cli) -> Result<LinkConfig> {
             https: cli.https,
             insecure: cli.insecure,
             user: u.clone(),
-            home_root: HOME_ROOT.to_string(),
             // ★ M6：未配 roots 时由 `LinkConfig::roots()` 退回家目录根
             ipv4_only: cli.ipv4,
             // ★ M7：登录时先不定选择性同步规则（改 link JSON 后重启 daemon 生效）
@@ -1937,9 +1936,8 @@ fn print_peer(d: &PeerData) {
     }
 }
 
-/// NAS 目录一览（家目录根 + NAS 上登记的同步文件夹）。
+/// NAS 目录一览（NAS 上登记的同步文件夹；家目录是协议固定命名空间 `/home`）。
 fn print_roots(d: &RootsData) {
-    println!("家目录根  : {}", d.home_root);
     if d.syncing_folders.is_empty() {
         println!("NAS 同步文件夹 : （无 —— 该账号没有在 Qsync 里配同步文件夹）");
     } else {

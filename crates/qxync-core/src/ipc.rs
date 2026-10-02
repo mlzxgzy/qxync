@@ -90,7 +90,7 @@ pub enum Request {
     },
     Mount {
         mountpoint: PathBuf,
-        /// ★ 这一个 NAS 文件夹（省略 = link 的 `home_root`）。
+        /// ★ 这一个 NAS 文件夹（省略 = Qsync 家目录 `/home`）。
         /// 一对多是删除过的：一次挂载只对应**一个**远端路径。
         #[serde(default)]
         remote: Option<String>,
@@ -475,15 +475,6 @@ pub struct LinkInfo {
     pub https: bool,
     pub user: String,
     pub ipv4_only: bool,
-    /// ★ 这个 link 的家目录根（默认 `/home`）。
-    /// 有了它，GUI/CLI 才能判断「只改了 `home_root`」也需要重启 daemon 才生效。
-    #[serde(default = "default_ipc_home_root")]
-    pub home_root: String,
-}
-
-/// `LinkInfo.home_root` 的 serde 默认值（与 `LinkConfig` 保持同一个常量）。
-fn default_ipc_home_root() -> String {
-    crate::HOME_ROOT.to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -676,11 +667,13 @@ pub struct SyncingFolderInfo {
     pub volume_id: Option<String>,
 }
 
-/// ★ `roots` 请求的返回：家目录根 + NAS 上登记的同步文件夹（= 一对一配对时可选的 NAS 文件夹）。
+/// ★ `roots` 请求的返回：NAS 上登记的同步文件夹（= 一对一配对时可选的 NAS 文件夹）。
+///
+/// 家目录不是「配置项」而是 Qsync 协议里的固定命名空间（[`crate::HOME_ROOT`]），
+/// 所以这里不再回一个 `home_root` 字段。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RootsData {
-    pub home_root: String,
     /// NAS 上报的 Qsync 同步文件夹（普通账号没配对时是空数组 —— 实测如此）。
     pub syncing_folders: Vec<SyncingFolderInfo>,
     /// 一句话解释（例如「未登录时拿不到同步文件夹列表」）。
@@ -1195,18 +1188,18 @@ mod tests {
         assert_eq!(back.req, Request::Roots);
         // 老客户端不看新字段、新客户端不看老字段：默认值都要能解析
         let d: RootsData = serde_json::from_str("{}").unwrap();
-        assert_eq!(d.home_root, "");
         assert!(d.syncing_folders.is_empty());
         let m: MountInfo =
             serde_json::from_str(r#"{"mountpoint":"/m","remote":"/home","readonly":true}"#)
                 .unwrap();
         assert_eq!(m.remote, "/home");
-        // ★ LinkInfo：老响应没有 home_root 字段 → 默认家目录
+        // ★ LinkInfo：老响应里可能还带着已删除的 `roots` / `home_root` 字段 → 必须能忽略
         let li: LinkInfo = serde_json::from_str(
-            r#"{"id":"default","host":"nas","port":9834,"https":true,"user":"u","ipv4_only":false}"#,
+            r#"{"id":"default","host":"nas","port":9834,"https":true,"user":"u","ipv4_only":false,
+                "home_root":"/home","roots":["/home"]}"#,
         )
         .unwrap();
-        assert_eq!(li.home_root, "/home", "缺 home_root 时回默认 /home");
+        assert_eq!(li.id, "default");
     }
 
     #[test]

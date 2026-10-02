@@ -20,7 +20,7 @@
 //! * 断言只保证「调用成功且能解析」，**不**断言「一定不可用」——将来 NAS 开了版本化会变。
 
 use qxync_client::{Client, DeltaGate};
-use qxync_core::{LinkConfig, HOME_ROOT};
+use qxync_core::LinkConfig;
 
 fn env_creds() -> Option<(LinkConfig, String)> {
     let host = std::env::var("QXNYC_TEST_HOST").ok()?;
@@ -38,7 +38,6 @@ fn env_creds() -> Option<(LinkConfig, String)> {
             https: true,
             insecure: true,
             user,
-            home_root: HOME_ROOT.to_string(),
             ipv4_only: std::env::var("QXNYC_TEST_IPV4").is_ok(),
             exclude: Vec::new(),
             filter_temp: true,

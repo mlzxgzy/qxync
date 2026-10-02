@@ -198,34 +198,38 @@ fn as_u64(v: &serde_json::Value) -> Option<u64> {
     }
 }
 
-/// 真实路径 → Qsync 视图路径。
+/// 真实路径 → **这个挂载视图**的远端路径。
 ///
-/// 真机事件里是 `/share/homes/<user>/qxync-test/a.txt`，而 Qsync 视图的根是 `/home`
-/// （普通用户的家目录根）。`/home/...` 形式原样通过，其余（别的共享文件夹、别的用户）
-/// 一律丢弃 —— 报告 11 §5.3 明确要求校验归属，避免处理他人的事件。
-pub fn map_event_path(real: &str, user: &str, home_root: &str) -> Option<String> {
+/// 真机事件里是 `/share/homes/<user>/qxync-test/a.txt`（NAS 侧真实路径），而挂载视图用的是
+/// Qsync 命名空间的路径（家目录挂载就是 `/home`，共享文件夹挂载就是 `/Public`…）。
+/// 已经是视图内路径的原样通过；别的用户 / 归属不明的路径一律丢弃 —— 报告 11 §5.3 明确要求
+/// 校验归属，避免处理他人的事件。
+///
+/// `view_root` 是**调用方的挂载根**（`MountView::remote_root`），不是「家目录」：
+/// 挂 `/Public` 时就传 `/Public`。
+pub fn map_event_path(real: &str, user: &str, view_root: &str) -> Option<String> {
     let real = real.trim();
     if real.is_empty() {
         return None;
     }
-    let home_root = home_root.trim_end_matches('/');
-    if let Some(rest) = real.strip_prefix(home_root) {
-        // /home 或 /home/...；注意别把 /homebrew 当成 /home
+    let view_root = view_root.trim_end_matches('/');
+    if let Some(rest) = real.strip_prefix(view_root) {
+        // 视图根自身或它下面；注意别把 /homebrew 当成 /home
         if rest.is_empty() || rest.starts_with('/') {
             return Some(if rest.is_empty() {
-                home_root.to_string()
+                view_root.to_string()
             } else {
-                format!("{home_root}{rest}")
+                format!("{view_root}{rest}")
             });
         }
     }
-    let user_root = format!("/share/homes/{user}");
-    if let Some(rest) = real.strip_prefix(&user_root) {
+    let user_home = format!("/share/homes/{user}");
+    if let Some(rest) = real.strip_prefix(&user_home) {
         if rest.is_empty() {
-            return Some(home_root.to_string());
+            return Some(view_root.to_string());
         }
         if rest.starts_with('/') {
-            return Some(format!("{home_root}{rest}"));
+            return Some(format!("{view_root}{rest}"));
         }
     }
     None

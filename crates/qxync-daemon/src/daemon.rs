@@ -992,7 +992,6 @@ async fn status(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
             https: state.link.https,
             user: state.link.user.clone(),
             ipv4_only: state.link.ipv4_only,
-            home_root: state.link.root(),
         }),
         logged_in,
         session: session.map(|s| SessionInfo {
@@ -1187,7 +1186,6 @@ fn store_info(state: &Arc<State>, integrity: bool) -> Result<serde_json::Value, 
 /// （下面列出来的这些）可以写；没登记过的共享文件夹，服务端会拒绝上传（`status:20`）。
 /// 所以客户端的做法是：用户勾读写就按读写挂，真被拒了在错误列表里如实报。
 async fn roots_cmd(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
-    let home_root = state.link.root();
     let logged_in = current_session(state).await.is_some();
     let syncing = if logged_in {
         with_client!(state, |c| c.syncing_folders()).unwrap_or_default()
@@ -1202,7 +1200,6 @@ async fn roots_cmd(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
         "未登录：拿不到 NAS 上登记的同步文件夹列表，只能手输或用「浏览…」".to_string()
     };
     to_value(RootsData {
-        home_root,
         syncing_folders: syncing,
         note: Some(note),
     })
@@ -1215,7 +1212,7 @@ fn rules_cmd(
 ) -> Result<serde_json::Value, IpcError> {
     let rules = &state.rules;
     // 一对一：这里只有一个远端根（link 的 home_root）
-    let roots = vec![state.link.root()];
+    let roots = vec![qxync_core::HOME_ROOT.to_string()];
     let mut data = RulesData {
         roots: roots.clone(),
         exclude: state.link.exclude.clone(),
@@ -1385,7 +1382,8 @@ async fn mount(
     }
 
     // 这一个挂载点对应的 NAS 文件夹：显式给了就用它，否则用 link 的 home_root
-    let remote = qxync_core::normalize_root(&remote.unwrap_or_else(|| state.link.root()));
+    let remote =
+        qxync_core::normalize_root(&remote.unwrap_or_else(|| qxync_core::HOME_ROOT.to_string()));
     // ★ 可写性**不预判**：能不能写由 NAS 说了算 —— Qsync 里登记成同步文件夹的目录
     //   （`qbox_get_syncing_folder_list` 列出来的那些）可以写；没登记过的共享文件夹会被
     //   服务端拒绝（实测 `status:20`）。以前这里按「是不是 home_root」一刀切成只读，
@@ -2343,7 +2341,7 @@ fn disable_task_by_mountpoint(mp: &Path) -> Result<(), String> {
 async fn mount_task(state: &Arc<State>, t: &Task) -> Result<serde_json::Value, IpcError> {
     std::fs::create_dir_all(&t.mountpoint)
         .map_err(|e| core_err(format!("建挂载点 {} 失败: {e}", t.mountpoint.display())))?;
-    let remote = t.effective_root(&state.link.root());
+    let remote = t.effective_root();
     mount(
         state,
         t.mountpoint.clone(),
@@ -2402,7 +2400,7 @@ async fn tasks_cmd(
             // ★ 提交前的「目的地冲突」检查：本地文件夹重复 / 嵌套 → 直接拒；
             //   NAS 文件夹重复 → 只作为 warnings 回给界面（只读挂同一个是合法用法）。
             let (others, _bad) = Task::list(&paths);
-            let (errors, warnings) = t.conflict_report(&others, &state.link.root());
+            let (errors, warnings) = t.conflict_report(&others);
             if !errors.is_empty() {
                 return Err(IpcError::new(
                     ErrorKind::BadRequest,

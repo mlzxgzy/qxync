@@ -18,7 +18,7 @@
 //!   空列表是**正常状态**，不断言非空（该 NAS 的 test1 就是空的）。
 
 use qxync_client::Client;
-use qxync_core::{LinkConfig, HOME_ROOT};
+use qxync_core::LinkConfig;
 
 fn env_creds() -> Option<(LinkConfig, String)> {
     let host = std::env::var("QXNYC_TEST_HOST").ok()?;
@@ -36,7 +36,6 @@ fn env_creds() -> Option<(LinkConfig, String)> {
             https: true,
             insecure: true,
             user,
-            home_root: HOME_ROOT.to_string(),
             // 本测试只看 NAS 上报的同步文件夹，不配置任何额外根（空 = 只用家目录）。
             ipv4_only: std::env::var("QXNYC_TEST_IPV4").is_ok(),
             exclude: Vec::new(),

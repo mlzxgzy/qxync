@@ -7,7 +7,7 @@
 
 use crate::ipc;
 use qxync_core::ipc::{ErrorKind, PingData, Request, RequestEnvelope, StatusData, IPC_VERSION};
-use qxync_core::{ConfigPaths, Credentials, LinkConfig, Settings, HOME_ROOT};
+use qxync_core::{ConfigPaths, Credentials, LinkConfig, Settings};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -122,8 +122,6 @@ fn same_link(a: &qxync_core::ipc::LinkInfo, b: &LinkConfig) -> bool {
         && a.https == b.https
         && a.user == b.user
         && a.ipv4_only == b.ipv4_only
-        // home_root 变了也要重启 daemon（daemon 只在启动时读 link 文件）
-        && qxync_core::normalize_root(&a.home_root) == b.root()
 }
 
 /// 前端的连接表单（字段都可省，省了就用默认值/已有 link）。
@@ -139,8 +137,6 @@ struct LinkInput {
     #[serde(default)]
     insecure: bool,
     user: String,
-    #[serde(default = "default_home_root")]
-    home_root: String,
     #[serde(default)]
     ipv4_only: bool,
     /// ★ M7：选择性同步规则（GUI 暂不编辑；保存时**保留已有值**，不能被 GUI 抹掉）
@@ -163,10 +159,6 @@ fn default_port() -> u16 {
 fn yes() -> bool {
     true
 }
-fn default_home_root() -> String {
-    HOME_ROOT.to_string()
-}
-
 impl LinkInput {
     fn link(&self) -> LinkConfig {
         LinkConfig {
@@ -180,11 +172,6 @@ impl LinkInput {
             https: self.https,
             insecure: self.insecure,
             user: self.user.trim().to_string(),
-            home_root: if self.home_root.trim().is_empty() {
-                HOME_ROOT.to_string()
-            } else {
-                self.home_root.trim().to_string()
-            },
             ipv4_only: self.ipv4_only,
             // 前端没给就先用默认；真正保存时由 `link_with_existing` 用已有值补齐
             exclude: self.exclude.clone(),
@@ -720,23 +707,13 @@ mod tests {
         assert_eq!(link.port, 9834);
         assert!(link.https);
         assert!(!link.insecure);
-        assert_eq!(link.home_root, HOME_ROOT);
-        assert_eq!(link.root(), "/home", "生效根就是归一化后的 home_root");
-    }
-
-    /// 空的 / 带空白的 `home_root` 落回 `/home`（不能写出一个空根）。
-    #[test]
-    fn link_input_home_root_defaults() {
-        let li: LinkInput = serde_json::from_value(json!({
-            "host": "nas.local", "user": "test1", "home_root": "  "
-        }))
-        .unwrap();
-        assert_eq!(li.link().home_root, HOME_ROOT);
+        // 老前端可能还带着已删除的 `home_root` / `roots` 字段 → 忽略即可，不许报错
         let li2: LinkInput = serde_json::from_value(json!({
-            "host": "nas.local", "user": "test1", "home_root": "/home/test1/"
+            "host": "nas.local", "user": "test1", "home_root": "/home/test1", "roots": ["/home"]
         }))
         .unwrap();
-        assert_eq!(li2.link().root(), "/home/test1", "归一化（去尾斜杠）");
+        assert_eq!(li2.link().user, "test1");
+        assert_eq!(qxync_core::HOME_ROOT, "/home", "家目录是协议常量，不再是配置项");
     }
 
     #[test]
@@ -748,7 +725,6 @@ mod tests {
             https: true,
             user: "test1".into(),
             ipv4_only: false,
-            home_root: "/home".into(),
         };
         let mut link = LinkConfig {
             id: "default".into(),
@@ -757,7 +733,6 @@ mod tests {
             https: true,
             insecure: true,
             user: "test1".into(),
-            home_root: "/home".into(),
             ipv4_only: false,
             exclude: Vec::new(),
             filter_temp: true,
@@ -767,10 +742,9 @@ mod tests {
         assert!(same_link(&info, &link));
         link.user = "other".into();
         assert!(!same_link(&info, &link));
-        // home_root 变了也要能识别（否则「保存并登录」不会重启 daemon，新根不生效）
+        // 改回来 → 一致（不再有「家目录变了」这条：它已经不是配置项）
         link.user = "test1".into();
-        link.home_root = "/home/test1".into();
-        assert!(!same_link(&info, &link), "home_root 变了必须被判为不同");
+        assert!(same_link(&info, &link));
     }
 
     #[test]

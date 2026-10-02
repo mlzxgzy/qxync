@@ -76,7 +76,7 @@ impl ContentSource for DaemonContent {
     fn roots(&self) -> Vec<String> {
         self.state
             .upgrade()
-            .map(|st| vec![st.link.root()])
+            .map(|_st| vec![qxync_core::HOME_ROOT.to_string()])
             .unwrap_or_default()
     }
 }
@@ -129,8 +129,9 @@ impl PeerHost {
             .clone()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(crate::sync::hostname);
-        // 一对一：对外声明的可服务路径就是这个 link 的根
-        let roots = vec![link.root()];
+        // 一对一：对外声明的可服务路径就是 Qsync 家目录（协议里固定叫 /home）
+        let _ = link;
+        let roots = vec![qxync_core::HOME_ROOT.to_string()];
         let events_in: Arc<StdMutex<VecDeque<PeerEventInfo>>> =
             Arc::new(StdMutex::new(VecDeque::new()));
 
