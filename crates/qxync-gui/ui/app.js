@@ -1269,7 +1269,7 @@
       addAlert('home-alerts', '删除被熔断挡住：' + String(sy.delete_block_reason) +
         '（到「诊断 → 同步 / 缓存」可强制放行一轮）');
     }
-    if (sy.note) { addAlert('home-alerts', '说明：' + String(sy.note)); }
+    if (sy.note) { addAlert('home-alerts', '说明：' + String(sy.note), 'warn'); }
   }
 
   // ============================================================ Tab 1 状态
@@ -1473,10 +1473,14 @@
     label.textContent = humanSize(used) + ' / ' + humanSize(limit) + '（' + pct.toFixed(1) + '%）';
   }
 
-  function addAlert(containerId, text) {
+  // severity: 'error'（默认，红，真失败）| 'warn'（黄，需注意但不致命）。
+  // ★ 只有真失败才配红色；引擎的 note（如 qbox_get_sync_log 的 -17「区间内没有事件」）
+  //   是提示性诊断信息，归 'warn'，否则主页会常驻一个红框。
+  function addAlert(containerId, text, severity) {
     var box = $(containerId);
     if (!box) { return; }
-    box.appendChild(el('div', 'alert', text));
+    var cls = (severity === 'warn') ? 'alert alert-warn' : 'alert';
+    box.appendChild(el('div', cls, text));
   }
 
   function clearAlerts(containerId) {
