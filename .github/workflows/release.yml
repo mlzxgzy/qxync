@@ -71,6 +71,8 @@ jobs:
 
       - name: 生成 SHA256SUMS
         run: |
+          # 先删掉旧的：重跑时 `*` 会把上一轮的 SHA256SUMS 自己也算进去。
+          rm -f dist/SHA256SUMS
           cd dist && sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
 
