@@ -48,7 +48,7 @@ NAS 上的文件在本地只是一个「占位符」，`ls -l` 显示真实大�
 | **变更发现** | 三游标轮询 + baseline 三向对账；冲突生成**冲突副本**，远端批量删除有**熔断**保护 | [M2c](docs/M2c-变更发现.md) |
 | **脱水（释放空间）** | 完整安全检查链（pin / 未上传改动 / 打开的 fd / 被 mmap / 正在水合 / 刚访问过）后才清本地内容 | [M3](docs/M3-脱水.md) |
 | **本地状态库** | SQLite 承载游标 / baseline / pin / 上传队列，**同一事务**落盘；librsync 兼容的 delta 编解码 + 能力门控 | [M5](docs/M5-SQLite与delta.md) |
-| **共享文件夹（只读）** | NAS 文件夹**一对一**配到本地；家目录可读写，非家目录（共享文件夹）只能只读挂载 | [M6](docs/M6-多根与共享文件夹.md) · [CHANGELOG](CHANGELOG.md) |
+| **共享文件夹** | NAS 文件夹**一对一**配到本地；读写与否由 NAS 决定（登记成 Qsync 同步文件夹的目录可写） | [M6](docs/M6-多根与共享文件夹.md) · [CHANGELOG](CHANGELOG.md) |
 | **选择性同步** | gitignore 风味的 `exclude` 规则（锚定 / `**` / 反向包含 / 子树剪枝）+ 内置临时文件过滤 | [M7](docs/M7-选择性同步与LAN直连.md) |
 | **LAN 直连** | qxync↔qxync 自研对等协议：设备配对、事件快路径、本地区间直传（失败一律静默回落 NAS） | [M7](docs/M7-选择性同步与LAN直连.md) |
 | **同步任务** | `tasks/<id>.json` 持久化的挂载登记，逐任务暂停/继续，重启可 `--restore-tasks` 恢复 | [M8](docs/M8-向Qsync-Client-6靠拢.md) |
@@ -405,10 +405,12 @@ pin=pinned/excluded、未上传改动/队列在途、打开的 fd、被 mmap（�
 
 **共享文件夹 / NAS 目录**
 
-30. **共享文件夹「能读不能写」**：只要账号有读权限，用普通 `sid` 就能列 / stat / 下载
-    （`/Public`、`/Multimedia` 实测通过），**不需要** `auth_data` AES；但上传必须是 Qsync
-    同步文件夹，否则服务端只回一句含糊的 `status:20`。所以**非家目录一律只读**：
-    配对到共享文件夹的任务会被强制按只读挂载（`daemon::mount()` 里判 `remote != home_root`）。
+30. **共享文件夹「能不能写」由 NAS 说了算**：只要账号有读权限，用普通 `sid` 就能列 /
+    stat / 下载（`/Public`、`/Multimedia` 实测通过），**不需要** `auth_data` AES；但上传
+    必须是 **Qsync 里登记成同步文件夹**的目录，否则服务端只回一句含糊的 `status:20`。
+    判据是「在不在 `qbox_get_syncing_folder_list` 里」，**不是**「是不是家目录」——
+    家目录之外登记过的目录照样能写。所以客户端**不预判**：勾了读写就按读写挂，
+    真被拒了把服务端原话报进错误列表。
 31. **顶层共享列表枚举不出来**：`get_list /` 对普通用户是 `status:5`；
     能列举的只有 `qbox_get_syncing_folder_list`（NAS 上登记过同步的文件夹）
     → 「NAS 文件夹」要**让用户选**（下拉 + `ls` 逐层浏览 + 手输兜底），不能自动发现。

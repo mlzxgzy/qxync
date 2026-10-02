@@ -53,7 +53,7 @@ against a real NAS.
 | **Change discovery** | three-cursor polling + three-way baseline reconciliation; conflicts produce a **conflicted copy**, and bulk remote deletes are guarded by a **circuit breaker** | [M2c](docs/M2c-变更发现.md) |
 | **Dehydration (free up space)** | the full safety-check chain (pin / unuploaded changes / open fd / mmap'd / currently hydrating / recently accessed) must pass before local content is dropped | [M3](docs/M3-脱水.md) |
 | **Local state store** | SQLite carries cursors / baseline / pin / upload queue, persisted in **one and the same transaction**; librsync-compatible delta codec + capability gating | [M5](docs/M5-SQLite与delta.md) |
-| **Shared folders (read-only)** | NAS folders are paired **one-to-one** onto local folders; the home directory is read-write, non-home folders (shared folders) are read-only | [M6](docs/M6-多根与共享文件夹.md) · [CHANGELOG](CHANGELOG.en.md) |
+| **Shared folders** | NAS folders are paired **one-to-one** onto local folders; writability is decided by the NAS (folders registered as Qsync sync folders are writable) | [M6](docs/M6-多根与共享文件夹.md) · [CHANGELOG](CHANGELOG.en.md) |
 | **Selective sync** | gitignore-flavoured `exclude` rules (anchoring / `**` / negation / subtree pruning) + built-in temporary-file filtering | [M7](docs/M7-选择性同步与LAN直连.md) |
 | **LAN direct** | qxync↔qxync peer protocol: device pairing, event fast path, direct local range transfer (any failure silently falls back to the NAS) | [M7](docs/M7-选择性同步与LAN直连.md) |
 | **Sync tasks** | mount registrations persisted in `tasks/<id>.json`, pause/resume per task, restorable after a restart with `--restore-tasks` | [M8](docs/M8-向Qsync-Client-6靠拢.md) |
@@ -458,12 +458,14 @@ these are the ones most likely to bite you while writing code:
 
 **Shared folders & NAS folders**
 
-30. **Shared folders are readable but not writable**: as long as the account has read permission,
-    a plain `sid` is enough to list / stat / download (`/Public` and `/Multimedia` both passed on a
-    real NAS), and `auth_data` AES is **not** needed; but an upload requires a Qsync sync folder,
-    otherwise the server answers with a vague `status:20`. So **anything that is not the home
-    directory is read-only**: a task paired to a shared folder is forced to mount read-only
-    (`daemon::mount()` checks `remote != home_root`).
+30. **Whether a shared folder is writable is decided by the NAS**: as long as the account has read
+    permission, a plain `sid` is enough to list / stat / download (`/Public` and `/Multimedia` both
+    passed on a real NAS), and `auth_data` AES is **not** needed; but an upload requires a folder
+    **registered as a Qsync sync folder**, otherwise the server answers with a vague `status:20`.
+    The test is "is it in `qbox_get_syncing_folder_list`", **not** "is it the home directory" —
+    registered folders outside home are writable too. So the client **does not pre-judge**: tick
+    read-write and it mounts read-write; if the server refuses, its own message lands in the error
+    list.
 31. **The top-level share list cannot be enumerated**: `get_list /` returns `status:5` for a regular
     user; the only enumerable source is `qbox_get_syncing_folder_list` (folders registered for sync
     on the NAS) → the "NAS folder" must be **chosen by the user** (dropdown + level-by-level `ls`

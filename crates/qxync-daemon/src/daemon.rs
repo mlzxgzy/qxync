@@ -1183,8 +1183,9 @@ fn store_info(state: &Arc<State>, integrity: bool) -> Result<serde_json::Value, 
 /// —— 那会真的把整个目录列出来（贵），而且一对多删掉之后也没有「多个根」要探了。
 /// 选中某个文件夹之后，`ls` 会如实告诉你能不能读。
 ///
-/// 可写性规则（保留自 M6 的实测结论）：**只有家目录根可写** —— 普通账号往非 Qsync
-/// 同步文件夹上传会被服务端拒绝（`status:20`）。
+/// 可写性：**不做预判**。能写的判据在 NAS 侧 —— Qsync 里登记成同步文件夹的目录
+/// （下面列出来的这些）可以写；没登记过的共享文件夹，服务端会拒绝上传（`status:20`）。
+/// 所以客户端的做法是：用户勾读写就按读写挂，真被拒了在错误列表里如实报。
 async fn roots_cmd(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
     let home_root = state.link.root();
     let logged_in = current_session(state).await.is_some();
@@ -1194,7 +1195,8 @@ async fn roots_cmd(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
         Vec::new()
     };
     let note = if logged_in {
-        "「家目录」以外的 NAS 文件夹默认只读：服务端会拒绝往非 Qsync 同步文件夹上传（status 20）"
+        "能不能写由 NAS 决定：Qsync 里登记成同步文件夹的目录（下面这些）可以写；\
+         没登记过的共享文件夹会被服务端拒绝（status 20）。客户端不替你改只读。"
             .to_string()
     } else {
         "未登录：拿不到 NAS 上登记的同步文件夹列表，只能手输或用「浏览…」".to_string()
@@ -1383,20 +1385,12 @@ async fn mount(
     }
 
     // 这一个挂载点对应的 NAS 文件夹：显式给了就用它，否则用 link 的 home_root
-    let home_root = state.link.root();
-    let remote = qxync_core::normalize_root(&remote.unwrap_or_else(|| home_root.clone()));
-    // ★ M6 实测结论保留：只有家目录根可写（普通账号往 /Public 上传会被服务端拒 status 20）。
-    //   一对多删掉之后，单根也可能是共享文件夹 —— 所以这里按「是不是 home_root」判可写。
-    let read_write = if read_write && remote != home_root {
-        tracing::warn!(
-            "{} 不是家目录根（{}）：强制只读（实测服务端会拒绝往非 Qsync 同步文件夹上传，status 20）",
-            remote,
-            home_root
-        );
-        false
-    } else {
-        read_write
-    };
+    let remote = qxync_core::normalize_root(&remote.unwrap_or_else(|| state.link.root()));
+    // ★ 可写性**不预判**：能不能写由 NAS 说了算 —— Qsync 里登记成同步文件夹的目录
+    //   （`qbox_get_syncing_folder_list` 列出来的那些）可以写；没登记过的共享文件夹会被
+    //   服务端拒绝（实测 `status:20`）。以前这里按「是不是 home_root」一刀切成只读，
+    //   那是错的判据（家目录之外登记过的目录照样能写）：用户勾了「读写」就按读写挂，
+    //   真被服务端拒了由上传队列 / 错误列表如实报出来，而不是在本地替 NAS 做决定。
     // 缓存按「主机」隔离：不同 NAS 上的同名路径不能共用缓存文件
     let host_ns: String = state
         .link
@@ -2039,12 +2033,10 @@ fn resolve_limit(limit: Option<CacheLimit>, cache_dir: &std::path::Path) -> Opti
 /// 扫描 `/proc/*/maps`，找出挂载点下被 mmap 的远端路径（脱水必须避开它们）。
 /// 扫 `/proc/*/maps` 找出「挂载点下被 mmap 的文件」→ 映射回远端路径。
 ///
-/// ★ M6：多根视图在挂载点里多一层「视图名」（`~/mnt/Public/a`），所以要传 `view_prefix`；
-/// 单根直通传空串（行为与 M3 完全一致）。映射错了后果很严重：mmap 判定失守 →
-/// 脱水会在别人还映射着的时候清内容（铁则 2 的相关保护）。
+/// 一对一：挂载点**就是**那个远端根，所以「挂载点 + 挂载点内的相对路径」直接拼成远端路径。
+/// 映射错了后果很严重：mmap 判定失守 → 脱水会在别人还映射着的时候清内容（铁则 2 的相关保护）。
 fn mmap_remotes(
     mountpoint: &std::path::Path,
-    view_prefix: &str,
     remote_root: &str,
 ) -> std::collections::BTreeSet<String> {
     use std::collections::BTreeSet;
@@ -2070,14 +2062,6 @@ fn mmap_remotes(
                     continue;
                 }
                 let rest = &mapped[mp.len()..];
-                let rest = if view_prefix.is_empty() {
-                    rest
-                } else {
-                    match rest.strip_prefix(&format!("/{view_prefix}")) {
-                        Some(r) if r.is_empty() || r.starts_with('/') => r,
-                        _ => continue,
-                    }
-                };
                 if rest.starts_with('/') {
                     out.insert(format!("{}{}", remote_root.trim_end_matches('/'), rest));
                 }
@@ -2112,14 +2096,7 @@ async fn run_dehydrate_with_recent(
     }
 
     // 选定挂载点（一对一：一个挂载点 = 一个远端根，所以每个挂载只有一轮）
-    let targets: Vec<(
-        PathBuf,
-        String,
-        String,
-        FsHandle,
-        qxync_fuse::Notifier,
-        CacheMode,
-    )> = {
+    let targets: Vec<(PathBuf, String, FsHandle, qxync_fuse::Notifier, CacheMode)> = {
         let g = state.mounts.lock().unwrap();
         let mut out = Vec::new();
         for m in g.values().filter(|m| {
@@ -2130,7 +2107,6 @@ async fn run_dehydrate_with_recent(
         }) {
             out.push((
                 m.info.mountpoint.clone(),
-                String::new(),
                 m.info.remote.clone(),
                 m.handle.clone(),
                 m.notifier.clone(),
@@ -2145,7 +2121,7 @@ async fn run_dehydrate_with_recent(
         ..Default::default()
     };
     let manual_path = opts.path.clone();
-    for (mp, view_prefix, remote_root, handle, notifier, _mode) in &targets {
+    for (mp, remote_root, handle, notifier, _mode) in &targets {
         if let Some(p) = &manual_path {
             if !(p == remote_root
                 || p.starts_with(&format!("{}/", remote_root.trim_end_matches('/'))))
@@ -2156,24 +2132,18 @@ async fn run_dehydrate_with_recent(
         let cache_dir = handle.cache_dir().to_path_buf();
         let limit = resolve_limit(limit_spec, &cache_dir);
         out.limit_bytes = limit;
-        let mapped = mmap_remotes(mp, view_prefix, remote_root);
+        let mapped = mmap_remotes(mp, remote_root);
         let policy = Policy {
             idle_secs,
             cache_limit: limit,
             recent_secs,
             now,
         };
-        let mut cands = if let Some(p) = &manual_path {
+        let cands = if let Some(p) = &manual_path {
             handle.candidate(p).into_iter().collect::<Vec<_>>()
         } else {
             handle.dehydrate_candidates()
         };
-        // ★ M6：多根视图下候选是「整个挂载点的」，按当前根过滤（否则每个根都会把同一批文件算一遍）
-        if !view_prefix.is_empty() {
-            let r = remote_root.trim_end_matches('/').to_string();
-            let prefix = format!("{r}/");
-            cands.retain(|c| c.remote == r || c.remote.starts_with(&prefix));
-        }
         let plan = qxync_core::dehydrate::plan(&cands, &policy, &mapped);
         if manual_path.is_some() && plan.targets.is_empty() && plan.blocked.is_empty() {
             continue;
