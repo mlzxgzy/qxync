@@ -103,6 +103,7 @@ matching [Release](https://github.com/mlzxgzy/qxync/releases):
 | Asset | What it is |
 |---|---|
 | `qxync-<version>-x86_64-unknown-linux-gnu.tar.gz` | all three binaries + desktop entry / icons + licences / disclaimer |
+| `qxync-bin-<version>-1-x86_64.pkg.tar.zst` | the **Arch package** (built by CI with the real `makepkg` from the archlinux image, out of the tarball above) |
 | `qsync` · `qxyncd` · `qxync-gui` | the three binaries on their own, from the same build |
 | `SHA256SUMS` | checksums for the assets above |
 
@@ -111,10 +112,10 @@ itself and only then falls back to `PATH`. Running the GUI also needs the WebKit
 runtime (`libwebkit2gtk-4.1-0` + `libgtk-3-0` on Debian/Ubuntu). **Building from source is still
 the recommended path** (reproducible and auditable).
 
-**Arch Linux**: the repo ships an AUR package definition
-([`packaging/arch/PKGBUILD`](packaging/arch/), package name `qxync-bin`) — run `makepkg -si` in
-`packaging/arch/` to install it as a system package (three binaries in `/usr/bin`, plus a desktop
-entry and icons); once it is published to the AUR it is just `yay -S qxync-bin`. It is
+**Arch Linux**: each release ships a ready-made `qxync-bin-<version>-1-x86_64.pkg.tar.zst` —
+install it with `sudo pacman -U`. The repo also carries an AUR package definition
+([`packaging/arch/PKGBUILD`](packaging/arch/), package name `qxync-bin`) so you can run
+`makepkg -si` yourself; once it is published to the AUR it is `yay -S qxync-bin`. The package is
 **intentionally not stripped** (readable backtraces, see above), so it installs ~190 MB — see
 [`packaging/arch/README.md`](packaging/arch/README.md) for details and the checksum bump after
 each release.

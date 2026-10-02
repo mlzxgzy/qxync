@@ -21,6 +21,9 @@
   `tauri.conf.json` / AUR `PKGBUILD` 的 `pkgver` 必须一致，否则拒绝发版）；打包脚本
   `xtask/release/package-linux.sh` 可本地复跑，产物可复现（tar 内 owner/group 归零、
   顺序固定、gzip 不写时间戳）。
+- **Release 里也带 Arch 包**：`qxync-bin-<版本>-1-x86_64.pkg.tar.zst` 由 CI 在
+  `archlinux:base-devel` 容器里用**真 `makepkg`** 从上面那个 tar.gz 打出来，包里三个二进制
+  与 Release 资产**逐字节一致**；`sudo pacman -U` 直接装。
 - **Arch Linux 包（AUR `qxync-bin`）**：`packaging/arch/` 里带 AUR 包定义 —— 直接取 Release
   上的预编译 `tar.gz`，把 `qsync` / `qxyncd` / `qxync-gui` 装进 `/usr/bin`（带桌面项与图标）。
   `makepkg -si` 本地即可装，推到 AUR 后是 `yay -S qxync-bin`。包**有意不 strip**（与 Release
