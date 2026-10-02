@@ -8,6 +8,11 @@
 #
 # 依赖：已 `cargo build`（target/debug/qsync）、/dev/fuse、fusermount3。
 # 凭据：读 XDG_CONFIG_HOME 下的 qsync 配置；先用 `qsync login` 登录过一次。
+#
+# 状态隔离：状态库 `$RUNDIR/fuse-data` 与日志 `$RUNDIR/fuse-state` **每次开跑前清空**，
+#   不再跟别的矩阵共用 `.local-run/data`（NAS 的 @Recycle 会随删夹具无限增长，
+#   累积 baseline 曾让 M2c 的「远端改动」断言偶发失败）。要复用别的目录：
+#   `QSYNC_TEST_DATA_HOME=... QSYNC_TEST_STATE_HOME=...`（此时不会被清空）。
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -37,8 +42,15 @@ check(){ if [ "$1" = "0" ]; then ok "$2"; else bad "$2"; fi }
 
 mkdir -p "$MNT" "$CACHE"
 export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$RUNDIR/config}"
-export XDG_DATA_HOME="${XDG_DATA_HOME:-$RUNDIR/data}"
-export XDG_STATE_HOME="${XDG_STATE_HOME:-$RUNDIR/state}"
+# ★ 状态库与日志**独立**（像 m5-matrix 那样）：以前跟别的矩阵共用 $RUNDIR/data 与
+#   $RUNDIR/state，累积的状态会互相踩 —— 最明显的是 NAS 的 @Recycle 会随每次删夹具一直长，
+#   baseline 越滚越大（实测 540+ 条 @Recycle 记录 / dirs=29），M2c 的「远端改动」断言就
+#   开始偶发失败（同一场景换个干净状态必过）。独立 + 每次开跑前清空 = 可复现。
+export XDG_DATA_HOME="${QSYNC_TEST_DATA_HOME:-$RUNDIR/fuse-data}"
+export XDG_STATE_HOME="${QSYNC_TEST_STATE_HOME:-$RUNDIR/fuse-state}"
+# 默认目录每次开跑前清空；显式指定了 QSYNC_TEST_*_HOME 就尊重它、不动里面的东西
+[ -n "${QSYNC_TEST_DATA_HOME:-}" ] || rm -rf "$XDG_DATA_HOME"
+[ -n "${QSYNC_TEST_STATE_HOME:-}" ] || rm -rf "$XDG_STATE_HOME"
 export RUST_LOG="${RUST_LOG:-info}"
 LOG="$RUNDIR/fuse-matrix.log"
 
@@ -603,12 +615,25 @@ MPID=$!
   check "$([ "${c_after:-0}" -le 400000 ] && echo 0 || echo 1)" "M3-5b 清到了限额附近（≤ 400 KiB 含开销）"
 
   # ---- M3-6 后台自动扫描（动态开启 idle 脱水）
-  cat "$M3/hello.txt" >/dev/null 2>&1                        # 重新水合
+  # ★ 用**全新文件**测后台那一路，别复用 hello.txt：它带着前面几段留下的状态/页缓存，
+  #   实测后台 tick 根本不碰它 —— M3-6 会靠「`--idle-secs` 立即跑的那一趟」蒙混过关，
+  #   而 M3-6b 就变成假失败。顺序：先开后台扫描（此刻它没活干）→ 造个新文件并 `cat`
+  #   水合，留给后台 tick → 最多等 20s（QSYNC_DEHYDRATE_INTERVAL=5，≥4 个 tick），
+  #   占位符与「自动脱水：」日志两个条件都满足才算过。
   "$QS" dehydrate --idle-secs 1 >/dev/null 2>&1              # 动态开启后台扫描（闲置 ≥1s）
-  sleep 9
-  st_auto=$(xattr_state "$M3/hello.txt")
+  printf 'M3-BACKGROUND-%s\n' "$$" >"$RUNDIR/m3-bg.bin"
+  "$QS" --direct put "$RUNDIR/m3-bg.bin" "$FIXTURE" --name m3-bg.txt >/dev/null 2>&1
+  for _ in $(seq 1 40); do [ -e "$M3/m3-bg.txt" ] && break; sleep 0.5; done
+  cat "$M3/m3-bg.txt" >/dev/null 2>&1                        # 水合 → 留给后台 tick
+  for _ in $(seq 1 20); do
+    [ "$(xattr_state "$M3/m3-bg.txt")" = "placeholder" ] \
+      && grep -qh '自动脱水：' "$XDG_STATE_HOME"/qsync/log/qxyncd.log.* && break
+    sleep 1
+  done
+  st_auto=$(xattr_state "$M3/m3-bg.txt")
   check "$([ "$st_auto" = "placeholder" ] && echo 0 || echo 1)" "M3-6 后台定时脱水生效（闲置 ≥1s 后被自动清成占位符）"
-  check "$(grep -qh '自动脱水：' "$XDG_STATE_HOME"/qsync/log/qxyncd.log.* && echo 0 || echo 1)" "M3-6b daemon 日志有自动脱水记录"
+  check "$(grep -qh '自动脱水：' "$XDG_STATE_HOME"/qsync/log/qxyncd.log.* && echo 0 || echo 1)" "M3-6b daemon 日志有自动脱水记录（本轮后台那一轮）"
+  "$QS" --direct rm "$FIXTURE" m3-bg.txt >/dev/null 2>&1     # 清掉这条专用夹具
   "$QS" dehydrate --idle-secs 0 >/dev/null 2>&1              # 关掉，别影响 Direct 模式测试
 
   # ---- M3-7 status 可观测

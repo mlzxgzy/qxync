@@ -23,7 +23,7 @@
 | **M8.2 同步任务**（`tasks/<id>.json` 持久化 + 每任务暂停/继续 + `--restore-tasks` 重启恢复 + 自定义缓存目录 + GUI 任务页） | ✅ **已实现并真机验收**（`m82-matrix.sh` **37/37**；`fuse-matrix.sh` 68/68 回归） |
 | **M8.3 同步日志**（`sync.db` schema v2 加 `journal` 表 + 后台批量落库与轮转 + GUI 文件更新中心/错误列表） | ✅ **已实现并真机验收**（`m83-matrix.sh` **27/27**；`m5-matrix.sh` 扩到 30/30） |
 | **M8.4 设置中心 + 托盘/通知 + 自动释放空间 + M7 面板补课**（`settings.json` + 代理三模式接 reqwest + ksni 托盘（含「真可见」探测）+ 桌面通知 + 开机自启 + `statvfs` 自动释放空间（复用脱水安全链）+ 筛选器/LAN/冲突策略面板 + 文件页三态与右键菜单 + 文件选择器/opener/关于页） | ✅ **已实现并真机验收**（`m84-matrix.sh` **92/92**；全量回归见下方「M8.4 验收结论」） |
-| **M8.6 打磨与验收收口**（视觉规范 token 化（浅/深两份）+ 键盘可达性与焦点环 + 空/错/加载四态全库复查 + i18n 文案表（zh-CN 163 条 + en 预留）+ `ui_spec` 静态自检 + `gui-matrix.sh` 覆盖） | ✅ **已完成并验收**（`gui-matrix.sh` **148/148**（M8.6 新增 17 条：`ui_spec` 15 + 真窗口键盘 2）；**全量真挂载回归 491 项全过**（fuse 68/68 · m5 30 · m6 29 · m7 60 · m82 37 · m83 27 · m84 92 + gui 148），详见下方「M8.6 验收结论」） |
+| **M8.6 打磨与验收收口**（视觉规范 token 化（浅/深两份）+ 键盘可达性与焦点环 + 空/错/加载四态全库复查 + i18n 文案表（zh-CN 163 条 + en 预留）+ `ui_spec` 静态自检 + `gui-matrix.sh` 覆盖；**另修掉收口时发现的「挂载失败 → daemon worker panic」**） | ✅ **已完成并验收**（`gui-matrix.sh` **148/148**（M8.6 新增 17 条：`ui_spec` 15 + 真窗口键盘 2）；**全量真挂载回归 491 项全过**（fuse 68/68 · m5 30 · m6 29 · m7 60 · m82 37 · m83 27 · m84 92 + gui 148），详见下方「M8.6 验收结论」） |
 | **M5 SQLite 元数据 + delta**（`sync.db` 承载游标/baseline/pin/队列 + librsync 兼容编解码 + 能力门控） | ✅ **已实现并真机验收**（`m5-matrix.sh` **28/28**；服务端无历史版本 → 增量走门控，见 [`M5-SQLite与delta.md`](docs/M5-SQLite与delta.md)） |
 | **M6 多根 / 共享文件夹**（link `roots` + 同步文件夹发现 + FUSE 多根视图 + 非家目录根只读保护） | ✅ **已实现并真机验收**（`m6-matrix.sh` **29/29**，含多根真挂载：两根都能按需水合、共享根写回 `EROFS`、家目录能写、共享根可脱水） |
 | **M7 选择性同步 + 设备配对 / LAN 直连**（`exclude` 规则引擎贯通 FUSE/同步/脱水 + 内置临时文件过滤；qxync↔qxync 自研对等协议：配对、事件快路径、LAN 直传） | ✅ **已实现并真机验收**（`m7-matrix.sh` **60/60** 含真挂载段；回归 `fuse-matrix.sh` 68/68，见 [`docs/M7-选择性同步与LAN直连.md`](docs/M7-选择性同步与LAN直连.md)） |
@@ -44,7 +44,7 @@
 | `gui-matrix.sh`（M8.6 主判据） | ✅ **148/148**（= M8.4 的 131 + M8.6 新增 17：2c 的 15 条静态断言 + 3c 的 2 条真窗口键盘断言） |
 | `ui_spec`（随 `--self-test`，不开窗口） | ✅ 无 HTML 拼接（`innerHTML`/`outerHTML`/`insertAdjacentHTML`/`document.write` **全 0**）；文案表 `T()` 用 124 条 / DOM 挂 58 条 / **两边缺词都是 0**；焦点环 / skip-link / tablist+tabpanel / dialog / aria-busy / aria-current / reduced-motion / 深色 token 全绿；四态入口 + 13 个 `data-state` 标记 |
 | 真窗口键盘 | ✅ Tab 一次 → 画面变化 **AE 2918 px**（skip-link 显形 + 焦点环），截图 `.local-run/gui-shots/kbd-{before,after}.png` |
-| `fuse-matrix.sh` | ✅ **68/68**（真挂载：区间水合 / 写路径 / 变更发现 / 脱水安全检查链 / 状态库） |
+| `fuse-matrix.sh` | ✅ **68/68**（真挂载：区间水合 / 写路径 / 变更发现 / 脱水安全检查链 / 状态库；状态库与日志已按 m5 的做法**独立 + 每次清空**，连跑两次都是 68/68） |
 | `m5-matrix.sh` | ✅ **30/30** |
 | `m6-matrix.sh` · `m7-matrix.sh` | ✅ **29/29** · **60/60**（含多根真挂载、排除路径不可见/不可写、LAN 直传） |
 | `m82-matrix.sh` | ✅ **37/37**（含「登记 + 真挂载」「重启恢复 --restore-tasks」） |
@@ -68,14 +68,41 @@ M8.6 的写域只有 `crates/qxync-gui/ui/**` + `crates/qxync-gui/src/lib.rs`（
 > （`task add` / `task resume`），其余矩阵的真挂载段按设计跳过。
 > **沙箱放开后 `/dev/fuse`（`crw-rw-rw- 10,229`）可见，同一份冻结产物按全量口径重跑：fuse 68/68、
 > m82 37/37、m83 27/27、m84 92/92、m6 29/29、m7 60/60，全部 0 失败** —— 那 2 条失败确系环境所致。
+>
+> **第三轮（修完「挂载失败 → daemon panic」之后）**：`fuse-matrix` 68/68（连跑两次）、`m6` 29/29、
+> `m7` 60/60、`m82` 37/37、`m83` 27/27、`m84` 92/92、`cargo test --workspace` 全绿（含新增的
+> `dropping_fs_inside_async_context_does_not_panic` 回归单测）。这一轮顺带修了 fuse-matrix 自己的两处
+> 「测试环境」问题：**状态库/日志改成独立目录且每次清空**（像 m5 那样 —— NAS 的 `@Recycle` 会随每次
+> 删夹具无限增长，跟别的矩阵共用 `.local-run/data` 时累积 baseline 让 M2c 的「远端改动」断言偶发失败），
+> 以及 **M3-6b 改成用全新夹具 + 轮询等后台 tick**（原来它 grep 的是按天累积的日志，且 `--idle-secs`
+> 自己会先跑一趟，容易假通过/假失败）。
 
-> 🔎 **顺带发现的既有问题（不在 M8.6 写域，未修，如实记录）**：机器上**没有 `/dev/fuse`** 时，
-> `qsync task add` / `task resume`（默认要挂载）会让 daemon 的一个 worker **panic 并断连**：
-> `fuser::session: Mounting …` → `Cannot drop a runtime in a context where blocking is not allowed`
-> （tokio 运行时在异步上下文里被 drop）。复现：无 `/dev/fuse` 的机器上起 daemon 后跑
-> `qsync task add --id t1 --mountpoint <dir> --root /home`。临时绕法：加 `--no-mount`。
-> 建议的修法是把挂载失败包成 `Result` 返回给 IPC（而不是在 blocking 任务里让运行时析构）——
-> 留作下一个里程碑的候选，因为它动的是 `qxyncd` 的挂载路径（M8 风险 #2 明确要求谨慎）。
+#### 🔧 附：修掉一个收口时发现的既有 bug —— 「挂载失败 → daemon worker panic」
+
+**现象**：任何**挂载失败**都会把 daemon 的那个 IPC worker 打成 panic，客户端只看到
+「daemon 提前关闭了连接」，拿不到真正的错误；日志里是 tokio 的
+`Cannot drop a runtime in a context where blocking is not allowed`。触发条件不止「没有 `/dev/fuse`」——
+挂载点被 `fusermount3` 拒（例如 `/proc`）同样会中招。
+
+**根因**（`crates/qxync-fuse`）：`QxyncFs` 里握着一个自己的 tokio `Runtime`（FUSE 回调里用它
+`block_on` NAS 调用）。daemon 是在 **async IPC 命令**里调 `qsync_fuse::spawn` → `fuser::spawn_mount2`；
+挂载失败时 fuser 会把 `fs` **就地在那个 async worker 线程上 drop** —— 而 tokio 的 `Runtime::drop`
+要等阻塞池收尾，这件事在异步上下文里被禁止，于是 `blocking/shutdown.rs` 直接 panic。
+
+**修法**（`qxync-fuse`）：把那个 runtime 包成 `FsRuntime`，析构时按上下文选路 ——
+在 tokio 上下文里用 tokio 官方推荐的 `shutdown_background()`（不等阻塞池），
+在普通线程上保持原来的等待语义（正常卸载时 `fs` 是 fuser 线程析构的，行为一字不改）。
+另外在 `qxync-fuse` 里加了**回归单测** `dropping_fs_inside_async_context_does_not_panic`
+（修复前该测试 panic，修复后通过；`cargo test --workspace` 里常驻）。
+
+| 同一场景（FUSE 设备不可用，`unshare -rm` + 把 `/dev/null` 绑到 `/dev/fuse`） | 修复前 | 修复后 |
+|---|---|---|
+| `qsync mount …` | rc=3「❌ daemon 提前关闭了连接」 | rc=5「❌ 挂载失败: Error calling mount() … EINVAL」 |
+| daemon 日志 panic 条数 | **1** | **0** |
+| 后续 `qsync daemon status` | 该连接已被打死 | 正常 |
+
+> 顺带把这台的挂载点也验了：`qsync mount /proc`（非 root 必被拒）修复前同样 panic，修复后是
+> `❌ 挂载失败: fusermount3: user has no write access to mountpoint /proc`，daemon 毫发无损。
 
 ### M8.4 验收结论（2026-10-01）
 
@@ -354,11 +381,8 @@ cargo test -p qxync-proto-test -- --ignored --test-threads=1 --nocapture   # 协
   带内联 `<code>` 的**混合标记段落**有意不进表（前者面向开发者、后者与 HTML 结构耦合）。
   文案表的一致性由 `qxync-gui --self-test` 的 `ui_spec` 双向自检守住（`T()` 用到的 key 与 DOM 挂的
   key 都必须命中 zh-CN 表），**不引入任何 i18n 框架**。
-* **没有 `/dev/fuse` 时** `qsync task add` / `task resume`（默认要挂载）会让 daemon 的 worker
-  panic 并断连（`Cannot drop a runtime in a context where blocking is not allowed`）。
-  这是**既有问题**（不是 M8.6 引入的，M8.6 未改 `qxyncd`），临时绕法是 `--no-mount`；
-  详见下方「M8.6 验收结论」末尾的复现与建议修法。**有 `/dev/fuse` 的机器不受影响**
-  （2026-10-01 的全量真挂载回归：fuse 68/68、m6 29/29、m7 60/60、m82 37/37、m83 27/27、m84 92/92）。
+* ~~没有 `/dev/fuse` 时挂载失败会把 daemon 的 IPC worker 打成 panic~~ —— **已修**
+  （`crates/qxync-fuse` 的 `FsRuntime`；回归单测常驻 `cargo test`）。见下方「M8.6 验收结论」的修复记录。
 * 直连（`--direct`）模式下改 `settings.json` 只写文件，**跑着的 daemon 要重启才读到**新代理/释放空间设置。
 
 ## 已实测的协议要点（踩过的坑）

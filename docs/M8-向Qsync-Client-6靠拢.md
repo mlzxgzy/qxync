@@ -882,6 +882,7 @@ LAN 面板显示身份/监听/配对码/已配对设备/事件计数，并支持
 | ④ i18n | 新增 `ui/i18n.js`：**zh-CN 文案表 163 条**、`en` 预留（空表 = 整条回落到 zh-CN）、`{name}` 具名插值、`data-i18n` / `data-i18n-title` / `-placeholder` / `-aria-label` 四种静态挂钩 + 启动时 `apply()`；JS 侧动态文案走 `T(key)`。**不引入 i18n 框架**（方案 §8 风险 10 的口径）。范围划清：`logErr/logInfo` 的诊断日志与 `index.html` 里带内联 `<code>` 的混合标记段落**不进表**（写进 `i18n.js` 头注释） |
 | ⑤ 矩阵覆盖 | `gui-matrix.sh`：新增 2c（`ui_spec` 静态合规性 14 条 + 文案表运行时回落 1 条）+ 3c（真窗口 Tab 焦点断言 2 条）→ **148/148**；9 个目的地 + 8 个设置分区 + 5 个旧 tab 值的截图与 AE 断言全部保留 |
 | ⑥ 文档 | `README.md`（现状表 + M8.6 验收结论）、`docs/开发规划.md`（M8 进度块）、本文（§7 矩阵表、§9 排期、§12.7 数据安全） |
+| ⑦ 附带修复 | 「挂载失败 → daemon worker panic」：`qxync-fuse` 的 `FsRuntime`（tokio 上下文里 `shutdown_background()`）+ 回归单测；见 §12.7 末节 |
 
 #### 验收结果
 
@@ -895,6 +896,7 @@ LAN 面板显示身份/监听/配对码/已配对设备/事件计数，并支持
 | 键盘可达性（真窗口） | ✅ 窗口起来后发一次 Tab → 画面变化 **AE 2918 px**（skip-link 显形 + 焦点环），截图 `.local-run/gui-shots/kbd-{before,after}.png` |
 | `cargo test --workspace` | ✅ 全绿（6 个测试二进制 `test result: ok`，0 failed） |
 | 负向对照 | ✅ daemon 停掉后 `--self-test` 仍**非 0 退出**（自检没被新增的静态断言稀释成橡皮图章） |
+| 附带的 bug 修复 | ✅ 「挂载失败 → daemon worker panic」（`FsRuntime` + 回归单测），见 §12.7 末节 |
 | **合计** | **491 项全过**（68+148+30+29+60+37+27+92） |
 
 > 📌 **补跑记录（第一轮 → 第二轮）**：第一轮验收时沙箱里**没有 `/dev/fuse`**（`nodev fuse` 在 `/proc/filesystems` 里，
@@ -1156,6 +1158,13 @@ M8.6 一共比对了两轮，**两轮的基线各自独立**，因为第一轮�
 `/home/qxync-test`（夹具目录，子文件增删导致目录 mtime 变）。**关键字：两轮 `removed` 都是 0、
 `resized` 都是 0** —— 连跑了真挂载的写路径与脱水，也没有任何已有文件的内容被改或被删。
 
+**第三轮（修完 daemon panic 之后的全量回归）**：`fuse-matrix` **68/68**（连跑两次）、
+`m6` 29/29 · `m7` 60/60 · `m82` 37/37 · `m83` 27/27 · `m84` 92/92 · `cargo test --workspace` 全绿
+（含新增回归单测 `dropping_fs_inside_async_context_does_not_panic`）；NAS 比对 `added 0 / removed 0 / resized 0`。
+同一轮还修了 fuse-matrix 自己的两处环境问题：状态库/日志独立且每次清空（原来跟别的矩阵共用，
+NAS `@Recycle` 无限增长 → 累积 baseline 让 M2c 断言偶发失败）、M3-6b 改用全新夹具 + 轮询等后台 tick
+（原来 grep 按天累积的日志，`--idle-secs` 自己会先跑一趟 → 假通过/假失败）。
+
 **为什么这次改动本身不可能伤到 NAS**：M8.6 的写域只有
 `crates/qxync-gui/ui/**`、`crates/qxync-gui/src/lib.rs`（新增 `ui_spec` 静态自检）、
 `xtask/tests/gui-matrix.sh` 与文档 —— **零 daemon 改动、零协议改动、零 FUSE 改动**，
@@ -1169,10 +1178,24 @@ M8.6 一共比对了两轮，**两轮的基线各自独立**，因为第一轮�
 `m82` 因此报了 2 条「要求真挂载」的失败（`task add` / `task resume`）。
 沙箱放开后按全量口径重跑，这 2 条**全部转绿**（`m82` 37/37），确认是环境所致而非代码。
 
-**顺带发现的既有问题（不在 M8.6 写域，未修）**：**没有 `/dev/fuse` 的机器上** `qsync task add` / `task resume`
-（默认要挂载）会让 daemon 的 worker panic 断连（`Cannot drop a runtime in a context where blocking is not allowed`）。
-有 `/dev/fuse` 时不会触发（第二轮全绿即证）。建议修法：把挂载失败包成 `Result` 经 IPC 返回，
-而不是在 blocking 任务里让运行时析构。
+**顺带发现并修掉的既有 bug（M8.6 收口的一部分）**：「**挂载失败 → daemon worker panic**」。
+
+* **现象**：任何挂载失败（没有 `/dev/fuse`、挂载点被 `fusermount3` 拒……）都会把处理该 IPC 请求的
+  worker 打成 panic，客户端只看到「daemon 提前关闭了连接」，拿不到真正的错误。
+* **根因**：`QxyncFs` 里握着一个自己的 tokio `Runtime`；daemon 在 **async IPC 命令**里调
+  `fuser::spawn_mount2`，挂载失败时 fuser 把 `fs` **就地在那个 async worker 线程上 drop** ——
+  而 tokio 的 `Runtime::drop` 要等阻塞池收尾，这在异步上下文里被禁止（`blocking/shutdown.rs` panic）。
+* **修法**：`crates/qxync-fuse` 把该 runtime 包成 `FsRuntime`，析构时按上下文选路 ——
+  tokio 上下文里用官方推荐的 `shutdown_background()`（不等阻塞池），普通线程上保持原等待语义
+  （正常卸载时 `fs` 由 fuser 自己的线程析构，行为一字不改）；并加回归单测
+  `dropping_fs_inside_async_context_does_not_panic`（修复前 panic、修复后通过，常驻 `cargo test`）。
+* **前后对比**（同一场景：`unshare -rm` 里把 `/dev/null` 绑到 `/dev/fuse`）：
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| `qsync mount …` | rc=3「❌ daemon 提前关闭了连接」 | rc=5「❌ 挂载失败: Error calling mount() … EINVAL」 |
+| daemon 日志 panic | **1** 条 | **0** 条 |
+| 后续 `qsync daemon status` | 该连接被打死 | 正常 |
 
 ---
 

@@ -893,8 +893,49 @@ impl CacheMode {
     }
 }
 
+/// `QxyncFs` 内部那个 tokio runtime（FUSE 回调里用它把异步的 NAS 调用 `block_on` 掉）。
+///
+/// ★ 存在的唯一理由：**它的析构不能在 tokio 上下文里等阻塞池收尾**。
+/// tokio 的 `Runtime::drop` 会等阻塞任务跑完，而「等」这件事在异步上下文里是不允许的，
+/// 于是 `blocking/shutdown.rs` 直接 panic：
+/// `Cannot drop a runtime in a context where blocking is not allowed`。
+///
+/// 真实触发路径（2026-10-01 实测，daemon 日志 + 客户端「daemon 提前关闭了连接」）：
+/// daemon 在 **async IPC 命令**里调 `qsync_fuse::spawn` → `fuser::spawn_mount2` →
+/// 挂载失败（挂载点被系统拒、机器没有 `/dev/fuse` …）时，fuser 会把 `fs` **就地在那个
+/// async worker 线程上 drop**。于是「挂载失败」被放大成「daemon 打了个 panic、连接断掉」。
+///
+/// 修法就是 tokio 官方文档给的办法：在 tokio 上下文里改用 `shutdown_background()`
+/// （等价 `shutdown_timeout(0)`，不等待），**普通线程上保持原来的等待语义**
+/// （正常卸载时 `fs` 是在 fuser 自己的线程上析构的，行为一字不改）。
+struct FsRuntime(Option<tokio::runtime::Runtime>);
+
+impl FsRuntime {
+    fn new(rt: tokio::runtime::Runtime) -> Self {
+        Self(Some(rt))
+    }
+
+    fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
+        self.0
+            .as_ref()
+            .expect("QxyncFs 的 runtime 已关闭")
+            .block_on(future)
+    }
+}
+
+impl Drop for FsRuntime {
+    fn drop(&mut self) {
+        let Some(rt) = self.0.take() else { return };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            rt.shutdown_background();
+        } else {
+            drop(rt);
+        }
+    }
+}
+
 pub struct QxyncFs {
-    rt: tokio::runtime::Runtime,
+    rt: FsRuntime,
     client: Arc<Client>,
     /// 远端挂载根（普通用户家目录 = `/home`）。多根时是**第一个**根的远端路径。
     remote_root: String,
@@ -1005,7 +1046,7 @@ impl QxyncFs {
         by_remote.insert(remote_root.clone(), INodeNo::ROOT);
 
         Ok(Self {
-            rt,
+            rt: FsRuntime::new(rt),
             client,
             remote_root: remote_root.clone(),
             // ★ M6：单根 = 直通（M1–M5 行为一字不改）：只有一个根，挂载点**就是**它。
@@ -1132,7 +1173,7 @@ impl QxyncFs {
             .unwrap_or_default();
 
         Ok(Self {
-            rt,
+            rt: FsRuntime::new(rt),
             client,
             remote_root,
             roots,
@@ -2978,6 +3019,28 @@ mod tests {
         } else {
             fs
         }
+    }
+
+    /// ★ 修复回归：`QxyncFs` 里握着一个 tokio `Runtime`，**在 tokio 上下文里析构**会让
+    /// tokio 直接 panic —— "Cannot drop a runtime in a context where blocking is not allowed"。
+    ///
+    /// 真实触发路径：daemon 在 async IPC 命令里调 `qsync_fuse::spawn` → `fuser::spawn_mount2`
+    /// → 挂载失败（挂载点被内核/`fusermount3` 拒、机器没有 `/dev/fuse` …）时，fuser 会把
+    /// `fs` 就地在**那个 async worker 线程**上 drop → worker panic、连接断掉，
+    /// 客户端只看到「daemon 提前关闭了连接」，而不是一条能看懂的挂载错误。
+    #[test]
+    fn dropping_fs_inside_async_context_does_not_panic() {
+        let dir = std::env::temp_dir().join(format!("qxync-fs-drop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let outer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        outer.block_on(async {
+            let fs = test_fs(&dir, false);
+            drop(fs); // 期望：安静地收掉内部 runtime（修复前这一行 panic）
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn m7_rules(exclude: &[&str], filter_temp: bool) -> Arc<Rules> {
