@@ -11,10 +11,15 @@
 
 - **发版产物自动化**：推 `v*` tag（或手工触发 `Release` 工作流）即构建并发布
   `qsync` / `qxyncd` / `qxync-gui` 三个二进制 —— 一个
-  `qxync-<版本>-x86_64-unknown-linux-gnu.tar.gz`、三个裸二进制、`SHA256SUMS`，
-  全部挂到该 tag 的 Release。发版前有**版本一致性守卫**（tag 与 `Cargo.toml` /
-  `tauri.conf.json` 三处必须一致，否则拒绝发版）；打包脚本 `xtask/release/package-linux.sh`
-  可本地复跑，产物可复现（tar 内 owner/group 归零、顺序固定、gzip 不写时间戳）。
+  `qxync-<版本>-x86_64-unknown-linux-gnu.tar.gz`（含桌面项与图标）、三个裸二进制、
+  `SHA256SUMS`，全部挂到该 tag 的 Release。发版前有**版本一致性守卫**（tag 与 `Cargo.toml` /
+  `tauri.conf.json` / AUR `PKGBUILD` 的 `pkgver` 必须一致，否则拒绝发版）；打包脚本
+  `xtask/release/package-linux.sh` 可本地复跑，产物可复现（tar 内 owner/group 归零、
+  顺序固定、gzip 不写时间戳）。
+- **Arch Linux 包（AUR `qxync-bin`）**：`packaging/arch/` 里带 AUR 包定义 —— 直接取 Release
+  上的预编译 `tar.gz`，把 `qsync` / `qxyncd` / `qxync-gui` 装进 `/usr/bin`（带桌面项与图标）。
+  `makepkg -si` 本地即可装，推到 AUR 后是 `yay -S qxync-bin`。包**有意不 strip**（与 Release
+  产物一致，为了回溯可读），装完约 190 MB。
 
 ## [0.1.0] - 2026-10-02
 
