@@ -57,35 +57,56 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --locked
 
-  # ---------------------------------------------------------------- MSRV（非阻断）
+  # ---------------------------------------------------------------- MSRV
   msrv:
-    name: MSRV check (rust 1.85, advisory)
+    name: MSRV check (rust 1.90)
     runs-on: ubuntu-22.04
-    # ⚠️ 非阻断：workspace 声明了 rust-version = "1.85"，但这条**尚未在 1.85 上实测过**
-    #（开发机是 nightly）。首次跑通 CI 后，如果 1.85 确实编得过，就把它改成阻断；
-    # 如果编不过，就把 workspace 的 rust-version 抬到实际下限。
-    # 见 docs/发布清单-v0.1.0.md。
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
+
+      # 声明值取自依赖图里**最高的那个 MSRV**（当前是 Tauri 2.12 栈的 1.90）；
+      # 这里连 GUI 一起 check，所以要把 WebKitGTK 装上，否则量出来的不是真下限。
       - name: 安装系统依赖
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config fuse3 libfuse3-dev
-      - uses: dtolnay/rust-toolchain@1.85.0
-      - uses: Swatinem/rust-cache@v2
-      # GUI 依赖 WebKitGTK，MSRV 检查里先排除它（它的下限由 Tauri 决定）
-      - name: cargo check (rust-version = 1.85)
-        run: cargo check --workspace --exclude qxync-gui --locked
+            build-essential pkg-config \
+            fuse3 libfuse3-dev \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+            libssl-dev
 
-  # ---------------------------------------------------------------- 格式（非阻断）
+      - uses: dtolnay/rust-toolchain@1.90.0
+      - uses: Swatinem/rust-cache@v2
+
+      # `rust-version` 只做「声明」用，Cargo 不会自动回退到 MSRV 兼容版本
+      # （那是 resolver v3 的行为）。所以这条 job 是唯一能证明声明没撒谎的地方。
+      - name: cargo check --workspace (rust-version = 1.90)
+        run: cargo check --workspace --locked
+
+      # 依赖声明了更高 MSRV 时，上面的 check 会直接失败 —— 这里额外把
+      # 「依赖图里有没有超过声明值的包」显式打出来，方便定位。
+      - name: 列出依赖图里 MSRV 高于声明值的包（应为空）
+        run: |
+          cargo metadata --format-version 1 \
+            | python3 -c "
+          import sys, json
+          key = lambda v: tuple(int(x) for x in v.split('.'))
+          m = json.load(sys.stdin)
+          bad = sorted(
+              ((p['rust_version'], p['name'], p['version'])
+               for p in m['packages']
+               if p.get('rust_version') and key(p['rust_version']) > (1, 90)),
+              reverse=True)
+          print(f'{len(bad)} 个包的 MSRV 高于 1.90')
+          for rv, n, v in bad:
+              print(f'  {rv:<8} {n} {v}')
+          sys.exit(1 if bad else 0)
+          "
+
+  # ---------------------------------------------------------------- 格式
   fmt:
-    name: cargo fmt (advisory)
+    name: cargo fmt
     runs-on: ubuntu-22.04
-    # ⚠️ 本仓库尚未整体 cargo fmt（约 21 个文件 / 200+ 处差异），格式收口会单独作为一个
-    # commit 落地。在那之前这里**不阻断** CI，详情见 CONTRIBUTING.md §7「已知格式债」。
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

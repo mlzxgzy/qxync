@@ -37,7 +37,7 @@ cargo build --workspace
 cargo test --workspace        # 不需要 NAS
 ```
 
-- 需要 **Rust 1.85+**、**FUSE 3**（`/dev/fuse` + `fusermount3`）；
+- 需要 **Rust 1.90+**、**FUSE 3**（`/dev/fuse` + `fusermount3`）；
   构建 GUI 还需要 WebKitGTK 4.1 / GTK 3 的开发包。
 - 前端在 `crates/qxync-gui/ui/`，是**零依赖静态三件套**：改完必须重新 `cargo build`
   （`frontendDist` 是编译期嵌入的），没有 npm、没有打包器。
@@ -139,7 +139,7 @@ cargo build --workspace
 cargo test --workspace        # no NAS required
 ```
 
-- Requires **Rust 1.85+** and **FUSE 3** (`/dev/fuse` + `fusermount3`);
+- Requires **Rust 1.90+** and **FUSE 3** (`/dev/fuse` + `fusermount3`);
   building the GUI additionally needs the WebKitGTK 4.1 / GTK 3 dev packages.
 - The frontend lives in `crates/qxync-gui/ui/` and is a **dependency-free static trio**:
   after editing it you must re-run `cargo build` (`frontendDist` is embedded at compile time).
