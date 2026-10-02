@@ -77,7 +77,7 @@ body:
     attributes:
       label: 版本 / 提交
       description: 二进制版本（`qxync --version`）或 commit hash
-      placeholder: "0.2.0 / <commit hash>"
+      placeholder: "0.2.1 / <commit hash>"
     validations:
       required: true
 

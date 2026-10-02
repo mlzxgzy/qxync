@@ -133,14 +133,21 @@ pub(crate) struct State {
 
 // ---------------------------------------------------------------- 入口
 
-pub async fn run(opts: Options) -> Result<()> {
-    let paths = ConfigPaths::discover()?;
-    paths
-        .ensure_dirs()
-        .with_context(|| "创建配置 / 数据 / 日志目录失败")?;
-    let link = LinkConfig::load(&paths, &opts.link_id)
-        .with_context(|| format!("读取连接配置失败（先 `qxync --host ... login`）"))?;
+/// ★ 空转待命时，任何需要 NAS 连接的请求都回这一句。
+const NOT_CONFIGURED: &str = "daemon 在运行，但还没有配置 NAS 连接：先 `qxync login`\
+     （或在 GUI「设置 → 连接」里保存），配好后 daemon 会自动开始同步，不需要重启。";
 
+/// 空转待命是怎么结束的。
+enum IdleExit {
+    /// link 配置出现了：交给 [`run`] 转入同步模式（同一个进程）。
+    Configured,
+    /// 收到 shutdown / SIGINT：正常退出。
+    Shutdown,
+}
+
+/// 绑 socket + 写 pid 文件。「谁占着这个 socket」的语义只在这里定义一次，
+/// 空转待命与同步模式共用。
+async fn bind_socket(opts: &Options) -> Result<(UnixListener, PathBuf)> {
     if let Some(dir) = opts.socket.parent() {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("创建 socket 目录失败: {}", dir.display()))?;
@@ -153,7 +160,6 @@ pub async fn run(opts: Options) -> Result<()> {
         }
         std::fs::remove_file(&opts.socket).ok(); // 陈旧 socket
     }
-
     let listener = UnixListener::bind(&opts.socket)
         .with_context(|| format!("绑定 socket 失败: {}", opts.socket.display()))?;
     qxync_core::config::restrict_perms(&opts.socket, 0o600)?;
@@ -163,6 +169,183 @@ pub async fn run(opts: Options) -> Result<()> {
         format!("{}\n{}\n", std::process::id(), opts.socket.display()),
     )
     .ok();
+    Ok((listener, pid_path))
+}
+
+/// ★ 空转待命：**没有任何连接配置时，daemon 也要一直活着**。
+///
+/// 只服务 `Ping` / `Status` / `Shutdown`（其余请求一律回 [`NOT_CONFIGURED`]），
+/// 每 2 秒看一眼 link 文件；一旦出现就收掉自己的 socket/pid 返回，
+/// 由 [`run`] 在同一进程里接管并转入同步模式。
+///
+/// 为什么不做成「直接退出」：用户的计划是 daemon 常驻后台（systemd / 自启），
+/// 「没配连接」是**正常状态**而不是错误 —— 配好连接之后它自己就该开始干活。
+async fn idle_until_configured(paths: &ConfigPaths, opts: &Options) -> Result<IdleExit> {
+    let (listener, pid_path) = bind_socket(opts).await?;
+    let socket = opts.socket.clone();
+    let started = Instant::now();
+    let (tx, mut rx) = mpsc::channel::<()>(1);
+    let mut tick = tokio::time::interval(Duration::from_secs(2));
+    tracing::info!(
+        "qxyncd 空转待命 pid={} socket={} —— 只服务 ping/status/shutdown 与设置读写",
+        std::process::id(),
+        socket.display()
+    );
+    loop {
+        tokio::select! {
+            _ = rx.recv() => {
+                cleanup_idle(&socket, &pid_path);
+                tracing::info!("qxyncd 退出（空转待命：始终没有配置连接）");
+                return Ok(IdleExit::Shutdown);
+            }
+            _ = tokio::signal::ctrl_c() => {
+                cleanup_idle(&socket, &pid_path);
+                tracing::info!("收到 SIGINT（空转待命）");
+                return Ok(IdleExit::Shutdown);
+            }
+            _ = tick.tick() => {
+                if LinkConfig::load(paths, &opts.link_id).is_ok() {
+                    // 让 `run()` 能干净地重新绑（它自己会建 socket/pid）
+                    cleanup_idle(&socket, &pid_path);
+                    return Ok(IdleExit::Configured);
+                }
+            }
+            accepted = listener.accept() => {
+                match accepted {
+                    Ok((stream, _)) => {
+                        let tx = tx.clone();
+                        let socket = socket.clone();
+                        let paths = paths.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) =
+                                handle_idle_conn(stream, started, socket, tx, paths).await
+                            {
+                                tracing::warn!("连接结束（空转待命）: {e}");
+                            }
+                        });
+                    }
+                    Err(e) => tracing::warn!("accept 失败: {e}"),
+                }
+            }
+        }
+    }
+}
+
+fn cleanup_idle(socket: &Path, pid_path: &Path) {
+    let _ = std::fs::remove_file(socket);
+    let _ = std::fs::remove_file(pid_path);
+}
+
+/// 空转待命时的连接处理：放行 `Ping` / `Status` / `Shutdown`，以及**纯本地文件**的
+/// `Settings` / `SettingsSave`（GUI 的设置页要用；它们跟 NAS 连接无关）。
+async fn handle_idle_conn(
+    stream: UnixStream,
+    started: Instant,
+    socket: PathBuf,
+    shutdown: mpsc::Sender<()>,
+    paths: ConfigPaths,
+) -> Result<()> {
+    let (rd, mut wr) = stream.into_split();
+    let mut lines = BufReader::new(rd).lines();
+    while let Some(line) = lines.next_line().await? {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let resp = match decode_line::<RequestEnvelope>(line.as_bytes()) {
+            Ok(env) if env.v != IPC_VERSION => Response::err(
+                ErrorKind::BadVersion,
+                format!("协议版本 {} 不受支持（本进程支持 {IPC_VERSION}）", env.v),
+            ),
+            Ok(env) => {
+                let out: Result<serde_json::Value, IpcError> = match env.req {
+                    Request::Ping => to_value(PingData {
+                        pong: true,
+                        daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+                        pid: std::process::id(),
+                        uptime_secs: started.elapsed().as_secs(),
+                    }),
+                    Request::Status => to_value(idle_status(&socket, started)),
+                    Request::Settings => to_value(idle_settings_data(
+                        &paths,
+                        false,
+                        Some("daemon 空转待命中：设置是纯本地文件，与有没有 NAS 连接无关".into()),
+                    )),
+                    Request::SettingsSave {
+                        settings,
+                        autostart_exe,
+                    } => idle_settings_save(&paths, settings, autostart_exe),
+                    Request::Shutdown => {
+                        // 与同步模式一致：先回响应，再触发退出
+                        let tx = shutdown.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(150)).await;
+                            let _ = tx.send(()).await;
+                        });
+                        to_value(ShutdownData { unmounted: 0 })
+                    }
+                    other => {
+                        tracing::debug!("空转待命：拒绝 {}（还没有配置 NAS 连接）", other.method());
+                        Err(IpcError::new(ErrorKind::NotLoggedIn, NOT_CONFIGURED))
+                    }
+                };
+                match out {
+                    Ok(v) => Response::ok(v),
+                    Err(e) => Response::err(e.kind, e.message),
+                }
+            }
+            Err(e) => Response::err(ErrorKind::BadRequest, format!("请求解析失败: {e}")),
+        };
+        wr.write_all(&encode_line(&resp)?).await?;
+    }
+    Ok(())
+}
+
+/// 空转待命时的 `status`：daemon 信息如实报，`link: None` 让前端显示「未配置」。
+fn idle_status(socket: &Path, started: Instant) -> StatusData {
+    StatusData {
+        daemon: DaemonInfo {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            pid: std::process::id(),
+            uptime_secs: started.elapsed().as_secs(),
+            socket: socket.display().to_string(),
+        },
+        link: None,
+        logged_in: false,
+        session: None,
+        server: None,
+        cursors: None,
+        hydro: HydroStats::default(),
+        uploads: None,
+        sync: None,
+        cache: None,
+        mounts: Vec::new(),
+    }
+}
+
+pub async fn run(opts: Options) -> Result<()> {
+    let paths = ConfigPaths::discover()?;
+    paths
+        .ensure_dirs()
+        .with_context(|| "创建配置 / 数据 / 日志目录失败")?;
+
+    // ★ 常驻后台的第一要义是**起得来**：一份连接配置都还没有时，daemon 照样要活着
+    //   （ping 有回应、status 报「未配置」），而不是直接退出。
+    //   这层「空转待命」只服务 ping/status/shutdown 并盯着 link 文件；配置一出现就
+    //   原地转入下面的同步模式 —— 不 re-exec、不换进程，也不用用户再敲一次 `daemon start`。
+    if let Err(e) = LinkConfig::load(&paths, &opts.link_id) {
+        tracing::warn!(
+            "还没有可用的 NAS 连接「{}」（{e}）—— daemon 空转待命，配好连接后自动开始同步",
+            opts.link_id
+        );
+        match idle_until_configured(&paths, &opts).await? {
+            IdleExit::Shutdown => return Ok(()),
+            IdleExit::Configured => tracing::info!("检测到 NAS 连接配置，转入同步模式"),
+        }
+    }
+
+    let link = LinkConfig::load(&paths, &opts.link_id)
+        .with_context(|| format!("读取连接配置失败（先 `qxync --host ... login`）"))?;
+    let (listener, pid_path) = bind_socket(&opts).await?;
 
     // ★ M8.4：全局设置（代理 / 自动释放空间 / 通知）。
     //   读不到就全默认（= M8.3 行为）：**设置文件坏了也不该让 daemon 起不来**。
@@ -764,7 +947,7 @@ async fn status(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
             uptime_secs: state.started.elapsed().as_secs(),
             socket: state.socket.display().to_string(),
         },
-        link: LinkInfo {
+        link: Some(LinkInfo {
             id: state.link.id.clone(),
             host: state.link.host.clone(),
             port: state.link.port,
@@ -772,7 +955,7 @@ async fn status(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
             user: state.link.user.clone(),
             ipv4_only: state.link.ipv4_only,
             roots: state.link.roots(),
-        },
+        }),
         logged_in,
         session: session.map(|s| SessionInfo {
             sid_masked: mask_sid(&s.sid),
@@ -2576,6 +2759,82 @@ fn journal_cmd(
 // 设置中心 / 冲突待裁决队列 / 文件三态 / 自动释放空间
 
 /// 拼一个状态快照（`settings` 与 `settings_save` 共用）。
+/// 设置落盘的**文件层**：校验代理 → 处理 autostart 桌面项 → 写 `settings.json`。
+///
+/// 空转待命与同步模式共用这一半，避免两边逻辑漂移。
+/// 返回 `(落盘路径, 是否写了 autostart 桌面项, 解析好的代理)`。
+fn save_settings_to_disk(
+    paths: &ConfigPaths,
+    s: &mut Settings,
+    autostart_exe: Option<String>,
+) -> Result<(PathBuf, bool, ProxySpec), IpcError> {
+    s.normalize();
+    // 手动代理缺服务器/缺用户名 → **明确报错**，不静默退回直连
+    let proxy = s.proxy.resolve().map_err(|e| bad_req(e.to_string()))?;
+
+    // 开机自启：只有真要用的时候才需要可执行文件路径
+    let mut autostart_written = false;
+    if s.launch_at_startup || autostart_exe.is_some() {
+        let exe = match autostart_exe
+            .clone()
+            .map(PathBuf::from)
+            .or_else(default_gui_exe)
+        {
+            Some(e) => e,
+            None => {
+                return Err(bad_req(
+                    "开机自启需要 qxync-gui 的绝对路径：没传 autostart_exe，\
+                     同目录下也没找到 qxync-gui（CLI 可显式传 GUI 路径）",
+                ))
+            }
+        };
+        s.apply_autostart(paths, &exe).map_err(core_err)?;
+        autostart_written = s.launch_at_startup;
+    } else {
+        // 关掉自启：把桌面项删掉（不存在也算成功）
+        s.apply_autostart(paths, &PathBuf::from("qxync-gui"))
+            .map_err(core_err)?;
+    }
+    let saved_path = s.save(paths).map_err(core_err)?;
+    Ok((saved_path, autostart_written, proxy))
+}
+
+/// 空转待命时的 `settings` / `settings_save` 返回。
+///
+/// **设置是纯本地文件，跟有没有 NAS 连接无关** —— 而且 GUI 的设置页（登录表单就在那一页）
+/// 靠它渲染，所以空转时也必须能读能写，否则用户还没配连接就先看到一个报错。
+fn idle_settings_data(paths: &ConfigPaths, saved: bool, note: Option<String>) -> SettingsData {
+    let s = Settings::load(paths).unwrap_or_default();
+    let proxy_url = match s.proxy.resolve() {
+        Ok(ProxySpec::Manual { url, .. }) => Some(url),
+        _ => None,
+    };
+    SettingsData {
+        path: Settings::file(paths).display().to_string(),
+        autostart_path: Settings::autostart_file(paths).display().to_string(),
+        autostart_present: Settings::autostart_present(paths),
+        saved,
+        proxy_env: Settings::proxy_env(),
+        proxy_url,
+        note,
+        settings: s,
+    }
+}
+
+/// 空转待命时的 `settings_save`：只落盘，不刷新内存态（那时压根没有内存态）。
+fn idle_settings_save(
+    paths: &ConfigPaths,
+    mut s: Settings,
+    autostart_exe: Option<String>,
+) -> Result<serde_json::Value, IpcError> {
+    save_settings_to_disk(paths, &mut s, autostart_exe)?;
+    to_value(idle_settings_data(
+        paths,
+        true,
+        Some("设置已落盘（daemon 空转待命中：还没有配置 NAS 连接）".into()),
+    ))
+}
+
 fn settings_data(state: &Arc<State>, saved: bool, note: Option<String>) -> SettingsData {
     let paths = ConfigPaths::discover().ok();
     let s = state.settings.lock().unwrap().clone();
@@ -2619,35 +2878,9 @@ fn settings_save_cmd(
     mut s: Settings,
     autostart_exe: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    s.normalize();
-    // 手动代理缺服务器/缺用户名 → **明确报错**，不静默退回直连
-    let proxy = s.proxy.resolve().map_err(|e| bad_req(e.to_string()))?;
     let paths = ConfigPaths::discover().map_err(core_err)?;
-
-    // 开机自启：只有真要用的时候才需要可执行文件路径
-    let mut autostart_written = false;
-    if s.launch_at_startup || autostart_exe.is_some() {
-        let exe = match autostart_exe
-            .clone()
-            .map(PathBuf::from)
-            .or_else(default_gui_exe)
-        {
-            Some(e) => e,
-            None => {
-                return Err(bad_req(
-                    "开机自启需要 qxync-gui 的绝对路径：没传 autostart_exe，\
-                     同目录下也没找到 qxync-gui（CLI 可显式传 GUI 路径）",
-                ))
-            }
-        };
-        s.apply_autostart(&paths, &exe).map_err(core_err)?;
-        autostart_written = s.launch_at_startup;
-    } else {
-        // 关掉自启：把桌面项删掉（不存在也算成功）
-        s.apply_autostart(&paths, &PathBuf::from("qxync-gui"))
-            .map_err(core_err)?;
-    }
-    let saved_path = s.save(&paths).map_err(core_err)?;
+    let (saved_path, autostart_written, proxy) =
+        save_settings_to_disk(&paths, &mut s, autostart_exe)?;
     *state.settings.lock().unwrap() = s.clone();
     *state.proxy.lock().unwrap() = proxy;
     journal_log(

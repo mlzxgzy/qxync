@@ -7,7 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-02
+
+**The daemon can now keep running with no NAS configured at all.** `qxyncd` used to require a
+link config (`~/.config/qxync/links/<id>.json`) at startup and **exit outright** when it was
+missing — so "not logged in / nothing configured yet" meant "the daemon is unusable", which
+directly contradicts running it permanently in the background. The GUI even pointed you at
+`qxync daemon start`, which failed again.
+
+### Changed
+
+- **New "idle standby" state**: with no connection configured the daemon still starts and stays
+  up, serving only `ping` / `status` / `shutdown` plus settings read/write (**plain local files**).
+  `status` reports `link: null`, which the GUI already renders as "not configured"
+  (`top.conn_none` / `home.conn_no_link`). Requests that need the NAS are **explicitly rejected**
+  ("还没有配置 NAS 连接：先 `qxync login`…") instead of being sent to an empty host.
+- **Saving a connection takes effect automatically — no restart, no extra command**: the idle
+  daemon checks the link file every 2 seconds and, when it appears, switches to sync mode
+  **in place** (same process, same pid, no re-exec) and starts syncing.
+- **`qxync daemon start` and the GUI's "start daemon" no longer refuse to start without a link
+  config**; when it starts unconfigured the CLI says so ("idle standby") and the GUI home page
+  shows "not configured".
+- **Settings stay readable and writable while idle**: the GUI's settings page (which hosts the
+  login form) renders from it and used to show an error first. The `settings_save` disk logic is
+  now a shared helper so the idle and sync paths can't drift apart.
+
+### Tests
+
+- Added a **NAS-free regression test** `idle_daemon_serves_without_any_link_config`: it really
+  spawns `qxyncd` and really speaks the unix socket, checking "no link still means
+  ping/status/settings/clean shutdown" and "NAS-dependent requests are rejected with a readable
+  reason". This one runs in CI (the existing case needs real hardware and stays `#[ignore]`d).
+
 ## [0.2.0] - 2026-10-02
+
+> **This version was never released on its own** (no tag was pushed). The first actual release is
+> **0.2.1**, which contains all of the rename work below — the section is kept because the rename
+> deserves its own entry.
 
 **The rename release: the command line is now `qxync`, not `qsync`.** The old name fought the
 **official QNAP Qsync client** for the same `/usr/bin/qsync`, and `~/.config/qsync`, the

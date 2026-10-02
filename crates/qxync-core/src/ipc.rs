@@ -636,7 +636,10 @@ pub struct StoreData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusData {
     pub daemon: DaemonInfo,
-    pub link: LinkInfo,
+    /// 当前 NAS 连接。**`None` = daemon 在空转待命**（进程在跑，但一份连接配置都没有）——
+    /// 前端据此显示「未配置」（既有文案 `top.conn_none` / `home.conn_no_link`）。
+    #[serde(default)]
+    pub link: Option<LinkInfo>,
     pub logged_in: bool,
     pub session: Option<SessionInfo>,
     pub server: Option<ServerInfo>,

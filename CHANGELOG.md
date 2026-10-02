@@ -7,7 +7,38 @@
 
 ## [未发布]
 
+## [0.2.1] - 2026-10-02
+
+**daemon 现在「没配 NAS 也能一直跑着」了。** 之前 `qxyncd` 启动时硬性要求一份连接配置
+（`~/.config/qxync/links/<id>.json`），读不到就**直接退出** —— 于是「还没登录 / 还没配连接」
+等同于「daemon 用不了」，和「daemon 常驻后台」的用法直接冲突；GUI 还会把你引到
+`qxync daemon start` 那句提示上（照做依然报错）。
+
+### 变更
+
+- **新增「空转待命」态**：一份连接配置都没有时，daemon 照样启动、照样常驻，只服务
+  `ping` / `status` / `shutdown` 与**纯本地文件**的设置读写。`status` 里 `link` 为 `null`，
+  GUI 直接显示「未配置」（用的是既有的 `top.conn_none` / `home.conn_no_link` 文案）。
+  需要 NAS 的请求被**明确拒绝**（「还没有配置 NAS 连接：先 `qxync login`…」），
+  而不是拿着空 host 去发请求。
+- **配好连接后自动生效，不用重启、不用再敲命令**：空转的 daemon 每 2 秒看一眼 link 文件，
+  一出现就**原地**转入同步模式（同一进程、同一个 pid，不 re-exec），随后自动开始同步。
+- **`qxync daemon start` / GUI 的「启动 daemon」不再因缺连接配置而拒绝启动**：
+  启动成功但还没配连接时，CLI 会明说「空转待命」，GUI 主页显示「未配置」。
+- **空转时设置照常可读可写**：GUI 的设置页（登录表单就在那一页）靠它渲染，
+  之前会先弹一个错误。`settings_save` 的落盘逻辑抽成共用函数，避免空转态与同步态漂移。
+
+### 测试
+
+- 新增**不需要 NAS 的回归测试** `idle_daemon_serves_without_any_link_config`：真起
+  `qxyncd`、真走 unix socket，验「无 link 也能 ping/status/设置读写/干净退出」，
+  并验「依赖 NAS 的请求被拒且理由可读」。这个用例在 CI 里就能跑
+  （原有那条要真机，只能常年 `#[ignore]`）。
+
 ## [0.2.0] - 2026-10-02
+
+> **这一版没有单独发出去**（没有打 tag）。第一个真正发布的版本是 **0.2.1**，
+> 它包含下面全部改名内容 —— 这里的记录保留，是因为改名本身值得单独成一节。
 
 **改名版本：命令行从 `qsync` 改成 `qxync`。** 旧名 `qsync` 会和 **QNAP 官方 Qsync 客户端**
 抢同一个 `/usr/bin/qsync`，而 `~/.config/qsync`、`QSYNC_*` 环境变量、`user.qsync.*` xattr
