@@ -1,9 +1,14 @@
 [package]
 name = "qxync-proto-test"
-description = "对真机 NAS 的协议集成测试（默认 #[ignore]，手动跑）"
+description = "Live-NAS protocol integration tests (ignored by default) · 真机 NAS 协议集成测试（默认 #[ignore]，手动跑）"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
 publish = false
 
 [dev-dependencies]
