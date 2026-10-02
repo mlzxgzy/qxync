@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Automated release artifacts**: pushing a `v*` tag (or manually running the `Release`
+  workflow) builds and publishes the three binaries `qsync` / `qxyncd` / `qxync-gui` — one
+  `qxync-<version>-x86_64-unknown-linux-gnu.tar.gz`, the three binaries on their own, and
+  `SHA256SUMS`, all attached to the release for that tag. A **version consistency guard**
+  (tag vs. `Cargo.toml` vs. `tauri.conf.json`) blocks publishing on drift, and
+  `xtask/release/package-linux.sh` can be re-run locally; the tarball is reproducible
+  (zeroed owner/group, fixed order, gzip without a timestamp).
+
 ## [0.1.0] - 2026-10-02
 
 **First public release.** This is not a "it launches" milestone: every milestone went through a full
