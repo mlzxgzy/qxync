@@ -39,7 +39,7 @@ pub use encode::{build_query, encode_query_value};
 pub use error::{Error, Result};
 pub use freespace::{statvfs, AutoFreeDecision, FsSpace};
 pub use model::{parse_listing, parse_max_log, parse_nas_uid, DirEntry, Listing, MaxLog, NasUid};
-pub use roots::{layout, normalize_roots, RootSpec, ViewLayout};
+pub use roots::{client_path_from_share, layout, normalize_roots, RootSpec, ViewLayout};
 pub use rules::{HideReason, RuleParse, Rules, TEMP_PATTERNS};
 pub use settings::{ProxySettings, ProxySpec, Settings};
 pub use status::ServerStatus;

@@ -286,6 +286,10 @@ pin=pinned/excluded、未上传改动/队列在途、打开的 fd、被 mmap（�
 上传队列）仍用远端路径做键**。单根是**直通**（挂载点就是那个根），M1–M5 的行为一字不改 ——
 `roots.rs` 里专门有一条「单根必须还是 Passthrough」的断言守着这件事。
 
+> ★ 「配对文件夹」（GUI 任务 / `qxync task`）**是一对一**的：一个本地文件夹 ⇄ 一个 NAS 目录，
+> 挂载点里**直接**就是那个 NAS 目录（不会多出 `home/` 这一层）。多根挂载只活在
+> `qxync mount --remote A --remote B` 这条路上，**不登记任务**；要同步多个 NAS 目录就建多个任务。
+
 ## 已知限制
 
 * **托盘需要 SNI 宿主**：qxync 走的是 `org.kde.StatusNotifierItem`（ksni 实现，
@@ -457,6 +461,7 @@ xtask/tests/m6-matrix.sh              # 29 项（多根真挂载）
 xtask/tests/m7-matrix.sh              # 60 项（规则 / FUSE 过滤 / LAN 配对·事件·直传）
 xtask/tests/m7-matrix.sh --no-nas     #    不需要 NAS：单测 + 两个真 daemon 的 loopback
 xtask/tests/m82-matrix.sh             # 37 项（任务登记 / 重启恢复）
+xtask/tests/pair-1to1.sh              # 15 项（一对一配对 + 目的地冲突；不需要 NAS）
 xtask/tests/m83-matrix.sh             # 27 项（日志 schema 迁移 / 过滤 / 轮转）
 xtask/tests/m84-matrix.sh             # 92 项（设置 / 代理 / 托盘 / 释放空间 / 冲突策略）
 xtask/tests/gui-matrix.sh             # 148 项（9 个目的地真窗口截图 + ui_spec 静态自检）

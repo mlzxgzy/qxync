@@ -336,7 +336,8 @@ enum TaskAction {
         /// 本地挂载点（绝对路径，不存在会被创建）
         #[arg(long)]
         mountpoint: PathBuf,
-        /// 远端根（可重复；不填 = 用 link 的 home_root）
+        /// NAS 目录（★ 一对一：任务只接受**一个**；不填 = 用 link 的 home_root。
+        /// 要同步多个目录请分建多个任务；多根挂载用 `qxync mount --remote A --remote B`）
         #[arg(long = "root")]
         roots: Vec<String>,
         /// 读写挂载（默认只读）
@@ -1990,8 +1991,13 @@ fn print_roots(d: &RootsData) {
         println!("NAS 同步文件夹 : {} 个", d.syncing_folders.len());
         for f in &d.syncing_folders {
             println!(
-                "  · {}  权限={}  可删除={}  realpath={}",
+                "  · {}  客户端路径={}  权限={}  可删除={}  realpath={}",
                 f.folder,
+                // ★ 选 NAS 文件夹时能直接用的路径（映射不出来就退回共享路径）
+                f.client_path
+                    .as_deref()
+                    .or(f.path.as_deref())
+                    .unwrap_or("-"),
                 f.permission,
                 f.read_deletable,
                 f.realpath.as_deref().unwrap_or("-")

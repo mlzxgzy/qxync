@@ -59,7 +59,7 @@ async fn logged_in() -> Option<Client> {
 /// 登录 → `syncing_folders()` → 打印 total 与每一项（folder/permission/realpath）。
 ///
 /// ★ 只断言「调用成功」。真机实测（test1）响应是
-/// `{"total": 0, "client_key": "754879e7…", "folder" :[]}` —— 空就是预期结果。
+/// `{"total": 0, "client_key": "<redacted>", "folder" :[]}` —— 空就是预期结果。
 #[tokio::test]
 #[ignore = "需要真机 NAS"]
 async fn syncing_folder_list_is_readable() {
