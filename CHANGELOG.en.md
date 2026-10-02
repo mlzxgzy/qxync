@@ -11,14 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 point *is* that folder's content (pair `/home` and you see the home directory directly — no extra
 `home/` level). The NAS side became a dropdown (candidates = the Qsync sync folders registered on
 the NAS + the home directory); you can still browse level by level or type a path. Destination
-conflicts are checked on submit. **No compatibility is kept**: the old `roots` config, multi-root
-mounts and multi-root task arrays no longer exist (see below).
+conflicts are checked on submit. **The whole "Advanced" section on the Connection page is gone**:
+neither `roots` nor `home_root` exists any more. **No compatibility is kept.**
 
 ### Removed (breaking)
 
 - **The one-to-many (multi-root) capability is gone**, including every entry point it had:
-  * `roots` in the link config (the "Advanced: sync scope" box on the Connection page is gone;
-    only `home_root` remains);
+  * `roots` **and `home_root`** in the link config (the whole "Advanced" section on the Connection
+    page is gone; the form is host / port / user / password / https / insecure / ipv4-only). The
+    home directory is fixed to `/home` in the Qsync protocol (`qxync_core::HOME_ROOT`), not a
+    config field;
   * `qxync mount --remote A --remote B` — `--remote` (and `--root`) can now be given only once;
   * the FUSE **virtual root** (`ViewLayout::Multi` / `RootSpec` / `QxyncFs::new_multi` /
     `multi_root` branches), plus `MountInfo.roots` and `RootsData.configured` / `roots`;
@@ -69,10 +71,11 @@ mounts and multi-root task arrays no longer exist (see below).
   showed "empty name + 0 permission" and mistook "listable" for "not listable". Both spellings
   are accepted now (real-machine fields first), with a HAR-verbatim regression test
   (`syncing_folders_real_machine_response_is_not_lost`).
-- **A task's default NAS folder was not the link's `home_root`.** The GUI result rows and the
-  `Task` doc comment both said "decided by the link", but the daemon used the compile-time
-  constant `/home` (the default in `mount()`); anyone who had changed `home_root` was silently
-  mounted at `/home`. It now goes through `Task::effective_root(link.home_root)`.
+- **The "no NAS folder given" default is now consistent.** The GUI result rows and the `Task` doc
+  comment both said "decided by the link's `home_root`", but the daemon used the compile-time
+  constant `/home` (the default in `mount()`) — anyone who had changed `home_root` was silently
+  mounted at `/home`. Both sides now go through `Task::effective_root()` = the protocol constant
+  `/home` (and the `home_root` field itself is gone).
 - **Destination conflicts are checked on submit**: a local folder that duplicates or nests inside
   another task's folder is **rejected** with the conflicting task named (nested mounts hide each
   other); the same NAS folder used by another task is a **warning** (read-only mounts of one NAS

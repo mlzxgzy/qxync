@@ -1191,7 +1191,8 @@ impl Client {
         let mut items = parse_syncing_folders(&v);
         // ★ 把 NAS 共享路径换算成客户端路径（`/share/homes/test1/.Qsync` → `/home/.Qsync`）：
         //   选 NAS 文件夹时要用的是**客户端能 get_list 的路径**，不是共享路径。
-        let home_root = self.link.home_root.clone();
+        //   家目录在 Qsync 协议里固定叫 `/home`（[`qxync_core::HOME_ROOT`]），不是配置项。
+        let home_root = qxync_core::HOME_ROOT;
         let user = self.link.user.clone();
         for it in items.iter_mut() {
             it.client_path = qxync_core::client_path_from_share(

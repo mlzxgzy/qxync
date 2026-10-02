@@ -223,7 +223,6 @@ async fn self_test_login_inner() -> Value {
         "https": link.https,
         "insecure": link.insecure,
         "user": link.user,
-        "home_root": link.home_root,
         "ipv4_only": link.ipv4_only,
         "password": cred.password,
     }))

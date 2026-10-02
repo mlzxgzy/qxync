@@ -306,8 +306,8 @@ the two `rename` calls produced "cursor advanced, baseline not". The old
 
 **One-to-one: one mount point = one NAS folder.** The mount point *is* that folder's content
 (pair `/home` and you see the home directory directly — no extra `home/` level). Cache / baseline /
-pin / xattr / upload queue all key by remote path; the link's `home_root` is only the default used
-when no NAS folder is given.
+pin / xattr / upload queue all key by remote path; the home directory is **fixed to `/home`** in the
+Qsync protocol (it is not a config field).
 
 > ★ 2026-10-02: **one-to-many (multi-root) mounts were removed entirely** (the `roots` config,
 > `--remote A --remote B`, the FUSE virtual root, and the legacy multi-root `roots` array in task

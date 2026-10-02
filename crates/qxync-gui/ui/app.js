@@ -714,7 +714,7 @@
     return out;
   }
 
-  /** 这个任务/挂载对应的**那一个** NAS 文件夹（一对一）。空 = 跟 link 的 home_root。 */
+  /** 这个任务/挂载对应的**那一个** NAS 文件夹（一对一）。空 = 没指定（用家目录 /home）。 */
   function taskRoot(v) {
     if (v.task) { return str(v.task.root); }
     var m = v.mount || {};
@@ -1370,7 +1370,7 @@
     chk('t-smart-delete', t.smart_delete === true);
     chk('t-read-write', t.read_write === true);
     chk('t-do-mount', t.enabled !== false);
-    // ★ 一对一：NAS 侧就一个文件夹（没写 = 跟 link 的 home_root）
+    // ★ 一对一：NAS 侧就一个文件夹（没写 = 用默认的家目录 /home）
     setNasFolder(str(t.root));
     setText('task-form-title', '文件夹对设置 · ' + str(t.id));
     card.hidden = false;
@@ -1777,7 +1777,6 @@
     setBusyState('roots-folders', false);
 
     var kv = $('roots-summary-kv');
-    kvText(kv, 'home_root（家目录）', optText(data.home_root) || '—');
     kvText(kv, 'NAS 登记的同步文件夹', sf.length ? (sf.length + ' 个（配对时可下拉选）') : '（无）');
 
     var note = $('roots-note');
@@ -1790,7 +1789,7 @@
     else { setListState('roots-folders-empty', 'empty', T('roots.folders_empty')); }
     for (var j = 0; j < sf.length; j++) {
       var f = sf[j];
-      // ★ 真机字段是 name/path/privilege；`client_path` 是按 home_root 映射好的可用路径。
+      // ★ 真机字段是 name/path/privilege；`client_path` 是映射好的客户端路径（/home/…）。
       //   没有 client_path 说明映射不出来（别把它当成能挂的目录）。
       var usable = str(f.client_path).trim();
       var raw = str(f.path).trim() || str(f.realpath).trim();
@@ -1859,7 +1858,6 @@
       var host = $('f-host'); if (host) { host.value = str(link.host); }
       var port = $('f-port'); if (port) { port.value = str(link.port); }
       var user = $('f-user'); if (user) { user.value = str(link.user); }
-      var hr = $('f-home-root'); if (hr) { hr.value = str(link.home_root); }
       var ht = $('f-https'); if (ht) { ht.checked = link.https !== false; }
       var ins = $('f-insecure'); if (ins) { ins.checked = link.insecure === true; }
       var v4 = $('f-ipv4-only'); if (v4) { v4.checked = link.ipv4_only === true; }
@@ -1916,7 +1914,6 @@
       https: isOn('f-https', true),
       insecure: isOn('f-insecure', false),
       user: user,
-      home_root: str($('f-home-root') ? $('f-home-root').value : '/home').trim() || '/home',
       ipv4_only: isOn('f-ipv4-only', false)
     };
     if (withPassword) {
@@ -1952,8 +1949,7 @@
           ['文件', str(d.path)],
           ['host:port', str(d.link && d.link.host) + ':' + str(d.link && d.link.port)],
           ['user', str(d.link && d.link.user)],
-          ['https', d.link && d.link.https ? '是' : '否'],
-          ['home_root', str(d.link && d.link.home_root)]
+          ['https', d.link && d.link.https ? '是' : '否']
         ]);
       } else {
         renderError('login-result', '保存连接配置失败', str(r.error));
@@ -1989,7 +1985,6 @@
       var rows = [
         ['link 文件', str(d.link_path)],
         ['凭据文件', str(d.credential_path)],
-        ['home_root', built.input.home_root],
         ['daemon 已重启', d.restarted ? '是' : '否']
       ];
       if (login && isObj(login.data)) {
@@ -3247,7 +3242,6 @@
       https: link.https !== false,
       insecure: link.insecure === true,
       user: str(link.user),
-      home_root: str(link.home_root) || '/home',
       ipv4_only: link.ipv4_only === true,
       exclude: lines,
       filter_temp: isOn('flt-filter-temp', true)
@@ -3503,7 +3497,6 @@
       https: link.https !== false,
       insecure: link.insecure === true,
       user: str(link.user),
-      home_root: str(link.home_root) || '/home',
       ipv4_only: link.ipv4_only === true,
       // 空串 = 关闭监听（daemon 侧 `peer_listen` 去空白后为空就不监听）
       peer_listen: listen,

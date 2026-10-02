@@ -32,7 +32,6 @@ fn env_creds() -> Option<(LinkConfig, String)> {
             https: true,
             insecure: true,
             user,
-            home_root: HOME_ROOT.to_string(),
             ipv4_only: std::env::var("QXNYC_TEST_IPV4").is_ok(),
             exclude: Vec::new(),
             filter_temp: true,

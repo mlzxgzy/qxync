@@ -283,7 +283,7 @@ pin=pinned/excluded、未上传改动/队列在途、打开的 fd、被 mmap（�
 
 **一对一：一个挂载点 = 一个 NAS 文件夹**。挂载点里**直接**就是那个文件夹的内容
 （配 `/home` 就看到家目录，不会多出 `home/` 这一层）。缓存 / baseline / pin / xattr / 上传队列
-全都以远端路径为键，link 的 `home_root` 只是「没写 NAS 文件夹时」的默认值。
+全都以远端路径为键；家目录在 Qsync 协议里**固定叫 `/home`**（不是配置项）。
 
 > ★ 2026-10-02：**一对多（多根挂载）已整体删除**（`roots` 配置、`--remote A --remote B`、
 > FUSE 虚拟根、旧任务里的多根 `roots` 数组都不再存在）。要同步多个 NAS 文件夹就建多个任务
@@ -430,7 +430,7 @@ pin=pinned/excluded、未上传改动/队列在途、打开的 fd、被 mmap（�
     页面刚起来时它是 `null`，「文件 / pin」页的 `ls` 直接被跳过。
     修法：首轮 status 回来后补一次当前 tab 的刷新。
 36. Tauri 2 的命令参数是 **camelCase**（Rust `link_id` → JS `{linkId}`），但传进去的**对象内部
-    字段仍是 snake_case**（`home_root`/`force_deletes`/`cache_mode`/`hydrate_timeout_secs`…）；
+    字段仍是 snake_case**（`force_deletes`/`cache_mode`/`hydrate_timeout_secs`…）；
     `frontendDist` 是**编译期**嵌入，改 `ui/` 必须重新 `cargo build`
     （`--self-test` 里的 `ui_assets` 字节数就是「资源有没有真的进包」的判据）。
 37. **挂载失败会把 daemon 的 IPC worker 打成 panic**：`QxyncFs` 里的 tokio `Runtime`

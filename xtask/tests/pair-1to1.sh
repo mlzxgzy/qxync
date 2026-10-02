@@ -44,7 +44,7 @@ export XDG_DATA_HOME="$RUNDIR/data"
 # ⚠️ 假 link：daemon 要有 link 才进「同步模式」（没 link 时它空转待命，只服务 ping/status）。
 cat > "$XDG_CONFIG_HOME/qxync/links/default.json" <<'JSON'
 {"id":"default","host":"nas.invalid","port":9834,"https":true,"insecure":true,
- "user":"test1","home_root":"/home"}
+ "user":"test1"}
 JSON
 
 "$DAEMON" --socket "$SOCK" --foreground >"$LOG" 2>&1 &
