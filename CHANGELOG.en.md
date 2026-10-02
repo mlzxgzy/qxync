@@ -11,11 +11,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Automated release artifacts**: pushing a `v*` tag (or manually running the `Release`
   workflow) builds and publishes the three binaries `qsync` / `qxyncd` / `qxync-gui` — one
-  `qxync-<version>-x86_64-unknown-linux-gnu.tar.gz`, the three binaries on their own, and
-  `SHA256SUMS`, all attached to the release for that tag. A **version consistency guard**
-  (tag vs. `Cargo.toml` vs. `tauri.conf.json`) blocks publishing on drift, and
-  `xtask/release/package-linux.sh` can be re-run locally; the tarball is reproducible
-  (zeroed owner/group, fixed order, gzip without a timestamp).
+  `qxync-<version>-x86_64-unknown-linux-gnu.tar.gz` (desktop entry and icons included), the
+  three binaries on their own, and `SHA256SUMS`, all attached to the release for that tag. A
+  **version consistency guard** (tag vs. `Cargo.toml` vs. `tauri.conf.json` vs. the AUR
+  `PKGBUILD` `pkgver`) blocks publishing on drift, and `xtask/release/package-linux.sh` can be
+  re-run locally; the tarball is reproducible (zeroed owner/group, fixed order, gzip without a
+  timestamp).
+- **Arch Linux package (AUR `qxync-bin`)**: `packaging/arch/` ships an AUR package definition
+  that pulls the prebuilt tarball from the release and installs `qsync` / `qxyncd` / `qxync-gui`
+  into `/usr/bin`, with a desktop entry and icons. `makepkg -si` installs it locally; once it is
+  on the AUR it is `yay -S qxync-bin`. The package is **intentionally not stripped** (same as the
+  release artifacts, so backtraces stay readable) and installs ~190 MB.
 
 ## [0.1.0] - 2026-10-02
 

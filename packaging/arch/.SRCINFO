@@ -1,0 +1,27 @@
+pkgbase = qxync-bin
+	pkgdesc = QNAP Qsync client for Linux: FUSE on-demand sync + qxyncd daemon + Tauri GUI (prebuilt)
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/mlzxgzy/qxync
+	arch = x86_64
+	license = MIT
+	license = Apache-2.0
+	depends = fuse3
+	depends = glibc
+	depends = gcc-libs
+	depends = glib2
+	depends = gtk3
+	depends = gdk-pixbuf2
+	depends = cairo
+	depends = dbus
+	depends = libsoup3
+	depends = webkit2gtk-4.1
+	provides = qxync
+	conflicts = qxync
+	conflicts = qxync-git
+	options = !strip
+	options = !debug
+	source = qxync-0.1.0-x86_64-unknown-linux-gnu.tar.gz::https://github.com/mlzxgzy/qxync/releases/download/v0.1.0/qxync-0.1.0-x86_64-unknown-linux-gnu.tar.gz
+	sha256sums = 0000000000000000000000000000000000000000000000000000000000000000
+
+pkgname = qxync-bin

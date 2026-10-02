@@ -1,0 +1,69 @@
+# Maintainer: Kami <mlzxgzy@gmail.com>
+#
+# AUR 预编译包（qxync-bin）：直接取 GitHub Release 上的
+# `qxync-<版本>-x86_64-unknown-linux-gnu.tar.gz`（CI 在 ubuntu-22.04 上构建，
+# 只要 glibc ≥ 2.35 的 x86_64 Linux 就能跑）。想从源码构建见仓库 README「构建」。
+#
+# ★ 每个新版本发出去之后，**必须先更新校验和再推 AUR**（在 packaging/arch/ 下）：
+#     pkgver=...            # 与 tag 对齐（发版流水线会校验这一行）
+#     updpkgsums            # 下载 Release 产物并回填 sha256sums
+#     makepkg --printsrcinfo > .SRCINFO
+#   没更新就推上去，用户装的时候会直接 checksum 失败（不会静默装错东西）。
+
+pkgname=qxync-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='QNAP Qsync client for Linux: FUSE on-demand sync + qxyncd daemon + Tauri GUI (prebuilt)'
+arch=('x86_64')
+url='https://github.com/mlzxgzy/qxync'
+license=('MIT' 'Apache-2.0')
+# 这些是三个二进制的直接 DT_NEEDED（`readelf -d`）对应的包，不是传递依赖：
+# qsync / qxyncd 只直接链 glibc / gcc-libs，但挂载、卸载要调 `fusermount3`
+# （fuser 0.17 不链接 libfuse，走的是 fuse3 包里的命令行工具）。
+depends=(
+  'fuse3'
+  'glibc'
+  'gcc-libs'
+  'glib2'
+  'gtk3'
+  'gdk-pixbuf2'
+  'cairo'
+  'dbus'
+  'libsoup3'
+  'webkit2gtk-4.1'
+)
+provides=('qxync')
+conflicts=('qxync' 'qxync-git')
+# ★ 与仓库口径一致：release 产物**有意不 strip**，带 line-tables-only 调试信息，
+# 用户报 bug 时贴出来的回溯才可读（见 Cargo.toml 的 [profile.release] 注释）。
+# `!debug` 同样必要：makepkg 默认会把调试信息切进单独的 -debug 包，那就白留了。
+# 代价是装完约 190 MB —— 这是换「回溯可读」付的钱，别改成 strip。
+options=('!strip' '!debug')
+
+_triple='x86_64-unknown-linux-gnu'
+source=("qxync-${pkgver}-${_triple}.tar.gz::https://github.com/mlzxgzy/qxync/releases/download/v${pkgver}/qxync-${pkgver}-${_triple}.tar.gz")
+# ⚠️ 占位值：Release 产物由 CI 构建，本机算不出来。发版后跑一次 `updpkgsums`
+#    就会把这行换成真实值（发版清单 §6 有这一步）。
+sha256sums=('0000000000000000000000000000000000000000000000000000000000000000')
+
+package() {
+  local stem="qxync-${pkgver}-${_triple}"
+
+  # 三个二进制都装进 /usr/bin：GUI 先找「自己旁边的 qxyncd」，再退回 PATH，
+  # 所以同目录安装是它最省事、也最符合预期的布局。
+  install -Dm755 "$srcdir/$stem/qsync" "$pkgdir/usr/bin/qsync"
+  install -Dm755 "$srcdir/$stem/qxyncd" "$pkgdir/usr/bin/qxyncd"
+  install -Dm755 "$srcdir/$stem/qxync-gui" "$pkgdir/usr/bin/qxync-gui"
+
+  # 桌面项与图标（tar.gz 里带着，避免打包器各抄一份）
+  install -Dm644 "$srcdir/$stem/qxync.desktop" "$pkgdir/usr/share/applications/qxync.desktop"
+  install -Dm644 "$srcdir/$stem/icons/32x32.png" "$pkgdir/usr/share/icons/hicolor/32x32/apps/qxync.png"
+  install -Dm644 "$srcdir/$stem/icons/128x128.png" "$pkgdir/usr/share/icons/hicolor/128x128/apps/qxync.png"
+  install -Dm644 "$srcdir/$stem/icons/128x128@2x.png" "$pkgdir/usr/share/icons/hicolor/256x256/apps/qxync.png"
+  install -Dm644 "$srcdir/$stem/icons/icon.png" "$pkgdir/usr/share/icons/hicolor/512x512/apps/qxync.png"
+
+  install -Dm644 "$srcdir/$stem/LICENSE-MIT" "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
+  install -Dm644 "$srcdir/$stem/LICENSE-APACHE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
+  install -Dm644 "$srcdir/$stem/DISCLAIMER.md" "$pkgdir/usr/share/doc/$pkgname/DISCLAIMER.md"
+  install -Dm644 "$srcdir/$stem/README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

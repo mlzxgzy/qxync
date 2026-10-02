@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# 打包 Linux 发版产物：把已构建好的三个二进制（qsync / qxyncd / qxync-gui）
-# 连同许可证与免责声明打成 tar.gz，并把三个裸二进制复制到输出目录。
+# 打包 Linux 发版产物：把已构建好的三个二进制（qsync / qxyncd / qxync-gui）连同
+# 桌面项、图标、许可证与免责声明打成 tar.gz，并把三个裸二进制复制到输出目录。
 #
 # 用法：
 #   xtask/release/package-linux.sh <version> <target-triple> [bin-dir] [out-dir]
@@ -11,7 +11,9 @@
 #   out-dir          默认 <repo>/dist
 #
 # 产物（out-dir 下）：
-#   qxync-<version>-<triple>.tar.gz   解包后是 <stem>/{qsync,qxyncd,qxync-gui,+文档}
+#   qxync-<version>-<triple>.tar.gz   解包后是 <stem>/{三个二进制, qxync.desktop,
+#                                     icons/, README*, LICENSE-*, DISCLAIMER.md}
+#                                     —— 发行版打包（packaging/arch/）直接从这里取
 #   qsync / qxyncd / qxync-gui        三个裸二进制（供直接下载）
 #
 # 可复现性：tar 内 owner/group 归零、顺序按名字排序、mtime 取 HEAD 提交时间
@@ -24,7 +26,7 @@
 set -euo pipefail
 
 if [ "$#" -lt 2 ]; then
-  sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^#\{1,\} \{0,1\}//'
+  sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^#\{1,\} \{0,1\}//'
   exit 2
 fi
 
@@ -74,6 +76,14 @@ for f in README.md README.en.md LICENSE-MIT LICENSE-APACHE DISCLAIMER.md; do
   else
     echo "⚠️  跳过缺失的文档：$f" >&2
   fi
+done
+
+# 发行版打包要用的桌面项与图标（packaging/arch/ 的 PKGBUILD 直接从这里取，
+# 不在打包器里另抄一份，免得图标换了只改一处）。
+install -m 0644 "$root/packaging/qxync.desktop" "$dest/qxync.desktop"
+mkdir -p "$dest/icons"
+for i in 32x32 128x128 128x128@2x icon; do
+  install -m 0644 "$root/crates/qxync-gui/icons/$i.png" "$dest/icons/$i.png"
 done
 
 # 先写 gzip（-n 不写时间戳），再原子替换，避免留下半个包。
