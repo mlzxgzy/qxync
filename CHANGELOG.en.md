@@ -54,6 +54,24 @@ the probes' `QSYNC` constant and the myQNAPcloud path prefix `qsync/`. The `.des
 `GenericName=QNAP Qsync client` and the crates.io `qsync` keyword stay too — they describe what
 this interoperates with, not what this project is called.
 
+### Fixed
+
+- **`qxyncd` startup failures are no longer silent.** The daemon daemonizes by default (after
+  `fork`, fds 0/1/2 all point at `/dev/null`), so a fatal startup error used to go only to
+  `/dev/null` through anyhow — leaving `qxync daemon start` to report nothing but "socket not
+  ready", with no way to find out why (this is exactly what bit us here). Three fixes:
+  ① the daemon logs its startup failure into `<state>/log/qxyncd.log*`;
+  ② `qxync daemon start` brings the log tail back to the foreground when the socket never comes up;
+  ③ the CLI checks the link config **before** spawning and, when it is missing, says so and prints
+  the `login` command (the GUI's `daemon_start` already had this pre-flight check; the CLI now
+  matches it).
+- **The GUI's empty-state hint now names the step that is actually missing**: when it cannot reach
+  the daemon it no longer always says "run `qxync daemon start`" — with no connection configured at
+  all it instead says to save one in "Settings → Connection" (or run `qxync --host … login`).
+  On a fresh install the old hint just sent people into the same wall again.
+- The daemon's "create config/data/log directories" and "create / restrict the socket directory"
+  steps now carry anyhow context, so the log shows exactly where it stopped.
+
 ### Other
 
 - **User agent and login body**: `client_agent` went from the hardcoded `QSyncLinux/0.1` to
