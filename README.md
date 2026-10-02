@@ -98,6 +98,7 @@ cargo build --workspace --release # release（已配 lto=thin；保留行号回�
 | 资产 | 说明 |
 |---|---|
 | `qxync-<版本>-x86_64-unknown-linux-gnu.tar.gz` | 三个二进制 + 桌面项 / 图标 + 许可证 / 免责声明 |
+| `qxync-bin-<版本>-1-x86_64.pkg.tar.zst` | **Arch 包**（CI 用 archlinux 镜像里的真 `makepkg` 从上面那个 tar.gz 打的） |
 | `qsync` · `qxyncd` · `qxync-gui` | 三个裸二进制（同一份构建，供挑着下） |
 | `SHA256SUMS` | 上述资产的校验和 |
 
@@ -105,11 +106,12 @@ cargo build --workspace --release # release（已配 lto=thin；保留行号回�
 运行 GUI 还要系统里有 WebKitGTK 4.1 / GTK 3 运行时（Debian/Ubuntu 是
 `libwebkit2gtk-4.1-0` + `libgtk-3-0`）。**仍然建议优先从源码构建**（可复现、可审计）。
 
-**Arch Linux**：仓库里带一份 AUR 用的包定义
+**Arch Linux**：Release 里直接带打好的 `qxync-bin-<版本>-1-x86_64.pkg.tar.zst`，
+`sudo pacman -U` 就能装；仓库里还带一份 AUR 用的包定义
 [`packaging/arch/PKGBUILD`](packaging/arch/)（包名 `qxync-bin`），在 `packaging/arch/` 下
-`makepkg -si` 就装成系统包（三个二进制进 `/usr/bin`，带桌面项与图标）；
-推到 AUR 之后就是 `yay -S qxync-bin`。它**有意不 strip**（为了回溯可读，见上一节），
-所以装完约 190 MB —— 细节与发版后的校验和更新见 [`packaging/arch/README.md`](packaging/arch/README.md)。
+`makepkg -si` 可以自己打，推到 AUR 之后就是 `yay -S qxync-bin`。
+包**有意不 strip**（为了回溯可读，见上一节），所以装完约 190 MB —— 细节与发版后的
+校验和更新见 [`packaging/arch/README.md`](packaging/arch/README.md)。
 
 ### 3. 首次登录
 

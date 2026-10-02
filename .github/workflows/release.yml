@@ -40,6 +40,7 @@ jobs:
           ref: ${{ inputs.tag || github.ref_name }}
 
       # 与 CI 的依赖表保持一致；GUI 要 WebKitGTK 4.1 / GTK 3 才编得出来。
+      # libarchive-tools 是为了 bsdtar —— 后面要读 Arch 包里的 .PKGINFO / 文件清单。
       - name: 安装系统依赖（FUSE3 + WebKitGTK/GTK3）
         run: |
           sudo apt-get update
@@ -47,7 +48,7 @@ jobs:
             build-essential pkg-config \
             fuse3 libfuse3-dev \
             libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
-            libssl-dev
+            libssl-dev libarchive-tools
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -68,6 +69,64 @@ jobs:
         run: |
           bash xtask/release/package-linux.sh "${TAG#v}" x86_64-unknown-linux-gnu
           ls -l dist
+
+      # Arch 包：用 Arch 官方镜像里的**真 makepkg** 打（与用户 / AUR 同一套工具），
+      # 源就是上一步刚打出来的 tar.gz —— 包里的二进制与 Release 资产完全同源。
+      # 这一步失败就整体不发：宁可修好重跑，也不要发一个「说好带 Arch 包却没有」的 Release。
+      - name: 打 Arch 包（archlinux:base-devel 容器里的真 makepkg）
+        run: |
+          set -euo pipefail
+          # PKGBUILD 的 sha256sums 是占位值（提交代码时 Release 产物还不存在），这里换成真实值。
+          tarball="dist/qxync-${TAG#v}-x86_64-unknown-linux-gnu.tar.gz"
+          sum="$(sha256sum "$tarball" | cut -d' ' -f1)"
+          sed -i "s/^sha256sums=.*/sha256sums=('$sum')/" packaging/arch/PKGBUILD
+
+          docker run --rm \
+            --volume "$PWD:/work" \
+            --workdir /work \
+            --env HOST_UID="$(id -u)" \
+            --env HOST_GID="$(id -g)" \
+            --env HOME=/home/qxync-builder \
+            --env PACKAGER="Kami <mlzxgzy@gmail.com>" \
+            archlinux:base-devel \
+            bash -euxo pipefail -c '
+              # makepkg 不允许以 root 跑；建一个与 runner **同 uid** 的用户，
+              # 这样它能在挂进来的 /work 里直接读写（宿主目录属主就是 runner）。
+              getent group "$HOST_GID" >/dev/null || groupadd --gid "$HOST_GID" qxync-builder
+              useradd --create-home --uid "$HOST_UID" --gid "$HOST_GID" --shell /bin/bash qxync-builder
+
+              # fakeroot 在 base-devel 里；zstd 是 pacman → libarchive 的依赖，镜像里一定有。
+              # 显式确认一遍：缺了就响亮地失败，而不是打出一个坏包。
+              command -v makepkg fakeroot zstd
+
+              # --nodeps：容器只负责打包，运行期依赖是给装机用户解的；
+              # SRCDEST 指到 /work/dist：makepkg 直接复用刚打出来的 tar.gz，不下载（全程离线）。
+              su qxync-builder -s /bin/bash -c "cd /work/packaging/arch && SRCDEST=/work/dist PKGDEST=/work/dist makepkg -f --nodeps"
+            '
+          ls -l dist/*.pkg.tar.zst
+
+      - name: 校验 Arch 包内容
+        run: |
+          set -euo pipefail
+          mapfile -t pkgs < <(ls dist/*.pkg.tar.zst)
+          [ "${#pkgs[@]}" -eq 1 ] || { echo "❌ 期望恰好一个 .pkg.tar.zst，实际 ${#pkgs[@]} 个"; exit 1; }
+          # 版本号以 PKGBUILD 为准（pkgrel 变了也不用改这里）
+          want="$(bash -c 'set -e; source packaging/arch/PKGBUILD; printf "%s-%s" "$pkgver" "$pkgrel"')"
+          bsdtar -xOf "${pkgs[0]}" .PKGINFO | grep -E "^(pkgname|pkgver|arch) = "
+          bsdtar -xOf "${pkgs[0]}" .PKGINFO | grep -qx "pkgname = qxync-bin"
+          bsdtar -xOf "${pkgs[0]}" .PKGINFO | grep -qx "pkgver = ${want}"
+          for f in usr/bin/qsync usr/bin/qxyncd usr/bin/qxync-gui \
+                   usr/share/applications/qxync.desktop \
+                   usr/share/icons/hicolor/512x512/apps/qxync.png; do
+            bsdtar -tf "${pkgs[0]}" | grep -qx "$f" || { echo "❌ 包里缺 $f"; exit 1; }
+          done
+          # 包里的三个二进制必须与 Release 资产**逐字节一致**（同一个 tar.gz 装出来的）
+          for b in qsync qxyncd qxync-gui; do
+            in_pkg="$(bsdtar -xOf "${pkgs[0]}" "usr/bin/$b" | sha256sum | cut -d' ' -f1)"
+            on_disk="$(sha256sum "dist/$b" | cut -d' ' -f1)"
+            [ "$in_pkg" = "$on_disk" ] || { echo "❌ 包里的 $b 与 dist/$b 不一致"; exit 1; }
+          done
+          echo "✅ Arch 包内容检查通过（${pkgs[0]}）"
 
       - name: 生成 SHA256SUMS
         run: |

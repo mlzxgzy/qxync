@@ -13,17 +13,23 @@
 
 ## 装
 
-Release 发出来、`sha256sums` 也填好之后，在 `packaging/arch/` 下：
+三条路，随便挑：
+
+| 方式 | 命令 |
+|---|---|
+| **Release 里 CI 打好的包**（最快，推荐给用户） | `sudo pacman -U qxync-bin-<版本>-1-x86_64.pkg.tar.zst` |
+| 本机自己打（改完 PKGBUILD 后 `updpkgsums` + `makepkg -si`） | 见下面 |
+| 发布到 AUR 之后 | `yay -S qxync-bin`（或 `paru` / `pamac`） |
+
+Release 里那份是 CI 用 Arch 官方镜像（`archlinux:base-devel`）里的**真 `makepkg`**、
+从**同一个 tar.gz** 打的 —— 包里三个二进制与 Release 资产**逐字节一致**，所以
+「下 Release 那份」和「自己 `makepkg`」装出来的东西相同，区别只是校验和由谁填。
+
+自己打（在 `packaging/arch/` 下，需要 Release 已发布）：
 
 ```bash
 updpkgsums      # 从 Release 下载产物并回填 sha256sums
 makepkg -si     # 构建并安装（三个二进制都进 /usr/bin，GUI 会在旁边找到 qxyncd）
-```
-
-包发布到 AUR 之后，对用户就是一行：
-
-```bash
-yay -S qxync-bin        # 或 paru / pamac
 ```
 
 ## 只想先验证打包流程（Release 还没发）
@@ -34,7 +40,8 @@ yay -S qxync-bin        # 或 paru / pamac
 cd packaging/arch
 sum=$(sha256sum ../../dist/qxync-0.1.1-x86_64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
 sed -i "s/^sha256sums=.*/sha256sums=('$sum')/" PKGBUILD    # 验证完记得改回占位值再提交
-SRCDEST=../../dist makepkg -f
+# BUILDDIR 指到临时目录：否则 makepkg 会在本目录留 src/ 与 pkg/（各有 ~180 MB，已在 .gitignore 里）
+BUILDDIR=$(mktemp -d) SRCDEST=../../dist makepkg -f
 namcap PKGBUILD ./*.pkg.tar.zst
 sudo pacman -U qxync-bin-0.1.1-1-x86_64.pkg.tar.zst
 ```

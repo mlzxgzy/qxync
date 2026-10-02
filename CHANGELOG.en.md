@@ -23,6 +23,10 @@ is empty).
   `PKGBUILD` `pkgver`) blocks publishing on drift, and `xtask/release/package-linux.sh` can be
   re-run locally; the tarball is reproducible (zeroed owner/group, fixed order, gzip without a
   timestamp).
+- **The Arch package ships with the release too**: `qxync-bin-<version>-1-x86_64.pkg.tar.zst` is
+  built by CI with the **real `makepkg`** inside an `archlinux:base-devel` container, out of the
+  very same tarball — the three binaries inside are **byte-for-byte the release assets**, and
+  `sudo pacman -U` installs it.
 - **Arch Linux package (AUR `qxync-bin`)**: `packaging/arch/` ships an AUR package definition
   that pulls the prebuilt tarball from the release and installs `qsync` / `qxyncd` / `qxync-gui`
   into `/usr/bin`, with a desktop entry and icons. `makepkg -si` installs it locally; once it is
