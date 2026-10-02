@@ -32,11 +32,11 @@ yay -S qxync-bin        # 或 paru / pamac
 
 ```bash
 cd packaging/arch
-sum=$(sha256sum ../../dist/qxync-0.1.0-x86_64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
+sum=$(sha256sum ../../dist/qxync-0.1.1-x86_64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
 sed -i "s/^sha256sums=.*/sha256sums=('$sum')/" PKGBUILD    # 验证完记得改回占位值再提交
 SRCDEST=../../dist makepkg -f
 namcap PKGBUILD ./*.pkg.tar.zst
-sudo pacman -U qxync-bin-0.1.0-1-x86_64.pkg.tar.zst
+sudo pacman -U qxync-bin-0.1.1-1-x86_64.pkg.tar.zst
 ```
 
 ## 发新版本要做的三件事
@@ -58,7 +58,7 @@ makepkg --printsrcinfo > .SRCINFO
 git clone ssh://aur@aur.archlinux.org/qxync-bin.git
 cp PKGBUILD .SRCINFO qxync-bin/
 cd qxync-bin && git add PKGBUILD .SRCINFO \
-  && git commit -m "upgpkg: qxync-bin 0.2.0-1" && git push
+  && git commit -m "upgpkg: qxync-bin 0.1.1-1" && git push
 ```
 
 ## 两个有意为之的选择（别「顺手修掉」）

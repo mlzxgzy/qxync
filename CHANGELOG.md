@@ -7,6 +7,11 @@
 
 ## [未发布]
 
+## [0.1.1] - 2026-10-02
+
+**只改了「怎么把 qxync 交到用户手里」，客户端行为与 v0.1.0 完全一致** ——
+`v0.1.0..v0.1.1` 之间**没有任何 Rust 代码改动**（`git diff --stat v0.1.0 HEAD -- '*.rs'` 为空）。
+
 ### 新增
 
 - **发版产物自动化**：推 `v*` tag（或手工触发 `Release` 工作流）即构建并发布
@@ -89,5 +94,6 @@
 - 验收结论从 README 抽出为 [`docs/验收记录.md`](docs/验收记录.md)。
 - 采用 **MIT OR Apache-2.0** 双许可（`LICENSE-MIT` / `LICENSE-APACHE`）。
 
-[未发布]: https://github.com/mlzxgzy/qxync/compare/v0.1.0...HEAD
+[未发布]: https://github.com/mlzxgzy/qxync/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/mlzxgzy/qxync/releases/tag/v0.1.1
 [0.1.0]: https://github.com/mlzxgzy/qxync/releases/tag/v0.1.0
