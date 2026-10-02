@@ -69,7 +69,11 @@ if [ ! -x "$DAEMON" ] || [ ! -x "$QS" ]; then echo "❌ 缺少二进制，先 ca
 
 # ---------------------------------------------------------------- 0. schema v1 → v3
 echo "== 0. schema v1 → v3（老库自动补表，数据不动） =="
-DB="$XDG_DATA_HOME/qsync/sync/nas.example.com/sync.db"
+# 状态库路径由 **link 里的 host** 决定（和 m5-matrix.sh 一样从配置推导，
+# 不要把任何具体 NAS 地址写进脚本 —— 这既让脚本对任意用户可用，也避免泄漏）。
+DB_HOST="$(jq -r .host "$RUNDIR/config/qsync/links/$LINK.json")"
+[ -n "$DB_HOST" ] && [ "$DB_HOST" != "null" ] || { echo "❌ link 里读不到 host"; exit 2; }
+DB="$XDG_DATA_HOME/qsync/sync/$DB_HOST/sync.db"
 mkdir -p "$(dirname "$DB")"
 python3 - "$DB" <<'PY'
 import sqlite3, sys
