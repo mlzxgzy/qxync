@@ -123,8 +123,8 @@ each release.
 ### 2.5 Upgrading from 0.1.x (the rename)
 
 On 0.1.x the command line was called `qsync`, which fought the **official QNAP Qsync client**
-for the same name in `PATH`; from 0.2.0 it is `qxync`. The full list is in the
-[CHANGELOG](CHANGELOG.en.md#020---2026-10-02).
+for the same name in `PATH`; from 0.2.1 it is `qxync`. The full list is in the
+[CHANGELOG](CHANGELOG.en.md#021---2026-10-02).
 
 On the first run after upgrading, the local directories are **migrated automatically**:
 `~/.config/qsync`, `~/.local/share/qsync` and `~/.local/state/qsync` are renamed to their
@@ -134,7 +134,7 @@ directory exist (for example an early prototype's `~/.local/share/qxync`), only 
 **missing** from the new directory are filled in, **nothing already there is overwritten**, and a
 note prints both paths. The only things you must update are your own scripts:
 
-| Old (0.1.x) | New (0.2.0+) |
+| Old (0.1.x) | New (0.2.1+) |
 |---|---|
 | `qsync …` | `qxync …` |
 | `QSYNC_PASSWORD` / `QSYNC_HOST` / `QSYNC_USER` / `QSYNC_SOCKET` | `QXNYC_PASSWORD` / `QXNYC_HOST` / `QXNYC_USER` / `QXNYC_SOCKET` |
@@ -144,6 +144,11 @@ note prints both paths. The only things you must update are your own scripts:
 > **Where the line is drawn**: only **our own** identifiers changed. The NAS protocol surface is
 > untouched — `cgi-bin/qsync/qsyncsrv.cgi`, `qsync_version`, `service=Qsync`,
 > `WFM_QSYNC_DISABLED` and friends are exactly as before.
+
+> **The daemon does not need a login to start**: with no connection configured `qxyncd` goes into
+> **idle standby** (the UI shows "not configured", and `qxync daemon status` reports the link as
+> unconfigured); as soon as a connection is saved it switches to sync mode by itself — so
+> "run the daemon in the background now" and "log in later" are no longer in conflict.
 
 ### 3. First login
 

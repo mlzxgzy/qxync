@@ -363,19 +363,14 @@ pub async fn credential_present() -> Result<Value, String> {
 }
 
 /// 拉起 daemon（已在跑就返回 already）。
+///
+/// ★ 不再要求「先有连接配置」：daemon 没配 NAS 时会**空转待命**（界面显示「未配置」），
+/// 配好连接后它自己转入同步 —— 「配置」和「把 daemon 跑起来」是两件独立的事。
 #[tauri::command]
 pub async fn daemon_start(link_id: Option<String>) -> Result<Value, String> {
     let id = link_id
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "default".into());
-    // 没配置就直说，省得 daemon 起来又立刻退出
-    let p = paths()?;
-    if LinkConfig::load(&p, &id).is_err() {
-        return Ok(json!({
-            "started": false, "already": false,
-            "error": format!("没有连接配置 {}（先保存连接配置）", p.link_file(&id).display()),
-        }));
-    }
     Ok(start_daemon(&id).await)
 }
 
@@ -425,7 +420,8 @@ pub async fn login_flow(input: Value) -> Result<Value, String> {
             .ok();
         let same = current
             .as_ref()
-            .map(|s| same_link(&s.link, &link))
+            // `link: None` = daemon 还在空转待命（没有任何连接配置）→ 必须重启才能读新 link
+            .map(|s| s.link.as_ref().is_some_and(|dl| same_link(dl, &link)))
             .unwrap_or(false);
         if !same {
             // 换 NAS / 换账号：daemon 需要重启才会读新的 link

@@ -7,13 +7,23 @@
 //! 没设 `QXNYC_TEST_HOST` 时直接返回（视为跳过）。ping/status/shutdown 不需要 NAS。
 
 use qxync_core::ipc::{
-    decode_line, encode_line, DaemonInfo, LsData, PingData, Request, RequestEnvelope, Response,
-    StatusData,
+    decode_line, encode_line, DaemonInfo, ErrorKind, LsData, PingData, Request, RequestEnvelope,
+    Response, SettingsData, StatusData,
 };
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+
+/// 断言失败时也要把 daemon 收掉，免得留下一个永远空转的进程。
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 
 /// 定位 `qxyncd`：优先环境变量，其次 workspace 根的 `target/debug/`。
 fn daemon_bin() -> PathBuf {
@@ -117,7 +127,8 @@ async fn daemon_ipc_round_trip() {
     // 2) status：未登录（daemon 不强制登录）
     let st: StatusData = call(&socket, Request::Status).await.into_result().unwrap();
     assert!(!st.logged_in, "status 不应触发登录");
-    assert_eq!(st.link.user, user);
+    // 这个用例先写好 link 配置再起 daemon，所以必须报出连接（`None` 只出现在空转待命）
+    assert_eq!(st.link.as_ref().map(|l| l.user.clone()), Some(user));
     assert!(st.mounts.is_empty());
     let DaemonInfo { socket: s, .. } = st.daemon.clone();
     assert!(s.ends_with("qxyncd.sock"), "{s}");
@@ -177,4 +188,123 @@ async fn daemon_ipc_round_trip() {
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&root);
     println!("shutdown ok");
+}
+
+/// ★ 回归测试：**一份连接配置都没有时，daemon 也必须能起来、能常驻、能服务**。
+///
+/// 这正是用户报的那个问题：daemon 曾经在 `LinkConfig::load` 失败时直接退出，于是
+/// 「没配 NAS」=「daemon 起不来」，和「daemon 一直跑在后台」的计划直接冲突。
+///
+/// 不需要 NAS、不需要凭据 —— 只要 `target/debug/qxyncd` 在（`cargo build --workspace` 后即有）。
+#[tokio::test]
+async fn idle_daemon_serves_without_any_link_config() {
+    let bin = daemon_bin();
+    if !bin.exists() {
+        eprintln!(
+            "跳过：{} 不存在（先 cargo build --workspace）",
+            bin.display()
+        );
+        return;
+    }
+
+    let root = std::env::temp_dir().join(format!("qxync-idle-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let (cfg, run, state) = (root.join("config"), root.join("run"), root.join("state"));
+    // 关键：**故意不建** `qxync/links/default.json`
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::create_dir_all(&run).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let socket = run.join("qxync/qxyncd.sock");
+
+    let child = std::process::Command::new(&bin)
+        .args(["--foreground", "--link", "default", "--socket"])
+        .arg(&socket)
+        .env("XDG_CONFIG_HOME", &cfg)
+        .env("XDG_RUNTIME_DIR", &run)
+        .env("XDG_STATE_HOME", &state)
+        .env("RUST_LOG", "info")
+        .spawn()
+        .expect("启动 qxyncd");
+    let mut child = KillOnDrop(child);
+
+    assert!(
+        wait_socket(&socket, 10).await,
+        "空转待命的 daemon 也必须在 10s 内就绪"
+    );
+
+    // 1) 活着
+    let ping: PingData = call(&socket, Request::Ping).await.into_result().unwrap();
+    assert!(ping.pong);
+
+    // 2) status 如实报「在跑但未配置」：`link: None`（前端据此显示「未配置」）
+    let st: StatusData = call(&socket, Request::Status).await.into_result().unwrap();
+    assert!(
+        st.link.is_none(),
+        "没有 link 配置必须报 None，而不是空 host"
+    );
+    assert!(!st.logged_in);
+    assert!(st.mounts.is_empty());
+
+    // 3) 要 NAS 的请求被**明确拒绝**，而不是拿着空 host 去发请求
+    let err = call(
+        &socket,
+        Request::Ls {
+            path: "/home".into(),
+        },
+    )
+    .await
+    .into_result::<LsData>()
+    .expect_err("没有连接配置时 ls 必须失败");
+    assert_eq!(err.kind, ErrorKind::NotLoggedIn);
+    assert!(
+        err.message.contains("还没有配置 NAS 连接"),
+        "拒绝理由要能看懂：{}",
+        err.message
+    );
+
+    // 4) 纯本地文件的设置读写照常可用（GUI 的设置页 / 登录页就在那一页）
+    let d: SettingsData = call(&socket, Request::Settings)
+        .await
+        .into_result()
+        .unwrap();
+    assert!(d.path.ends_with("settings.json"), "{}", d.path);
+    let mut s = d.settings.clone();
+    s.desktop_notifications = false;
+    let d2: SettingsData = call(
+        &socket,
+        Request::SettingsSave {
+            settings: s,
+            autostart_exe: None,
+        },
+    )
+    .await
+    .into_result()
+    .unwrap();
+    assert!(d2.saved, "空转时也要能写设置");
+    assert!(!d2.settings.desktop_notifications);
+    assert!(
+        cfg.join("qxync/settings.json").exists(),
+        "设置要真的落盘到 {}",
+        cfg.display()
+    );
+
+    // 5) shutdown：干净退出（socket / pid 都收掉）
+    let _: serde_json::Value = call(&socket, Request::Shutdown)
+        .await
+        .into_result()
+        .unwrap();
+    for _ in 0..50 {
+        if !socket.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!socket.exists(), "shutdown 后 socket 应被删除");
+    assert!(
+        !state.join("qxync/qxyncd.pid").exists(),
+        "shutdown 后 pid 文件应被删除"
+    );
+    let _ = child.0.wait();
+    let _ = std::fs::remove_dir_all(&root);
+    println!("空转待命 ok：无 link 也能 ping/status/设置读写/退出");
 }

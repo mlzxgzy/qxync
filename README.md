@@ -116,7 +116,7 @@ cargo build --workspace --release # release（已配 lto=thin；保留行号回�
 ### 2.5 从 0.1.x 升级（改名了）
 
 0.1.x 的命令行叫 `qsync`，会和 **QNAP 官方 Qsync 客户端**在 `PATH` 里抢同一个名字；
-0.2.0 起统一叫 `qxync`。完整清单见 [CHANGELOG](CHANGELOG.md#020---2026-10-02)。
+0.2.1 起统一叫 `qxync`。完整清单见 [CHANGELOG](CHANGELOG.md#021---2026-10-02)。
 
 升级后第一次运行时，本地目录会**自动迁移**：`~/.config/qsync`、`~/.local/share/qsync`、
 `~/.local/state/qsync` 会被直接改名成对应的 `qxync` 目录（跨文件系统时退回复制），
@@ -124,7 +124,7 @@ cargo build --workspace --release # release（已配 lto=thin；保留行号回�
 （例如早期原型留下的 `~/.local/share/qxync`），只把旧目录里**缺**的条目补进去，
 **已有的一律不覆盖**，并打一行提示告诉你两个路径。唯一要动的是你自己的脚本：
 
-| 旧写法（0.1.x） | 新写法（0.2.0+） |
+| 旧写法（0.1.x） | 新写法（0.2.1+） |
 |---|---|
 | `qsync …` | `qxync …` |
 | `QSYNC_PASSWORD` / `QSYNC_HOST` / `QSYNC_USER` / `QSYNC_SOCKET` | `QXNYC_PASSWORD` / `QXNYC_HOST` / `QXNYC_USER` / `QXNYC_SOCKET` |
@@ -133,6 +133,10 @@ cargo build --workspace --release # release（已配 lto=thin；保留行号回�
 
 > **名字边界**：只有**我们自己的**标识改了。NAS 协议面照旧 —— `cgi-bin/qsync/qsyncsrv.cgi`、
 > `qsync_version`、`service=Qsync`、`WFM_QSYNC_DISABLED` 这些**一字未动**。
+
+> **daemon 不用等登录也能起**：一份连接配置都没有时 `qxyncd` 会**空转待命**（界面显示
+> 「未配置」，`qxync daemon status` 里连接是 `未配置`），配好连接后它自己转入同步 ——
+> 所以「先把 daemon 挂后台」和「稍后再登录」不冲突。
 
 ### 3. 首次登录
 

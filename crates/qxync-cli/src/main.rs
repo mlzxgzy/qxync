@@ -2113,22 +2113,26 @@ fn print_status(st: &StatusData) {
         st.daemon.version, st.daemon.pid, st.daemon.uptime_secs
     );
     println!("socket    : {}", st.daemon.socket);
-    println!(
-        "连接      : {} ({}://{}:{})",
-        st.link.id,
-        if st.link.https { "https" } else { "http" },
-        st.link.host,
-        st.link.port
-    );
-    println!(
-        "用户      : {}{}",
-        st.link.user,
-        if st.link.ipv4_only {
-            "  [仅 IPv4]"
-        } else {
-            ""
+    match &st.link {
+        Some(link) => {
+            println!(
+                "连接      : {} ({}://{}:{})",
+                link.id,
+                if link.https { "https" } else { "http" },
+                link.host,
+                link.port
+            );
+            println!(
+                "用户      : {}{}",
+                link.user,
+                if link.ipv4_only { "  [仅 IPv4]" } else { "" }
+            );
         }
-    );
+        None => println!(
+            "连接      : 未配置（daemon 空转待命中 —— 先 `qxync login`，\
+             或在 GUI「设置 → 连接」里保存；配好后会自动开始同步）"
+        ),
+    }
     println!(
         "登录状态  : {}",
         if st.logged_in {
@@ -2242,20 +2246,9 @@ async fn daemon_cmd(cli: &Cli, socket: &std::path::Path, action: &DaemonAction) 
                 println!("✅ qxyncd 已在运行（{}）", socket.display());
                 return Ok(());
             }
-            // ★ 先自己核对一遍 link 配置：daemon 会 fork 到后台（fd 0/1/2 → /dev/null），
-            //   少了这个文件它会在后台**静默退出**，用户只看到「socket 未就绪」。
-            //   GUI 的 `daemon_start` 早就有这道前置检查，CLI 这边补齐。
-            let paths = ConfigPaths::discover()?;
-            let link_file = paths.link_file(&cli.link);
-            if let Err(e) = LinkConfig::load(&paths, &cli.link) {
-                bail!(
-                    "还没有配置 NAS 连接「{}」（{}）：\n  {e}\n\
-                     先登录一次（会同时写 link 与凭据），或在 GUI 的登录页保存连接：\n  \
-                     qxync --host <NAS地址> --port 9834 --insecure --user <用户> login",
-                    cli.link,
-                    link_file.display()
-                );
-            }
+            // ★ **不检查 link 配置**：daemon 的职责是常驻后台，没配 NAS 时它空转待命
+            //   （只服务 ping/status/shutdown），配置一出现就自己转入同步模式。
+            //   所以「还没有连接配置」不是启动失败的理由。
             let exe = daemon_binary()?;
             let mut cmd = std::process::Command::new(&exe);
             cmd.arg("--link").arg(&cli.link).arg("--socket").arg(socket);
@@ -2288,6 +2281,13 @@ async fn daemon_cmd(cli: &Cli, socket: &std::path::Path, action: &DaemonAction) 
                 p.daemon_version,
                 socket.display()
             );
+            if LinkConfig::load(&ConfigPaths::discover()?, &cli.link).is_err() {
+                println!(
+                    "   空转待命：还没有配置 NAS 连接「{}」—— 先 `qxync login`，\
+                     或在 GUI「设置 → 连接」里保存；配好后它会自动开始同步（不用重启）",
+                    cli.link
+                );
+            }
         }
         DaemonAction::Stop => {
             if !ipc_client::available(socket).await {
