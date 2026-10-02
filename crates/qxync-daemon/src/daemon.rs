@@ -689,6 +689,18 @@ async fn dispatch(state: &Arc<State>, req: Request, shutdown: &mpsc::Sender<()>)
             } else {
                 None
             };
+            // ★ 一对一：`mount --remote A --remote B` 照挂（M6 多根视图保留），
+            //   但**不再登记成任务** —— 任务层只表达「一个本地文件夹 ⇄ 一个 NAS 文件夹」。
+            let reg = match reg {
+                Some(t) => match t.ensure_one_root() {
+                    Ok(()) => Some(t),
+                    Err(e) => {
+                        tracing::warn!("不登记任务（挂载本身不受影响）：{e}");
+                        None
+                    }
+                },
+                None => None,
+            };
             let out = mount(
                 state,
                 mountpoint,
@@ -2433,15 +2445,32 @@ fn disable_task_by_mountpoint(mp: &Path) -> Result<(), String> {
 }
 
 /// 按任务登记的参数挂载（**复用既有 `mount()` 路径，不改 FUSE**）。
+///
+/// ★ 一对一：任务只该有一个 NAS 目录。旧的多根任务文件仍**照挂**（多根视图 =
+/// 挂载点顶层多一层视图名目录），但那正是用户反馈的「本地文件夹里又冒出一个
+/// `home/`」；编辑保存一次就会收敛成单目录。
 async fn mount_task(state: &Arc<State>, t: &Task) -> Result<serde_json::Value, IpcError> {
     std::fs::create_dir_all(&t.mountpoint)
         .map_err(|e| core_err(format!("建挂载点 {} 失败: {e}", t.mountpoint.display())))?;
+    if t.roots.len() > 1 {
+        tracing::warn!(
+            "任务 {} 登记了多个 NAS 目录（{:?}）：这是 M6 的旧多根格式，\
+             挂载点顶层会多出视图名目录；请编辑任务收敛成一个 NAS 目录（一对一）",
+            t.id,
+            t.roots
+        );
+    }
     let roots = if t.roots.is_empty() {
         None
     } else {
         Some(t.roots.clone())
     };
-    let remote = roots.as_ref().and_then(|r| r.first().cloned());
+    // ★ 空 roots 的语义是「由 link 的 home_root 决定」—— 以前这里落的是编译期常量
+    //   `/home`（daemon.rs 的 `mount()` 默认值），用户改过 home_root 就会静默挂错。
+    let remote = roots
+        .as_ref()
+        .and_then(|r| r.first().cloned())
+        .or_else(|| Some(state.link.home_root.clone()));
     mount(
         state,
         t.mountpoint.clone(),
@@ -2498,11 +2527,24 @@ async fn tasks_cmd(
         "save" => {
             let mut t = task.ok_or_else(|| bad_req("save 需要 task"))?;
             t.normalize().map_err(core_err)?;
+            // ★ 一对一：一个配对文件夹只能有一个 NAS 目录（多根请分建任务）
+            t.ensure_one_root().map_err(core_err)?;
+            // ★ 提交前的「目的地冲突」检查：本地文件夹重复 / 嵌套 → 直接拒；
+            //   NAS 目录重复 → 只作为 warnings 回给界面（只读挂同一目录是合法用法）。
+            let (others, _bad) = Task::list(&paths);
+            let (errors, warnings) = t.conflict_report(&others);
+            if !errors.is_empty() {
+                return Err(IpcError::new(
+                    ErrorKind::BadRequest,
+                    format!("目的地冲突：{}", errors.join("；")),
+                ));
+            }
             let p = t.save(&paths).map_err(core_err)?;
             to_value(serde_json::json!({
                 "saved": true,
                 "path": p.display().to_string(),
                 "task": t,
+                "warnings": warnings,
             }))
         }
         "delete" => {

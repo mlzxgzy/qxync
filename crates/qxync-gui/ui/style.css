@@ -1040,6 +1040,39 @@ button.link-btn {
 .modal-card h3 { font-size: 13px; margin-bottom: 4px; }
 .modal-card input { margin: 6px 0 10px; }
 
+/* ★ 一对一配对：NAS 文件夹用「下拉 + 浏览…」并排（下拉吃满剩余宽度） */
+.select-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.select-row select { flex: 1 1 auto; }
+.select-row button { flex: 0 0 auto; }
+
+/* ★ NAS 文件夹选择器：窗口宽一点，目录列表可点、可滚动 */
+.modal-wide { min-width: 520px; }
+#nas-picker-path {
+  margin: 2px 0 8px;
+  padding: 4px 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 12px;
+  word-break: break-all;
+}
+#nas-picker-list {
+  max-height: 42vh;
+  overflow: auto;
+  margin-top: 8px;
+}
+#nas-picker-list li {
+  cursor: pointer;
+  padding: 3px 6px;
+  border-radius: 4px;
+}
+#nas-picker-list li:hover,
+#nas-picker-list li:focus-visible { background: var(--bg-head); }
+
 /* ============================================================================
  * ★ M8.4：设置中心分区 / 文件三态 / 行右键菜单
  * ==========================================================================*/

@@ -312,6 +312,119 @@ impl Task {
         Ok(())
     }
 
+    // ------------------------------------------------------------ ★ 一对一（1:1）配对
+    //
+    // 用户反馈（2026-10-02）：本地 `/home/user/qsync` 配 NAS `/home` 之后，里面又出现了
+    // 一层 `home/` —— 那是 M6 的**多根视图**（挂载点当虚拟根，每个远端根一个目录）。
+    // 「配对文件夹」在 Qsync 里是**一对一**的：本地文件夹就是 NAS 文件夹本身。
+    // 所以任务层从此只接受**一个** NAS 目录；多根挂载仍可用 `qxync mount --remote A --remote B`
+    // （M6 矩阵不动），只是**不再登记成任务**。
+
+    /// ★ 一对一铁律：一个配对文件夹 = 一个本地文件夹 + 一个 NAS 文件夹。
+    ///
+    /// 只在**创建 / 编辑**路径上调用（daemon `tasks save`、`mount --task` 登记、
+    /// CLI `task add`）。旧的多根任务文件**照样能读、能挂、能暂停**，否则升级会
+    /// 直接把用户已有任务变成「坏文件」；但它一被编辑保存就会收敛成一个目录。
+    pub fn ensure_one_root(&self) -> Result<()> {
+        if self.roots.len() > 1 {
+            return Err(Error::Io(format!(
+                "一个配对文件夹只能有一个 NAS 目录（一对一映射）：任务「{}」填了 {} 个（{}）。\
+                 要同步多个 NAS 目录，请分建多个任务（每个任务一个本地文件夹）。",
+                self.id,
+                self.roots.len(),
+                self.roots.join("、")
+            )));
+        }
+        Ok(())
+    }
+
+    /// 这个任务生效的**单个** NAS 目录（`roots` 为空 = 家目录，与旧行为一致）。
+    pub fn single_root(&self) -> String {
+        self.roots
+            .first()
+            .cloned()
+            .unwrap_or_else(|| crate::HOME_ROOT.to_string())
+    }
+
+    /// 本地文件夹的**比较键**：只做词法规范化（`.`/`..`/多余分隔符），
+    /// 不碰文件系统 —— 挂载点可能还不存在，`canonicalize` 会失败。
+    pub fn local_key(&self) -> PathBuf {
+        normalize_local(&self.mountpoint)
+    }
+
+    /// ★ 提交前的「目的地冲突」检查（**会拦保存**）：本地这一侧撞车。
+    ///
+    /// 两类：
+    /// 1. **本地文件夹相同** —— 两个任务挂同一个挂载点，必然互相踩；
+    /// 2. **本地文件夹嵌套** —— 外层挂载会把内层盖在下面（表现为内层目录消失）。
+    ///
+    /// 这是硬冲突：一提交就该被拒，别等挂上去才发现。
+    pub fn destination_conflicts_with(&self, other: &Task) -> Vec<String> {
+        let mut out = Vec::new();
+        if other.id == self.id {
+            return out;
+        }
+        let a = self.local_key();
+        let b = other.local_key();
+        if a == b {
+            out.push(format!(
+                "本地文件夹 {} 已经分配给任务「{}」（一个本地文件夹只能配一个 NAS 目录）",
+                a.display(),
+                other.id
+            ));
+        } else if a.starts_with(&b) || b.starts_with(&a) {
+            out.push(format!(
+                "本地文件夹 {} 与任务「{}」的 {} 互相嵌套（嵌套挂载会互相遮挡）",
+                a.display(),
+                other.id,
+                b.display()
+            ));
+        }
+        out
+    }
+
+    /// NAS 目录与别的任务重叠 —— **只提示、不拦**。
+    ///
+    /// 为什么不当错误：只读地把同一个 NAS 目录挂到两个本地文件夹是完全合理的用法
+    /// （`xtask/tests/m82-matrix.sh` 就靠这个建 t1/t2）。真正的风险是**两边都读写**，
+    /// 那由调用方决定怎么呈现；core 只负责把事实说清楚。
+    pub fn nas_overlaps_with(&self, other: &Task) -> Vec<String> {
+        let mut out = Vec::new();
+        if other.id == self.id {
+            return out;
+        }
+        // 空 roots 的语义是家目录，所以两边都走同一套归一化
+        let mine = crate::roots::normalize_roots(&self.roots);
+        let theirs = crate::roots::normalize_roots(&other.roots);
+        for r in &mine {
+            if theirs.iter().any(|t| t == r) {
+                out.push(format!(
+                    "NAS 目录 {r} 也配给了任务「{}」{}",
+                    other.id,
+                    if self.read_write && other.read_write {
+                        "（两个任务都是读写：同一个 NAS 目录被双向写会打架）"
+                    } else {
+                        "（只是提示；只读挂载通常没问题）"
+                    }
+                ));
+            }
+        }
+        out
+    }
+
+    /// 与一组已有任务比对：返回（**会拦保存的错误**，**只提示的警告**）。
+    ///
+    /// 调用方负责把「自己」从 `others` 里排除，或依赖 id 去重（同 id 直接跳过）。
+    pub fn conflict_report(&self, others: &[Task]) -> (Vec<String>, Vec<String>) {
+        let mut errors = Vec::new();
+        let mut warnings = Vec::new();
+        for o in others {
+            errors.extend(self.destination_conflicts_with(o));
+            warnings.extend(self.nas_overlaps_with(o));
+        }
+        (errors, warnings)
+    }
+
     pub fn load(paths: &ConfigPaths, id: &str) -> Result<Self> {
         if !Self::is_valid_id(id) {
             return Err(Error::Io(format!("任务 id 不合法：{id:?}")));
@@ -428,6 +541,28 @@ impl Task {
             None => String::new(),
         }
     }
+}
+
+/// 词法规范化本地路径（**不访问文件系统**）：去掉 `.`、就地消解 `..`、去掉结尾分隔符。
+///
+/// 只用于**比较**（目的地冲突检测）：挂载点在保存时可能还不存在，`canonicalize`
+/// 会失败；符号链接也不该影响「是不是同一个文件夹」的判断。
+pub fn normalize_local(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // 绝对路径到根就停（`/..` = `/`）；相对路径的 `..` 必须留着
+                if !out.pop() && !p.is_absolute() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// 任务目录里是否有任何任务文件（判断「用户是否已经用过任务模型」）。
@@ -662,7 +797,156 @@ mod tests {
             None,
         );
         t.normalize().unwrap();
+        // ⚠️ 结构性归一化**仍然允许多个根**：旧文件要读得出来（不然升级即坏文件）。
+        //    「一对一」是**创建/编辑**路径上的校验，见 `ensure_one_root`。
         assert_eq!(t.roots, vec!["/home".to_string(), "/Public".to_string()]);
+    }
+
+    // ------------------------------------------------------------ ★ 一对一 + 目的地冲突
+
+    #[test]
+    fn one_to_one_rejects_multiple_roots_but_allows_legacy_reads() {
+        let t = Task::from_mount(
+            Some("pair".into()),
+            PathBuf::from("/mnt"),
+            vec!["/home".into(), "/Public".into()],
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let e = t.ensure_one_root().unwrap_err().to_string();
+        assert!(e.contains("只能有一个 NAS 目录"), "{e}");
+        assert!(e.contains("/Public"), "错误里要说清是哪几个：{e}");
+
+        // 单根 / 空根（= 家目录）都放行
+        let one = Task::from_mount(
+            Some("pair".into()),
+            PathBuf::from("/mnt"),
+            vec!["/home".into()],
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(one.ensure_one_root().is_ok());
+        let none = Task::from_mount(
+            Some("pair".into()),
+            PathBuf::from("/mnt"),
+            vec![],
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(none.ensure_one_root().is_ok());
+        assert_eq!(none.single_root(), "/home", "空 roots 的语义 = 家目录");
+    }
+
+    fn mk(id: &str, mp: &str, root: &str) -> Task {
+        Task::from_mount(
+            Some(id.into()),
+            PathBuf::from(mp),
+            vec![root.into()],
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn destination_conflicts_are_detected() {
+        let mine = mk("a", "/home/user/qs", "/home");
+
+        // ① 本地文件夹相同 → 硬冲突
+        let same_local = mk("b", "/home/user/qs", "/Public");
+        let c = mine.destination_conflicts_with(&same_local);
+        assert_eq!(c.len(), 1, "{c:?}");
+        assert!(c[0].contains("本地文件夹") && c[0].contains("「b」"), "{c:?}");
+
+        // ② 本地文件夹嵌套（外层盖内层）→ 硬冲突
+        let nested = mk("b", "/home/user/qs/inner", "/Public");
+        let c = mine.destination_conflicts_with(&nested);
+        assert_eq!(c.len(), 1, "{c:?}");
+        assert!(c[0].contains("嵌套"), "{c:?}");
+
+        // ③ NAS 目录相同 → **只警告不拦**（m82 矩阵靠它建 t1/t2；只读挂载合法）
+        let same_remote = mk("b", "/home/user/other", "/home");
+        assert!(mine.destination_conflicts_with(&same_remote).is_empty());
+        let w = mine.nas_overlaps_with(&same_remote);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("NAS 目录 /home") && w[0].contains("「b」"), "{w:?}");
+
+        // 两个都读写时，警告里要说明「双写打架」
+        let mut rw = same_remote.clone();
+        rw.read_write = true;
+        let mut me_rw = mine.clone();
+        me_rw.read_write = true;
+        assert!(me_rw.nas_overlaps_with(&rw)[0].contains("双向写"), "{w:?}");
+        // 一读一写 → 只提示，不提双写
+        assert!(me_rw.nas_overlaps_with(&same_remote)[0].contains("只读挂载"));
+
+        // 自己跟自己不算冲突（编辑保存时最常见）
+        assert!(mine.destination_conflicts_with(&mine).is_empty());
+        assert!(mine.nas_overlaps_with(&mine).is_empty());
+        let (e, w2) = mine.conflict_report(&[mine.clone(), same_local.clone(), same_remote.clone()]);
+        assert_eq!(e.len(), 1, "两两比：只有 same_local 是硬冲突：{e:?}");
+        assert_eq!(w2.len(), 1, "只有 same_remote 是警告：{w2:?}");
+
+        // 互不打扰的另一个任务 → 干净
+        let ok = mk("c", "/home/user/other", "/Public");
+        let (e, w) = mine.conflict_report(&[ok]);
+        assert!(e.is_empty() && w.is_empty(), "{e:?} {w:?}");
+    }
+
+    #[test]
+    fn destination_conflicts_handle_dots_and_legacy_multi_root() {
+        // `/mnt/./x/..` 与 `/mnt` 是同一个文件夹（词法规范化，不碰文件系统）
+        let a = mk("a", "/mnt", "/home");
+        let b = mk("b", "/mnt/./x/..", "/Public");
+        let c = a.destination_conflicts_with(&b);
+        assert_eq!(c.len(), 1, "{c:?}");
+
+        // 空 roots（旧文件）= 家目录 → 与显式 /home 重叠（挂载点特意不嵌套，隔离出这一条）
+        let mut legacy = mk("b", "/srv/other", "/Public");
+        legacy.roots.clear();
+        let (e, w) = a.conflict_report(&[legacy]);
+        assert!(e.is_empty(), "挂载点不嵌套 → 没有目的地冲突：{e:?}");
+        assert_eq!(w.len(), 1, "空 roots 的语义是家目录，必须提示：{w:?}");
+
+        // 旧的多根任务：任一重叠都算 NAS 侧提示
+        let multi = Task::from_mount(
+            Some("b".into()),
+            PathBuf::from("/srv/other"),
+            vec!["/Public".into(), "/home".into()],
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let (e, w) = a.conflict_report(&[multi]);
+        assert!(e.is_empty());
+        assert_eq!(w.len(), 1, "多根任务里含 /home：{w:?}");
+    }
+
+    #[test]
+    fn normalize_local_is_lexical() {
+        assert_eq!(normalize_local(Path::new("/a/b/../c")), PathBuf::from("/a/c"));
+        assert_eq!(normalize_local(Path::new("/a/./b/")), PathBuf::from("/a/b"));
+        assert_eq!(normalize_local(Path::new("/")), PathBuf::from("/"));
+        assert_eq!(normalize_local(Path::new("a/../b")), PathBuf::from("b"));
+        assert_eq!(normalize_local(Path::new("../x")), PathBuf::from("../x"));
     }
 
     #[test]

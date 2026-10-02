@@ -179,12 +179,23 @@
             <label>本地文件夹（挂载点，绝对路径）
               <input type="text" id="t-mountpoint" class="mono" spellcheck="false">
             </label>
-            <label>NAS 上要同步的目录（每行一个）
-              <textarea id="t-roots" rows="2" class="mono" spellcheck="false" placeholder="/home">/home</textarea>
+            <label>NAS 文件夹（一对一映射）
+              <span class="select-row">
+                <select id="t-nas-folder" class="mono"></select>
+                <button type="button" class="mini" id="btn-nas-browse">浏览…</button>
+              </span>
             </label>
+            <label id="t-nas-manual-wrap" hidden>手动输入 NAS 路径
+              <input type="text" id="t-nas-manual" class="mono" spellcheck="false"
+                     placeholder="/home/.Qsync">
+            </label>
+            <p class="note" id="t-nas-legacy" hidden></p>
             <p class="hint">
-              就是 NAS 上的起点目录：<code>/home</code> = 家目录。要连共享文件夹再一行写一个
-              （如 <code>/Public</code>，默认只读）；写两行以上时挂载点顶层会多出每个目录的名字。
+              ★ **一对一**：本地文件夹 ⇄ 这**一个** NAS 文件夹；挂载点里**直接**就是它的内容，
+              不会再套一层目录名（NAS 选 <code>/home</code>，挂载点里就是家目录，不是
+              <code>挂载点/home</code>）。候选来自「NAS 上登记的 Qsync 同步文件夹」和已配置的
+              NAS 目录；选不到就点「浏览…」逐层挑，或选「手动输入」。要同步多个 NAS 文件夹
+              → 建多个任务（提交时会检查本地文件夹重复/嵌套、NAS 目录重复）。
             </p>
             <label>水合缓存目录（留空 = 默认 <code>~/.local/share/qxync/cache</code>）
               <input type="text" id="t-cache-dir" class="mono" spellcheck="false"
@@ -219,7 +230,7 @@
             <p class="hint">
               保存位置 <code>~/.config/qxync/tasks/&lt;id&gt;.json</code>；**只登记参数，不动 NAS 上的任何数据**。
               冲突策略与节省空间模式已经接到后端；选择性同步（勾选子文件夹）仍是 M9 的事，
-              现在用「多任务 / 每条任务配多个 NAS 目录」近似。
+              现在用「多任务」近似 —— **一个任务 = 一个配对文件夹（一对一）**。
             </p>
             <div class="btn-row">
               <button type="submit" id="btn-task-save" class="primary">保存任务</button>
@@ -872,6 +883,25 @@
       <button type="button" id="modal-ok" class="primary" data-i18n="modal.ok">确定</button>
       <button type="button" id="modal-cancel" data-i18n="modal.cancel">取消</button>
     </div>
+  </div>
+</div>
+
+<!-- ===================== NAS 文件夹选择器（一对一配对的 NAS 侧） ===================== -->
+<div id="nas-picker" class="modal" hidden>
+  <div class="modal-card modal-wide" role="dialog" aria-modal="true" aria-labelledby="nas-picker-title">
+    <h3 id="nas-picker-title" data-i18n="nas_picker.title">选择 NAS 文件夹</h3>
+    <p class="hint" data-i18n="nas_picker.hint">
+      逐层点开目录；「选择这个文件夹」= 把当前目录作为配对的那一个 NAS 目录。
+    </p>
+    <p class="mono" id="nas-picker-path">/home</p>
+    <div class="btn-row">
+      <button type="button" id="btn-nas-up" data-i18n="nas_picker.up">↑ 上级</button>
+      <button type="button" id="btn-nas-pick" class="primary" data-i18n="nas_picker.pick">选择这个文件夹</button>
+      <button type="button" id="btn-nas-cancel" data-i18n="modal.cancel">取消</button>
+      <span class="busy" id="nas-picker-busy" hidden data-i18n="busy.text">进行中…</span>
+    </div>
+    <ul class="plain-list mono" id="nas-picker-list"></ul>
+    <p class="empty-hint" id="nas-picker-empty" hidden data-state="ready"></p>
   </div>
 </div>
 

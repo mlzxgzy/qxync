@@ -311,6 +311,11 @@ still keys by remote path**. A single root is **passthrough** (the mount point *
 M1–M5 behaviour is unchanged down to the letter — `roots.rs` keeps a dedicated
 "a single root must still be passthrough" assertion guarding exactly this.
 
+> ★ A **paired folder** (a GUI task / `qxync task`) is **one-to-one**: one local folder ⇄ one NAS
+> folder, and the mount point *is* that NAS folder (no extra `home/` level). Multi-root mounts
+> live only on the `qxync mount --remote A --remote B` path and are **never registered as tasks**;
+> to sync several NAS folders, create several tasks.
+
 ## Known limitations
 
 * **The tray needs an SNI host**: qxync speaks `org.kde.StatusNotifierItem` (a ksni implementation,
@@ -519,6 +524,7 @@ xtask/tests/m6-matrix.sh              # 29 items (real multi-root mounts)
 xtask/tests/m7-matrix.sh              # 60 items (rules / FUSE filtering / LAN pairing·events·direct transfer)
 xtask/tests/m7-matrix.sh --no-nas     #    no NAS needed: unit tests + loopback between two real daemons
 xtask/tests/m82-matrix.sh             # 37 items (task registration / restart recovery)
+xtask/tests/pair-1to1.sh              # 15 items (one-to-one pairing + destination conflicts; no NAS needed)
 xtask/tests/m83-matrix.sh             # 27 items (journal schema migration / filtering / rotation)
 xtask/tests/m84-matrix.sh             # 92 items (settings / proxy / tray / free up space / conflict policy)
 xtask/tests/gui-matrix.sh             # 148 items (real-window screenshots of 9 destinations + ui_spec static self-check)

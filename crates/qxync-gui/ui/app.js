@@ -1141,15 +1141,254 @@
     });
   }
 
+  // ==================================================== ★ 一对一配对：NAS 文件夹选择
+  //
+  // 用户反馈（2026-10-02）：NAS 目录原来是个「每行一个」的 textarea，能填多个 →
+  // 挂载点被当成虚拟根，顶层多出一层目录名（本地 `/home/user/qsync` 里又出现 `home/`）。
+  // Qsync 的「配对文件夹」是**一对一**的，所以这里改成单选：
+  //   * 候选来自 daemon 的 `roots`（NAS 上登记的 Qsync 同步文件夹 + 已配置的 NAS 目录）；
+  //   * 选不到就「浏览…」逐层挑（复用文件页的 `ls`），或选「手动输入」；
+  //   * 保存时只写一个根 —— 多根会被 daemon 的 `tasks save` 直接拒掉。
+
+  var NAS_MANUAL = '__manual__';
+  var nas = { loaded: false, inflight: null, candidates: [] };
+
+  /**
+   * 从一份 `roots` 响应里提取候选项。
+   *
+   * `roots` 会去 NAS 上**真的列一遍每个根**（贵），所以：
+   *   * 任务表单只在**还没拿到过**候选时拉一次；
+   *   * 诊断页「NAS 目录」卡片每次刷新都会把同一份响应喂进来（不额外请求），
+   *     于是在那边刷新之后，表单里的候选也是新的。
+   */
+  function applyNasCandidates(data) {
+    var d = isObj(data) ? data : {};
+    var out = [];
+    var seen = {};
+    var push = function (path, label) {
+      var p = str(path).trim();
+      if (!p || seen[p]) { return; }
+      seen[p] = true;
+      out.push({ path: p, label: label });
+    };
+    var sf = (d.syncing_folders || []).filter(isObj);
+    for (var i = 0; i < sf.length; i++) {
+      // ★ client_path 是映射好的**客户端路径**（/share/homes/<user>/x → /home/x）；
+      //   映射不出来就不当候选（宁可不给，也不猜一个挂载不了的 NAS 路径）。
+      var cp = str(sf[i].client_path).trim();
+      if (!cp) { continue; }
+      push(cp, T('task.nas_syncing_folder') + '：' + (str(sf[i].folder) || cp) + '（' + cp + '）');
+    }
+    var cfg = (d.configured || []).filter(function (x) { return str(x); });
+    for (var j = 0; j < cfg.length; j++) {
+      push(str(cfg[j]), T('task.nas_configured') + '：' + str(cfg[j]));
+    }
+    nas.candidates = out;
+    nas.loaded = true;
+  }
+
+  /** 拿候选：已经有就直接重画（不重复请求 NAS），没有才走一次 `roots`。 */
+  function loadNasCandidates() {
+    if (nas.inflight) { return nas.inflight; }
+    if (nas.loaded) {
+      var sel0 = $('t-nas-folder');
+      renderNasFolderSelect(nasSelectCurrent(), !!sel0 && sel0.value === NAS_MANUAL);
+      return Promise.resolve(null);
+    }
+    nas.inflight = ipc({ method: 'roots' }).then(function (r) {
+      nas.inflight = null;
+      if (r.ok) { applyNasCandidates(r.data); } else { nas.candidates = []; }
+      // 候选是异步到的：**保留用户当前选中的值/模式**（可能是正在编辑的任务根）
+      var sel = $('t-nas-folder');
+      renderNasFolderSelect(nasSelectCurrent(), !!sel && sel.value === NAS_MANUAL);
+      return r;
+    }, function (e) {
+      nas.inflight = null;
+      throw e;
+    });
+    return nas.inflight;
+  }
+
+  function nasSelectCurrent() {
+    var sel = $('t-nas-folder');
+    if (!sel) { return ''; }
+    if (sel.value === NAS_MANUAL) {
+      return str($('t-nas-manual') ? $('t-nas-manual').value : '').trim();
+    }
+    return str(sel.value).trim();
+  }
+
+  /** 重建下拉：家目录 + 候选项 + 当前值（不在候选里也要能选出来）+ 手动输入。 */
+  function renderNasFolderSelect(current, manualMode) {
+    var sel = $('t-nas-folder');
+    if (!sel) { return; }
+    var cur = str(current).trim();
+    clear(sel);
+    var add = function (value, label) {
+      var o = el('option', null, label);
+      o.value = value;
+      sel.appendChild(o);
+    };
+    add('/home', T('task.nas_home'));
+    var known = cur === '/home';
+    for (var i = 0; i < nas.candidates.length; i++) {
+      var c = nas.candidates[i];
+      if (c.path === '/home') { continue; }
+      if (c.path === cur) { known = true; }
+      add(c.path, c.label);
+    }
+    if (cur && !known) { add(cur, cur); }
+    add(NAS_MANUAL, T('task.nas_manual'));
+    if (manualMode) {
+      // 候选是异步到的：用户正停在「手动输入」上，就别把他弹回列表
+      sel.value = NAS_MANUAL;
+    } else {
+      sel.value = cur || '/home';
+      if (str(sel.value) !== (cur || '/home')) { sel.value = '/home'; }
+    }
+    syncNasManual();
+  }
+
+  function syncNasManual() {
+    var sel = $('t-nas-folder');
+    var wrap = $('t-nas-manual-wrap');
+    if (!sel || !wrap) { return; }
+    var manual = sel.value === NAS_MANUAL;
+    wrap.hidden = !manual;
+    if (manual) {
+      var inp = $('t-nas-manual');
+      if (inp) { inp.focus(); }
+    }
+  }
+
+  function nasSelectedPath() {
+    var sel = $('t-nas-folder');
+    if (!sel) { return ''; }
+    if (sel.value === NAS_MANUAL) {
+      return str($('t-nas-manual') ? $('t-nas-manual').value : '').trim();
+    }
+    return str(sel.value).trim();
+  }
+
+  /** 表单填值入口（打开新表单 / 编辑已有任务都走这里）。 */
+  function setNasFolder(path, legacyRoots) {
+    var p = str(path).trim();
+    var inp = $('t-nas-manual');
+    if (inp) { inp.value = p; }
+    renderNasFolderSelect(p);
+    var legacy = $('t-nas-legacy');
+    if (legacy) {
+      if (legacyRoots && legacyRoots.length > 1) {
+        legacy.hidden = false;
+        legacy.textContent = T('task.nas_legacy_multi', {
+          roots: legacyRoots.join('、'),
+          keep: str(legacyRoots[0])
+        });
+      } else {
+        legacy.hidden = true;
+        legacy.textContent = '';
+      }
+    }
+  }
+
+  // ---------------------------------------------------- ★ NAS 文件夹浏览器（逐层挑）
+  var nasPicker = { dir: '', inflight: null };
+
+  function openNasPicker() {
+    var box = $('nas-picker');
+    if (!box) { return; }
+    box.hidden = false;
+    // 从「当前选中的 NAS 路径」开始浏览；手动输入模式下就是那一格里填的路径
+    loadNasPickerDir(nasSelectedPath() || '/home');
+  }
+
+  function closeNasPicker() {
+    var box = $('nas-picker');
+    if (box) { box.hidden = true; }
+  }
+
+  function loadNasPickerDir(path) {
+    var p = str(path).trim() || '/home';
+    var busy = $('nas-picker-busy');
+    if (busy) { busy.hidden = false; }
+    nasPicker.dir = p;
+    setText('nas-picker-path', p);
+    clear($('nas-picker-list'));
+    setListState('nas-picker-empty', 'loading', T('nas_picker.loading'));
+    nasPicker.inflight = ipc({ method: 'ls', path: p }).then(function (r) {
+      nasPicker.inflight = null;
+      var b = $('nas-picker-busy');
+      if (b) { b.hidden = true; }
+      if (!r.ok) {
+        setListState('nas-picker-empty', 'error', T('list.error', { msg: str(r.error) }));
+        return r;
+      }
+      var d = isObj(r.data) ? r.data : {};
+      nasPicker.dir = str(d.path || p);
+      setText('nas-picker-path', nasPicker.dir);
+      var dirs = (d.entries || []).filter(function (e) { return isObj(e) && e.isfolder === true; });
+      dirs.sort(function (a, b) { return str(a.filename).localeCompare(str(b.filename)); });
+      renderNasPickerList(dirs);
+      return r;
+    });
+    return nasPicker.inflight;
+  }
+
+  function renderNasPickerList(dirs) {
+    var ul = $('nas-picker-list');
+    if (!ul) { return; }
+    clear(ul);
+    if (!dirs.length) {
+      setListState('nas-picker-empty', 'empty', T('nas_picker.empty'));
+      return;
+    }
+    setListState('nas-picker-empty', 'ready');
+    for (var i = 0; i < dirs.length; i++) {
+      (function (name) {
+        var full = pathJoin(nasPicker.dir, name);
+        var li = el('li', null, '📁 ' + name);
+        li.tabIndex = 0;
+        li.setAttribute('role', 'button');
+        var go = function () { loadNasPickerDir(full); };
+        li.addEventListener('click', go);
+        li.addEventListener('keydown', function (ev) {
+          if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); go(); }
+        });
+        ul.appendChild(li);
+      })(str(dirs[i].filename));
+    }
+  }
+
+  function pickNasFolder() {
+    var p = nasPicker.dir;
+    closeNasPicker();
+    if (p) { setNasFolder(p, null); }
+  }
+
+  function resetTaskForm() {
+    var set = function (id, v) { var n = $(id); if (n) { n.value = v; } };
+    var chk = function (id, v) { var n = $(id); if (n) { n.checked = !!v; } };
+    set('t-id', 'default');
+    set('t-mountpoint', (str(state.home) || '~') + '/qxync-mnt');
+    set('t-cache-dir', '');
+    set('t-cache-mode', 'pagecache');
+    set('t-conflict', 'rename_local');
+    set('t-direction', '2way');
+    chk('t-space-saving', false);
+    chk('t-smart-delete', false);
+    chk('t-read-write', false);
+    chk('t-do-mount', true);
+    setNasFolder('/home', null);
+    setText('task-form-title', '文件夹对设置');
+  }
+
   function openTaskForm() {
     var card = $('task-form-card');
     if (!card) { return; }
-    var mp = $('t-mountpoint');
-    if (mp && !mp.value) {
-      mp.value = (str(state.home) || '~') + '/qxync-mnt';
-    }
+    resetTaskForm();
     card.hidden = false;
     card.scrollIntoView({ block: 'nearest' });
+    loadNasCandidates();
     var idEl = $('t-id');
     if (idEl) { idEl.focus(); }
   }
@@ -1162,7 +1401,6 @@
     var chk = function (id, v) { var n = $(id); if (n) { n.checked = !!v; } };
     set('t-id', str(t.id));
     set('t-mountpoint', str(t.mountpoint));
-    set('t-roots', (t.roots && t.roots.length) ? t.roots.join('\n') : '');
     set('t-cache-dir', t.cache_dir ? str(t.cache_dir) : '');
     set('t-cache-mode', str(t.cache_mode) || 'pagecache');
     set('t-conflict', str(t.conflict) || 'rename_local');
@@ -1171,9 +1409,13 @@
     chk('t-smart-delete', t.smart_delete === true);
     chk('t-read-write', t.read_write === true);
     chk('t-do-mount', t.enabled !== false);
+    // ★ 一对一：NAS 侧只保留一个目录；旧的多根任务给明确提示（保存即收敛）
+    var roots = (t.roots || []).filter(function (x) { return str(x); });
+    setNasFolder(roots.length ? str(roots[0]) : '', roots);
     setText('task-form-title', '文件夹对设置 · ' + str(t.id));
     card.hidden = false;
     card.scrollIntoView({ block: 'nearest' });
+    loadNasCandidates();
   }
 
   function closeTaskForm() {
@@ -1190,7 +1432,13 @@
       renderError('task-result', '参数错误', '本地文件夹（挂载点）不能为空');
       return Promise.resolve(null);
     }
-    var roots = parseRootLines('t-roots');
+    // ★ 一对一：NAS 侧**一个**目录（下拉 / 浏览 / 手输，三选一）
+    var nasPath = nasSelectedPath();
+    if (!nasPath) {
+      renderError('task-result', '参数错误',
+        'NAS 文件夹不能为空：一个配对文件夹 = 一个本地文件夹 + 一个 NAS 文件夹');
+      return Promise.resolve(null);
+    }
     var cdir = str($('t-cache-dir') ? $('t-cache-dir').value : '').trim();
     var task = {
       id: id,
@@ -1198,7 +1446,7 @@
       enabled: true,
       mountpoint: mp,
       cache_dir: cdir ? cdir : null,
-      roots: roots,
+      roots: [nasPath],
       read_write: isOn('t-read-write', false),
       cache_mode: str($('t-cache-mode') ? $('t-cache-mode').value : 'pagecache') || 'pagecache',
       auto_unmount: true,
@@ -1209,20 +1457,27 @@
       space_saving: isOn('t-space-saving', false),
       smart_delete: isOn('t-smart-delete', false)
     };
+    var rows = [
+      ['id', id], ['本地', mp],
+      ['NAS（一对一）', nasPath],
+      ['缓存目录', cdir || '（默认 ~/.local/share/qxync/cache）'],
+      ['冲突策略', conflictLabel(task.conflict)]
+    ];
     return withBusy({ spinners: ['task-busy'], buttons: ['btn-task-save'] }, function () {
       return ipc({ method: 'tasks', action: 'save', task: task });
     }).then(function (r) {
       if (!r.ok) {
+        // daemon 的「目的地冲突 / 一对一」错误原样展示（它已经是人话了）
         renderError('task-result', '保存任务失败', str(r.error));
         return r;
       }
+      // ★ daemon 的 NAS 侧提示（同一 NAS 目录被别的任务用了）—— 只提示，不拦保存
+      var warns = (isObj(r.data) && r.data.warnings) ? r.data.warnings : [];
+      for (var wi = 0; wi < warns.length; wi++) {
+        if (str(warns[wi])) { rows.push(['⚠️ 提示', str(warns[wi])]); }
+      }
       if (!isOn('t-do-mount', true)) {
-        renderResult('task-result', true, '任务已保存（未挂载）', [
-          ['id', id], ['本地', mp],
-          ['NAS', roots.length ? roots.join(', ') : '（由 link 决定）'],
-          ['缓存目录', cdir || '（默认 ~/.local/share/qxync/cache）'],
-          ['冲突策略', conflictLabel(task.conflict)]
-        ]);
+        renderResult('task-result', true, '任务已保存（未挂载）', rows);
         refreshTasks();
         return r;
       }
@@ -1230,14 +1485,8 @@
         return ipc({ method: 'tasks', action: 'resume', id: id });
       }).then(function (r2) {
         var okMount = r2.ok;
-        renderResult('task-result', okMount, okMount ? '任务已保存并挂载' : '任务已保存，但挂载失败', [
-          ['id', id],
-          ['本地', mp],
-          ['NAS', roots.length ? roots.join(', ') : '（由 link 决定）'],
-          ['缓存目录', cdir || '（默认 ~/.local/share/qxync/cache）'],
-          ['冲突策略', conflictLabel(task.conflict)],
-          ['挂载', okMount ? '成功' : str(r2.error)]
-        ]);
+        renderResult('task-result', okMount, okMount ? '任务已保存并挂载' : '任务已保存，但挂载失败',
+          rows.concat([['挂载', okMount ? '成功' : str(r2.error)]]));
         refreshTasks();
         refreshStatus(true);
         return r2;
@@ -1561,6 +1810,9 @@
     var list = $('roots-list');
     var folders = $('roots-folders');
     if (!list) { return; }
+    // ★ 同一份响应顺手喂给「配对文件夹」的 NAS 候选（不额外请求 NAS）：
+    //   在诊断页点过刷新之后，任务表单里的下拉也是新的。
+    applyNasCandidates(data);
     clear(list);
     clear(folders);
     clear($('roots-summary-kv'));
@@ -1605,7 +1857,13 @@
     else { setListState('roots-folders-empty', 'empty', T('roots.folders_empty')); }
     for (var j = 0; j < sf.length; j++) {
       var f = sf[j];
-      var txt = str(f.folder) + ' · permission=' + str(f.permission) +
+      // ★ 真机字段是 name/path/privilege；`client_path` 是按 home_root 映射好的可用路径。
+      //   没有 client_path 说明映射不出来（别把它当成能挂的目录）。
+      var usable = str(f.client_path).trim();
+      var raw = str(f.path).trim() || str(f.realpath).trim();
+      var txt = str(f.folder) + ' · ' +
+        (usable ? usable : '（不可映射：' + (raw || '?') + '）') +
+        ' · 权限=' + str(f.permission) +
         (f.read_deletable === true ? ' · 可删' : '');
       folders.appendChild(el('li', null, txt));
     }
@@ -3710,6 +3968,23 @@
     on('btn-tasks-refresh', 'click', function () { refreshTasks(); });
     on('btn-tasks-add', 'click', function () { openTaskForm(); });
     on('btn-task-cancel', 'click', function () { closeTaskForm(); });
+    // ★ 一对一配对：NAS 文件夹下拉 / 浏览 / 选择器
+    on('btn-nas-browse', 'click', function () { openNasPicker(); });
+    on('btn-nas-up', 'click', function () { loadNasPickerDir(pathParent(nasPicker.dir || '/home')); });
+    on('btn-nas-pick', 'click', function () { pickNasFolder(); });
+    on('btn-nas-cancel', 'click', function () { closeNasPicker(); });
+    var nasSel = $('t-nas-folder');
+    if (nasSel) { nasSel.addEventListener('change', function () { syncNasManual(); }); }
+    var nasBox = $('nas-picker');
+    if (nasBox) {
+      // 点遮罩 / Esc 关掉（列表项可聚焦，所以 Esc 在键盘浏览时也能用）
+      nasBox.addEventListener('click', function (ev) {
+        if (ev.target === nasBox) { closeNasPicker(); }
+      });
+      nasBox.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Escape') { ev.preventDefault(); closeNasPicker(); }
+      });
+    }
     var ft = $('form-task');
     if (ft) {
       ft.addEventListener('submit', function (ev) {

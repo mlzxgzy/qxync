@@ -1165,8 +1165,8 @@ impl Client {
 // ------------------------------------------------------- M6 同步文件夹列表
 //
 // `GET /cgi-bin/qsync/qsyncsrv.cgi?func=qbox_get_syncing_folder_list&sid=…`（新命名空间）。
-// 真机实测（用户 test1）响应原文：
-// `{"total": 0, "client_key": "754879e7…", "folder" :[]}` —— **端点可用，但该账号没有登记
+// 真机实测（用户 test1）响应原文（`client_key` 已脱敏）：
+// `{"total": 0, "client_key": "<redacted>", "folder" :[]}` —— **端点可用，但该账号没有登记
 // 任何 Qsync 同步文件夹**。所以「空列表」是正常状态，绝不报错。
 
 impl Client {
@@ -1176,7 +1176,10 @@ impl Client {
     /// 或带上非成功 `status` 时才回 `Err`。复用 core 的
     /// [`qxync_core::ipc::SyncingFolderInfo`]，不另造类型。
     pub async fn syncing_folders(&self) -> Result<Vec<qxync_core::ipc::SyncingFolderInfo>> {
-        let body = self.qsync_func("qbox_get_syncing_folder_list", &[]).await?;
+        // ★ `detail=1` 与官方客户端一致（2026-10-02 HAR 抓到的就是这个请求）。
+        let body = self
+            .qsync_func("qbox_get_syncing_folder_list", &[("detail", "1")])
+            .await?;
         let v: serde_json::Value = serde_json::from_slice(&body)
             .map_err(|e| Error::Parse(format!("qbox_get_syncing_folder_list 非 JSON: {e}")))?;
         // 真机正常响应里没有 `status`；一旦出现且非成功就按协议错误处理。
@@ -1185,17 +1188,44 @@ impl Client {
                 return Err(Error::status(s, "qbox_get_syncing_folder_list"));
             }
         }
-        Ok(parse_syncing_folders(&v))
+        let mut items = parse_syncing_folders(&v);
+        // ★ 把 NAS 共享路径换算成客户端路径（`/share/homes/test1/.Qsync` → `/home/.Qsync`）：
+        //   选 NAS 文件夹时要用的是**客户端能 get_list 的路径**，不是共享路径。
+        let home_root = self.link.home_root.clone();
+        let user = self.link.user.clone();
+        for it in items.iter_mut() {
+            it.client_path = qxync_core::client_path_from_share(
+                it.path.as_deref().unwrap_or(""),
+                it.realpath.as_deref(),
+                &home_root,
+                &user,
+            );
+        }
+        Ok(items)
     }
 }
 
 /// 解析 `qbox_get_syncing_folder_list` 的 JSON（纯函数，便于离线单测）。
 ///
-/// 容错要点（真机实测 + 报告 §4.2 的宽松字段表）：
-/// * `folder` 可能是数组，也可能**缺失 / 是 `null` / 类型不对** → 一律当**空列表**，
+/// ★ 真机形状（2026-10-02 HAR，`detail=1`，用户 test1）：
+///
+/// ```json
+/// { "total": 1, "folder": [ { "name": "Qsync", "privilege": 2,
+///     "path": "/share/homes/test1/.Qsync",
+///     "realpath": "/share/CACHEDEV1_DATA/homes/test1/.Qsync", … } ] }
+/// ```
+///
+/// 也就是说**外层**数组叫 `folder`，而每一项里的名字字段叫 `name`、权限叫 `privilege`、
+/// 路径叫 `path` —— 早期实现按 `folder` / `permission` 去读项内字段，遇到真有内容的
+/// 响应会解析出「空名字 + 0 权限」，正好把「能列举」判成了「列举不出来」。
+/// 现在两种拼法都认（真机字段优先）。
+///
+/// 其他容错要点（真机实测 + 报告 §4.2 的宽松字段表）：
+/// * 外层 `folder` 可能**缺失 / 是 `null` / 类型不对** → 一律当**空列表**，
 ///   「没配对」是正常状态，不报错；`"folder" :[]`（冒号前空格）由 `serde_json` 自行容错；
-/// * `permission` / `read_deletable` 可能是数字或字符串 → 宽松解析（`"3"` / `"1"` 都认）；
-/// * `realpath` / `volume_id`（别名 `vol_id`）的**空串当作 `None`**；
+/// * `privilege` / `permission` / `read_deletable` 可能是数字或字符串 → 宽松解析
+///   （`"3"` / `"1"` 都认）；
+/// * `path` / `realpath` / `volume_id`（别名 `vol_id`）的**空串当作 `None`**；
 /// * `total` 与数组长度不一致**不报错**，以数组为准（`total` 只是提示）；
 /// * 数组里的非对象条目直接跳过。
 pub fn parse_syncing_folders(raw: &serde_json::Value) -> Vec<qxync_core::ipc::SyncingFolderInfo> {
@@ -1212,13 +1242,22 @@ pub fn parse_syncing_folders(raw: &serde_json::Value) -> Vec<qxync_core::ipc::Sy
                     .filter(|s| !s.is_empty())
                     .map(str::to_string)
             };
+            let i = |k: &str| -> Option<i64> { obj.get(k).and_then(json_i64) };
             Some(qxync_core::ipc::SyncingFolderInfo {
-                folder: s("folder").unwrap_or_default(),
-                permission: obj.get("permission").and_then(json_i64).unwrap_or(0),
+                // 真机 `name`（展示名，如 `Qsync`）；老拼法 `folder` 兼容
+                folder: s("name").or_else(|| s("folder")).unwrap_or_default(),
+                path: s("path"),
+                // `client_path` 由 `syncing_folders()` 按 link 的 home_root/user 填
+                client_path: None,
+                // 真机 `privilege`；老拼法 `permission` 兼容
+                permission: i("privilege").or_else(|| i("permission")).unwrap_or(0),
                 read_deletable: obj.get("read_deletable").map(json_bool).unwrap_or(false),
                 realpath: s("realpath"),
-                // 报告 §4.2 里同一字段有 `volume_id` / `vol_id` 两种拼法
-                volume_id: s("volume_id").or_else(|| s("vol_id")),
+                // 报告 §4.2 里同一字段有 `volume_id` / `vol_id` 两种拼法；
+                // ★ 真机是**数字** `1`（卷 id），所以要再兜一层数字→字符串
+                volume_id: s("volume_id")
+                    .or_else(|| s("vol_id"))
+                    .or_else(|| i("volume_id").or_else(|| i("vol_id")).map(|n| n.to_string())),
             })
         })
         .collect()
@@ -1557,8 +1596,9 @@ mod tests {
 
     #[test]
     fn syncing_folders_empty_real_response() {
-        // ★ 真机原文。注意 `"folder" :[]` 冒号前有空格 —— serde_json 本身就容错。
-        let raw = r#"{ "total": 0, "client_key": "754879e7da2632f22eef398e885d0467de50d9629cc1529b6c1dbe29cccb6999", "folder" :[]}"#;
+        // ★ 真机原文（`client_key` 已脱敏；省略号处是没抄进来的字段）。
+        //   注意 `"folder" :[]` 冒号前有空格 —— serde_json 本身就容错。
+        let raw = r#"{ "total": 0, "client_key": "<redacted>", "folder" :[]}"#;
         let v: serde_json::Value = serde_json::from_str(raw).unwrap();
         assert!(
             parse_syncing_folders(&v).is_empty(),
@@ -1576,6 +1616,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(raw).unwrap();
         let f = parse_syncing_folders(&v);
         assert_eq!(f.len(), 1);
+        // 老拼法：项内 `folder` 当展示名
         assert_eq!(f[0].folder, "/share/Photos");
         assert_eq!(f[0].permission, 3);
         assert!(f[0].read_deletable, "字符串 \"1\" 也必须算真");
@@ -1584,6 +1625,30 @@ mod tests {
             Some("/share/CACHEDEV1_DATA/Photos")
         );
         assert_eq!(f[0].volume_id.as_deref(), Some("ce_cachedev1"));
+    }
+
+    /// ★ 真机响应原文（2026-10-02 reqable HAR，`detail=1`）。
+    ///
+    /// **字段名与类型逐字照抄**（这正是回归点：真机是 `name`/`path`/`privilege`，不是
+    /// `folder`/`permission`）；`client_key` 与卷容量这类跟这台 NAS 绑定的数值**已脱敏**，
+    /// 换成中性值，类型不变。
+    ///
+    /// 这条测试是**回归闸门**：早期实现按项内 `folder`/`permission` 读，遇到这个响应
+    /// 会得到「名字空 + 权限 0」，于是「NAS 明明登记了同步文件夹」在界面上显示成空。
+    #[test]
+    fn syncing_folders_real_machine_response_is_not_lost() {
+        let raw = r#"{ "client_key": "<redacted>", "total": 1, "admingroup": 0, "folder": [ { "name": "Qsync", "fkey": "", "privilege": 2, "path": "/share/homes/test1/.Qsync", "realpath": "/share/CACHEDEV1_DATA/homes/test1/.Qsync", "read_deletable": 0, "iconCls": "folder", "enc": 0, "lock": 0, "volume_id": 1, "used_unit": "Byte", "used_size": "0", "capacity_unit": "GB", "capacity": 1, "free_size": 0, "volume_status": 0, "volume_encrypt": 0, "volume_lock": 0, "volume_name": "vol", "raid_level": 5, "raid_disk_cnt": 4, "pool_id": 1, "pool_name": "pool", "raid_count": 1, "raid_id1": 5, "pool_capacity": "1.00 TB", "pool_status": 0, "max_item_limit": 2000 } ] }"#;
+        let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let f = parse_syncing_folders(&v);
+        assert_eq!(f.len(), 1, "真机 total=1，必须解析出 1 条");
+        assert_eq!(f[0].folder, "Qsync", "展示名取真机 `name`");
+        assert_eq!(f[0].permission, 2, "权限取真机 `privilege`（数字）");
+        assert_eq!(f[0].path.as_deref(), Some("/share/homes/test1/.Qsync"));
+        assert_eq!(
+            f[0].realpath.as_deref(),
+            Some("/share/CACHEDEV1_DATA/homes/test1/.Qsync")
+        );
+        assert_eq!(f[0].volume_id.as_deref(), Some("1"), "数字型 volume_id 也认");
     }
 
     #[test]

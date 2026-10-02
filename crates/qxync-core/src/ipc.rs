@@ -671,10 +671,20 @@ pub struct RootInfo {
 }
 
 /// ★ M6：`qbox_get_syncing_folder_list` 的一项（NAS 侧登记的 Qsync 同步文件夹）。
+///
+/// ★ 真机字段（2026-10-02 HAR，`detail=1`）是 `name` / `path` / `privilege` /
+/// `realpath`，**不是** `folder` / `permission`：解析在 `qxync-client`（两边都认）。
+/// 早期单测是照着想象的形状写的，真机从没跑到过「有内容」的响应。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SyncingFolderInfo {
+    /// 同步文件夹的**展示名**（真机 `name`，如 `Qsync`；老字段 `folder` 也认）。
     pub folder: String,
+    /// NAS 上报的**共享路径**（真机 `path`，如 `/share/homes/test1/.Qsync`）。
+    pub path: Option<String>,
+    /// ★ 映射成**客户端可见路径**（如 `/home/.Qsync`）—— 由 `qxync-client` 按
+    /// `home_root` + 用户名换算；映射不出来时为 `None`（GUI 就别把它当选项目）。
+    pub client_path: Option<String>,
     pub permission: i64,
     pub read_deletable: bool,
     pub realpath: Option<String>,

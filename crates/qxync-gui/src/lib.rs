@@ -733,3 +733,29 @@ fn init_logging() {
         .with(file_layer)
         .init();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ★ UI 静态合规性（`ui_spec`）必须是绿的。
+    ///
+    /// 这一条把「改界面忘了补文案键 / 用 innerHTML 拼外部字符串 / 四态与无障碍标记丢了」
+    /// 变成 `cargo test -p qxync-gui` 就能拦住的失败 —— 不用起窗口，也不用真机 NAS
+    /// （`--self-test` 那条路需要 daemon，这里只扫 `include_str!` 进来的这一份资源）。
+    #[test]
+    fn ui_spec_is_green() {
+        let s = ui_spec();
+        let i18n = &s["i18n"];
+        assert!(
+            i18n["missing_used"].as_array().is_some_and(|a| a.is_empty()),
+            "app.js 里 T('key') 用到的键必须在 ZH 表里：{i18n:#}"
+        );
+        assert!(
+            i18n["missing_dom"].as_array().is_some_and(|a| a.is_empty()),
+            "index.html 的 data-i18n 键必须在 ZH 表里：{i18n:#}"
+        );
+        assert_eq!(s["html_sinks"].as_array().map(Vec::len), Some(0));
+        assert_eq!(s["ok"], serde_json::Value::Bool(true), "ui_spec: {s:#}");
+    }
+}

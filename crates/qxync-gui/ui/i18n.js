@@ -125,7 +125,13 @@
     'task.badge_paused': '已暂停',
     'task.badge_unmounted': '未挂载',
     'task.badge_mounted': '已挂载',
-    'task.badge_multi_root': '多个目录',
+    'task.badge_multi_root': '多个目录（旧格式）',
+    // ★ 一对一配对：NAS 文件夹下拉 / 浏览
+    'task.nas_home': '家目录（/home）',
+    'task.nas_manual': '手动输入 / 其他路径…',
+    'task.nas_syncing_folder': 'NAS 同步文件夹',
+    'task.nas_configured': '已配置的 NAS 目录',
+    'task.nas_legacy_multi': '⚠️ 这个任务是旧格式：登记了多个 NAS 目录（{roots}）。一对一映射只保留第一个（{keep}）；保存后即收敛。',
     'task.act_resume': '继续',
     'task.act_pause': '暂停',
     'task.act_mount': '挂载',
@@ -197,6 +203,13 @@
     'modal.title': '输入',
     'modal.ok': '确定',
     'modal.cancel': '取消',
+    // ★ NAS 文件夹选择器（一对一配对）
+    'nas_picker.title': '选择 NAS 文件夹',
+    'nas_picker.hint': '逐层点开目录；「选择这个文件夹」= 把当前目录作为配对的那一个 NAS 目录。',
+    'nas_picker.up': '↑ 上级',
+    'nas_picker.pick': '选择这个文件夹',
+    'nas_picker.loading': '正在读取 NAS 目录…',
+    'nas_picker.empty': '这个目录下没有子文件夹。',
     'busy.text': '进行中…',
 
     // ---- 行右键菜单（节省空间模式）
