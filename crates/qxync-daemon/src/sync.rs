@@ -14,16 +14,16 @@
 
 use anyhow::Result;
 use qxync_client::{write_action, Client};
+use qxync_core::rules::{HideReason, Rules};
 use qxync_core::store::{Store, DB_FILE};
 use qxync_core::sync::{
     conflict_name, conflict_name_with_seq, decide, is_log_missing, map_event_path, Baseline,
     Cursors, Decision, DeleteProtection, LocalSig, Sig, DEFAULT_LOG_BATCH,
 };
-use qxync_core::{Error as CoreError, MaxLog};
-use qxync_core::rules::{HideReason, Rules};
 use qxync_core::tasks::{
     CONFLICT_ASK, CONFLICT_RENAME_REMOTE, CONFLICT_REPLACE_LOCAL, CONFLICT_REPLACE_REMOTE,
 };
+use qxync_core::{Error as CoreError, MaxLog};
 use qxync_fuse::upload::UploadQueue;
 use qxync_fuse::LocalView;
 use std::collections::{BTreeMap, BTreeSet};
@@ -302,7 +302,17 @@ pub async fn poll_once(
                             uids.push(u.clone());
                         }
                     }
-                    apply_event(client, views, ev, cfg, user, &mut baseline, &mut report, store).await;
+                    apply_event(
+                        client,
+                        views,
+                        ev,
+                        cfg,
+                        user,
+                        &mut baseline,
+                        &mut report,
+                        store,
+                    )
+                    .await;
                 }
                 stats.record_devices(&uids);
                 for u in uids {
@@ -486,7 +496,17 @@ async fn apply_event(
         let local = local_sig(view, &path);
         let base = baseline.get(&path);
         let d = decide(&local, &base, &remote);
-        apply_decision(client, view, &path, d, remote, baseline, report, state_store).await;
+        apply_decision(
+            client,
+            view,
+            &path,
+            d,
+            remote,
+            baseline,
+            report,
+            state_store,
+        )
+        .await;
         return;
     }
     report.events_skipped += 1;
@@ -808,7 +828,14 @@ async fn resolve_conflict(
     match policy {
         // ---- 用 NAS 上的文件替换本地（本地那份**丢**，UI 有显式警告）
         CONFLICT_REPLACE_LOCAL => {
-            replace_local_with_remote(view, path, remote, baseline, report, "用 NAS 上的文件替换本地文件");
+            replace_local_with_remote(
+                view,
+                path,
+                remote,
+                baseline,
+                report,
+                "用 NAS 上的文件替换本地文件",
+            );
         }
         // ---- 用本地文件替换 NAS 上的（远端那份**丢**）
         CONFLICT_REPLACE_REMOTE => {
@@ -866,11 +893,19 @@ async fn resolve_conflict(
                     finish_decision(state_store, path);
                 }
                 Some("keep_remote") => {
-                    replace_local_with_remote(view, path, remote, baseline, report, "按用户裁决：保留 NAS 上的");
+                    replace_local_with_remote(
+                        view,
+                        path,
+                        remote,
+                        baseline,
+                        report,
+                        "按用户裁决：保留 NAS 上的",
+                    );
                     finish_decision(state_store, path);
                 }
                 Some("keep_both") => {
-                    rename_local_copy(client, view, path, remote, baseline, report, local.mtime).await;
+                    rename_local_copy(client, view, path, remote, baseline, report, local.mtime)
+                        .await;
                     finish_decision(state_store, path);
                 }
                 _ => {
@@ -1565,8 +1600,16 @@ mod tests {
         {
             let g = store.lock().unwrap();
             g.save_all().unwrap();
-            assert!(g.db_path().exists(), "状态库必须存在: {}", g.db_path().display());
-            assert_eq!(g.store.integrity_check().unwrap(), "ok", "integrity_check 必须是 ok");
+            assert!(
+                g.db_path().exists(),
+                "状态库必须存在: {}",
+                g.db_path().display()
+            );
+            assert_eq!(
+                g.store.integrity_check().unwrap(),
+                "ok",
+                "integrity_check 必须是 ok"
+            );
             assert_eq!(
                 g.store.baseline_len().unwrap() as usize,
                 g.baseline.len(),
@@ -1614,7 +1657,10 @@ mod tests {
         assert!(mv.hidden("/home/secret/deep/x.bin", false).is_some());
         assert!(mv.hidden("/home/a.crdownload", false).is_some(), "临时文件");
         assert!(mv.hidden("/home/qxync-test/hello.txt", false).is_none());
-        assert!(mv.hidden(HOME_ROOT, true).is_none(), "根目录是视图本身，不能被隐藏");
+        assert!(
+            mv.hidden(HOME_ROOT, true).is_none(),
+            "根目录是视图本身，不能被隐藏"
+        );
 
         // 默认规则（只有临时过滤）= M1–M6 行为：普通路径一律不隐藏
         let plain = MountView {

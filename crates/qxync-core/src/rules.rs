@@ -298,7 +298,12 @@ impl Rules {
     }
 
     /// 便捷入口：在 `roots` 里找归属根后判定（找不到归属 = 不隐藏）。
-    pub fn hides_in_roots(&self, roots: &[String], remote: &str, is_dir: bool) -> Option<HideReason> {
+    pub fn hides_in_roots(
+        &self,
+        roots: &[String],
+        remote: &str,
+        is_dir: bool,
+    ) -> Option<HideReason> {
         let root = containing_root(roots, remote)?;
         self.hides_remote(root, remote, is_dir)
     }
@@ -404,7 +409,10 @@ mod tests {
         let r = rules(&[]);
         assert_eq!(r.hides("/a/b.crdownload", false), Some(HideReason::Temp));
         assert_eq!(r.hides("/a/~$doc.docx", false), Some(HideReason::Temp));
-        assert_eq!(r.hides("/a/.goutputstream-1A2B", false), Some(HideReason::Temp));
+        assert_eq!(
+            r.hides("/a/.goutputstream-1A2B", false),
+            Some(HideReason::Temp)
+        );
         assert_eq!(r.hides("/.upload_cache", true), Some(HideReason::Temp));
         assert_eq!(r.hides("/a/x.qsync-part", false), Some(HideReason::Temp));
         assert_eq!(r.hides("/a/normal.txt", false), None);
@@ -422,10 +430,16 @@ mod tests {
             r.hides_in_roots(&roots, "/home/qxync-test/secret", true),
             Some(HideReason::Excluded)
         );
-        assert_eq!(r.hides_in_roots(&roots, "/Public/other/secret", false), None);
+        assert_eq!(
+            r.hides_in_roots(&roots, "/Public/other/secret", false),
+            None
+        );
         // 最长前缀：/home/test1 与 /home 同时给时，属于 /home/test1 的根
         let long = vec!["/home".to_string(), "/home/test1".to_string()];
-        assert_eq!(containing_root(&long, "/home/test1/a.txt"), Some("/home/test1"));
+        assert_eq!(
+            containing_root(&long, "/home/test1/a.txt"),
+            Some("/home/test1")
+        );
         assert_eq!(rel_under("/home", "/home/a/b").as_deref(), Some("/a/b"));
         assert_eq!(rel_under("/home", "/home").as_deref(), Some("/"));
         assert_eq!(rel_under("/home", "/Public/a"), None);
@@ -435,7 +449,13 @@ mod tests {
     fn bad_rules_are_reported_not_panicked() {
         // 只有分隔符/空白/注释的规则 → 忽略；其余进 bad
         let parsed = Rules::parse(
-            &["/ok".into(), "# 注释".into(), " ; ".into(), "/".into(), "///".into()],
+            &[
+                "/ok".into(),
+                "# 注释".into(),
+                " ; ".into(),
+                "/".into(),
+                "///".into(),
+            ],
             true,
         );
         assert_eq!(parsed.rules.pattern_list(), vec!["/ok".to_string()]);

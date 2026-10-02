@@ -285,7 +285,11 @@ impl FsHandle {
         g.nodes
             .values()
             .filter(|n| n.attr.kind == FileType::RegularFile)
-            .filter(|n| self.rules.hides_in_roots(&self.roots, &n.remote, false).is_none())
+            .filter(|n| {
+                self.rules
+                    .hides_in_roots(&self.roots, &n.remote, false)
+                    .is_none()
+            })
             .map(|n| self.candidate_of(&g, n, true))
             .collect()
     }
@@ -488,7 +492,11 @@ impl ContentSource for FsHandle {
         {
             return None;
         }
-        if self.rules.hides_in_roots(&self.roots, path, false).is_some() {
+        if self
+            .rules
+            .hides_in_roots(&self.roots, path, false)
+            .is_some()
+        {
             return None; // 被选择性同步排除的内容不对外服务
         }
         Some(PeerHead {
@@ -1167,10 +1175,7 @@ impl QxyncFs {
             by_remote.insert(entry.remote.clone(), ino);
             roots.push(entry);
         }
-        let remote_root = roots
-            .first()
-            .map(|r| r.remote.clone())
-            .unwrap_or_default();
+        let remote_root = roots.first().map(|r| r.remote.clone()).unwrap_or_default();
 
         Ok(Self {
             rt: FsRuntime::new(rt),
@@ -1318,9 +1323,14 @@ impl QxyncFs {
             g.clone()
         };
         self.lan_stats.attempts.fetch_add(1, Ordering::Relaxed);
-        let hit = self
-            .rt
-            .block_on(peer::fetch_range(&peers, remote, offset, len, expect_size, expect_mtime));
+        let hit = self.rt.block_on(peer::fetch_range(
+            &peers,
+            remote,
+            offset,
+            len,
+            expect_size,
+            expect_mtime,
+        ));
         match hit {
             Some(h) => {
                 self.lan_stats.hits.fetch_add(1, Ordering::Relaxed);
@@ -1429,7 +1439,8 @@ impl QxyncFs {
         if self.multi_root && self.roots.iter().any(|r| r.remote == remote) {
             return None; // 根目录本身是视图的一部分
         }
-        self.rules.hides_in_roots(&self.remote_roots(), remote, is_dir)
+        self.rules
+            .hides_in_roots(&self.remote_roots(), remote, is_dir)
     }
 
     /// ★ M7：被规则隐藏的路径**任何写操作都不许落地**（返回 `ENOENT`：它在挂载点里不存在）。
@@ -3099,7 +3110,10 @@ mod tests {
         // 单根默认（只有临时过滤）= M1–M6 行为：普通名字一个不少
         let plain = test_fs(&dir.join("plain"), false);
         assert!(plain.hide_reason("/home/secret", true).is_none());
-        assert_eq!(plain.hide_reason("/home/a.crdownload", false), Some(HideReason::Temp));
+        assert_eq!(
+            plain.hide_reason("/home/a.crdownload", false),
+            Some(HideReason::Temp)
+        );
         let off = test_fs(&dir.join("off"), false).with_rules(m7_rules(&[], false));
         assert!(off.hide_reason("/home/a.crdownload", false).is_none());
         let _ = std::fs::remove_dir_all(&dir);
@@ -3183,7 +3197,11 @@ mod tests {
         let inside = DirEntry::local("x.bin", false, 4096, 13);
         fs.insert_node(dnode.ino, "x.bin", "/home/secret/x.bin", &inside);
 
-        let paths: Vec<String> = h.dehydrate_candidates().into_iter().map(|c| c.remote).collect();
+        let paths: Vec<String> = h
+            .dehydrate_candidates()
+            .into_iter()
+            .map(|c| c.remote)
+            .collect();
         assert!(paths.contains(&"/home/keep.bin".to_string()));
         assert!(
             !paths.iter().any(|p| p.starts_with("/home/secret/")),
@@ -3237,7 +3255,9 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap();
-            let listener = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+            let listener = rt
+                .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+                .unwrap();
             let addr = listener.local_addr().unwrap().to_string();
             addr_tx.send(addr).unwrap();
             rt.spawn(async move { serve(listener, server2).await });
@@ -3276,9 +3296,17 @@ mod tests {
         let cache2 = m7_tmpdir("lan-cache2");
         let fs2 = test_fs(&cache2, false).with_peers(bad_peers);
         let entry2 = DirEntry::local("big.bin", false, payload.len() as u64, mtime + 42);
-        let node2 = fs2.insert_node(INodeNo::ROOT, "big.bin", "/home/qxync-test/big.bin", &entry2);
+        let node2 = fs2.insert_node(
+            INodeNo::ROOT,
+            "big.bin",
+            "/home/qxync-test/big.bin",
+            &entry2,
+        );
         fs2.cache_file_for(node2.ino).unwrap();
-        assert!(fs2.ensure_chunk(node2.ino, 0).is_err(), "元数据不符必须回落 NAS");
+        assert!(
+            fs2.ensure_chunk(node2.ino, 0).is_err(),
+            "元数据不符必须回落 NAS"
+        );
         let (a2, h2, _, m2) = fs2.lan_stats().snapshot();
         assert_eq!(a2, 1);
         assert_eq!(h2, 0);
@@ -3291,7 +3319,8 @@ mod tests {
     }
 
     #[test]
-    fn delete_guard_trips_and_resets() {        let g = DeleteGuard::new(3, Duration::from_secs(60));
+    fn delete_guard_trips_and_resets() {
+        let g = DeleteGuard::new(3, Duration::from_secs(60));
         assert!(g.allow());
         assert!(g.allow());
         assert!(g.allow());
@@ -3813,7 +3842,10 @@ mod tests {
         let public = fs.node_by_remote("/Public").expect("Public 目录节点");
         assert_eq!(home.parent, INodeNo::ROOT);
         assert_eq!(public.parent, INodeNo::ROOT);
-        assert_eq!((home.name.as_str(), public.name.as_str()), ("home", "Public"));
+        assert_eq!(
+            (home.name.as_str(), public.name.as_str()),
+            ("home", "Public")
+        );
         for n in [&home, &public] {
             assert_eq!(n.attr.kind, FileType::Directory);
             assert_eq!(n.attr.perm, 0o755);
@@ -3831,13 +3863,18 @@ mod tests {
             .expect("虚拟根 readdir 不该碰 NAS");
         assert_eq!(children.len(), 2, "{children:?}");
         for want in ["home", "Public"] {
-            assert!(children.iter().any(|n| n.name == want), "缺 {want}: {children:?}");
+            assert!(
+                children.iter().any(|n| n.name == want),
+                "缺 {want}: {children:?}"
+            );
         }
         assert!(children.iter().any(|n| n.remote == "/home"));
         assert!(children.iter().any(|n| n.remote == "/Public"));
 
         // 虚拟根 lookup：命中同一个节点；未知名 → ENOENT（绝不拿 "" 去 stat）
-        let got = fs.lookup_child(INodeNo::ROOT, "Public").expect("lookup Public");
+        let got = fs
+            .lookup_child(INodeNo::ROOT, "Public")
+            .expect("lookup Public");
         assert_eq!(got.ino, public.ino);
         assert_eq!(got.remote, "/Public");
         assert_eq!(
@@ -3893,8 +3930,14 @@ mod tests {
             Some(libc::EROFS)
         );
         // 不属于任何根（虚拟根下新建 / 未知路径）→ 也回 EROFS
-        assert_eq!(errno_code(fs.ensure_writable("/Unknown/x")), Some(libc::EROFS));
-        assert_eq!(errno_code(fs.ensure_writable("/homework/x")), Some(libc::EROFS));
+        assert_eq!(
+            errno_code(fs.ensure_writable("/Unknown/x")),
+            Some(libc::EROFS)
+        );
+        assert_eq!(
+            errno_code(fs.ensure_writable("/homework/x")),
+            Some(libc::EROFS)
+        );
         assert_eq!(errno_code(fs.ensure_writable("")), Some(libc::EROFS));
 
         // 单根直通：永远 Ok（挂载级 read_only 已经管住），任何路径都不做归属判定

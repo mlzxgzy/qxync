@@ -202,7 +202,9 @@ impl Task {
         delete_limit: Option<usize>,
         auto_unmount: Option<bool>,
     ) -> Self {
-        let id = id.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "default".into());
+        let id = id
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "default".into());
         Self {
             name: id.clone(),
             id,
@@ -316,8 +318,8 @@ impl Task {
         }
         let p = Self::file(paths, id);
         let raw = std::fs::read(&p).map_err(|e| Error::Io(format!("读取 {}: {e}", p.display())))?;
-        let mut t: Self =
-            serde_json::from_slice(&raw).map_err(|e| Error::Parse(format!("解析 {}: {e}", p.display())))?;
+        let mut t: Self = serde_json::from_slice(&raw)
+            .map_err(|e| Error::Parse(format!("解析 {}: {e}", p.display())))?;
         t.normalize()?;
         Ok(t)
     }
@@ -432,16 +434,27 @@ impl Task {
 pub fn has_any_task(paths: &ConfigPaths) -> bool {
     let dir = Task::tasks_dir(paths);
     match std::fs::read_dir(&dir) {
-        Ok(rd) => rd.flatten().any(|e| {
-            e.path().extension().and_then(|s| s.to_str()) == Some("json")
-        }),
+        Ok(rd) => rd
+            .flatten()
+            .any(|e| e.path().extension().and_then(|s| s.to_str()) == Some("json")),
         Err(_) => false,
     }
 }
 
 /// 给 CLI/GUI 用：把一个任务解析成 `Request::Mount` 的参数包。
 /// （不直接构造 `Request`，避免 core 依赖 ipc 的具体形状。）
-pub fn mount_args(t: &Task) -> (PathBuf, Vec<String>, bool, String, Option<usize>, Option<u64>, Option<usize>, bool) {
+pub fn mount_args(
+    t: &Task,
+) -> (
+    PathBuf,
+    Vec<String>,
+    bool,
+    String,
+    Option<usize>,
+    Option<u64>,
+    Option<usize>,
+    bool,
+) {
     (
         t.mountpoint.clone(),
         t.roots.clone(),
@@ -507,7 +520,10 @@ mod tests {
         );
         let path = t.save(&p).unwrap();
         assert!(path.exists(), "任务文件应落盘");
-        assert!(!path.with_extension("json.tmp").exists(), "临时文件必须已被 rename 掉");
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "临时文件必须已被 rename 掉"
+        );
 
         let got = Task::load(&p, "default").unwrap();
         assert_eq!(got.id, "default");
@@ -526,8 +542,17 @@ mod tests {
     fn list_is_sorted_and_skips_broken_files() {
         let p = tmp_paths("list");
         for id in ["zeta", "alpha", "m6"] {
-            let mut t = Task::from_mount(Some(id.into()), PathBuf::from("/tmp/m"), vec!["/home".into()],
-                false, None, None, None, None, None);
+            let mut t = Task::from_mount(
+                Some(id.into()),
+                PathBuf::from("/tmp/m"),
+                vec!["/home".into()],
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
             t.save(&p).unwrap();
         }
         // 塞一个坏文件：不能把整个 list 打挂
@@ -541,8 +566,17 @@ mod tests {
     #[test]
     fn delete_only_removes_registration() {
         let p = tmp_paths("del");
-        let mut t = Task::from_mount(Some("t1".into()), PathBuf::from("/tmp/m"), vec!["/home".into()],
-            false, None, None, None, None, None);
+        let mut t = Task::from_mount(
+            Some("t1".into()),
+            PathBuf::from("/tmp/m"),
+            vec!["/home".into()],
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         t.save(&p).unwrap();
         assert!(Task::delete(&p, "t1").unwrap());
         assert!(!Task::delete(&p, "t1").unwrap(), "第二次应是「本来就没有」");
@@ -553,19 +587,40 @@ mod tests {
     #[test]
     fn space_saving_and_smart_delete_are_mutually_exclusive() {
         // Qsync 原文语义：节省空间模式开启时，智能删除不可用
-        let mut t = Task::from_mount(None, PathBuf::from("/tmp/m"), vec!["/home".into()],
-            false, None, None, None, None, None);
+        let mut t = Task::from_mount(
+            None,
+            PathBuf::from("/tmp/m"),
+            vec!["/home".into()],
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         t.space_saving = true;
         t.smart_delete = true;
         t.normalize().unwrap();
         assert!(t.space_saving);
-        assert!(!t.smart_delete, "space_saving 开启时必须把 smart_delete 关掉");
+        assert!(
+            !t.smart_delete,
+            "space_saving 开启时必须把 smart_delete 关掉"
+        );
     }
 
     #[test]
     fn bad_enum_values_fall_back_to_defaults() {
-        let mut t = Task::from_mount(None, PathBuf::from("/tmp/m"), vec![],
-            false, Some("nonsense".into()), None, None, None, None);
+        let mut t = Task::from_mount(
+            None,
+            PathBuf::from("/tmp/m"),
+            vec![],
+            false,
+            Some("nonsense".into()),
+            None,
+            None,
+            None,
+            None,
+        );
         t.direction = "sideways".into();
         t.normalize().unwrap();
         assert_eq!(t.cache_mode, CACHE_PAGECACHE);
@@ -574,16 +629,38 @@ mod tests {
 
     #[test]
     fn relative_mountpoint_is_rejected() {
-        let mut t = Task::from_mount(None, PathBuf::from("relative/mnt"), vec![],
-            false, None, None, None, None, None);
+        let mut t = Task::from_mount(
+            None,
+            PathBuf::from("relative/mnt"),
+            vec![],
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert!(t.normalize().is_err(), "相对路径挂载点必须被拒");
     }
 
     #[test]
     fn roots_are_normalized() {
-        let mut t = Task::from_mount(None, PathBuf::from("/mnt"),
-            vec![" /home/ ".into(), "Public".into(), "/home".into(), "".into()],
-            false, None, None, None, None, None);
+        let mut t = Task::from_mount(
+            None,
+            PathBuf::from("/mnt"),
+            vec![
+                " /home/ ".into(),
+                "Public".into(),
+                "/home".into(),
+                "".into(),
+            ],
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         t.normalize().unwrap();
         assert_eq!(t.roots, vec!["/home".to_string(), "/Public".to_string()]);
     }
@@ -631,22 +708,53 @@ mod tests {
     #[test]
     fn cache_dir_roundtrip_and_validation() {
         let p = tmp_paths("cache");
-        let mut t = Task::from_mount(Some("c1".into()), PathBuf::from("/tmp/m"), vec!["/home".into()],
-            false, None, None, None, None, None)
-            .with_cache_dir(Some(PathBuf::from("/data/qxync-cache")));
+        let mut t = Task::from_mount(
+            Some("c1".into()),
+            PathBuf::from("/tmp/m"),
+            vec!["/home".into()],
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .with_cache_dir(Some(PathBuf::from("/data/qxync-cache")));
         t.save(&p).unwrap();
         let got = Task::load(&p, "c1").unwrap();
-        assert_eq!(got.cache_dir, Some(PathBuf::from("/data/qxync-cache")),
-            "缓存目录必须能往返（否则任务方式挂载改不了缓存位置）");
+        assert_eq!(
+            got.cache_dir,
+            Some(PathBuf::from("/data/qxync-cache")),
+            "缓存目录必须能往返（否则任务方式挂载改不了缓存位置）"
+        );
 
         // 相对路径必须被拒
-        let mut bad = Task::from_mount(Some("c2".into()), PathBuf::from("/tmp/m"), vec![],
-            false, None, None, None, None, None)
-            .with_cache_dir(Some(PathBuf::from("relative/cache")));
+        let mut bad = Task::from_mount(
+            Some("c2".into()),
+            PathBuf::from("/tmp/m"),
+            vec![],
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .with_cache_dir(Some(PathBuf::from("relative/cache")));
         assert!(bad.normalize().is_err(), "相对缓存目录必须被拒");
 
         // 默认 None
-        let d = Task::from_mount(None, PathBuf::from("/tmp/m"), vec![], false, None, None, None, None, None);
+        let d = Task::from_mount(
+            None,
+            PathBuf::from("/tmp/m"),
+            vec![],
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(d.cache_dir, None);
     }
 
@@ -662,7 +770,17 @@ mod tests {
     fn has_any_task_detects_registration() {
         let p = tmp_paths("any");
         assert!(!has_any_task(&p), "目录还不存在时 = 没有任务");
-        let mut t = Task::from_mount(None, PathBuf::from("/tmp/m"), vec![], false, None, None, None, None, None);
+        let mut t = Task::from_mount(
+            None,
+            PathBuf::from("/tmp/m"),
+            vec![],
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         t.save(&p).unwrap();
         assert!(has_any_task(&p));
     }

@@ -186,10 +186,7 @@ impl RollingWeak {
         let ov = old as u32 + CHAR_OFFSET;
         let nv = new as u32 + CHAR_OFFSET;
         self.a = self.a.wrapping_sub(ov).wrapping_add(nv);
-        self.b = self
-            .b
-            .wrapping_sub(n.wrapping_mul(ov))
-            .wrapping_add(self.a);
+        self.b = self.b.wrapping_sub(n.wrapping_mul(ov)).wrapping_add(self.a);
     }
 }
 
@@ -390,8 +387,12 @@ pub fn md4(data: &[u8]) -> [u8; 16] {
     }
     msg.extend_from_slice(&bit_len.to_le_bytes());
 
-    let (mut a0, mut b0, mut c0, mut d0) =
-        (0x6745_2301u32, 0xefcd_ab89u32, 0x98ba_dcfeu32, 0x1032_5476u32);
+    let (mut a0, mut b0, mut c0, mut d0) = (
+        0x6745_2301u32,
+        0xefcd_ab89u32,
+        0x98ba_dcfeu32,
+        0x1032_5476u32,
+    );
 
     for chunk in msg.chunks(64) {
         let mut m = [0u32; 16];
@@ -410,10 +411,7 @@ pub fn md4(data: &[u8]) -> [u8; 16] {
         for i in 0..16 {
             let (x, y, z) = (b, c, d);
             let f = (x & y) | (!x & z);
-            let t = a
-                .wrapping_add(f)
-                .wrapping_add(m[i])
-                .rotate_left(S1[i % 4]);
+            let t = a.wrapping_add(f).wrapping_add(m[i]).rotate_left(S1[i % 4]);
             a = d;
             d = c;
             c = b;
@@ -488,7 +486,9 @@ mod tests {
             "d79e1c308aa5bbcdeea8ed63df412da9"
         );
         assert_eq!(
-            hex(&md4(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")),
+            hex(&md4(
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+            )),
             "043f8582f241db351ce627e153e7f0e4"
         );
         // 跨块（>64 字节）也要对

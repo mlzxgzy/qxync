@@ -194,8 +194,7 @@ impl PeerRegistry {
         if !p.exists() {
             return Ok(Self::default());
         }
-        let raw =
-            std::fs::read(&p).map_err(|e| Error::Io(format!("读取 {}: {e}", p.display())))?;
+        let raw = std::fs::read(&p).map_err(|e| Error::Io(format!("读取 {}: {e}", p.display())))?;
         serde_json::from_slice(&raw).map_err(|e| Error::Parse(format!("解析 {}: {e}", p.display())))
     }
 
@@ -346,7 +345,10 @@ mod tests {
         };
         paths.ensure_dirs().unwrap();
         let mut reg = PeerRegistry::default();
-        assert!(PeerRegistry::load(&paths, "default").unwrap().peers.is_empty());
+        assert!(PeerRegistry::load(&paths, "default")
+            .unwrap()
+            .peers
+            .is_empty());
         reg.upsert(PeerConfig {
             name: "laptop".into(),
             addr: "127.0.0.1:9840".into(),

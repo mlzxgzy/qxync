@@ -99,14 +99,22 @@ fn view_name(remote: &str, taken: &BTreeSet<String>) -> String {
         .next()
         .unwrap_or("")
         .to_string();
-    let base = if base.is_empty() { "root".to_string() } else { base };
+    let base = if base.is_empty() {
+        "root".to_string()
+    } else {
+        base
+    };
     if !taken.contains(&base) {
         return base;
     }
     // `/a/b` 与 `/c/b` → `a_b` / `c_b`
     let parts: Vec<&str> = remote.trim_matches('/').split('/').collect();
     let joined = parts.join("_");
-    let joined = if joined.is_empty() { "root".to_string() } else { joined };
+    let joined = if joined.is_empty() {
+        "root".to_string()
+    } else {
+        joined
+    };
     if !taken.contains(&joined) {
         return joined;
     }
@@ -201,7 +209,10 @@ mod tests {
                 let names: Vec<&str> = entries.iter().map(|e| e.view_name.as_str()).collect();
                 assert_eq!(names, vec!["home", "Public", "Multimedia"]);
                 assert!(entries[0].writable, "家目录可写");
-                assert!(!entries[1].writable, "共享文件夹默认只读（实测服务端拒绝写）");
+                assert!(
+                    !entries[1].writable,
+                    "共享文件夹默认只读（实测服务端拒绝写）"
+                );
                 assert!(!entries[2].writable);
                 assert_eq!(roots, v(&["/home", "/Public", "/Multimedia"]));
                 assert_eq!(entries.len(), 3);

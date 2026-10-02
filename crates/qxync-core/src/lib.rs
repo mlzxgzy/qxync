@@ -44,11 +44,11 @@ pub use rules::{HideReason, RuleParse, Rules, TEMP_PATTERNS};
 pub use settings::{ProxySettings, ProxySpec, Settings};
 pub use status::ServerStatus;
 pub use store::{JournalEntry, MigrateReport, Store, DB_FILE};
-pub use tasks::{Task, DIR_2WAY, DIR_DOWN, DIR_UP};
 pub use sync::{
     parse_sync_log, Baseline, Cursors, Decision, DeleteProtection, LocalSig, Sig, SyncEvent,
     SyncLogBatch,
 };
+pub use tasks::{Task, DIR_2WAY, DIR_DOWN, DIR_UP};
 
 /// 普通用户的 Qsync 家目录根（不是 `/home/<user>`）。
 pub const HOME_ROOT: &str = "/home";

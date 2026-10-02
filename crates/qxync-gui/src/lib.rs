@@ -121,7 +121,9 @@ pub fn run() {
 /// 按 `true` 处理 —— 那正好是 `Settings::default()` 的取值，也和 QSync 一致。
 fn close_to_tray_now() -> bool {
     match qxync_core::ConfigPaths::discover() {
-        Ok(p) => qxync_core::Settings::load(&p).map(|s| s.close_to_tray).unwrap_or(true),
+        Ok(p) => qxync_core::Settings::load(&p)
+            .map(|s| s.close_to_tray)
+            .unwrap_or(true),
         Err(_) => true,
     }
 }
@@ -140,7 +142,10 @@ pub fn self_test() -> bool {
     {
         Ok(rt) => rt,
         Err(e) => {
-            println!("{}", json!({"ok": false, "error": format!("建 tokio 运行时失败: {e}")}));
+            println!(
+                "{}",
+                json!({"ok": false, "error": format!("建 tokio 运行时失败: {e}")})
+            );
             return false;
         }
     };
@@ -167,7 +172,10 @@ pub fn self_test_login() -> bool {
     {
         Ok(rt) => rt,
         Err(e) => {
-            println!("{}", json!({"ok": false, "error": format!("建 tokio 运行时失败: {e}")}));
+            println!(
+                "{}",
+                json!({"ok": false, "error": format!("建 tokio 运行时失败: {e}")})
+            );
             return false;
         }
     };
@@ -225,7 +233,9 @@ async fn self_test_login_inner() -> Value {
 
     // 3) 复核
     let st = commands::daemon_status().await.ok();
-    let st_json = st.and_then(|s| serde_json::to_value(s).ok()).unwrap_or(Value::Null);
+    let st_json = st
+        .and_then(|s| serde_json::to_value(s).ok())
+        .unwrap_or(Value::Null);
     let logged_in = st_json["status"]["logged_in"].as_bool().unwrap_or(false);
     let running = st_json["running"].as_bool().unwrap_or(false);
 
@@ -344,11 +354,9 @@ pub fn self_test_notify() -> bool {
         });
     });
 
-    let payload = outcome
-        .lock()
-        .unwrap()
-        .take()
-        .unwrap_or_else(|| json!({"ok": false, "shown": false, "error": "事件循环结束了但没跑过通知分支"}));
+    let payload = outcome.lock().unwrap().take().unwrap_or_else(
+        || json!({"ok": false, "shown": false, "error": "事件循环结束了但没跑过通知分支"}),
+    );
     // 事件循环在子线程里 request_exit 之后才返回，这里才轮到我们说话。
     {
         use std::io::Write as _;
@@ -380,7 +388,12 @@ pub fn ui_spec() -> Value {
 
     // 1) M4 的安全约定：外部字符串只走 textContent，绝不拼 HTML
     let mut sinks: Vec<&str> = Vec::new();
-    for needle in ["innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"] {
+    for needle in [
+        "innerHTML",
+        "outerHTML",
+        "insertAdjacentHTML",
+        "document.write",
+    ] {
         if app.contains(needle) || index.contains(needle) || i18n.contains(needle) {
             sinks.push(needle);
         }
@@ -391,7 +404,12 @@ pub fn ui_spec() -> Value {
     let en = table_keys(&i18n, "var EN = {");
     let used = quoted_keys(&app, "T('", '\'');
     let mut dom: Vec<String> = Vec::new();
-    for attr in ["data-i18n", "data-i18n-title", "data-i18n-placeholder", "data-i18n-aria-label"] {
+    for attr in [
+        "data-i18n",
+        "data-i18n-title",
+        "data-i18n-placeholder",
+        "data-i18n-aria-label",
+    ] {
         dom.extend(quoted_keys(&index, &format!("{attr}=\""), '"'));
     }
     let missing_used: Vec<String> = used.iter().filter(|k| !zh.contains(k)).cloned().collect();
@@ -411,7 +429,10 @@ pub fn ui_spec() -> Value {
             && css.matches("--overlay:").count() >= 2
             && css.matches("--shadow-lg:").count() >= 2,
     });
-    let a11y_ok = a11y.as_object().map(|m| m.values().all(|v| v.as_bool() == Some(true))).unwrap_or(false);
+    let a11y_ok = a11y
+        .as_object()
+        .map(|m| m.values().all(|v| v.as_bool() == Some(true)))
+        .unwrap_or(false);
 
     // 4) 空/错/加载四态：统一入口 + 页面上的 data-state 标记
     let states = json!({
@@ -426,7 +447,8 @@ pub fn ui_spec() -> Value {
         && states["screens"].as_u64().unwrap_or(0) >= 8;
 
     let en_reserved = i18n.contains("var EN = {");
-    let i18n_ok = missing_used.is_empty() && missing_dom.is_empty() && zh.len() >= 100 && en_reserved;
+    let i18n_ok =
+        missing_used.is_empty() && missing_dom.is_empty() && zh.len() >= 100 && en_reserved;
 
     json!({
         "ok": sinks.is_empty() && i18n_ok && a11y_ok && states_ok,
@@ -535,7 +557,10 @@ fn table_keys(src: &str, marker: &str) -> Vec<String> {
         Some(i) => i + marker.len(),
         None => return Vec::new(),
     };
-    let end = src[start..].find("\n  };").map(|i| start + i).unwrap_or(src.len());
+    let end = src[start..]
+        .find("\n  };")
+        .map(|i| start + i)
+        .unwrap_or(src.len());
     let mut out = Vec::new();
     for line in src[start..end].lines() {
         let t = line.trim();
@@ -588,10 +613,16 @@ async fn self_test_inner() -> Value {
     let mut ls: Value = Value::Null;
     let mut ping: Value = Value::Null;
     if running {
-        if let Ok(p) = ipc::call_typed::<qxync_core::ipc::PingData>(&sock, qxync_core::ipc::Request::Ping).await {
+        if let Ok(p) =
+            ipc::call_typed::<qxync_core::ipc::PingData>(&sock, qxync_core::ipc::Request::Ping)
+                .await
+        {
             ping = json!({"pid": p.pid, "version": p.daemon_version, "uptime_secs": p.uptime_secs});
         }
-        if let Ok(st) = ipc::call_typed::<qxync_core::ipc::StatusData>(&sock, qxync_core::ipc::Request::Status).await {
+        if let Ok(st) =
+            ipc::call_typed::<qxync_core::ipc::StatusData>(&sock, qxync_core::ipc::Request::Status)
+                .await
+        {
             status_ok = true;
             logged_in = st.logged_in;
             if st.logged_in {
@@ -690,7 +721,11 @@ fn init_logging() {
         let appender = tracing_appender::rolling::daily(&dir, "qsync-gui.log");
         let (nb, guard) = tracing_appender::non_blocking(appender);
         let _ = GUARD.set(guard);
-        Some(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(nb))
+        Some(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(nb),
+        )
     });
     tracing_subscriber::registry()
         .with(filter)

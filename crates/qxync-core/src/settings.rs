@@ -139,9 +139,7 @@ impl ProxySettings {
                 })?;
                 let auth = if self.auth {
                     if self.user.is_empty() {
-                        return Err(Error::Io(
-                            "勾选了「代理服务器需要口令」但用户名为空".into(),
-                        ));
+                        return Err(Error::Io("勾选了「代理服务器需要口令」但用户名为空".into()));
                     }
                     Some((self.user.clone(), self.password.clone()))
                 } else {
@@ -495,7 +493,10 @@ mod tests {
     fn missing_file_means_defaults() {
         let (paths, dir) = paths_for("default");
         let s = Settings::load(&paths).unwrap();
-        assert_eq!(s.proxy.mode, PROXY_AUTO, "默认 = 自动检测（= reqwest 既有行为）");
+        assert_eq!(
+            s.proxy.mode, PROXY_AUTO,
+            "默认 = 自动检测（= reqwest 既有行为）"
+        );
         assert!(!s.launch_at_startup);
         assert!(s.desktop_notifications, "桌面通知默认开");
         assert!(!s.free_space.auto, "自动释放默认关（= M8.3 行为）");
@@ -624,19 +625,26 @@ mod tests {
     fn autostart_written_and_removed() {
         let (paths, dir) = paths_for("autostart");
         let t = Settings::autostart_file(&paths);
-        assert!(t.ends_with("autostart/qsync.desktop"), "路径: {}", t.display());
+        assert!(
+            t.ends_with("autostart/qsync.desktop"),
+            "路径: {}",
+            t.display()
+        );
         assert!(!Settings::autostart_present(&paths));
 
         let mut s = Settings::default();
         s.launch_at_startup = true;
-        let p = s.apply_autostart(&paths, Path::new("/usr/bin/qxync-gui")).unwrap();
+        let p = s
+            .apply_autostart(&paths, Path::new("/usr/bin/qxync-gui"))
+            .unwrap();
         let body = std::fs::read_to_string(&p).unwrap();
         assert!(body.contains("Exec=/usr/bin/qxync-gui"));
         assert!(body.contains("Type=Application"));
         assert!(Settings::autostart_present(&paths));
 
         s.launch_at_startup = false;
-        s.apply_autostart(&paths, Path::new("/usr/bin/qxync-gui")).unwrap();
+        s.apply_autostart(&paths, Path::new("/usr/bin/qxync-gui"))
+            .unwrap();
         assert!(!t.exists(), "关掉自启要把桌面项删掉");
         std::fs::remove_dir_all(&dir).ok();
     }
