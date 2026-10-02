@@ -3720,7 +3720,10 @@
 
     // 主页快捷动作
     on('btn-home-settings', 'click', function () { switchPage('settings'); });
-    on('btn-home-add-task', 'click', function () { switchPage('diag', 'mounts'); });
+    // ★ 主页「＋ 添加任务」= 任务页的「＋ 添加配对文件夹」：切到任务页并直接摊开文件夹对表单。
+    //   （别再去诊断 → 挂载：那条路是「先挂载、再登记任务」的专家流程；
+    //   任务页的表单提交走 tasks/save + tasks/resume，登记和挂载一步到位。）
+    on('btn-home-add-task', 'click', function () { switchPage('tasks'); openTaskForm(); });
     on('btn-home-refresh', 'click', function () { refreshStatus(true); refreshMounts(); });
     on('btn-home-sync-now', 'click', function () {
       doSync({ once: true }, ['btn-home-sync-now'], '立即同步');
