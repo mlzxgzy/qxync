@@ -1,0 +1,108 @@
+name: Release
+
+# 推 `v*` tag → 自动构建三个二进制并挂到该 tag 的 Release：
+#   qsync / qxyncd / qxync-gui（三个裸二进制 + 一个 tar.gz）+ SHA256SUMS
+# 手动重跑同一个 tag：Actions → Release → Run workflow，填 tag；同名资产会被覆盖，
+# 不会重复建 Release。Release 正文优先用 `docs/发布说明-<tag>.md`（存在时），
+# 否则用 GitHub 自动生成的 Release Notes。
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布/重跑的 tag（例如 v0.1.0）"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # tag 是唯一真值：push 事件取 ref（就是 tag 本身），手动跑取输入。
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+# 发版不取消进行中的跑批：宁可排队，也不要留下「产物传了一半」的 Release。
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  linux-x86_64:
+    name: build + publish (ubuntu-22.04 · x86_64)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 检出（tag 指向的提交）
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      # 与 CI 的依赖表保持一致；GUI 要 WebKitGTK 4.1 / GTK 3 才编得出来。
+      - name: 安装系统依赖（FUSE3 + WebKitGTK/GTK3）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            fuse3 libfuse3-dev \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+            libssl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # tag / Cargo.toml(workspace) / tauri.conf.json 三处版本必须一致，否则拒绝发版。
+      - name: 版本一致性守卫
+        run: python3 xtask/release/check-version.py "$TAG"
+
+      # 三个二进制一次构建出来（GUI 与 CLI/daemon 共用同一份 release profile）。
+      # 这里**不重复跑测试**：测试闸门是 ci.yml —— tag 应当打在 master 上已绿的提交
+      # （发版清单 §3 的自查步骤也是这么要求的）。
+      # 有意**不 strip**：release profile 带 line-tables-only 调试信息，
+      # 用户报 bug 时贴出来的回溯才可读（见 Cargo.toml 的 [profile.release] 注释）。
+      - name: cargo build --release --locked（qsync / qxyncd / qxync-gui）
+        run: cargo build --release --locked -p qxync-cli -p qxync-daemon -p qxync-gui
+
+      - name: 打包为 tar.gz + 裸二进制（输出到 dist/）
+        run: |
+          bash xtask/release/package-linux.sh "${TAG#v}" x86_64-unknown-linux-gnu
+          ls -l dist
+
+      - name: 生成 SHA256SUMS
+        run: |
+          cd dist && sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+
+      # 先留档到 Actions artifacts：万一后面的 Release 步骤失败，产物还能从这次 run 里取回。
+      - name: 留档到 Actions artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: qxync-${{ inputs.tag || github.ref_name }}-x86_64-unknown-linux-gnu
+          path: dist/
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: 选 Release 正文（docs/发布说明-<tag>.md 存在就用它）
+        id: notes
+        run: |
+          body="docs/发布说明-${TAG}.md"
+          if [ -f "$body" ]; then
+            echo "body_path=$body" >> "$GITHUB_OUTPUT"
+            echo "用正文文件：$body"
+          else
+            echo "body_path=" >> "$GITHUB_OUTPUT"
+            echo "没有 $body，改用 GitHub 自动生成的 Release Notes"
+          fi
+
+      - name: 发布 / 更新 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: qxync ${{ inputs.tag || github.ref_name }}
+          body_path: ${{ steps.notes.outputs.body_path }}
+          generate_release_notes: true
+          prerelease: ${{ contains(inputs.tag || github.ref_name, '-') }}
+          files: dist/*
+          overwrite_files: true
+          fail_on_unmatched_files: true

@@ -32,6 +32,9 @@ __pycache__/
 .cargo/
 .cargo-home/
 
+# ===== 发版打包输出（xtask/release/package-linux.sh 写这里）=====
+/dist/
+
 # ===== Tauri（tauri-build 每次编译重新生成）=====
 crates/qxync-gui/gen/schemas/
 
