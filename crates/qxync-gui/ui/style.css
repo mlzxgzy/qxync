@@ -530,6 +530,13 @@ code {
   word-break: break-word;
 }
 
+/* ★ 提示性 alert（引擎 note，如 -17「区间内没有事件」）：黄色，别用报错红。
+   border 走 currentColor，所以只需覆盖 background/color。 */
+.alert-warn {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
 .alert-stack:empty { display: none; }
 
 /* ★ M8.3：错误列表的一行（要能换行显示长路径） */

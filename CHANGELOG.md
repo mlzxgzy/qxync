@@ -7,6 +7,19 @@
 
 ## [未发布]
 
+### 修复
+
+- **主页不再把引擎的「说明」当报错标红**。`qbox_get_sync_log` 恒返回 `status:-17`
+  （本账号从未登记同步文件夹，区间内没有事件）时，引擎在
+  `crates/qxync-daemon/src/sync.rs` 里走的本来就是 `report.note(...)` 而不是
+  `report.error(...)`；但 GUI 主页用同一个 `addAlert()` 渲染 `sy.note`，而
+  `addAlert()` 没有严重度参数、硬编码 `div.alert`，`.alert` 的配色写死
+  `--err-soft` / `--err` —— 于是一条正常提示在主页常驻成红框，而且计数每轮 +1、
+  红框永远不消失。同一个 `note` 在「状态」页走的是中性的 `<p class="note">`，
+  两处表现不一致，可见红色并非有意。
+  现在 `addAlert()` 增加 `severity` 参数（默认 `'error'`，真错误仍为红），`note`
+  传 `'warn'` 挂 `.alert-warn`（`--warn-soft` / `--warn`）；错误与删除熔断的红色不变。
+
 ## [0.2.2] - 2026-10-02
 
 **给 daemon 配了 systemd user 单元**，并修掉一个会让 `systemctl stop` 留下 FUSE 挂载的问题。

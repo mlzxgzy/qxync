@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The home page no longer paints the engine's "note" as an error.** When
+  `qbox_get_sync_log` keeps returning `status:-17` (this account has never registered a sync
+  folder, so there are no events in range), the engine in
+  `crates/qxync-daemon/src/sync.rs` already classifies it as `report.note(...)`, not
+  `report.error(...)`. But the GUI home page rendered `sy.note` through the same `addAlert()`,
+  which had no severity parameter and hardcoded `div.alert`, whose colours are fixed to
+  `--err-soft` / `--err` — so a perfectly normal hint sat permanently on the home page as a red
+  box, and since the counter increments every round it never went away. The same `note` renders
+  as a neutral `<p class="note">` on the Status page, so the red was clearly unintended.
+  `addAlert()` now takes a `severity` argument (default `'error'`, real errors stay red) and
+  `note` passes `'warn'`, which applies `.alert-warn` (`--warn-soft` / `--warn`).
+
 ## [0.2.2] - 2026-10-02
 
 **The daemon now ships a systemd user unit**, plus a fix for a bug that left FUSE mounts behind
