@@ -1518,7 +1518,7 @@
         var tdRemote = el('td', 'mono', roots.join(', '));
         if (roots.length > 1) {
           tdRemote.appendChild(document.createTextNode(' '));
-          tdRemote.appendChild(el('span', 'badge', '多根'));
+          tdRemote.appendChild(el('span', 'badge', '多个目录'));
         }
         tr.appendChild(tdRemote);
         var mode = el('td');
@@ -1573,9 +1573,9 @@
     else { setListState('roots-empty', 'empty', T('roots.unreadable')); }
 
     var kv = $('roots-summary-kv');
-    kvText(kv, 'home_root', optText(data.home_root) || '—');
+    kvText(kv, 'home_root（家目录的名字）', optText(data.home_root) || '—');
     var cfg = (data.configured || []);
-    kvText(kv, 'configured', cfg.length ? cfg.join(', ') : '（未配置 roots，仅家目录）');
+    kvText(kv, 'configured（要同步的 NAS 目录）', cfg.length ? cfg.join(', ') : '（空 = 只同步家目录）');
 
     for (var i = 0; i < roots.length; i++) {
       var r = roots[i];
@@ -1585,7 +1585,7 @@
       // ✅/❌ 按「可读」判定：不可读时下面是哪一步失败的看得见
       li.appendChild(el('span', 'root-mark', readable ? '✅' : '❌'));
       li.appendChild(el('span', 'root-path mono', str(r.remote)));
-      li.appendChild(el('span', 'root-view', '视图名 ' + (str(r.view_name) || '直通')));
+      li.appendChild(el('span', 'root-view', '挂载点里叫 ' + (str(r.view_name) || '（直通）')));
       li.appendChild(el('span', 'badge ' + (writable ? 'badge-on' : 'badge-off'), writable ? '可写' : '只读'));
       li.appendChild(el('span', 'badge ' + (readable ? 'badge-on' : 'badge-err'), readable ? '可读' : '不可读'));
       if (!readable && r.note) {
@@ -1946,7 +1946,7 @@
       return Promise.resolve(null);
     }
     if (!roots.length) {
-      renderError('mount-result', '参数错误', '远端根至少填一个（每行一个，默认 /home）');
+      renderError('mount-result', '参数错误', 'NAS 目录至少填一个（每行一个，默认 /home）');
       return Promise.resolve(null);
     }
     var req = {
@@ -1970,7 +1970,7 @@
       if (r.ok) {
         renderResult('mount-result', true, '挂载成功', [
           ['挂载点', mp],
-          ['远端根', roots.join(', ') + (roots.length > 1 ? '（多根）' : '')],
+          ['NAS 目录', roots.join(', ') + (roots.length > 1 ? '（多个）' : '')],
           ['模式', req.read_write ? '读写' : '只读'],
           ['cache_mode', req.cache_mode]
         ]);
@@ -3111,12 +3111,12 @@
       if (d.match_hidden === true) {
         verdict = (d.match_reason === 'temp') ? '隐藏（临时文件规则）' : '隐藏（命中排除规则）';
       } else if (d.match_root === null || d.match_root === undefined) {
-        verdict = '不在任何配置的远端根之内';
+        verdict = '不在任何要同步的 NAS 目录之内';
       }
       renderResult('flt-match-result', true, '判定：' + verdict, [
         ['路径', p],
-        ['归属根', d.match_root ? str(d.match_root) : '（不在任何根内）'],
-        ['根相对路径', d.match_rel ? str(d.match_rel) : '—'],
+        ['属于哪个目录', d.match_root ? str(d.match_root) : '（不在任何目录内）'],
+        ['目录内相对路径', d.match_rel ? str(d.match_rel) : '—'],
         ['原因', str(d.match_reason) || '—']
       ]);
       return r;
