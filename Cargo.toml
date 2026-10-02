@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.90"
 
@@ -20,7 +20,9 @@ rust-version = "1.90"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/mlzxgzy/qxync"
 authors = ["Kami <mlzxgzy@gmail.com>"]
-keywords = ["qnap", "qsync", "fuse", "on-demand", "sync"]
+# keywords 描述的是「跟什么互通」，不是本项目的名字 —— 所以 `qsync` 保留
+# （就像 `.desktop` 里的 `GenericName=QNAP Qsync client` 一样）。
+keywords = ["qnap", "qsync", "qxync", "fuse", "on-demand"]
 categories = ["command-line-utilities", "filesystem", "network-programming"]
 
 [workspace.dependencies]

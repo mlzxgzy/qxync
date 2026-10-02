@@ -10,7 +10,7 @@
 //! * Qsync 的策略字段（同步方向 / 节省空间模式 / 智能删除 / 选择性同步）**先落盘不丢**，
 //!   行为在后续里程碑接上（M8.4）。
 //!
-//! 存储：`~/.config/qsync/tasks/<id>.json`（一个任务一个文件，原子写）。
+//! 存储：`~/.config/qxync/tasks/<id>.json`（一个任务一个文件，原子写）。
 //!
 //! ## 兼容性铁律
 //!
@@ -116,7 +116,7 @@ pub struct Task {
     /// 本地挂载点（绝对路径）。
     pub mountpoint: PathBuf,
     /// ★ 水合缓存目录（**父目录**；实际缓存会再拼一层 NAS 主机名做隔离）。
-    /// `None` = 用默认 `$XDG_DATA_HOME/qsync/cache`。
+    /// `None` = 用默认 `$XDG_DATA_HOME/qxync/cache`。
     /// ⚠️ 这是**父目录**：daemon 会 `cache_dir.join(<nas host>)`，见 `daemon.rs::mount()`。
     #[serde(default)]
     pub cache_dir: Option<PathBuf>,

@@ -47,7 +47,7 @@ pub const DEFAULT_CHUNK_SIZE: u64 = 128 * 1024;
 /// 目录列举分页上限（对应服务端 `Max_File_List`）。
 const LIST_LIMIT: usize = 200;
 /// ★ M2c：本地大批删除熔断的默认阈值（60 秒窗口内最多 100 次删除）。
-/// 超过就熔断并把后续删除回 `EACCES`；`qsync sync --force-deletes` 可解除。
+/// 超过就熔断并把后续删除回 `EACCES`；`qxync sync --force-deletes` 可解除。
 pub const DEFAULT_DELETE_LIMIT: usize = 100;
 pub const DEFAULT_DELETE_WINDOW: Duration = Duration::from_secs(60);
 
@@ -761,7 +761,7 @@ fn node_snapshot(n: &Node) -> LocalNode {
 }
 
 /// 本地大批删除熔断（M2c）：60 秒窗口内删除数超过阈值就熔断，
-/// 之后所有删除回 `EACCES`，直到 `qsync sync --force-deletes`（或重新挂载）。
+/// 之后所有删除回 `EACCES`，直到 `qxync sync --force-deletes`（或重新挂载）。
 #[derive(Debug)]
 pub struct DeleteGuard {
     limit: usize,
@@ -812,7 +812,7 @@ impl DeleteGuard {
         }
         if g.hits.len() >= self.limit {
             let reason = format!(
-                "{} 秒内删除超过 {} 项，已熔断（`qsync sync --force-deletes` 可解除）",
+                "{} 秒内删除超过 {} 项，已熔断（`qxync sync --force-deletes` 可解除）",
                 self.window.as_secs(),
                 self.limit
             );
@@ -909,7 +909,7 @@ impl CacheMode {
 /// `Cannot drop a runtime in a context where blocking is not allowed`。
 ///
 /// 真实触发路径（2026-10-01 实测，daemon 日志 + 客户端「daemon 提前关闭了连接」）：
-/// daemon 在 **async IPC 命令**里调 `qsync_fuse::spawn` → `fuser::spawn_mount2` →
+/// daemon 在 **async IPC 命令**里调 `qxync_fuse::spawn` → `fuser::spawn_mount2` →
 /// 挂载失败（挂载点被系统拒、机器没有 `/dev/fuse` …）时，fuser 会把 `fs` **就地在那个
 /// async worker 线程上 drop**。于是「挂载失败」被放大成「daemon 打了个 panic、连接断掉」。
 ///
@@ -2689,12 +2689,12 @@ impl Filesystem for QxyncFs {
         let key = name.to_string_lossy();
         let value: Option<String> = match key.as_ref() {
             // 占位符状态：placeholder（未取任何区间）/ partial（取了一部分）/ hydrated（全取）
-            "user.qsync.state" => Some(state.into()),
+            "user.qxync.state" => Some(state.into()),
             // 已就绪区间数 / 总区间数（M2 的可观测性）
-            "user.qsync.chunks" => Some(chunks),
-            "user.qsync.remote" => Some(remote),
-            "user.qsync.vsize" => Some(fsize.to_string()),
-            "user.qsync.pin" => Some(
+            "user.qxync.chunks" => Some(chunks),
+            "user.qxync.remote" => Some(remote),
+            "user.qxync.vsize" => Some(fsize.to_string()),
+            "user.qxync.pin" => Some(
                 self.pins
                     .lock()
                     .unwrap()
@@ -2720,7 +2720,7 @@ impl Filesystem for QxyncFs {
         // ★ 末尾必须留一个 NUL：内核 fuse_verify_xattr_list() 会逐项 strnlen，
         // 最后一项没有终止符就直接对整个 listxattr 回 -EIO（实测过：size<66 回 ERANGE，
         // size>=66 反而回 EIO，就是这个校验触发的）。
-        let names = "user.qsync.state\0user.qsync.pin\0user.qsync.remote\0user.qsync.vsize\0user.qsync.chunks\0";
+        let names = "user.qxync.state\0user.qxync.pin\0user.qxync.remote\0user.qxync.vsize\0user.qxync.chunks\0";
         let exists = { self.inner.lock().unwrap().nodes.contains_key(&ino) };
         if !exists {
             return reply.error(fuser::Errno::ENOENT);
@@ -2845,7 +2845,7 @@ pub fn mount_config(n_threads: usize, auto_unmount: bool, read_only: bool) -> Co
     let mut cfg = Config::default();
     cfg.mount_options = mount_options(auto_unmount, read_only);
     cfg.n_threads = Some(n_threads.max(1));
-    cfg.clone_fd = std::env::var("QSYNC_CLONE_FD")
+    cfg.clone_fd = std::env::var("QXNYC_CLONE_FD")
         .map(|v| v != "0")
         .unwrap_or(false);
     if auto_unmount {
@@ -2857,7 +2857,7 @@ pub fn mount_config(n_threads: usize, auto_unmount: bool, read_only: bool) -> Co
 
 /// ★ M3：可通知内核的挂载句柄。
 ///
-/// `qsync_fuse::mount()` 用 `fuser::mount2`（拿不到 Notifier）；脱水必须能发
+/// `qxync_fuse::mount()` 用 `fuser::mount2`（拿不到 Notifier）；脱水必须能发
 /// `inval_inode`，所以 daemon 用 [`spawn`] —— 它返回 `BackgroundSession`（可 join/卸载）
 /// 和 `Notifier`（`inval_inode(ino, 0, 0)`）。
 pub struct MountHandle {
@@ -3035,7 +3035,7 @@ mod tests {
     /// ★ 修复回归：`QxyncFs` 里握着一个 tokio `Runtime`，**在 tokio 上下文里析构**会让
     /// tokio 直接 panic —— "Cannot drop a runtime in a context where blocking is not allowed"。
     ///
-    /// 真实触发路径：daemon 在 async IPC 命令里调 `qsync_fuse::spawn` → `fuser::spawn_mount2`
+    /// 真实触发路径：daemon 在 async IPC 命令里调 `qxync_fuse::spawn` → `fuser::spawn_mount2`
     /// → 挂载失败（挂载点被内核/`fusermount3` 拒、机器没有 `/dev/fuse` …）时，fuser 会把
     /// `fs` 就地在**那个 async worker 线程**上 drop → worker panic、连接断掉，
     /// 客户端只看到「daemon 提前关闭了连接」，而不是一条能看懂的挂载错误。

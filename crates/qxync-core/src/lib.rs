@@ -1,6 +1,6 @@
 //! # qxync-core
 //!
-//! QSync-Linux 的共享层：错误码、数据模型、URL 编码规则、本地配置布局、
+//! qxync 的共享层：错误码、数据模型、URL 编码规则、本地配置布局、
 //! **M5 起**还包含本地状态库（SQLite）与 librsync 兼容的 delta 编解码。
 //! 不依赖任何 HTTP 运行时，方便被 client / daemon / fuse / cli 复用，也方便单测。
 //!

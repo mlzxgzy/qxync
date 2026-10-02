@@ -18,7 +18,7 @@ pub const IPC_VERSION: u32 = 1;
 pub fn default_socket_path() -> PathBuf {
     if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR") {
         if !rt.is_empty() {
-            return PathBuf::from(rt).join("qsync/qxyncd.sock");
+            return PathBuf::from(rt).join("qxync/qxyncd.sock");
         }
     }
     match ConfigPaths::discover() {
@@ -248,14 +248,14 @@ pub enum Request {
         #[serde(default)]
         clear: Option<bool>,
     },
-    /// ★ M8.4：全局设置（`~/.config/qsync/settings.json`）—— 只读。
+    /// ★ M8.4：全局设置（`~/.config/qxync/settings.json`）—— 只读。
     ///
     /// 返回 `SettingsData`（当前设置 + 落盘路径 + autostart 实际状态 + 环境里的代理变量）。
     Settings,
     /// ★ M8.4：写全局设置。
     ///
     /// * `settings` 完整设置对象（做归一化 + 校验；`manual` 代理缺服务器会**报错**）；
-    /// * `autostart_exe` 要写进 `~/.config/autostart/qsync.desktop` 的可执行文件路径
+    /// * `autostart_exe` 要写进 `~/.config/autostart/qxync.desktop` 的可执行文件路径
     ///   （GUI 传自己的 `current_exe()`；CLI 不传则尝试取同目录下的 `qxync-gui`）。
     SettingsSave {
         settings: crate::settings::Settings,
@@ -747,7 +747,7 @@ impl TasksData {
     }
 }
 
-/// ★ M7：`rules` 请求的返回（`qsync rules [--json] [--match PATH]`）。
+/// ★ M7：`rules` 请求的返回（`qxync rules [--json] [--match PATH]`）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RulesData {
@@ -896,7 +896,7 @@ pub struct SettingsData {
     pub settings: crate::settings::Settings,
     /// `settings.json` 的落盘路径（**可能还不存在**：全默认时不写文件）。
     pub path: String,
-    /// `~/.config/autostart/qsync.desktop` 路径。
+    /// `~/.config/autostart/qxync.desktop` 路径。
     pub autostart_path: String,
     /// 该桌面项此刻是否真的存在（「开机自启」是否已生效）。
     pub autostart_present: bool,
@@ -1001,7 +1001,7 @@ pub struct FileStatesData {
     pub note: Option<String>,
 }
 
-/// ★ M8.4：`space` 的返回（设置 →「释放空间」页 + `qsync space`）。
+/// ★ M8.4：`space` 的返回（设置 →「释放空间」页 + `qxync space`）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SpaceData {
@@ -1023,7 +1023,7 @@ pub struct SpaceData {
     pub reason: String,
     /// 上一次触发时间（unix 秒；0 = 从未）。
     pub last_run_unix: u64,
-    /// 是否在用 `QSYNC_TEST_FAKE_STATVFS` 注入值（验收要能看见这一点）。
+    /// 是否在用 `QXNYC_TEST_FAKE_STATVFS` 注入值（验收要能看见这一点）。
     pub injected: bool,
     /// `now=true` 时是否真的跑了。
     pub ran: bool,
@@ -1229,7 +1229,7 @@ mod tests {
             }
             other => panic!("解析成了 {other:?}"),
         }
-        // 省略 match_path 也要能解析（CLI 只跑 `qsync rules`）
+        // 省略 match_path 也要能解析（CLI 只跑 `qxync rules`）
         let e2: RequestEnvelope = serde_json::from_str(r#"{"v":1,"method":"rules"}"#).unwrap();
         assert_eq!(e2.req, Request::Rules { match_path: None });
         // 响应缺字段 → 默认值

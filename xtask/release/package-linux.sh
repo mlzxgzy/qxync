@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 打包 Linux 发版产物：把已构建好的三个二进制（qsync / qxyncd / qxync-gui）连同
+# 打包 Linux 发版产物：把已构建好的三个二进制（qxync / qxyncd / qxync-gui）连同
 # 桌面项、图标、许可证与免责声明打成 tar.gz，并把三个裸二进制复制到输出目录。
 #
 # 用法：
@@ -14,7 +14,7 @@
 #   qxync-<version>-<triple>.tar.gz   解包后是 <stem>/{三个二进制, qxync.desktop,
 #                                     icons/, README*, LICENSE-*, DISCLAIMER.md}
 #                                     —— 发行版打包（packaging/arch/）直接从这里取
-#   qsync / qxyncd / qxync-gui        三个裸二进制（供直接下载）
+#   qxync / qxyncd / qxync-gui        三个裸二进制（供直接下载）
 #
 # 可复现性：tar 内 owner/group 归零、顺序按名字排序、mtime 取 HEAD 提交时间
 # （或 SOURCE_DATE_EPOCH），gzip 用 `-n` 不写时间戳 —— 同一份输入 → 同一个 sha256。
@@ -41,7 +41,7 @@ case "$version" in
   "") echo "❌ version 不能为空" >&2; exit 1 ;;
 esac
 
-binaries=(qsync qxyncd qxync-gui)
+binaries=(qxync qxyncd qxync-gui)
 for b in "${binaries[@]}"; do
   if [ ! -x "$bin_dir/$b" ]; then
     echo "❌ 找不到可执行文件：$bin_dir/$b" >&2

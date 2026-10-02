@@ -14,7 +14,7 @@ xtask/probe/probe-out/
 target/
 **/*.rs.bk
 # Cargo.lock **要提交**，不要加回这里：
-# 本项目产出的是二进制（qsync / qxyncd / qxync-gui），锁定依赖版本才能保证
+# 本项目产出的是二进制（qxync / qxyncd / qxync-gui），锁定依赖版本才能保证
 # 「同一份源码 → 同一份依赖 → 可复现的构建」。
 # （2026-10 发版准备时从 .gitignore 移除，见 docs/发布清单-v0.1.0.md）
 

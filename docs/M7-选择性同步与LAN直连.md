@@ -33,7 +33,7 @@
 ### 1.1 配置
 
 ```json
-// ~/.config/qsync/links/default.json
+// ~/.config/qxync/links/default.json
 {
   "id": "default", "host": "nas.local", "port": 9834, "https": true,
   "user": "test1", "home_root": "/home", "roots": ["/home", "/Public"],
@@ -44,9 +44,9 @@
 
 * `exclude`：排除规则（空/缺省 = M1–M6 行为**一字不改**）。
 * `filter_temp`：内置临时文件过滤（默认 `true`），对应报告 03 §3.7 的
-  `*.crdownload` / `.upload_cache` / `~$*` / `.goutputstream-*`（并补上我们自己的 `*.qsync-part`）。
+  `*.crdownload` / `.upload_cache` / `~$*` / `.goutputstream-*`（并补上我们自己的 `*.qxync-part`）。
 * `LinkConfig::rules()` 解析成 [`qxync_core::rules::Rules`]；解析失败 **不静默**：
-  `qsync rules` 会把坏规则标出来，daemon 启动日志 WARN 并**忽略那一条**（其余照常生效）。
+  `qxync rules` 会把坏规则标出来，daemon 启动日志 WARN 并**忽略那一条**（其余照常生效）。
 
 ### 1.2 规则语法（gitignore 风味，但只保留够用的子集）
 
@@ -63,11 +63,11 @@
 匹配输入是**根相对路径**（`/qxync-test/secret`，相对 `home_root`/`roots` 中命中它的那个根），
 不是用户视角的挂载路径（多根时挂载点多一层 `home/`、`Public/`）。原因：baseline、pin、
 缓存键、上传队列全部以远端路径为键，规则跟着同一套键走，多根/单根语义才一致。
-`qsync rules --match /home/qxync-test/secret` 可以直接在 bash 里验规则。
+`qxync rules --match /home/qxync-test/secret` 可以直接在 bash 里验规则。
 
 ⚠️ 由此带来一个取舍：**同一条规则对每个根都生效**（`/tailscale.txt` 同时作用于 `/home` 与 `/Public`），
 没有「只排除某个共享文件夹」的写法；要彻底不同步某个根，直接从 `roots` 里去掉它（M6 的能力）。
-整个根**不能**被规则隐藏（根目录是挂载视图本身）——`qsync rules --match /Public` 会回 `visible`。
+整个根**不能**被规则隐藏（根目录是挂载视图本身）——`qxync rules --match /Public` 会回 `visible`。
 
 ### 1.3 生效点（一个都不能漏）
 
@@ -90,7 +90,7 @@
 
 那是 on-demand（M1 起就有）。选择性同步的语义是**根本不管**：
 两种都做成「看得见、打不开」只会让用户分不清「这个文件是占位符还是没被选中」。
-所以：**排除 = 挂载点里不存在**，`qsync rules` 负责把「为什么看不到」讲清楚。
+所以：**排除 = 挂载点里不存在**，`qxync rules` 负责把「为什么看不到」讲清楚。
 
 ---
 
@@ -100,14 +100,14 @@
 
 ```
 daemon A（peer_listen=0.0.0.0:9840）        daemon B（peer_listen=0.0.0.0:9840）
-   │  qsync peer pair 192.168.1.5:9840 --code 4821
+   │  qxync peer pair 192.168.1.5:9840 --code 4821
    ├────────── pair(code, name, ver) ──────────►
    │                                            校验 code → 生成 token
    │◄───────── ok(token, identity) ─────────────┤
    双方把 {name, addr, token} 存进 links/<id>.peers.json（0600）
 ```
 
-* 配对码：daemon 启动/开启监听时随机 6 位数字，`qsync peer status` 显示；
+* 配对码：daemon 启动/开启监听时随机 6 位数字，`qxync peer status` 显示；
   配对成功后**立即轮换**；同一来源每分钟最多 10 次尝试（超过直接拒绝，不泄露码）。
 * token：32 位十六进制（`/dev/urandom`，无该文件时退化为「时间+pid+计数器」的 FNV-1a 混合，
   只用于测试环境）。token 不走 NAS，只在本机 `peers.json`（0600）与对端内存里。
@@ -173,7 +173,7 @@ peers 逐个 head(path) → size/mtime 与本地 node 的远端签名一致 且 
 
 * FUSE 只依赖「一组 `PeerConfig` + `qxync_client::peer::fetch_range`」，
   因此**不挂 FUSE 也能测**（单测用 `DirContent` 起真 TCP 对端，见 `qxync-fuse` 的 `m7_lan_*`）。
-* 计数：每个挂载的 LAN 命中数/字节会汇总到 `qsync peer status` 的 `lan_hits` / `lan_bytes`。
+* 计数：每个挂载的 LAN 命中数/字节会汇总到 `qxync peer status` 的 `lan_hits` / `lan_bytes`。
 
 ### 2.5 安全边界（明确写死）
 
@@ -190,8 +190,8 @@ peers 逐个 head(path) → size/mtime 与本地 node 的远端签名一致 且 
 ```bash
 xtask/tests/m7-matrix.sh              # 全量（单测 + LAN loopback + 真机；有 /dev/fuse 再加 FUSE 段）
 xtask/tests/m7-matrix.sh --no-nas     # 不需要 NAS
-qsync rules [--json] [--match PATH]   # 规则一览 / 单路径判定
-qsync peer status|list|pair|ping|events|notify|fetch
+qxync rules [--json] [--match PATH]   # 规则一览 / 单路径判定
+qxync peer status|list|pair|ping|events|notify|fetch
 ```
 
 矩阵覆盖（**60 项**，本机全绿，含真挂载段）：
@@ -209,8 +209,8 @@ qsync peer status|list|pair|ping|events|notify|fetch
    配对码不同、错码被拒、配对成功、A 登记 B、**B 通过 hello 也登记 A**（双向）、
    双向 `ping`、不存在地址 ping 失败（负向）、`peer notify` → **B 的轮询被唤醒**
    （B 轮询间隔 3600 s，polls 0 → 1）、B 事件日志与 `events_in`；
-6. **真机（NAS）**：`qsync ls` 仍能看到被排除文件（选择性同步**不动远端**）、
-   无挂载时 `peer fetch` 被拒（没有完整水合就不服务）、`qsync put` 上传后 A 自动广播且 B 收到；
+6. **真机（NAS）**：`qxync ls` 仍能看到被排除文件（选择性同步**不动远端**）、
+   无挂载时 `peer fetch` 被拒（没有完整水合就不服务）、`qxync put` 上传后 A 自动广播且 B 收到；
 7. **FUSE 真挂载段**：被排除文件在挂载点里不可见、**写它失败且不产生上传作业、
    远端内容逐字节不变（`cmp` 基线对比）**、`mkdir` 被排除目录失败且 NAS 上不会凭空出现、
    `*.crdownload` 既不可写也不可见、正常文件可读、B 读同一文件时 **LAN 直传命中**
@@ -242,12 +242,12 @@ qsync peer status|list|pair|ping|events|notify|fetch
 
 * **与官方 Windows 客户端不互通**：官方 LAN 通道是未还原的 WebSocket 二进制协议；
   我们的协议只服务 qxync ↔ qxync。同一台机器上装官方客户端不会互相干扰（端口默认不开）。
-* **规则改动要重启 daemon**（规则在挂载/同步引擎构造时注入）。`qsync rules` 能看到当前生效值。
+* **规则改动要重启 daemon**（规则在挂载/同步引擎构造时注入）。`qxync rules` 能看到当前生效值。
 * **LAN 直传只在「对端已完整水合且未修改」时命中**：冷启动后第一份内容仍要各自从 NAS 拿
   （没有做「对端代拉」，那会把 NAS 流量变成 LAN 流量但延迟更差）。
 * **没有内容哈希**：用「大小 + mtime 与 NAS `stat` 一致」做一致性判据（与 M2c 的 baseline 同源）。
   恶意对端仍可投毒 —— 因此 token 与「只在可信局域网」是前提。
-* 多网卡/广播发现不做：对端地址在配对时写死（`qsync peer pair <addr>`），
+* 多网卡/广播发现不做：对端地址在配对时写死（`qxync peer pair <addr>`），
   没有 UDP 广播自动发现（报告 03 §3.10 的 `UpdateUDPInfo` 不在 M7 范围）。
 
 ## 5. 踩到的坑
@@ -263,7 +263,7 @@ qsync peer status|list|pair|ping|events|notify|fetch
 0b. **回调跑在哪个线程上，决定你能不能 `tokio::spawn`**。事件快路径最初在「上传成功回调」里
    `tokio::spawn` 一个广播任务 —— 那个回调跑在**上传 worker 的 OS 线程**里（不是 tokio worker），
    于是 spawn 直接 panic，把 worker 打死：表现是「上传队列永远卡住、`drain` 超时、
-   `qsync status` 一直显示上传中」，整个 daemon 像挂了（fuse-matrix 的冲突段卡了 3 分钟才被发现）。
+   `qxync status` 一直显示上传中」，整个 daemon 像挂了（fuse-matrix 的冲突段卡了 3 分钟才被发现）。
    修复两层：① 事件广播改成**同步 send + 常驻 task 消费**（发送端不需要 runtime 上下文）；
    ② 回调调用点用 `catch_unwind` 兜住 —— 回调只能坏它自己，队列必须继续跑。
    教训：**任何会从 FUSE/上传线程调用的代码，都不能假设自己在 tokio 上下文里**。
@@ -281,5 +281,5 @@ qsync peer status|list|pair|ping|events|notify|fetch
    否则「GUI 里点一下保存」就会把选择性同步规则清空。
 5. **`--lib` 对二进制 crate 无效**：`qxync-daemon` 的单测在 `src/main.rs` 里，
    矩阵里必须用 `cargo test -p qxync-daemon --bins`（M6 矩阵没踩到，因为只跑 core/fuse/client）。
-6. **`qsync sync` 原本没有 `--json`**：验收要断言「事件唤醒后轮询计数 +1」，
-   读人读文本太脆，顺手给 `qsync sync` 补了 `--json`（和 roots/store/rules 一致）。
+6. **`qxync sync` 原本没有 `--json`**：验收要断言「事件唤醒后轮询计数 +1」，
+   读人读文本太脆，顺手给 `qxync sync` 补了 `--json`（和 roots/store/rules 一致）。

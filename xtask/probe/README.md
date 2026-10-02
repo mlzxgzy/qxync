@@ -30,8 +30,8 @@
 连接目标一律走环境变量或 `--host`，**默认值是指不到任何真实设备的占位符**：
 
 ```bash
-export QSYNC_TEST_HOST=your-nas.example.com
-export QSYNC_TEST_PORT=9834
+export QXNYC_TEST_HOST=your-nas.example.com
+export QXNYC_TEST_PORT=9834
 ```
 
 ## 用法

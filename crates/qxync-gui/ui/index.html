@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>QSync — QNAP 按需同步</title>
+<title>qxync — QNAP 按需同步</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -15,7 +15,7 @@
 <div id="env-banner" class="env-banner" hidden>
   <strong>未在 Tauri 中运行</strong>
   <span>当前页面被当作普通网页打开，<code>window.__TAURI__</code> 不存在，所有操作均不可用。
-  请用 QSync 桌面程序（或 <code>qxync-gui</code>）打开本界面。</span>
+  请用 qxync 桌面程序（或 <code>qxync-gui</code>）打开本界面。</span>
 </div>
 
 <div class="shell">
@@ -24,7 +24,7 @@
        6.x 的左栏只有图标、没有文字标签；这里保留小号文字是为了可发现性
        （7 个目的地靠 tooltip 认不全），属**有意的偏离**，见 docs/M8-向Qsync-Client-6靠拢.md §1.1。 -->
   <aside class="rail">
-    <div class="rail-logo" title="QSync — QNAP 按需同步">Q</div>
+    <div class="rail-logo" title="qxync — QNAP 按需同步">Q</div>
 
     <!-- ★ M8.6：图标栏是一组按钮（键盘可达）—— 方向键在条目间移动、Home/End 到首尾，
          aria-current="page" 标出当前页；图标本身 aria-hidden，可读名来自 span 文本。
@@ -182,7 +182,7 @@
             <label>NAS 文件夹（远端根，每行一个）
               <textarea id="t-roots" rows="2" class="mono" spellcheck="false" placeholder="/home">/home</textarea>
             </label>
-            <label>水合缓存目录（留空 = 默认 <code>~/.local/share/qsync/cache</code>）
+            <label>水合缓存目录（留空 = 默认 <code>~/.local/share/qxync/cache</code>）
               <input type="text" id="t-cache-dir" class="mono" spellcheck="false"
                      placeholder="留空用默认；实际缓存会再拼一层 NAS 主机名">
             </label>
@@ -213,7 +213,7 @@
               <label class="check"><input type="checkbox" id="t-do-mount" checked> 保存后立即挂载</label>
             </div>
             <p class="hint">
-              保存位置 <code>~/.config/qsync/tasks/&lt;id&gt;.json</code>；**只登记参数，不动 NAS 上的任何数据**。
+              保存位置 <code>~/.config/qxync/tasks/&lt;id&gt;.json</code>；**只登记参数，不动 NAS 上的任何数据**。
               冲突策略与节省空间模式已经接到后端；选择性同步（勾选子文件夹）仍是 M9 的事，
               现在用「多任务 / 多根」近似。
             </p>
@@ -320,7 +320,7 @@
       <!-- ======================= 页面 6：设置（M8.4 补齐全部分区） ======================= -->
       <section class="page" id="page-settings">
         <!-- ★ M8.4：设置内分区（对齐 Qsync 的四个 tab + 连接/筛选/LAN/关于）
-             直达写法：QSYNC_GUI_TAB=settings:proxy（验收矩阵逐个分区出图） -->
+             直达写法：QXNYC_GUI_TAB=settings:proxy（验收矩阵逐个分区出图） -->
         <nav class="tabs settings-tabs" id="settings-tabs" role="tablist"
              aria-label="设置分区" data-i18n-aria-label="sec.tabs_aria">
           <button type="button" class="tab active" id="sec-tab-connect" data-sec="connect" role="tab" aria-selected="true"  aria-controls="sec-connect" data-i18n="sec.connect">连接</button>
@@ -444,7 +444,7 @@
               <textarea id="flt-lines" rows="6" class="mono" spellcheck="false"
                         placeholder="*.iso&#10;/cache/&#10;thumbs.db"></textarea>
             </label>
-            <label class="check"><input type="checkbox" id="flt-filter-temp"> 过滤临时文件（*.crdownload / ~$* / .goutputstream-* / *.qsync-part）</label>
+            <label class="check"><input type="checkbox" id="flt-filter-temp"> 过滤临时文件（*.crdownload / ~$* / .goutputstream-* / *.qxync-part）</label>
             <div class="btn-row">
               <button type="button" id="btn-flt-save" class="primary">保存筛选器</button>
               <button type="button" id="btn-flt-reload">重新读取</button>
@@ -511,7 +511,7 @@
             <div class="form">
               <label class="check"><input type="checkbox" id="s-debug-log"> 启用调试日志（Enable debug log，⚠ 影响同步性能）</label>
               <p class="hint">
-                真正的日志级别仍由 <code>RUST_LOG</code> 控制（qsync 的日志落在状态目录 <code>log/</code>，按天滚动）；
+                真正的日志级别仍由 <code>RUST_LOG</code> 控制（qxync 的日志落在状态目录 <code>log/</code>，按天滚动）；
                 这个开关是给界面/后续里程碑用的记录位。
               </p>
               <label class="check"><input type="checkbox" id="s-notifications"> 显示桌面通知（Show desktop notifications）</label>

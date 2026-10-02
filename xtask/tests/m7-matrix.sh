@@ -6,7 +6,7 @@
 #   xtask/tests/m7-matrix.sh --no-nas     # 单测 + LAN loopback（完全不需要 NAS）
 #   xtask/tests/m7-matrix.sh --keep-mounted
 #
-# 依赖: cargo build --workspace、jq；真机项需要先 `qsync login`（见 docs/测试环境.local.md）
+# 依赖: cargo build --workspace、jq；真机项需要先 `qxync login`（见 docs/测试环境.local.md）
 #
 # 验的是什么（对应 docs/M7-选择性同步与LAN直连.md §3）:
 #   1. 规则引擎：锚定/任意层级/**/尾斜杠目录剪枝/!/内置临时文件/坏规则不 panic（core 单测）；
@@ -20,18 +20,18 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-QS="$REPO/target/debug/qsync"
+QS="$REPO/target/debug/qxync"
 DAEMON="$REPO/target/debug/qxyncd"
-RUNDIR="${QSYNC_TEST_RUNDIR:-$REPO/.local-run}"
+RUNDIR="${QXNYC_TEST_RUNDIR:-$REPO/.local-run}"
 M7="$RUNDIR/m7"
 A="$M7/a"; B="$M7/b"
 SOCKA="$A/qxyncd.sock"; SOCKB="$B/qxyncd.sock"
 LOGA="$A/daemon.log"; LOGB="$B/daemon.log"
-PORT_A="${QSYNC_TEST_PEER_A:-19870}"
-PORT_B="${QSYNC_TEST_PEER_B:-19871}"
-SHARE_DIR="${QSYNC_TEST_DIR:-/home/qxync-test}"
-HIDDEN_FILE="${QSYNC_TEST_HIDDEN:-1k.bin}"      # 被规则排除的真实文件
-VISIBLE_FILE="${QSYNC_TEST_VISIBLE:-hello.txt}" # 正常文件（LAN 直传也用它）
+PORT_A="${QXNYC_TEST_PEER_A:-19870}"
+PORT_B="${QXNYC_TEST_PEER_B:-19871}"
+SHARE_DIR="${QXNYC_TEST_DIR:-/home/qxync-test}"
+HIDDEN_FILE="${QXNYC_TEST_HIDDEN:-1k.bin}"      # 被规则排除的真实文件
+VISIBLE_FILE="${QXNYC_TEST_VISIBLE:-hello.txt}" # 正常文件（LAN 直传也用它）
 NO_NAS=0; KEEP=0
 for a in "$@"; do
   case "$a" in
@@ -77,17 +77,17 @@ qb() { env_b "$QS" --socket "$SOCKB" "$@"; }
 
 setup_instance() { # dir name port  (exclude 规则另加)
   local dir="$1" name="$2" port="$3"
-  mkdir -p "$dir/config/qsync/links" "$dir/data" "$dir/state"
+  mkdir -p "$dir/config/qxync/links" "$dir/data" "$dir/state"
   jq --arg n "$name" --arg l "127.0.0.1:$port" \
-     '.peer_name=$n | .peer_listen=$l' "$LINKF" >"$dir/config/qsync/links/default.json"
-  [ -f "$CREDF" ] && cp "$CREDF" "$dir/config/qsync/credentials.json"
+     '.peer_name=$n | .peer_listen=$l' "$LINKF" >"$dir/config/qxync/links/default.json"
+  [ -f "$CREDF" ] && cp "$CREDF" "$dir/config/qxync/credentials.json"
 }
 
 start_daemon() { # dir socket log poll  → 回显 pid
   local dir="$1" sock="$2" log="$3" poll="$4"
   rm -f "$sock"
   XDG_CONFIG_HOME="$dir/config" XDG_DATA_HOME="$dir/data" XDG_STATE_HOME="$dir/state" \
-  QSYNC_POLL_INTERVAL="$poll" \
+  QXNYC_POLL_INTERVAL="$poll" \
     "$DAEMON" --link default --socket "$sock" --foreground >>"$log" 2>&1 &
   echo $!
 }
@@ -107,10 +107,10 @@ mkdir -p "$M7"
 miss=0
 for b in "$QS" "$DAEMON"; do [ -x "$b" ] || { echo "  ❌ 缺少 $b（先 cargo build --workspace）"; miss=1; }; done
 command -v jq >/dev/null || { echo "  ❌ 需要 jq"; miss=1; }
-check "$miss" "qsync / qxyncd / jq 都在"
-LINKF="${XDG_CONFIG_HOME:-$RUNDIR/config}/qsync/links/default.json"
-CREDF="${XDG_CONFIG_HOME:-$RUNDIR/config}/qsync/credentials.json"
-if [ ! -f "$LINKF" ]; then echo "  ❌ 没有 $LINKF —— 先 qsync login"; exit 2; fi
+check "$miss" "qxync / qxyncd / jq 都在"
+LINKF="${XDG_CONFIG_HOME:-$RUNDIR/config}/qxync/links/default.json"
+CREDF="${XDG_CONFIG_HOME:-$RUNDIR/config}/qxync/credentials.json"
+if [ ! -f "$LINKF" ]; then echo "  ❌ 没有 $LINKF —— 先 qxync login"; exit 2; fi
 HOST=$(jq -r .host "$LINKF"); USER_=$(jq -r .user "$LINKF")
 ok "连接配置存在（host=$HOST user=$USER_）"
 
@@ -131,17 +131,17 @@ run_test daemon-m7 qxync-daemon "m7_" "--bins"
 run_test client-peer qxync-client "peer"
 
 # ---------------------------------------------------------------- 2. 两个实例 + 规则命令
-echo "== 2. 选择性同步规则（qsync rules） =="
+echo "== 2. 选择性同步规则（qxync rules） =="
 setup_instance "$A" "qxync-a" "$PORT_A"
 setup_instance "$B" "qxync-b" "$PORT_B"
 # 给 A 加排除规则（真实文件 + 目录 + 一条不存在的）
 jq --arg h "/qxync-test/$HIDDEN_FILE" '.exclude=[$h, "/qxync-test/nope-dir"]' \
-   "$A/config/qsync/links/default.json" >"$A/config/qsync/links/default.json.tmp" \
-   && mv "$A/config/qsync/links/default.json.tmp" "$A/config/qsync/links/default.json"
+   "$A/config/qxync/links/default.json" >"$A/config/qxync/links/default.json.tmp" \
+   && mv "$A/config/qxync/links/default.json.tmp" "$A/config/qxync/links/default.json"
 check $? "写好 A/B 两个实例的 link（A 带 2 条 exclude，peer_listen=127.0.0.1:$PORT_A/$PORT_B）"
 # 故意塞一条坏规则：必须被点名而不是静默
-jq '.exclude += ["///"]' "$A/config/qsync/links/default.json" >"$A/config/qsync/links/default.json.tmp" \
-   && mv "$A/config/qsync/links/default.json.tmp" "$A/config/qsync/links/default.json"
+jq '.exclude += ["///"]' "$A/config/qxync/links/default.json" >"$A/config/qxync/links/default.json.tmp" \
+   && mv "$A/config/qxync/links/default.json.tmp" "$A/config/qxync/links/default.json"
 
 PID_A=$(start_daemon "$A" "$SOCKA" "$LOGA" 5)
 wait_daemon "$A" "$SOCKA"; check $? "qxyncd A 起来了（--link default）"

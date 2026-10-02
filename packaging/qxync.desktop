@@ -1,10 +1,10 @@
 [Desktop Entry]
 Type=Application
-Name=QSync
+Name=qxync
 GenericName=QNAP Qsync client
 Comment=QNAP Qsync 按需同步（qxync）
 Exec=qxync-gui
 Icon=qxync
 Terminal=false
 Categories=Utility;FileTools;
-Keywords=qnap;qsync;sync;fuse;on-demand;
+Keywords=qnap;qxync;qsync;sync;fuse;on-demand;

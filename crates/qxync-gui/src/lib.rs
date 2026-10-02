@@ -1,4 +1,4 @@
-//! `qxync-gui` —— QSync for Linux 桌面应用（Tauri 2）。
+//! `qxync-gui` —— qxync 桌面应用（Tauri 2）。
 //!
 //! 定位（见 `docs/开发规划.md` §2「M4」）：**daemon 的图形客户端**，
 //! 首版只做四件事——登录/连接配置、挂载管理、状态与进度面板、pin 管理。
@@ -109,7 +109,7 @@ pub fn run() {
         .run(tauri::generate_context!());
     if let Err(e) = result {
         tracing::error!("GUI 退出: {e}");
-        eprintln!("❌ QSync GUI 启动失败: {e}");
+        eprintln!("❌ qxync GUI 启动失败: {e}");
         std::process::exit(1);
     }
 }
@@ -118,7 +118,7 @@ pub fn run() {
 ///
 /// **每次关闭都重新读盘**：`close_to_tray` 是运行时可改的设置（前端设置页会写
 /// `settings.json`），缓存住的话用户改完得重启才生效。读失败（文件损坏/没权限）
-/// 按 `true` 处理 —— 那正好是 `Settings::default()` 的取值，也和 QSync 一致。
+/// 按 `true` 处理 —— 那正好是 `Settings::default()` 的取值，也和 Qsync 一致。
 fn close_to_tray_now() -> bool {
     match qxync_core::ConfigPaths::discover() {
         Ok(p) => qxync_core::Settings::load(&p)
@@ -200,7 +200,7 @@ async fn self_test_login_inner() -> Value {
     let cred = match qxync_core::Credentials::load(&paths) {
         Ok(c) => c,
         Err(e) => {
-            return json!({"ok": false, "error": format!("读凭据失败（先 `qsync login --password`）: {e}")})
+            return json!({"ok": false, "error": format!("读凭据失败（先 `qxync login --password`）: {e}")})
         }
     };
     if cred.host != link.host || cred.user != link.user {
@@ -317,7 +317,7 @@ pub fn self_test_notify() -> bool {
         let result = if commands::notifications_enabled() {
             commands::show_notification(
                 handle,
-                "QSync 桌面通知自检",
+                "qxync 桌面通知自检",
                 "如果你看到这条通知，说明 qxync-gui 的通知链路是通的。",
             )
         } else {
@@ -328,13 +328,13 @@ pub fn self_test_notify() -> bool {
                 "ok": true,
                 "shown": false,
                 "reason": "桌面通知已关闭",
-                "title": "QSync 桌面通知自检",
+                "title": "qxync 桌面通知自检",
                 "note": "settings.json 里 desktop_notifications=false：按设置**不发**通知",
             }),
             Ok(()) => json!({
                 "ok": true,
                 "shown": true,
-                "title": "QSync 桌面通知自检",
+                "title": "qxync 桌面通知自检",
                 // `shown=true` 的准确含义：已交给通知后端**异步**派发（插件内部 spawn 后
                 // 立即返回，连 D-Bus 错误都被它吞掉了），不代表已经确认投递到托盘区。
                 "dispatch": "async",
@@ -703,7 +703,7 @@ async fn self_test_inner() -> Value {
     })
 }
 
-/// 日志：stderr + 按天滚动文件 `<state>/log/qsync-gui.log.YYYY-MM-DD`（与 daemon 同目录）。
+/// 日志：stderr + 按天滚动文件 `<state>/log/qxync-gui.log.YYYY-MM-DD`（与 daemon 同目录）。
 fn init_logging() {
     static GUARD: OnceLock<tracing_appender::non_blocking::WorkerGuard> = OnceLock::new();
     static INIT: OnceLock<()> = OnceLock::new();
@@ -718,7 +718,7 @@ fn init_logging() {
         if std::fs::create_dir_all(&dir).is_err() {
             return None;
         }
-        let appender = tracing_appender::rolling::daily(&dir, "qsync-gui.log");
+        let appender = tracing_appender::rolling::daily(&dir, "qxync-gui.log");
         let (nb, guard) = tracing_appender::non_blocking(appender);
         let _ = GUARD.set(guard);
         Some(

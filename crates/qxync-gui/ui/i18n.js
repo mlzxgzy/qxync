@@ -1,5 +1,5 @@
 /* ============================================================================
- * QSync GUI —— i18n 文案表（★ M8.6）
+ * qxync GUI —— i18n 文案表（★ M8.6）
  *
  * 目标（对应 docs/M8-向Qsync-Client-6靠拢.md §M8.6 交付物 ④）：
  *   * **把 zh-CN 文案集中到一张表**（不引入任何 i18n 框架 / 不做 ICU 复数规则）；
@@ -25,7 +25,7 @@
   // ---------------------------------------------------------------- zh-CN
   var ZH = {
     // ---- 应用外壳
-    'app.title': 'QSync — QNAP 按需同步',
+    'app.title': 'qxync — QNAP 按需同步',
     'app.skip': '跳到主内容',
     'nav.aria': '主导航',
     'nav.home': '主页',
@@ -95,7 +95,7 @@
     'home.conn_ok': '{user}@{host}:{port} · {state}',
     'home.conn_connected': '已连接',
     'home.conn_disconnected': '未登录',
-    'home.conn_qsync': ' · Qsync {version}',
+    'home.conn_qxync': ' · Qsync {version}',
     'home.tasks_empty': '还没有同步任务。点右上「＋ 添加任务」把本地文件夹与 NAS 文件夹配成一对。',
     'home.task_count': '（{n}）',
     'task.state_no_daemon': 'qxyncd 未运行',
@@ -308,7 +308,7 @@
     };
   }
 
-  global.QSYNC_I18N = {
+  global.QXNYC_I18N = {
     t: t,
     apply: apply,
     setLocale: setLocale,

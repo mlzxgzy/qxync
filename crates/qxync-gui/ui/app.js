@@ -1,5 +1,5 @@
 /* ============================================================================
- * QSync GUI 前端（vanilla ES2020，无打包器 / 无框架 / 无外部资源）
+ * qxync GUI 前端（vanilla ES2020，无打包器 / 无框架 / 无外部资源）
  *
  * 通道只有一个：window.__TAURI__.core.invoke(cmd, args)
  *   - Tauri v2 命令参数名是 camelCase（Rust 侧 snake_case）：link_id → linkId
@@ -12,7 +12,7 @@
   // --------------------------------------------------------------- i18n（★ M8.6）
   // 文案表在 ui/i18n.js：zh-CN 是真值，en 预留、查不到就整条回落到 zh-CN。
   // 表没加载（旧包 / 被单测直接 eval）时退化成「返回 key」，界面不至于抛错。
-  var I18N = (typeof window !== 'undefined' && window.QSYNC_I18N) ? window.QSYNC_I18N : null;
+  var I18N = (typeof window !== 'undefined' && window.QXNYC_I18N) ? window.QXNYC_I18N : null;
   function T(key, vars) {
     if (I18N && typeof I18N.t === 'function') { return I18N.t(key, vars); }
     return String(key);
@@ -54,7 +54,7 @@
     lan: T('sec.lan'),
     about: T('sec.about')
   };
-  // ★ 兼容：M8.1 之前 QSYNC_GUI_TAB 用的是这 5 个值，必须继续可用
+  // ★ 兼容：M8.1 之前 QXNYC_GUI_TAB 用的是这 5 个值，必须继续可用
   var LEGACY_TABS = {
     status: { page: 'diag', diag: 'status' },
     mounts: { page: 'diag', diag: 'mounts' },
@@ -700,7 +700,7 @@
           user: str(link.user), host: str(link.host), port: str(link.port),
           state: (logged ? T('home.conn_connected') : T('home.conn_disconnected'))
         }) + (s && s.server && s.server.qsync_version
-          ? T('home.conn_qsync', { version: str(s.server.qsync_version) }) : '');
+          ? T('home.conn_qxync', { version: str(s.server.qsync_version) }) : '');
       }
     }
 
@@ -856,7 +856,7 @@
       var bDel = el('button', 'mini danger', T('task.act_delete'));
       bDel.type = 'button';
       bDel.addEventListener('click', function () {
-        if (!window.confirm('删除任务登记？\n' + t.id + '\n\n只删 ~/.config/qsync/tasks/' + t.id +
+        if (!window.confirm('删除任务登记？\n' + t.id + '\n\n只删 ~/.config/qxync/tasks/' + t.id +
           '.json，**不动挂载点里的文件，也不动 NAS 上的数据**。')) { return; }
         doTaskAction('delete', t.id, '删除登记', bDel);
       });
@@ -1146,7 +1146,7 @@
     if (!card) { return; }
     var mp = $('t-mountpoint');
     if (mp && !mp.value) {
-      mp.value = (str(state.home) || '~') + '/qsync-mnt';
+      mp.value = (str(state.home) || '~') + '/qxync-mnt';
     }
     card.hidden = false;
     card.scrollIntoView({ block: 'nearest' });
@@ -1220,7 +1220,7 @@
         renderResult('task-result', true, '任务已保存（未挂载）', [
           ['id', id], ['本地', mp],
           ['NAS', roots.length ? roots.join(', ') : '（由 link 决定）'],
-          ['缓存目录', cdir || '（默认 ~/.local/share/qsync/cache）'],
+          ['缓存目录', cdir || '（默认 ~/.local/share/qxync/cache）'],
           ['冲突策略', conflictLabel(task.conflict)]
         ]);
         refreshTasks();
@@ -1234,7 +1234,7 @@
           ['id', id],
           ['本地', mp],
           ['NAS', roots.length ? roots.join(', ') : '（由 link 决定）'],
-          ['缓存目录', cdir || '（默认 ~/.local/share/qsync/cache）'],
+          ['缓存目录', cdir || '（默认 ~/.local/share/qxync/cache）'],
           ['冲突策略', conflictLabel(task.conflict)],
           ['挂载', okMount ? '成功' : str(r2.error)]
         ]);
@@ -1716,7 +1716,7 @@
     // 挂载点默认值 & 下载默认目录
     var mp = $('m-mountpoint');
     if (mp && !mp.value) {
-      mp.value = (str(info.home) || '~') + '/qsync-mnt';
+      mp.value = (str(info.home) || '~') + '/qxync-mnt';
     }
   }
 
@@ -2691,7 +2691,7 @@
       if (state.errorTick % 3 === 0) { checkErrorsForNotify(); }
     }, POLL_MS);
   }
-  // 首轮 status 到位前切到某些页（用户手快，或 QSYNC_GUI_TAB 指定）时，
+  // 首轮 status 到位前切到某些页（用户手快，或 QXNYC_GUI_TAB 指定）时，
   // requireLogin() 还拿不到状态 → refreshFiles 会直接返回空态。status 回来后补一次。
   function refreshCurrentPage() {
     if (state.page === 'home') {
@@ -2964,7 +2964,7 @@
       kvText(dl, '上次触发', clock(num(d.last_run_unix, 0) * 1000));
     }
     if (d.injected === true) {
-      kvRow(dl, '⚠ 注入', '正在使用 QSYNC_TEST_FAST_STATVFS 注入值（验收模式）', 'val-warn');
+      kvRow(dl, '⚠ 注入', '正在使用 QXNYC_TEST_FAST_STATVFS 注入值（验收模式）', 'val-warn');
     }
     setText('space-used-label', '缓存 ' + humanSize(num(d.cache_used_bytes, 0)));
 
@@ -3353,7 +3353,7 @@
     var addr = str($('lan-pair-addr') ? $('lan-pair-addr').value : '').trim();
     var code = str($('lan-pair-code') ? $('lan-pair-code').value : '').trim();
     if (!addr || !code) {
-      renderError('lan-result', '参数错误', '需要「地址 + 配对码」两样：先在对方机器上跑 qsync peer status 拿配对码');
+      renderError('lan-result', '参数错误', '需要「地址 + 配对码」两样：先在对方机器上跑 qxync peer status 拿配对码');
       return Promise.resolve(null);
     }
     return withBusy({ buttons: ['btn-lan-pair'] }, function () {
@@ -3381,7 +3381,7 @@
     if (!dl) { return; }
     clear(dl);
     var info = state.appInfo;
-    kvText(dl, 'QSync for Linux', info ? str(info.version) : '—');
+    kvText(dl, 'qxync', info ? str(info.version) : '—');
     kvText(dl, '说明', 'FUSE 按需同步 + qxyncd 常驻守护；对齐 Qsync Client 6.1 的界面与术语');
     kvText(dl, 'socket', info ? str(info.socket) : '—');
     kvText(dl, '配置目录', info ? str(info.config_dir) : '—');
@@ -3473,13 +3473,13 @@
           state.settings.settings.desktop_notifications === false) {
         return r;   // 用户关掉了通知
       }
-      notifyUser('QSync 同步出错', str(e.path) + ' —— ' + str(e.detail));
+      notifyUser('qxync 同步出错', str(e.path) + ' —— ' + str(e.detail));
       return r;
     }, function () { return { ok: false }; });
   }
 
   // ============================================================ 页面切换
-  /** 旧值 → 新目的地（`QSYNC_GUI_TAB` 的历史值必须继续可用）。 */
+  /** 旧值 → 新目的地（`QXNYC_GUI_TAB` 的历史值必须继续可用）。 */
   function resolvePage(name) {
     if (LEGACY_TABS[name]) { return LEGACY_TABS[name]; }
     // `diag:<status|mounts|sync>` —— 给验收矩阵用的「直达诊断子页」写法
@@ -3820,7 +3820,7 @@
     on('btn-lan-pair', 'click', function () { doLanPair(); });
     on('btn-about-refresh', 'click', function () { loadConnect(); m84InfoRefresh(); renderAbout(); });
     on('btn-notify-test', 'click', function () {
-      notifyUser('QSync 测试通知', '如果你看到这条，说明桌面通知链路是通的。').then(function (r) {
+      notifyUser('qxync 测试通知', '如果你看到这条，说明桌面通知链路是通的。').then(function (r) {
         if (r.ok && isObj(r.data) && r.data.ok === false) {
           renderError('advanced-result', '通知未发出', str(r.data.error || r.data.reason));
         } else if (r.ok) {
@@ -3942,7 +3942,7 @@
       if (banner) { banner.hidden = false; }
       logErr('未在 Tauri 中运行：window.__TAURI__.core.invoke 不存在，界面只做静态展示');
     } else {
-      logInfo('QSync GUI 已启动，开始轮询 daemon_status（每 2s）');
+      logInfo('qxync GUI 已启动，开始轮询 daemon_status（每 2s）');
     }
 
     // ★ M8.6：i18n 一致性 —— DOM 里挂了 data-i18n 但表里没有的 key 直接报出来（拼错立刻可见）
@@ -3959,7 +3959,7 @@
     call('app_info', {}).then(function (r) {
       if (r.ok) {
         renderAppInfo(isObj(r.data) ? r.data : null);
-        // 调试/验收用：环境变量 QSYNC_GUI_TAB 指定初始目的地
+        // 调试/验收用：环境变量 QXNYC_GUI_TAB 指定初始目的地
         //   新值：home|tasks|files|journal|errors|settings|diag
         //   旧值（M8.1 之前，必须继续可用）：status|mounts|sync→诊断；connect→设置；files
         // 后端 app_info 原样透传，截图矩阵靠它逐个目的地出图。

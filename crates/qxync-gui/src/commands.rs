@@ -23,7 +23,7 @@ fn paths() -> Result<ConfigPaths, String> {
 }
 
 fn daemon_binary() -> Result<PathBuf, String> {
-    if let Some(p) = std::env::var_os("QSYNC_DAEMON_BIN") {
+    if let Some(p) = std::env::var_os("QXNYC_DAEMON_BIN") {
         let p = PathBuf::from(p);
         if p.is_file() {
             return Ok(p);
@@ -44,7 +44,7 @@ fn daemon_binary() -> Result<PathBuf, String> {
             }
         }
     }
-    Err("找不到 qxyncd（先 `cargo build --workspace`，或设置 QSYNC_DAEMON_BIN）".into())
+    Err("找不到 qxyncd（先 `cargo build --workspace`，或设置 QXNYC_DAEMON_BIN）".into())
 }
 
 async fn wait_gone(socket: &std::path::Path) -> bool {
@@ -242,8 +242,8 @@ pub async fn app_info() -> Result<Value, String> {
         "daemon_bin": daemon_binary().ok().map(|b| b.display().to_string()),
         "daemon_running": ipc::available(&socket).await,
         "ui_assets": crate::ui_assets(),
-        // 调试/验收用：`QSYNC_GUI_TAB=<status|connect|mounts|files|sync>` 指定初始 tab
-        "initial_tab": std::env::var("QSYNC_GUI_TAB").ok(),
+        // 调试/验收用：`QXNYC_GUI_TAB=<status|connect|mounts|files|sync>` 指定初始 tab
+        "initial_tab": std::env::var("QXNYC_GUI_TAB").ok(),
     }))
 }
 
@@ -318,7 +318,7 @@ pub async fn link_read(link_id: Option<String>) -> Result<Value, String> {
     }
 }
 
-/// 写连接配置 `~/.config/qsync/links/<id>.json`。
+/// 写连接配置 `~/.config/qxync/links/<id>.json`。
 #[tauri::command]
 pub async fn link_save(input: Value) -> Result<Value, String> {
     let li: LinkInput = serde_json::from_value(input).map_err(|e| format!("参数错误: {e}"))?;
@@ -332,7 +332,7 @@ pub async fn link_save(input: Value) -> Result<Value, String> {
     Ok(json!({"ok": true, "path": path.display().to_string(), "link": link}))
 }
 
-/// 写凭据 `~/.config/qsync/credentials.json`（0600，先临时文件再 rename）。
+/// 写凭据 `~/.config/qxync/credentials.json`（0600，先临时文件再 rename）。
 #[tauri::command]
 pub async fn credential_save(input: Value) -> Result<Value, String> {
     let li: LinkInput = serde_json::from_value(input).map_err(|e| format!("参数错误: {e}"))?;
@@ -434,7 +434,7 @@ pub async fn login_flow(input: Value) -> Result<Value, String> {
                 return Ok(json!({
                     "ok": false, "link_path": link_path.display().to_string(),
                     "credential_path": cred_path.display().to_string(),
-                    "error": "参数已改，但旧 daemon 没能在 10s 内退出；请手动 `qsync daemon stop` 后重试",
+                    "error": "参数已改，但旧 daemon 没能在 10s 内退出；请手动 `qxync daemon stop` 后重试",
                 }));
             }
             let started = start_daemon(&link.id).await;

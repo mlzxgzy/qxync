@@ -5,7 +5,7 @@
 #   xtask/tests/m5-matrix.sh                 # 全量（含真机 delta_gate 判定）
 #   xtask/tests/m5-matrix.sh --no-nas        # 跳过真机项（只跑本地状态库/编解码）
 #
-# 依赖: cargo build --workspace、真机凭据（先 `qsync login`，见 docs/测试环境.local.md）、jq
+# 依赖: cargo build --workspace、真机凭据（先 `qxync login`，见 docs/测试环境.local.md）、jq
 #
 # 验的是什么（每一项都可复现）:
 #   1. M2c 的 cursors.json / baseline.json 能被迁进 sync.db，且旧文件归档成 *.json.migrated；
@@ -19,12 +19,12 @@ set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DAEMON="$REPO/target/debug/qxyncd"
-QS="$REPO/target/debug/qsync"
-RUNDIR="${QSYNC_TEST_RUNDIR:-$REPO/.local-run}"
+QS="$REPO/target/debug/qxync"
+RUNDIR="${QXNYC_TEST_RUNDIR:-$REPO/.local-run}"
 M5="$RUNDIR/m5"
 SOCK="$M5/m5.sock"
 DBG="$M5/daemon.log"
-LINK="${QSYNC_TEST_LINK:-default}"
+LINK="${QXNYC_TEST_LINK:-default}"
 export CARGO_HOME="${CARGO_HOME:-$REPO/.cargo-home}"
 
 NO_NAS=0
@@ -39,7 +39,7 @@ done
 export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$RUNDIR/config}"
 export XDG_DATA_HOME="$M5/data"
 export XDG_STATE_HOME="$M5/state"
-export QSYNC_SOCKET="$SOCK"
+export QXNYC_SOCKET="$SOCK"
 export RUST_LOG="${RUST_LOG:-info}"
 
 PASS=0; FAIL=0; DAEMON_PID=""
@@ -79,19 +79,19 @@ echo "== 0. 前置 =="
 miss=0
 for b in "$DAEMON" "$QS"; do [ -x "$b" ] || { echo "  ❌ 缺少 $b（先 cargo build --workspace）"; miss=1; }; done
 command -v jq >/dev/null || { echo "  ❌ 需要 jq"; miss=1; }
-check "$miss" "qxyncd / qsync / jq 都在"
-LINKF="$XDG_CONFIG_HOME/qsync/links/$LINK.json"
+check "$miss" "qxyncd / qxync / jq 都在"
+LINKF="$XDG_CONFIG_HOME/qxync/links/$LINK.json"
 if [ ! -f "$LINKF" ]; then
-  echo "  ❌ 没有连接配置 $LINKF —— 先跑一次 qsync login"; exit 2
+  echo "  ❌ 没有连接配置 $LINKF —— 先跑一次 qxync login"; exit 2
 fi
 HOST=$(jq -r .host "$LINKF")
 ok "连接配置存在（host=$HOST）"
 
-rm -rf "$M5"; mkdir -p "$M5" "$XDG_DATA_HOME/qsync/sync/$HOST"
+rm -rf "$M5"; mkdir -p "$M5" "$XDG_DATA_HOME/qxync/sync/$HOST"
 
 # ---------------------------------------------------------------- 1. 造一份「M2c 时代」的 JSON
 echo "== 1. M2c 的 JSON → sync.db 迁移 =="
-LEG="$XDG_DATA_HOME/qsync/sync/$HOST"
+LEG="$XDG_DATA_HOME/qxync/sync/$HOST"
 cat >"$LEG/cursors.json" <<'JSON'
 {"config":188,"notify":37,"global_notify":177,"max_log_seen":188,"log_missing_count":111}
 JSON
@@ -104,7 +104,7 @@ cat >"$LEG/baseline.json" <<'JSON'
 JSON
 check 0 "已铺好旧 JSON（cursors + 3 条 baseline，含 1 条 MISSING）"
 
-start_daemon; check $? "qxyncd 起来了（状态目录 $XDG_DATA_HOME/qsync/sync/$HOST）"
+start_daemon; check $? "qxyncd 起来了（状态目录 $XDG_DATA_HOME/qxync/sync/$HOST）"
 grep -aq "M5 状态迁移" "$DBG"; check $? "启动日志里有「M5 状态迁移」"
 grep -aq "baseline=3 条" "$DBG"; check $? "日志显示导入了 3 条 baseline"
 
@@ -177,15 +177,15 @@ echo "== 5. 真机 delta_gate（versioning_* 能力判定） =="
 if [ "$NO_NAS" = "1" ]; then
   skip "真机项（--no-nas）"
 else
-  CRED="$XDG_CONFIG_HOME/qsync/credentials.json"
+  CRED="$XDG_CONFIG_HOME/qxync/credentials.json"
   if [ ! -f "$CRED" ]; then
-    bad "缺凭据 $CRED（先 qsync login）"
+    bad "缺凭据 $CRED（先 qxync login）"
   else
-    export QSYNC_TEST_HOST="$HOST"
-    export QSYNC_TEST_PORT="$(jq -r .port "$LINKF")"
-    export QSYNC_TEST_USER="$(jq -r .user "$LINKF")"
-    export QSYNC_TEST_PASSWORD="$(jq -r .password "$CRED")"
-    export QSYNC_TEST_FIXTURE="${QSYNC_TEST_FIXTURE:-/home/qxync-test}"
+    export QXNYC_TEST_HOST="$HOST"
+    export QXNYC_TEST_PORT="$(jq -r .port "$LINKF")"
+    export QXNYC_TEST_USER="$(jq -r .user "$LINKF")"
+    export QXNYC_TEST_PASSWORD="$(jq -r .password "$CRED")"
+    export QXNYC_TEST_FIXTURE="${QXNYC_TEST_FIXTURE:-/home/qxync-test}"
     ( cd "$REPO" && cargo test -p qxync-proto-test --test versioning -- --ignored --nocapture 2>&1 | tail -40 >"$M5/t-versioning.log" )
     grep -aq "test result: ok. 1 passed" "$M5/t-versioning.log"; check $? "真机 versioning 探测测试通过（1 passed）"
     grep -ao "gate: .*" "$M5/t-versioning.log" | head -1 | sed 's/^/     /'

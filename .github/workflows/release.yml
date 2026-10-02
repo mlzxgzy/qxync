@@ -1,7 +1,7 @@
 name: Release
 
 # 推 `v*` tag → 自动构建三个二进制并挂到该 tag 的 Release：
-#   qsync / qxyncd / qxync-gui（三个裸二进制 + 一个 tar.gz）+ SHA256SUMS
+#   qxync / qxyncd / qxync-gui（三个裸二进制 + 一个 tar.gz）+ SHA256SUMS
 # 手动重跑同一个 tag：Actions → Release → Run workflow，填 tag；同名资产会被覆盖，
 # 不会重复建 Release。Release 正文优先用 `docs/发布说明-<tag>.md`（存在时），
 # 否则用 GitHub 自动生成的 Release Notes。
@@ -62,7 +62,7 @@ jobs:
       # （发版清单 §3 的自查步骤也是这么要求的）。
       # 有意**不 strip**：release profile 带 line-tables-only 调试信息，
       # 用户报 bug 时贴出来的回溯才可读（见 Cargo.toml 的 [profile.release] 注释）。
-      - name: cargo build --release --locked（qsync / qxyncd / qxync-gui）
+      - name: cargo build --release --locked（qxync / qxyncd / qxync-gui）
         run: cargo build --release --locked -p qxync-cli -p qxync-daemon -p qxync-gui
 
       - name: 打包为 tar.gz + 裸二进制（输出到 dist/）
@@ -115,13 +115,13 @@ jobs:
           bsdtar -xOf "${pkgs[0]}" .PKGINFO | grep -E "^(pkgname|pkgver|arch) = "
           bsdtar -xOf "${pkgs[0]}" .PKGINFO | grep -qx "pkgname = qxync-bin"
           bsdtar -xOf "${pkgs[0]}" .PKGINFO | grep -qx "pkgver = ${want}"
-          for f in usr/bin/qsync usr/bin/qxyncd usr/bin/qxync-gui \
+          for f in usr/bin/qxync usr/bin/qxyncd usr/bin/qxync-gui \
                    usr/share/applications/qxync.desktop \
                    usr/share/icons/hicolor/512x512/apps/qxync.png; do
             bsdtar -tf "${pkgs[0]}" | grep -qx "$f" || { echo "❌ 包里缺 $f"; exit 1; }
           done
           # 包里的三个二进制必须与 Release 资产**逐字节一致**（同一个 tar.gz 装出来的）
-          for b in qsync qxyncd qxync-gui; do
+          for b in qxync qxyncd qxync-gui; do
             in_pkg="$(bsdtar -xOf "${pkgs[0]}" "usr/bin/$b" | sha256sum | cut -d' ' -f1)"
             on_disk="$(sha256sum "dist/$b" | cut -d' ' -f1)"
             [ "$in_pkg" = "$on_disk" ] || { echo "❌ 包里的 $b 与 dist/$b 不一致"; exit 1; }

@@ -1,8 +1,8 @@
-//! qxyncd —— QSync-Linux 守护进程（M1.5：本地 IPC；FUSE 由本进程持有）。
+//! qxyncd —— qxync 守护进程（M1.5：本地 IPC；FUSE 由本进程持有）。
 //!
 //! ```text
-//! qsync (CLI) ──unix socket + JSON 行──► qxyncd
-//!                                          ├─ QsyncSession（登录/保活/重登）
+//! qxync (CLI) ──unix socket + JSON 行──► qxyncd
+//!                                          ├─ QxyncSession（登录/保活/重登）
 //!                                          ├─ MountRegistry（FUSE 线程）
 //!                                          └─ （M2 起）水合/轮询/队列/脱水
 //! ```
@@ -18,9 +18,13 @@ use qxync_core::ipc::{default_pid_path, default_socket_path};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "qxyncd", version, about = "QSync for Linux 守护进程")]
+#[command(
+    name = "qxyncd",
+    version,
+    about = "qxync —— QNAP Qsync 的 Linux 常驻同步守护"
+)]
 struct Args {
-    /// 连接 id（对应 ~/.config/qsync/links/<id>.json）
+    /// 连接 id（对应 ~/.config/qxync/links/<id>.json）
     #[arg(long, default_value = "default")]
     link: String,
 
@@ -45,7 +49,7 @@ struct Args {
     print_config: bool,
 
     /// ★ M8.2：启动时恢复 enabled=true 的同步任务（默认关闭）。
-    /// 也可用环境变量 QSYNC_TASK_RESTORE=1 打开。
+    /// 也可用环境变量 QXNYC_TASK_RESTORE=1 打开。
     /// 默认关闭是刻意的：恢复会「凭空挂载」，可能让上一次跑崩留下的挂载复活。
     #[arg(long)]
     restore_tasks: bool,
@@ -82,10 +86,10 @@ fn main() -> Result<()> {
         .enable_all()
         .build()
         .context("建 tokio 运行时失败")?;
-    // ★ M8.2：`--restore-tasks` 或 QSYNC_TASK_RESTORE=1 → 启动时恢复启用的任务
+    // ★ M8.2：`--restore-tasks` 或 QXNYC_TASK_RESTORE=1 → 启动时恢复启用的任务
     let restore = args.restore_tasks
         || matches!(
-            std::env::var("QSYNC_TASK_RESTORE").ok().as_deref(),
+            std::env::var("QXNYC_TASK_RESTORE").ok().as_deref(),
             Some("1") | Some("true") | Some("yes")
         );
     rt.block_on(daemon::run(daemon::Options {
@@ -102,7 +106,7 @@ fn daemonize() -> Result<()> {
         match libc::fork() {
             -1 => return Err(std::io::Error::last_os_error()).context("fork"),
             0 => { /* 子进程继续 */ }
-            _ => std::process::exit(0), // 父进程返回，让 `qsync daemon start` 立即结束
+            _ => std::process::exit(0), // 父进程返回，让 `qxync daemon start` 立即结束
         }
         if libc::setsid() == -1 {
             return Err(std::io::Error::last_os_error()).context("setsid");

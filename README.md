@@ -23,7 +23,7 @@ NAS 上的文件在本地只是一个「占位符」，`ls -l` 显示真实大�
 
 | 二进制 | 角色 |
 |---|---|
-| `qsync` | 命令行（登录 / 列举 / 上传下载 / 挂载 / 同步 / 脱水 / 任务 / 设置 / 日志 / LAN 对等） |
+| `qxync` | 命令行（登录 / 列举 / 上传下载 / 挂载 / 同步 / 脱水 / 任务 / 设置 / 日志 / LAN 对等） |
 | `qxyncd` | 常驻守护进程：**唯一**持有 FUSE 挂载与 NAS 会话，对外提供本地 unix socket JSON IPC |
 | `qxync-gui` | Tauri 2 桌面应用（零依赖静态前端，全部经 daemon 的 IPC） |
 
@@ -99,7 +99,7 @@ cargo build --workspace --release # release（已配 lto=thin；保留行号回�
 |---|---|
 | `qxync-<版本>-x86_64-unknown-linux-gnu.tar.gz` | 三个二进制 + 桌面项 / 图标 + 许可证 / 免责声明 |
 | `qxync-bin-<版本>-1-x86_64.pkg.tar.zst` | **Arch 包**（CI 用 archlinux 镜像里的真 `makepkg` 从上面那个 tar.gz 打的） |
-| `qsync` · `qxyncd` · `qxync-gui` | 三个裸二进制（同一份构建，供挑着下） |
+| `qxync` · `qxyncd` · `qxync-gui` | 三个裸二进制（同一份构建，供挑着下） |
 | `SHA256SUMS` | 上述资产的校验和 |
 
 三个二进制放在**同一个目录**即可：GUI 先找自己旁边的 `qxyncd`，找不到再退回 `PATH`。
@@ -113,9 +113,30 @@ cargo build --workspace --release # release（已配 lto=thin；保留行号回�
 包**有意不 strip**（为了回溯可读，见上一节），所以装完约 190 MB —— 细节与发版后的
 校验和更新见 [`packaging/arch/README.md`](packaging/arch/README.md)。
 
+### 2.5 从 0.1.x 升级（改名了）
+
+0.1.x 的命令行叫 `qsync`，会和 **QNAP 官方 Qsync 客户端**在 `PATH` 里抢同一个名字；
+0.2.0 起统一叫 `qxync`。完整清单见 [CHANGELOG](CHANGELOG.md#020---2026-10-02)。
+
+升级后第一次运行时，本地目录会**自动迁移**：`~/.config/qsync`、`~/.local/share/qsync`、
+`~/.local/state/qsync` 会被直接改名成对应的 `qxync` 目录（跨文件系统时退回复制），
+所以凭据、状态库、日志都跟着走，**不需要重新 `login`**。如果新旧目录同时存在
+（例如早期原型留下的 `~/.local/share/qxync`），只把旧目录里**缺**的条目补进去，
+**已有的一律不覆盖**，并打一行提示告诉你两个路径。唯一要动的是你自己的脚本：
+
+| 旧写法（0.1.x） | 新写法（0.2.0+） |
+|---|---|
+| `qsync …` | `qxync …` |
+| `QSYNC_PASSWORD` / `QSYNC_HOST` / `QSYNC_USER` / `QSYNC_SOCKET` | `QXNYC_PASSWORD` / `QXNYC_HOST` / `QXNYC_USER` / `QXNYC_SOCKET` |
+| `QSYNC_TEST_*`（验收矩阵） | `QXNYC_TEST_*` |
+| `getfattr -n user.qsync.state` | `getfattr -n user.qxync.state` |
+
+> **名字边界**：只有**我们自己的**标识改了。NAS 协议面照旧 —— `cgi-bin/qsync/qsyncsrv.cgi`、
+> `qsync_version`、`service=Qsync`、`WFM_QSYNC_DISABLED` 这些**一字未动**。
+
 ### 3. 首次登录
 
-凭据写入 `~/.config/qsync/credentials.json`（权限 `0600`）。
+凭据写入 `~/.config/qxync/credentials.json`（权限 `0600`）。
 
 ```bash
 cargo run -p qxync-cli -- \
@@ -124,30 +145,30 @@ cargo run -p qxync-cli -- \
 ```
 
 > `--insecure` = 接受自签证书。**口令不要写进 shell 历史**：
-> `--password` 也可以用 `QSYNC_PASSWORD` 环境变量代替。
+> `--password` 也可以用 `QXNYC_PASSWORD` 环境变量代替。
 
 ### 4. 挂载按需同步视图
 
 ```bash
 cargo run -p qxync-cli -- daemon start            # 拉起 qxyncd（幂等）
-mkdir -p ~/qsync-mnt
-qsync mount ~/qsync-mnt --remote /home            # FUSE 由 daemon 持有（默认只读）
-qsync mount ~/qsync-mnt --remote /home --rw       # 需要写回时就加 --rw
+mkdir -p ~/qxync-mnt
+qxync mount ~/qxync-mnt --remote /home            # FUSE 由 daemon 持有（默认只读）
+qxync mount ~/qxync-mnt --remote /home --rw       # 需要写回时就加 --rw
 
-ls -l ~/qsync-mnt/qxync-test          # 真实大小，尚未下载
-cat ~/qsync-mnt/qxync-test/hello.txt  # 首次读触发按需水合（只取需要的区间）
-getfattr -n user.qsync.state ~/qsync-mnt/qxync-test/hello.txt   # placeholder / partial / hydrated
+ls -l ~/qxync-mnt/qxync-test          # 真实大小，尚未下载
+cat ~/qxync-mnt/qxync-test/hello.txt  # 首次读触发按需水合（只取需要的区间）
+getfattr -n user.qxync.state ~/qxync-mnt/qxync-test/hello.txt   # placeholder / partial / hydrated
 
-qsync dehydrate --path /home/qxync-test/big.bin   # 脱水：丢本地内容、只留占位符
-qsync umount ~/qsync-mnt
-qsync daemon stop                                 # 干净退出：卸载全部挂载 + 删 socket/pid
+qxync dehydrate --path /home/qxync-test/big.bin   # 脱水：丢本地内容、只留占位符
+qxync umount ~/qxync-mnt
+qxync daemon stop                                 # 干净退出：卸载全部挂载 + 删 socket/pid
 ```
 
 ### 5. GUI
 
 ```bash
 cargo build -p qxync-gui
-qsync daemon start
+qxync daemon start
 ./target/debug/qxync-gui
 
 # 无窗口自检（脚本 / CI 用；daemon 在跑时退出码 0）
@@ -161,31 +182,31 @@ GUI 自己不发 HTTP，**全部经 daemon 的 IPC**。
 ### 6. 常用命令速查
 
 ```bash
-qsync status                     # 会话 + 服务端 + 游标 + 水合统计 + 挂载
-qsync ls /home                   # 列目录（自动翻页）
-qsync store [--integrity|--json] # 状态库快照（游标 / baseline / pin / 上传队列）
-qsync roots [--json]             # 远端根一览 + 可读/可写判定
-qsync rules [--match <路径>]     # 选择性同步规则判定（visible / excluded / temp / outside-roots）
-qsync sync [--once]              # 变更发现状态；--force-deletes 放行批量删除
-qsync task list|add|pause|resume|rm
-qsync journal [--level error]    # 同步活动日志（--level error 就是「错误列表」）
-qsync settings [--set k=v]       # 代理 / 开机自启 / 通知 / 释放空间
-qsync space [--now]              # 释放空间状态 / 立即释放
-qsync conflicts --resolve <id> --as keep_local|keep_remote|keep_both
-qsync file-states /home          # 文件三态：仅在线 / 本地可用 / 始终可用
-qsync peer status|pair|ping|events|fetch    # LAN 对等（需先在 link 里配 peer_listen）
+qxync status                     # 会话 + 服务端 + 游标 + 水合统计 + 挂载
+qxync ls /home                   # 列目录（自动翻页）
+qxync store [--integrity|--json] # 状态库快照（游标 / baseline / pin / 上传队列）
+qxync roots [--json]             # 远端根一览 + 可读/可写判定
+qxync rules [--match <路径>]     # 选择性同步规则判定（visible / excluded / temp / outside-roots）
+qxync sync [--once]              # 变更发现状态；--force-deletes 放行批量删除
+qxync task list|add|pause|resume|rm
+qxync journal [--level error]    # 同步活动日志（--level error 就是「错误列表」）
+qxync settings [--set k=v]       # 代理 / 开机自启 / 通知 / 释放空间
+qxync space [--now]              # 释放空间状态 / 立即释放
+qxync conflicts --resolve <id> --as keep_local|keep_remote|keep_both
+qxync file-states /home          # 文件三态：仅在线 / 本地可用 / 始终可用
+qxync peer status|pair|ping|events|fetch    # LAN 对等（需先在 link 里配 peer_listen）
 ```
 
-全部子命令见 `qsync --help`；IPC 契约（unix socket + 一行一个 JSON）见
+全部子命令见 `qxync --help`；IPC 契约（unix socket + 一行一个 JSON）见
 [`docs/M1.5-设计.md`](docs/M1.5-设计.md)。
 
 ## 架构
 
-**进程模型**：`qxyncd` 是**唯一**持有 FUSE 与 NAS 会话的进程。`qsync` 默认**自动路由** ——
-socket 可连就走 IPC（`--via-daemon` 强制、`--direct` 跳过），所以 `qsync ls /home/x` 对用户无感。
+**进程模型**：`qxyncd` 是**唯一**持有 FUSE 与 NAS 会话的进程。`qxync` 默认**自动路由** ——
+socket 可连就走 IPC（`--via-daemon` 强制、`--direct` 跳过），所以 `qxync ls /home/x` 对用户无感。
 
 ```
-qsync (CLI) ──┐
+qxync (CLI) ──┐
               ├─IPC(unix socket)──> qxyncd ──┬── FUSE 挂载（按需水合 / 写回 / 脱水）
 qxync-gui ────┘                              ├── 同步引擎（轮询 + baseline 对账 + 冲突/删除保护）
                                              └── qxync-client ──HTTP──> NAS
@@ -198,7 +219,7 @@ crates/
 ├── qxync-client/      NAS HTTP API 封装（登录 / 元数据 / 上传下载）+ LAN 对等协议
 ├── qxync-fuse/        FUSE 层：只读/读写挂载 + 区间水合 + 脱水（含上传队列）
 ├── qxync-daemon/      二进制 qxyncd：常驻进程 + IPC 服务端 + 同步引擎 + 对端监听
-├── qxync-cli/         二进制 qsync：命令行
+├── qxync-cli/         二进制 qxync：命令行
 ├── qxync-gui/         二进制 qxync-gui：Tauri 2 应用（ui/ 为零依赖静态前端）
 └── qxync-proto-test/  真机集成测试（默认 #[ignore]，手动跑）
 xtask/tests/           8 个验收矩阵脚本（见「验收与测试」）
@@ -213,22 +234,22 @@ DISCLAIMER.md          免责声明与法律边界
 
 **元数据不走数据面**：`ls -l` 直接答 NAS 元数据（真实大小、零下载）。缓存是
 「apparent size = 文件大小」的稀疏文件，只把读到的区间 `pwrite` 进去；
-`user.qsync.state` 暴露 `placeholder`/`partial`/`hydrated`，`user.qsync.chunks` 暴露「已就绪/总数」。
+`user.qxync.state` 暴露 `placeholder`/`partial`/`hydrated`，`user.qxync.chunks` 暴露「已就绪/总数」。
 缓存文件名用**远端路径的稳定哈希**（不能用 ino —— 两次挂载里同一个 ino 可能对应不同文件）。
 
 **脱水前先过完整安全检查链**（`qxync-core/src/dehydrate.rs` + `qxync-fuse`/`qxyncd`）：
 pin=pinned/excluded、未上传改动/队列在途、打开的 fd、被 mmap（扫 `/proc/*/maps`）、
 正在水合、刚访问过。全部通过后按**铁则 2** 执行 `inval_inode(0,0)` → 清缓存内容 → 更新占位符；
 `inval_inode` 失败就**什么都不清**。默认**不**自动脱水，
-由 `QSYNC_DEHYDRATE_IDLE=600`（闲置）/ `QSYNC_CACHE_LIMIT=2G|25%`（限额，LRU）触发，
-或手动 `qsync dehydrate`。`--cache-mode direct` 用 `FOPEN_DIRECT_IO` 绕过 page cache
+由 `QXNYC_DEHYDRATE_IDLE=600`（闲置）/ `QXNYC_CACHE_LIMIT=2G|25%`（限额，LRU）触发，
+或手动 `qxync dehydrate`。`--cache-mode direct` 用 `FOPEN_DIRECT_IO` 绕过 page cache
 （脱水天然安全，代价是没有 readahead、mmap 不可用）。
 
-**变更发现以 baseline 对账为主路径**：daemon 每 30s（`QSYNC_POLL_INTERVAL` 可调）跑一轮
+**变更发现以 baseline 对账为主路径**：daemon 每 30s（`QXNYC_POLL_INTERVAL` 可调）跑一轮
 「三游标 + baseline 对账」—— 先拉事件快路径，再按「已知目录列举 + baseline 差集」兜底。
 远端改动 → 刷新元数据并**失效本地缓存**（下次读按需水合新内容）；双方都改 → **冲突副本**
 （远端占原名，本地内容存 `xxx (conflicted copy from <设备> <日期>).txt` 并上传）；
-远端批量删除 → **熔断**（`qsync sync --force-deletes` 才放行）。
+远端批量删除 → **熔断**（`qxync sync --force-deletes` 才放行）。
 
 **状态搬进了 SQLite**（`qxync-core/src/store.rs`）：`<data>/sync/<host>/sync.db` 承载三个事件游标
 + baseline + **pin**（以前只在内存里，daemon 一重启就丢 → 脱水安全检查会静默失守）+ 上传队列。
@@ -423,9 +444,9 @@ xtask/tests/gui-matrix.sh --no-window #    无 DISPLAY 的机器只跑自检
 真机集成测试（`#[ignore]`，需要你自己的 NAS 凭据）：
 
 ```bash
-export QSYNC_TEST_HOST=... QSYNC_TEST_PORT=9834
-export QSYNC_TEST_USER=... QSYNC_TEST_PASSWORD='...'
-export QSYNC_TEST_FIXTURE=/home/qxync-test
+export QXNYC_TEST_HOST=... QXNYC_TEST_PORT=9834
+export QXNYC_TEST_USER=... QXNYC_TEST_PASSWORD='...'
+export QXNYC_TEST_FIXTURE=/home/qxync-test
 cargo test -p qxync-proto-test -- --ignored --test-threads=1 --nocapture  # 协议 5 项 + IPC 端到端 1 项
 cargo test -p qxync-daemon -- --ignored --test-threads=1 --nocapture     # M2c 引擎（冲突副本 / 删除保护）
 ```
@@ -455,7 +476,7 @@ cargo test -p qxync-daemon -- --ignored --test-threads=1 --nocapture     # M2c �
 
 ## 安全与隐私
 
-- **凭据**：`~/.config/qsync/credentials.json`（`0600`）；IPC socket 目录 `0700` / socket `0600`。
+- **凭据**：`~/.config/qxync/credentials.json`（`0600`）；IPC socket 目录 `0700` / socket `0600`。
 - **本项目不采集、不上报任何遥测数据**，也不连接除你配置的 NAS 与（可选的）LAN 对端以外的任何主机。
 - **LAN 对等是明文 TCP**，只在可信局域网开启即可；token 只授权「读已水合文件 + 提交事件」，
   **没有任何写/删远端的能力**。

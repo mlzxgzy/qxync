@@ -986,7 +986,7 @@ pub async fn broadcast_event(peers: &[PeerConfig], ev: PeerEvent) -> usize {
     ok
 }
 
-/// 探测一个地址是不是 qxync 对端（用于 `qsync peer ping <addr>`）。
+/// 探测一个地址是不是 qxync 对端（用于 `qxync peer ping <addr>`）。
 pub async fn probe(addr: &str) -> io::Result<(PeerIdentity, Duration)> {
     let started = Instant::now();
     let id = PeerClient::ping(addr).await?;

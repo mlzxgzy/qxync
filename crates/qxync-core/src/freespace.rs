@@ -17,12 +17,12 @@
 //!
 //! ## 验收注入点
 //!
-//! `QSYNC_TEST_FAKE_STATVFS` 让验收脚本把「剩余空间」打到 5% 而不必真的塞满磁盘：
+//! `QXNYC_TEST_FAKE_STATVFS` 让验收脚本把「剩余空间」打到 5% 而不必真的塞满磁盘：
 //!
 //! ```text
-//! QSYNC_TEST_FAKE_STATVFS="avail_pct=5"
-//! QSYNC_TEST_FAKE_STATVFS="total=100G,avail=5G,free=5G"
-//! QSYNC_TEST_FAKE_STATVFS="used_pct=95"
+//! QXNYC_TEST_FAKE_STATVFS="avail_pct=5"
+//! QXNYC_TEST_FAKE_STATVFS="total=100G,avail=5G,free=5G"
+//! QXNYC_TEST_FAKE_STATVFS="used_pct=95"
 //! ```
 //!
 //! 只影响 `probe()`；注入值同样会进 `status`/日志，**不静默**。
@@ -103,7 +103,7 @@ pub fn statvfs(_path: &Path) -> Result<FsSpace> {
     Err(Error::Unsupported("statvfs 只在 unix 上实现".into()))
 }
 
-/// 解析 `QSYNC_TEST_FAKE_STATVFS` 的注入值；不在验收里时返回 `None`。
+/// 解析 `QXNYC_TEST_FAKE_STATVFS` 的注入值；不在验收里时返回 `None`。
 pub fn fake_from_str(spec: &str) -> Option<FsSpace> {
     let mut total = 100u64 * 1024 * 1024 * 1024; // 默认 100 GiB
     let mut avail: Option<u64> = None;
@@ -154,15 +154,15 @@ pub fn fake_from_str(spec: &str) -> Option<FsSpace> {
     })
 }
 
-/// 量空间：**优先用注入值**（`QSYNC_TEST_FAKE_STATVFS`），否则真 `statvfs`。
+/// 量空间：**优先用注入值**（`QXNYC_TEST_FAKE_STATVFS`），否则真 `statvfs`。
 pub fn probe(path: &Path) -> Result<FsSpace> {
-    if let Ok(spec) = std::env::var("QSYNC_TEST_FAKE_STATVFS") {
+    if let Ok(spec) = std::env::var("QXNYC_TEST_FAKE_STATVFS") {
         if !spec.trim().is_empty() {
             if let Some(s) = fake_from_str(&spec) {
                 return Ok(s);
             }
             return Err(Error::Io(format!(
-                "QSYNC_TEST_FAKE_STATVFS 写法无效: {spec:?}（例：avail_pct=5 / total=100G,avail=5G）"
+                "QXNYC_TEST_FAKE_STATVFS 写法无效: {spec:?}（例：avail_pct=5 / total=100G,avail=5G）"
             )));
         }
     }
@@ -333,7 +333,7 @@ mod tests {
         // 这个测试独占环境变量：串行跑（cargo test 默认多线程）→ 用互斥锁
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _g = LOCK.lock().unwrap();
-        let key = "QSYNC_TEST_FAKE_STATVFS";
+        let key = "QXNYC_TEST_FAKE_STATVFS";
         let old = std::env::var(key).ok();
         std::env::set_var(key, "avail_pct=3");
         let s = probe(Path::new("/")).unwrap();

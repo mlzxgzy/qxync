@@ -10,8 +10,8 @@ authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
-# Tauri 约定：GUI 二进制（应用名由 tauri.conf.json 的 productName=QSync 决定）。
-# CLI 的二进制已经叫 `qsync`，这里不抢名字，避免 `cargo build` 产物冲突。
+# Tauri 约定：GUI 二进制（应用名由 tauri.conf.json 的 productName=qxync 决定）。
+# CLI 的二进制已经叫 `qxync`，这里不抢名字，避免 `cargo build` 产物冲突。
 [[bin]]
 name = "qxync-gui"
 path = "src/main.rs"

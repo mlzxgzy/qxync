@@ -425,7 +425,7 @@ impl UploadQueue {
             // 端到端没法稳定复现冲突。停在这里 + 上面的 `cancelled` 集合，
             // 就能让 `m84-matrix.sh` 逐个策略跑出确定性的冲突产物。
             // **默认 0（不等待）**，对生产行为没有任何影响。
-            let hold_ms: u64 = std::env::var("QSYNC_TEST_UPLOAD_HOLD_MS")
+            let hold_ms: u64 = std::env::var("QXNYC_TEST_UPLOAD_HOLD_MS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0);

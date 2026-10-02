@@ -66,7 +66,7 @@ CREATE TABLE meta     (key TEXT PRIMARY KEY, value TEXT NOT NULL);
   * 旧文件一律改名 `*.json.migrated` **保留备份**，不删除；
   * 幂等：第二次启动什么都不做（矩阵里有专项断言）。
 * `Store::integrity_check()` —— `PRAGMA integrity_check`，把「库是不是好的」变成可验收项
-  （`qsync store --integrity`）。
+  （`qxync store --integrity`）。
 
 ## 3. delta 那一半：先探测，再决定
 
@@ -158,7 +158,7 @@ unlock: ok
 ```bash
 xtask/tests/m5-matrix.sh          # 28 项：迁移 / 幂等 / 不双写 / pin 存活 / 单测 / 真机 gate
 xtask/tests/m5-matrix.sh --no-nas # 不连真机
-qsync store [--integrity] [--json]  # 状态库快照（JSON 形态给脚本用）
+qxync store [--integrity] [--json]  # 状态库快照（JSON 形态给脚本用）
 ```
 
 矩阵覆盖（28 项，全绿）：
@@ -181,7 +181,7 @@ qsync store [--integrity] [--json]  # 状态库快照（JSON 形态给脚本用�
 
 真机实测的额外证据：主状态目录从 M2c 升级时迁移了 **225 条 baseline**（cursors
 `config=188 notify=37 global_notify=177 max_log_seen=188`），旧文件归档成 `.json.migrated`；
-`qsync sync --once` 在 SQLite 状态上照常跑完对账（baseline 225 项、0 冲突 0 删除）。
+`qxync sync --once` 在 SQLite 状态上照常跑完对账（baseline 225 项、0 冲突 0 删除）。
 
 ## 6. 已知限制 / 后续
 
