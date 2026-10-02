@@ -11,12 +11,15 @@
 #   没更新就推上去，用户装的时候会直接 checksum 失败（不会静默装错东西）。
 
 pkgname=qxync-bin
-pkgver=0.2.1
+pkgver=0.2.2
 pkgrel=1
 pkgdesc='QNAP Qsync client for Linux: FUSE on-demand sync + qxyncd daemon + Tauri GUI (prebuilt)'
 arch=('x86_64')
 url='https://github.com/mlzxgzy/qxync'
 license=('MIT' 'Apache-2.0')
+# 装完给一段提示：user 单元**不会**被自动启用（那是每个用户自己的会话里的事），
+# 顺便说明「装了单元之后别再用 qxync daemon start/stop 管它」。
+install=qxync-bin.install
 # 这些是三个二进制的直接 DT_NEEDED（`readelf -d`）对应的包，不是传递依赖：
 # qxync / qxyncd 只直接链 glibc / gcc-libs，但挂载、卸载要调 `fusermount3`
 # （fuser 0.17 不链接 libfuse，走的是 fuse3 包里的命令行工具）。
@@ -61,6 +64,11 @@ package() {
   install -Dm644 "$srcdir/$stem/icons/128x128.png" "$pkgdir/usr/share/icons/hicolor/128x128/apps/qxync.png"
   install -Dm644 "$srcdir/$stem/icons/128x128@2x.png" "$pkgdir/usr/share/icons/hicolor/256x256/apps/qxync.png"
   install -Dm644 "$srcdir/$stem/icons/icon.png" "$pkgdir/usr/share/icons/hicolor/512x512/apps/qxync.png"
+
+  # systemd **user** 单元。qxyncd 是「某个用户的同步客户端」（用 $HOME / $XDG_RUNTIME_DIR，
+  # FUSE 挂载点也属于该用户），所以装 /usr/lib/systemd/user/，由用户自己
+  # `systemctl --user enable --now qxyncd` —— 包**不能**替某个用户启用它。
+  install -Dm644 "$srcdir/$stem/qxyncd.service" "$pkgdir/usr/lib/systemd/user/qxyncd.service"
 
   install -Dm644 "$srcdir/$stem/LICENSE-MIT" "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
   install -Dm644 "$srcdir/$stem/LICENSE-APACHE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"

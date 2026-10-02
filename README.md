@@ -116,7 +116,7 @@ cargo build --workspace --release # release（已配 lto=thin；保留行号回�
 ### 2.5 从 0.1.x 升级（改名了）
 
 0.1.x 的命令行叫 `qsync`，会和 **QNAP 官方 Qsync 客户端**在 `PATH` 里抢同一个名字；
-0.2.1 起统一叫 `qxync`。完整清单见 [CHANGELOG](CHANGELOG.md#021---2026-10-02)。
+0.2.2 起统一叫 `qxync`。完整清单见 [CHANGELOG](CHANGELOG.md#022---2026-10-02)。
 
 升级后第一次运行时，本地目录会**自动迁移**：`~/.config/qsync`、`~/.local/share/qsync`、
 `~/.local/state/qsync` 会被直接改名成对应的 `qxync` 目录（跨文件系统时退回复制），
@@ -124,7 +124,7 @@ cargo build --workspace --release # release（已配 lto=thin；保留行号回�
 （例如早期原型留下的 `~/.local/share/qxync`），只把旧目录里**缺**的条目补进去，
 **已有的一律不覆盖**，并打一行提示告诉你两个路径。唯一要动的是你自己的脚本：
 
-| 旧写法（0.1.x） | 新写法（0.2.1+） |
+| 旧写法（0.1.x） | 新写法（0.2.2+） |
 |---|---|
 | `qsync …` | `qxync …` |
 | `QSYNC_PASSWORD` / `QSYNC_HOST` / `QSYNC_USER` / `QSYNC_SOCKET` | `QXNYC_PASSWORD` / `QXNYC_HOST` / `QXNYC_USER` / `QXNYC_SOCKET` |
@@ -167,6 +167,26 @@ qxync dehydrate --path /home/qxync-test/big.bin   # 脱水：丢本地内容、�
 qxync umount ~/qxync-mnt
 qxync daemon stop                                 # 干净退出：卸载全部挂载 + 删 socket/pid
 ```
+
+> **没配 NAS 也能先把 daemon 挂后台**：一份连接配置都没有时它会「空转待命」（不做事但一直活着，
+> 界面显示「未配置」），配好连接后自己转入同步 —— 所以「先挂后台、稍后登录」不冲突。
+
+#### 4.1 用 systemd 让它常驻（推荐）
+
+`packaging/systemd/qxyncd.service` 是一个 **user 单元**，装了包的话它在
+`/usr/lib/systemd/user/qxyncd.service`：
+
+```bash
+systemctl --user enable --now qxyncd     # 登录即启动（现在也启动）
+systemctl --user status qxyncd
+journalctl --user -u qxyncd -f           # 日志（daemon 的 stderr 进 journald）
+systemctl --user stop qxyncd             # 优雅停止：卸载 FUSE 挂载 + 删 socket/pid
+sudo loginctl enable-linger "$USER"      # 想「不登录也常驻」（开机就起）再执行这条
+```
+
+> 用了 systemd 单元之后就**别再用** `qxync daemon start` / `qxync daemon stop` 管它 ——
+> 那条路是给没有 systemd 的用法准备的，两边同时用只会互相打架。
+> （`qxync daemon stop` 走 IPC 让进程自己退出，systemd 会看到主进程消失。）
 
 ### 5. GUI
 

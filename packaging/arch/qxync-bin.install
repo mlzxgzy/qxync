@@ -1,0 +1,25 @@
+post_install() {
+  cat <<'EOF'
+==> qxync 的用户级同步守护（qxyncd）
+    单元文件已装到 /usr/lib/systemd/user/qxyncd.service，但**不会**自动启用 ——
+    它是 user 单元，得在你自己的会话里开：
+
+        systemctl --user enable --now qxyncd      # 登录即启动（现在也启动）
+        systemctl --user status qxyncd
+        journalctl --user -u qxyncd -f            # 看日志
+
+    想让它不登录也常驻（开机就起、注销也不停）：
+
+        sudo loginctl enable-linger "$USER"
+
+    没有连接配置时它也能起来（空转待命，不做事但一直活着），配好连接后会自动开始同步。
+    装了本单元之后请用 systemctl 管它，别再 `qxync daemon start/stop`（两边会打架）。
+
+    图形界面：应用菜单里搜 qxync；首次使用在「设置 → 连接」里填 NAS 地址 / 用户 / 口令，
+    点「保存并登录」。
+EOF
+}
+
+post_upgrade() {
+  post_install
+}

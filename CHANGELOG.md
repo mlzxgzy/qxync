@@ -7,7 +7,37 @@
 
 ## [未发布]
 
+## [0.2.2] - 2026-10-02
+
+**给 daemon 配了 systemd user 单元**，并修掉一个会让 `systemctl stop` 留下 FUSE 挂载的问题。
+
+### 新增
+
+- **systemd user 单元 `qxyncd.service`**（`packaging/systemd/qxyncd.service`，装到
+  `/usr/lib/systemd/user/`）：`systemctl --user enable --now qxyncd` 就是「登录即启动 +
+  现在启动」，`Restart=on-failure` 崩了自动拉起；想不登录也常驻用
+  `sudo loginctl enable-linger "$USER"`。
+  刻意是 **user** 单元而不是 system 单元：qxyncd 是「某个用户的同步客户端」（用 `$HOME` /
+  `$XDG_RUNTIME_DIR`，FUSE 挂载点也属于该用户），所以包**不会**替用户启用它 ——
+  附 `qxync-bin.install` 在装完打印怎么开、以及「开了单元就别再用 `qxync daemon start/stop`」。
+- **Arch 包与 Release tarball 都带上这个单元**；CI 的包内容检查也把它列进必查清单。
+
+### 修复
+
+- **`qxyncd` 现在处理 SIGTERM**。`systemctl --user stop/restart`（以及 systemd-logind 注销）
+  发的就是它，之前没处理 → 默认动作是**立刻终止**：FUSE 挂载点会留在 `/proc/mounts` 里、
+  socket/pid 也不删。现在 SIGTERM 与 SIGINT、IPC `shutdown` 走同一条优雅退出路径
+  （卸载全部挂载点 → 删 socket/pid），单元里 `TimeoutStopSec=30` 给足卸载时间。
+  注册信号处理器失败时**不 panic**（daemon 化之后 panic 信息会掉进 `/dev/null`），
+  退化成「没有这条优雅退出路径」并记一条 WARN。
+
+### 变更
+
+- 版本号 → 0.2.2；发布说明改名 `docs/发布说明-v0.2.2.md`。
+
 ## [0.2.1] - 2026-10-02
+
+> **这一版也没有单独发出去**（同样没有打 tag）。第一个真正发布的版本是 **0.2.2**。
 
 **daemon 现在「没配 NAS 也能一直跑着」了。** 之前 `qxyncd` 启动时硬性要求一份连接配置
 （`~/.config/qxync/links/<id>.json`），读不到就**直接退出** —— 于是「还没登录 / 还没配连接」
@@ -37,7 +67,7 @@
 
 ## [0.2.0] - 2026-10-02
 
-> **这一版没有单独发出去**（没有打 tag）。第一个真正发布的版本是 **0.2.1**，
+> **这一版没有单独发出去**（没有打 tag）。第一个真正发布的版本是 **0.2.2**，
 > 它包含下面全部改名内容 —— 这里的记录保留，是因为改名本身值得单独成一节。
 
 **改名版本：命令行从 `qsync` 改成 `qxync`。** 旧名 `qsync` 会和 **QNAP 官方 Qsync 客户端**

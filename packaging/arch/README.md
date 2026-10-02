@@ -1,11 +1,16 @@
 # Arch Linux 打包（AUR：`qxync-bin`）
 
-这里只有两个需要维护的文件：
+这里有三个需要维护的文件：
 
 | 文件 | 作用 |
 |---|---|
-| `PKGBUILD` | AUR 包定义：直接取 GitHub Release 上的预编译 `qxync-<版本>-x86_64-unknown-linux-gnu.tar.gz`，把 `qxync` / `qxyncd` / `qxync-gui` 装进 `/usr/bin` |
+| `PKGBUILD` | AUR 包定义：直接取 GitHub Release 上的预编译 `qxync-<版本>-x86_64-unknown-linux-gnu.tar.gz`，把 `qxync` / `qxyncd` / `qxync-gui` 装进 `/usr/bin`，桌面项 / 图标装进 `/usr/share`，systemd **user** 单元装进 `/usr/lib/systemd/user/` |
+| `qxync-bin.install` | 装完打印的提示（`post_install`）：怎么 `systemctl --user enable --now qxyncd`、怎么看日志、以及「开了单元就别再用 `qxync daemon start/stop`」 |
 | `.SRCINFO` | AUR 要求的元数据，由 `makepkg --printsrcinfo > .SRCINFO` 生成，**不要手写** |
+
+> ⚠️ **不会**自动启用 `qxyncd.service`：它是 user 单元，得在**每个用户自己的会话**里
+> `systemctl --user enable --now qxyncd`（包不能替某个用户做这件事）。想「不登录也常驻」
+> 再加 `sudo loginctl enable-linger "$USER"`。
 
 > ⚠️ `sha256sums` 在仓库里是**占位值**（一串 `0`）：Release 产物由 CI 在 ubuntu-22.04 上构建，
 > 提交代码时算不出来。发版之后**必须**更新（见下面「发新版本」），否则用户装的时候
@@ -38,12 +43,12 @@ makepkg -si     # 构建并安装（三个二进制都进 /usr/bin，GUI 会在�
 
 ```bash
 cd packaging/arch
-sum=$(sha256sum ../../dist/qxync-0.1.1-x86_64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
+sum=$(sha256sum ../../dist/qxync-0.2.2-x86_64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
 sed -i "s/^sha256sums=.*/sha256sums=('$sum')/" PKGBUILD    # 验证完记得改回占位值再提交
 # BUILDDIR 指到临时目录：否则 makepkg 会在本目录留 src/ 与 pkg/（各有 ~180 MB，已在 .gitignore 里）
 BUILDDIR=$(mktemp -d) SRCDEST=../../dist makepkg -f
 namcap PKGBUILD ./*.pkg.tar.zst
-sudo pacman -U qxync-bin-0.1.1-1-x86_64.pkg.tar.zst
+sudo pacman -U qxync-bin-0.2.2-1-x86_64.pkg.tar.zst
 ```
 
 ## 发新版本要做的三件事
@@ -63,9 +68,9 @@ makepkg --printsrcinfo > .SRCINFO
 
 ```bash
 git clone ssh://aur@aur.archlinux.org/qxync-bin.git
-cp PKGBUILD .SRCINFO qxync-bin/
-cd qxync-bin && git add PKGBUILD .SRCINFO \
-  && git commit -m "upgpkg: qxync-bin 0.1.1-1" && git push
+cp PKGBUILD .SRCINFO qxync-bin.install qxync-bin/
+cd qxync-bin && git add PKGBUILD .SRCINFO qxync-bin.install \
+  && git commit -m "upgpkg: qxync-bin 0.2.2-1" && git push
 ```
 
 ## 两个有意为之的选择（别「顺手修掉」）

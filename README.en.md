@@ -123,8 +123,8 @@ each release.
 ### 2.5 Upgrading from 0.1.x (the rename)
 
 On 0.1.x the command line was called `qsync`, which fought the **official QNAP Qsync client**
-for the same name in `PATH`; from 0.2.1 it is `qxync`. The full list is in the
-[CHANGELOG](CHANGELOG.en.md#021---2026-10-02).
+for the same name in `PATH`; from 0.2.2 it is `qxync`. The full list is in the
+[CHANGELOG](CHANGELOG.en.md#022---2026-10-02).
 
 On the first run after upgrading, the local directories are **migrated automatically**:
 `~/.config/qsync`, `~/.local/share/qsync` and `~/.local/state/qsync` are renamed to their
@@ -134,7 +134,7 @@ directory exist (for example an early prototype's `~/.local/share/qxync`), only 
 **missing** from the new directory are filled in, **nothing already there is overwritten**, and a
 note prints both paths. The only things you must update are your own scripts:
 
-| Old (0.1.x) | New (0.2.1+) |
+| Old (0.1.x) | New (0.2.2+) |
 |---|---|
 | `qsync …` | `qxync …` |
 | `QSYNC_PASSWORD` / `QSYNC_HOST` / `QSYNC_USER` / `QSYNC_SOCKET` | `QXNYC_PASSWORD` / `QXNYC_HOST` / `QXNYC_USER` / `QXNYC_SOCKET` |
@@ -179,6 +179,28 @@ qxync dehydrate --path /home/qxync-test/big.bin   # dehydrate: drop the local co
 qxync umount ~/qxync-mnt
 qxync daemon stop                                 # clean exit: unmount everything + delete socket/pid
 ```
+
+> **You can start the daemon before configuring anything**: with no connection configured it goes
+> into **idle standby** (alive but doing nothing; the UI shows "not configured") and switches to
+> syncing by itself once a connection is saved — so "run it in the background now, log in later"
+> is no longer a conflict.
+
+#### 4.1 Keep it running with systemd (recommended)
+
+`packaging/systemd/qxyncd.service` is a **user unit**; if you installed the package it lives at
+`/usr/lib/systemd/user/qxyncd.service`:
+
+```bash
+systemctl --user enable --now qxyncd     # start at login (and start it now)
+systemctl --user status qxyncd
+journalctl --user -u qxyncd -f           # logs (the daemon's stderr goes to journald)
+systemctl --user stop qxyncd             # graceful stop: unmount FUSE + remove socket/pid
+sudo loginctl enable-linger "$USER"      # only if you want it up without an active login
+```
+
+> Once the unit is in use, **stop managing the daemon with** `qxync daemon start` /
+> `qxync daemon stop` — that path is for systems without systemd, and using both at once only
+> makes them fight (`qxync daemon stop` exits via IPC, so systemd sees its main process vanish).
 
 ### 5. GUI
 
