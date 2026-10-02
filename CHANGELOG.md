@@ -5,7 +5,7 @@
 
 [English](CHANGELOG.en.md) · [README](README.md) · [验收记录](docs/验收记录.md)
 
-## [未发布]
+## [0.3.0] - 2026-10-02
 
 **一对多整体删除，只留一对一**：一个挂载点 = 一个 NAS 文件夹，挂载点里**直接**就是那个
 文件夹的内容（配 `/home` 就看到家目录，不再多套一层 `home/`）。NAS 侧改成下拉选择
@@ -335,6 +335,7 @@ NAS 设置名 `QSYNC_FOLDERPAIR_USE_SPACE_SAVING`、Windows 客户端注册表�
 - 验收结论从 README 抽出为 [`docs/验收记录.md`](docs/验收记录.md)。
 - 采用 **MIT OR Apache-2.0** 双许可（`LICENSE-MIT` / `LICENSE-APACHE`）。
 
+[0.3.0]: https://github.com/mlzxgzy/qxync/compare/v0.2.3...v0.3.0
 [0.2.3]: https://github.com/mlzxgzy/qxync/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/mlzxgzy/qxync/releases/tag/v0.2.2
 [0.1.1]: https://github.com/mlzxgzy/qxync/releases/tag/v0.1.1

@@ -138,6 +138,22 @@ cargo build --workspace --release # release（已配 lto=thin；保留行号回�
 > 「未配置」，`qxync daemon status` 里连接是 `未配置`），配好连接后它自己转入同步 ——
 > 所以「先把 daemon 挂后台」和「稍后再登录」不冲突。
 
+### 2.6 从 0.2.x 升级（一对多删了）
+
+**0.3.0 是破坏性版本**：不再支持「一个挂载点 / 一个任务对多个 NAS 目录」。删除清单与
+理由见 [CHANGELOG](CHANGELOG.md#030---2026-10-02) 与
+[发布说明 v0.3.0](docs/发布说明-v0.3.0.md)。要动的地方很少：
+
+| 旧写法（≤0.2.3） | 新写法（0.3.0+） |
+|---|---|
+| `qxync mount ~/mnt --remote /home --remote /Public` | 建两个挂载点，或建两个任务（一个挂载点 = 一个 NAS 目录） |
+| 任务 JSON 里的 `"roots": ["/home"]` | `"root": "/home"`（单个 `roots` 会自动迁移；**多个会报成坏任务文件**，提示拆成多个任务） |
+| link 配置里的 `roots` / `home_root` | 都不再存在（未知字段会被忽略）；家目录在 Qsync 协议里固定叫 `/home` |
+| 连接页「高级」栏 | 已删除，表单只剩 host/port/user/password/https/insecure/ipv4-only |
+
+NAS 上的数据、缓存、baseline、凭据**都不受影响**；多根挂载点如果还挂着，升级前先
+`qxync umount <挂载点>`，升级后按一对一重新配。
+
 ### 3. 首次登录
 
 凭据写入 `~/.config/qxync/credentials.json`（权限 `0600`）。
@@ -209,7 +225,7 @@ GUI 自己不发 HTTP，**全部经 daemon 的 IPC**。
 qxync status                     # 会话 + 服务端 + 游标 + 水合统计 + 挂载
 qxync ls /home                   # 列目录（自动翻页）
 qxync store [--integrity|--json] # 状态库快照（游标 / baseline / pin / 上传队列）
-qxync roots [--json]             # 远端根一览 + 可读/可写判定
+qxync roots [--json]             # NAS 上登记的同步文件夹（配对时可选的 NAS 目录）
 qxync rules [--match <路径>]     # 选择性同步规则判定（visible / excluded / temp / outside-roots）
 qxync sync [--once]              # 变更发现状态；--force-deletes 放行批量删除
 qxync task list|add|pause|resume|rm

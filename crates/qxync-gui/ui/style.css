@@ -749,7 +749,7 @@ table.tbl tbody tr:focus-within td { box-shadow: inset 0 -1px 0 var(--focus); }
   font-style: italic;
 }
 
-/* ------------------------------------------------- M6 远端根（roots） */
+/* ------------------------------------------------- NAS 同步文件夹面板 */
 .root-list {
   list-style: none;
   margin: 4px 0 0;
@@ -759,28 +759,6 @@ table.tbl tbody tr:focus-within td { box-shadow: inset 0 -1px 0 var(--focus); }
 }
 
 .root-list:empty { display: none; }
-
-.root-row {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  flex-wrap: wrap;
-  padding: 3px 0;
-}
-
-.root-row + .root-row { border-top: 1px dashed var(--border-soft); }
-
-.root-mark { flex: 0 0 auto; }
-.root-path { color: var(--fg); flex: 0 0 auto; }
-.root-view { color: var(--fg-dim); flex: 0 0 auto; }
-
-.root-note-sub {
-  flex-basis: 100%;
-  padding-left: 22px;
-  font-size: 11px;
-  color: var(--fg-faint);
-  word-break: break-word;
-}
 
 /* --------------------------------------------------------------- 表单 */
 .form { display: flex; flex-direction: column; gap: 8px; }
@@ -824,7 +802,7 @@ input[type="text"], input[type="password"], input[type="number"], select, textar
   width: 100%;
 }
 
-/* ★ M6：roots 用多行 textarea（每行一个远端根） */
+/* 多行输入（筛选器规则每行一条） */
 textarea {
   resize: vertical;
   line-height: 1.45;

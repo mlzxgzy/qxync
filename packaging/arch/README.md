@@ -43,12 +43,12 @@ makepkg -si     # 构建并安装（三个二进制都进 /usr/bin，GUI 会在�
 
 ```bash
 cd packaging/arch
-sum=$(sha256sum ../../dist/qxync-0.2.2-x86_64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
+sum=$(sha256sum ../../dist/qxync-0.3.0-x86_64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
 sed -i "s/^sha256sums=.*/sha256sums=('$sum')/" PKGBUILD    # 验证完记得改回占位值再提交
 # BUILDDIR 指到临时目录：否则 makepkg 会在本目录留 src/ 与 pkg/（各有 ~180 MB，已在 .gitignore 里）
 BUILDDIR=$(mktemp -d) SRCDEST=../../dist makepkg -f
 namcap PKGBUILD ./*.pkg.tar.zst
-sudo pacman -U qxync-bin-0.2.2-1-x86_64.pkg.tar.zst
+sudo pacman -U qxync-bin-0.3.0-1-x86_64.pkg.tar.zst
 ```
 
 ## 发新版本要做的三件事
@@ -70,7 +70,7 @@ makepkg --printsrcinfo > .SRCINFO
 git clone ssh://aur@aur.archlinux.org/qxync-bin.git
 cp PKGBUILD .SRCINFO qxync-bin.install qxync-bin/
 cd qxync-bin && git add PKGBUILD .SRCINFO qxync-bin.install \
-  && git commit -m "upgpkg: qxync-bin 0.2.2-1" && git push
+  && git commit -m "upgpkg: qxync-bin 0.3.0-1" && git push
 ```
 
 ## 两个有意为之的选择（别「顺手修掉」）

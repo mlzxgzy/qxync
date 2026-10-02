@@ -3941,7 +3941,7 @@
     on('btn-mounts-refresh', 'click', function () { refreshMounts(); });
     on('btn-status-mounts-refresh', 'click', function () { refreshMounts(); });
 
-    // 远端根面板
+    // NAS 同步文件夹面板
     on('btn-roots-refresh', 'click', function () { refreshRoots(); });
 
     // 文件页
