@@ -71,9 +71,13 @@ jobs:
 
       - name: 生成 SHA256SUMS
         run: |
-          # 先删掉旧的：重跑时 `*` 会把上一轮的 SHA256SUMS 自己也算进去。
-          rm -f dist/SHA256SUMS
-          cd dist && sha256sum -- * > SHA256SUMS
+          # 只算 dist/ **顶层**的普通文件、按名字排序：
+          #   * 先删旧的 —— 重跑时 `*` 会把上一轮的 SHA256SUMS 自己也算进去；
+          #   * `-maxdepth 1 -type f` —— 本地复跑时 dist/ 下可能有子目录
+          #     （例如构建 Arch 包的 dist/arch/），`*` 会去 hash 目录并直接报错。
+          cd dist && rm -f SHA256SUMS
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\0' \
+            | sort -z | xargs -0 sha256sum > SHA256SUMS
           cat SHA256SUMS
 
       # 先留档到 Actions artifacts：万一后面的 Release 步骤失败，产物还能从这次 run 里取回。
