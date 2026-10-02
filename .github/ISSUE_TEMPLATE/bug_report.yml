@@ -1,0 +1,119 @@
+name: Bug 报告 / Bug report
+description: 报告一个可复现的问题 / Report a reproducible problem
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ⚠️ **先做两件事：**
+
+        1. **把敏感信息掩码**：NAS 域名 / IP、账号名、口令、`sid`、设备指纹、本机绝对路径。
+           贴日志前请替换成 `nas.example.com` / `<user>` 这类占位符。
+        2. **安全问题请走私密渠道**：见 [SECURITY.md](https://github.com/mlzxgzy/qxync/blob/master/SECURITY.md)，
+           不要在公开 Issue 里写细节。
+
+        如果你还没读过 README 的[「两条铁则」](https://github.com/mlzxgzy/qxync/blob/master/README.md#两条铁则)，
+        请先读一下 —— 涉及数据损坏的报告会被最高优先级处理。
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已把日志/截图里的域名、账号、口令、sid、本机路径全部掩码
+          required: true
+        - label: 我已搜索过现有 Issue，确认这不是重复报告
+          required: true
+        - label: 这不是安全问题（安全问题走 SECURITY.md 的私密渠道）
+          required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 现象
+      description: 实际发生了什么？期望发生什么？
+      placeholder: |
+        实际：cat 挂载点里的 big.bin 中途报了 EIO，输出 0 字节
+        期望：完整读出内容
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+      description: 越具体越好。能给出「第几次执行、什么参数、什么文件」最好。
+      placeholder: |
+        1. qsync daemon start
+        2. qsync mount ~/mnt --remote /home --rw
+        3. head -c 100 ~/mnt/qxync-test/big.bin
+        4. ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: 受影响的部分
+      multiple: true
+      options:
+        - CLI（qsync）
+        - 守护进程（qxyncd）/ IPC
+        - FUSE 挂载 / 按需水合
+        - 写路径 / 上传队列
+        - 变更发现 / 冲突 / 删除保护
+        - 脱水 / 释放空间
+        - 状态库（SQLite）/ delta
+        - 多根 / 共享文件夹
+        - 选择性同步 / exclude 规则
+        - LAN 对等（配对 / 事件 / 直传）
+        - GUI（qxync-gui）
+        - 托盘 / 通知 / 开机自启
+        - 文档 / 构建
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: 版本 / 提交
+      description: 二进制版本（`qsync --version`）或 commit hash
+      placeholder: "0.1.0 / bdd8a5a"
+    validations:
+      required: true
+
+  - type: input
+    id: nas
+    attributes:
+      label: NAS 型号与固件（**已脱敏**）
+      description: 型号 + QTS 版本 + Qsync QPKG 版本。**不要写你的域名或序列号。**
+      placeholder: "TS-464C / QTS 5.2.9 / Qsync QPKG 5.0.0.7"
+    validations:
+      required: false
+
+  - type: input
+    id: distro
+    attributes:
+      label: 发行版 / 内核 / FUSE 版本
+      placeholder: "Arch Linux / 6.16.7 / fuse3 3.17.4"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志
+      description: |
+        `daemon` 日志在 `~/.local/state/qsync/log/qxyncd.log.YYYY-MM-DD`；
+        也可以贴 `qsync status` / `qsync store` / `qsync journal --level error` 的输出。
+        **贴之前请逐行检查有没有敏感信息。**
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: 补充信息
+      description: 截图（记得涂抹敏感信息）、`getfattr -d` 输出、文件大小、网络环境等
+    validations:
+      required: false

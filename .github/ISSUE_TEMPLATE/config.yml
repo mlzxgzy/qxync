@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 🔒 报告安全问题 / Report a security issue
+    url: https://github.com/mlzxgzy/qxync/security/advisories/new
+    about: 请勿开公开 Issue。数据安全类问题优先处理。见 SECURITY.md。
+  - name: 📖 先读 README（两条铁则 / 它不是什么 / 已知限制）
+    url: https://github.com/mlzxgzy/qxync/blob/master/README.md
+    about: 很多问题在 README 的「已知限制」里已经写清楚了。
+  - name: 📄 协议与逆向结论（report/）
+    url: https://github.com/mlzxgzy/qxync/tree/master/report
+    about: 协议细节、证据与免责声明都在这里。
