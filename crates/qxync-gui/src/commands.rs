@@ -713,7 +713,11 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(li2.link().user, "test1");
-        assert_eq!(qxync_core::HOME_ROOT, "/home", "家目录是协议常量，不再是配置项");
+        assert_eq!(
+            qxync_core::HOME_ROOT,
+            "/home",
+            "家目录是协议常量，不再是配置项"
+        );
     }
 
     #[test]

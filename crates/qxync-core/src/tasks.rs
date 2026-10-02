@@ -790,7 +790,6 @@ mod tests {
         none.normalize().unwrap();
         assert!(none.root.is_none());
         assert_eq!(none.effective_root(), "/home");
-        
     }
 
     // ------------------------------------------------------------ ★ 一对一 + 目的地冲突
@@ -849,7 +848,10 @@ mod tests {
         let same_local = mk("b", "/home/user/qs", "/Public");
         let c = mine.destination_conflicts_with(&same_local);
         assert_eq!(c.len(), 1, "{c:?}");
-        assert!(c[0].contains("本地文件夹") && c[0].contains("「b」"), "{c:?}");
+        assert!(
+            c[0].contains("本地文件夹") && c[0].contains("「b」"),
+            "{c:?}"
+        );
 
         // ② 本地文件夹嵌套（外层盖内层）→ 硬冲突
         let nested = mk("b", "/home/user/qs/inner", "/Public");
@@ -862,17 +864,17 @@ mod tests {
         assert!(mine.destination_conflicts_with(&same_remote).is_empty());
         let w = mine.nas_overlaps_with(&same_remote);
         assert_eq!(w.len(), 1, "{w:?}");
-        assert!(w[0].contains("NAS 文件夹 /home") && w[0].contains("「b」"), "{w:?}");
+        assert!(
+            w[0].contains("NAS 文件夹 /home") && w[0].contains("「b」"),
+            "{w:?}"
+        );
 
         // 两个都读写时，警告里要说明「双写打架」
         let mut rw = same_remote.clone();
         rw.read_write = true;
         let mut me_rw = mine.clone();
         me_rw.read_write = true;
-        assert!(
-            me_rw.nas_overlaps_with(&rw)[0].contains("双向写"),
-            "{w:?}"
-        );
+        assert!(me_rw.nas_overlaps_with(&rw)[0].contains("双向写"), "{w:?}");
         // 一读一写 → 只提示，不提双写
         assert!(me_rw.nas_overlaps_with(&same_remote)[0].contains("只读挂载"));
 
@@ -913,7 +915,10 @@ mod tests {
 
     #[test]
     fn normalize_local_is_lexical() {
-        assert_eq!(normalize_local(Path::new("/a/b/../c")), PathBuf::from("/a/c"));
+        assert_eq!(
+            normalize_local(Path::new("/a/b/../c")),
+            PathBuf::from("/a/c")
+        );
         assert_eq!(normalize_local(Path::new("/a/./b/")), PathBuf::from("/a/b"));
         assert_eq!(normalize_local(Path::new("/")), PathBuf::from("/"));
         assert_eq!(normalize_local(Path::new("a/../b")), PathBuf::from("b"));
@@ -928,7 +933,11 @@ mod tests {
         let legacy = r#"{"id":"old","mountpoint":"/tmp/m","roots":["/home"]}"#;
         std::fs::write(Task::file(&p, "old"), legacy).unwrap();
         let t = Task::load(&p, "old").unwrap();
-        assert_eq!(t.root.as_deref(), Some("/home"), "旧的单个 roots 迁移成 root");
+        assert_eq!(
+            t.root.as_deref(),
+            Some("/home"),
+            "旧的单个 roots 迁移成 root"
+        );
         assert_eq!(t.name, "old", "name 缺省回填 id");
         assert!(t.enabled, "enabled 缺省 true");
         assert_eq!(t.cache_mode, CACHE_PAGECACHE);

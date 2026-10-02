@@ -2492,7 +2492,9 @@ fn print_tasks(d: &TasksData) {
             t.id,
             if ti.mounted { "已挂载" } else { "未挂载" },
             t.mountpoint.display(),
-            t.root.clone().unwrap_or_else(|| "(link home_root)".to_string())
+            t.root
+                .clone()
+                .unwrap_or_else(|| "(link home_root)".to_string())
         );
         println!(
             "       模式={} 方向={} 节省空间={} 智能删除={} 排除规则={} 选择性={}",

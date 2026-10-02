@@ -747,7 +747,9 @@ mod tests {
         let s = ui_spec();
         let i18n = &s["i18n"];
         assert!(
-            i18n["missing_used"].as_array().is_some_and(|a| a.is_empty()),
+            i18n["missing_used"]
+                .as_array()
+                .is_some_and(|a| a.is_empty()),
             "app.js 里 T('key') 用到的键必须在 ZH 表里：{i18n:#}"
         );
         assert!(
