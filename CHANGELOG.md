@@ -5,10 +5,28 @@
 
 [English](CHANGELOG.en.md) · [README](README.md) · [验收记录](docs/验收记录.md)
 
-## [未发布]
+## [0.2.3] - 2026-10-02
+
+**界面看得懂了**：术语去黑话（界面上不再出现「远端根」，统一叫「NAS 目录」），
+连接页那两个平时不用动的字段收进默认折叠的「高级」栏；主页「＋ 添加任务」也不再
+把你送去「诊断 → 挂载」。无破坏性变更，配置与协议一字未动，升级即用。
+
+### 新增
+
+- **连接页「高级：同步范围」折叠栏**（`roots` + `home_root` 两格）。这两格普通账号
+  根本不用填（默认就只同步家目录），原来裸放在表单里，用户既看不懂、又容易被误填。
+  现在收进原生 `<details>` 默认折叠，输入框 `id` 不变、收起状态下照样回填与提交；
+  展开后是两段大白话说明（含「配置文件里这个字段叫 `roots` / `home_root`」的对照）。
 
 ### 修复
 
+- **主页「＋ 添加任务」现在真的去「添加配对文件夹」**。这颗按钮的事件处理还是 M8.2
+  之前的老写法（`switchPage('diag', 'mounts')`）—— 那时任务登记还没进 GUI，只能把人
+  送去挂载页。M8.2 加了任务页与 `openTaskForm()`、M8.4 又把冲突策略/方向/节省空间并进
+  同一张表单之后，主页快捷动作没跟着改，于是和任务页 `#btn-tasks-add` 走了两条不同的路：
+  用户按字面理解要填「本地文件夹 ↔ NAS 文件夹」，看到的却是挂载点 / 远端根 / 线程数。
+  现在两者完全同路（`switchPage('tasks')` + `openTaskForm()`）。任务卡片上的「管理」
+  按钮仍去「诊断 → 挂载」（那里才是查看/卸载已建挂载的正确落点），未改。
 - **主页不再把引擎的「说明」当报错标红**。`qbox_get_sync_log` 恒返回 `status:-17`
   （本账号从未登记同步文件夹，区间内没有事件）时，引擎在
   `crates/qxync-daemon/src/sync.rs` 里走的本来就是 `report.note(...)` 而不是
@@ -19,6 +37,17 @@
   两处表现不一致，可见红色并非有意。
   现在 `addAlert()` 增加 `severity` 参数（默认 `'error'`，真错误仍为红），`note`
   传 `'warn'` 挂 `.alert-warn`（`--warn-soft` / `--warn`）；错误与删除熔断的红色不变。
+
+### 变更
+
+- **界面术语统一**：`远端根` → **`NAS 目录`**，`多根` → `多个目录`，`视图名 X` →
+  `挂载点里叫 X`，`归属根` / `根相对路径` → `属于哪个目录` / `目录内相对路径`；
+  文件页「远端目录」/ 右键「复制远端路径」/ 冲突策略里的「远端占原名」等单说「远端」的
+  地方也统一成「NAS」（原文案混用「NAS」与「远端」，同屏看着别扭）。
+  原始字段名（`roots` / `home_root`）保留在提示与诊断面板的 kv 标签里，方便对着配置
+  文件或 `--json` 排障；`docs/`、配置字段与 CLI 继续用「远端根」这套术语。
+- daemon 的 `roots` note 措辞跟着改（同时出现在 `qxync roots` 输出里，m6 矩阵只断言它非空）。
+- 版本号 → 0.2.3；发布说明 `docs/发布说明-v0.2.3.md`。
 
 ## [0.2.2] - 2026-10-02
 
@@ -241,6 +270,7 @@ NAS 设置名 `QSYNC_FOLDERPAIR_USE_SPACE_SAVING`、Windows 客户端注册表�
 - 验收结论从 README 抽出为 [`docs/验收记录.md`](docs/验收记录.md)。
 - 采用 **MIT OR Apache-2.0** 双许可（`LICENSE-MIT` / `LICENSE-APACHE`）。
 
-[未发布]: https://github.com/mlzxgzy/qxync/compare/v0.1.1...HEAD
+[0.2.3]: https://github.com/mlzxgzy/qxync/compare/v0.2.2...v0.2.3
+[0.2.2]: https://github.com/mlzxgzy/qxync/releases/tag/v0.2.2
 [0.1.1]: https://github.com/mlzxgzy/qxync/releases/tag/v0.1.1
 [0.1.0]: https://github.com/mlzxgzy/qxync/releases/tag/v0.1.0

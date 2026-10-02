@@ -11,7 +11,7 @@
 #   没更新就推上去，用户装的时候会直接 checksum 失败（不会静默装错东西）。
 
 pkgname=qxync-bin
-pkgver=0.2.2
+pkgver=0.2.3
 pkgrel=1
 pkgdesc='QNAP Qsync client for Linux: FUSE on-demand sync + qxyncd daemon + Tauri GUI (prebuilt)'
 arch=('x86_64')

@@ -5,10 +5,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [中文](CHANGELOG.md) · [README](README.en.md) · [Acceptance log](docs/验收记录.md)
 
-## [Unreleased]
+## [0.2.3] - 2026-10-02
+
+**The UI is readable now**: the jargon is gone (no more "remote root" on screen — it is called
+a **NAS folder** throughout), the two connection fields that ordinary users never touch moved
+into a collapsed **Advanced** section, and the home page's "Add task" button no longer sends you
+to Diagnostics → Mounts. No breaking changes; config and protocol are untouched — just upgrade.
+
+### Added
+
+- **"Advanced: sync scope" collapsible on the connection page** (the `roots` + `home_root`
+  fields). Ordinary accounts never need to fill these in (the default is "home folder only"),
+  yet they used to sit naked in the form where users could neither understand nor safely leave
+  them alone. They now live in a native `<details>` that is collapsed by default; the input ids
+  are unchanged and hidden inputs still round-trip through `link_read` / `link_save`. Expanding
+  it shows two plain-language explanations that also name the raw config fields
+  (`roots` / `home_root`).
 
 ### Fixed
 
+- **The home page's "＋ Add task" button now really adds a task.** Its click handler was still
+  the pre-M8.2 form (`switchPage('diag', 'mounts')`) — back then task registration did not exist
+  in the GUI and the mount page was the only place to send you. After M8.2 added the Tasks page
+  and `openTaskForm()`, and M8.4 folded conflict policy / direction / space-saving into that same
+  form, the home shortcut was never updated, so it took a different path from the Tasks page's own
+  `#btn-tasks-add`: users who read "add task" and expected to pair a local folder with a NAS
+  folder were shown mountpoint / remote root / thread-count instead. Both now take the identical
+  path (`switchPage('tasks')` + `openTaskForm()`). The task card's **Manage** button still opens
+  Diagnostics → Mounts, which is the right place to inspect or unmount an existing mount.
 - **The home page no longer paints the engine's "note" as an error.** When
   `qbox_get_sync_log` keeps returning `status:-17` (this account has never registered a sync
   folder, so there are no events in range), the engine in
@@ -20,6 +44,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as a neutral `<p class="note">` on the Status page, so the red was clearly unintended.
   `addAlert()` now takes a `severity` argument (default `'error'`, real errors stay red) and
   `note` passes `'warn'`, which applies `.alert-warn` (`--warn-soft` / `--warn`).
+
+### Changed
+
+- **UI terminology unified**: "remote root" → **"NAS folder"**, "multi-root" → "multiple
+  folders", "view name X" → "called X inside the mountpoint", "owning root" / "root-relative
+  path" → "which folder" / "path inside the folder". Places that said just "remote" (the Files
+  page title, the context menu's "copy remote path", the conflict policy text) now say "NAS" too
+  — the old copy mixed "NAS" and "remote" on the same screen. The raw config field names
+  (`roots` / `home_root`) are kept in the hints and in the diagnostics panel's key/value labels
+  so you can still match them against the config file or `--json` output; `docs/`, the config
+  fields and the CLI keep the technical term.
+- The daemon's `roots` note was reworded to match (it also shows up in `qxync roots`; the m6
+  matrix only asserts it is non-empty).
+- Version → 0.2.3; release notes at `docs/发布说明-v0.2.3.md`.
 
 ## [0.2.2] - 2026-10-02
 
@@ -279,6 +317,7 @@ Verified on **QNAP TS-464C / QTS 5.2.9 / Qsync QPKG 5.0.0.7 (build 20260723)**.
 - Acceptance results were split out of the README into [`docs/验收记录.md`](docs/验收记录.md).
 - Dual-licensed under **MIT OR Apache-2.0** (`LICENSE-MIT` / `LICENSE-APACHE`).
 
-[Unreleased]: https://github.com/mlzxgzy/qxync/compare/v0.1.1...HEAD
+[0.2.3]: https://github.com/mlzxgzy/qxync/compare/v0.2.2...v0.2.3
+[0.2.2]: https://github.com/mlzxgzy/qxync/releases/tag/v0.2.2
 [0.1.1]: https://github.com/mlzxgzy/qxync/releases/tag/v0.1.1
 [0.1.0]: https://github.com/mlzxgzy/qxync/releases/tag/v0.1.0
