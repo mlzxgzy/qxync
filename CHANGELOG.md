@@ -49,6 +49,22 @@ NAS 设置名 `QSYNC_FOLDERPAIR_USE_SPACE_SAVING`、Windows 客户端注册表�
 `.desktop` 的 `GenericName=QNAP Qsync client`、crates.io 关键词里的 `qsync`
 也保留 —— 它们描述的是「跟什么互通」，不是本项目的名字。
 
+### 修复
+
+- **`qxyncd` 启动失败不再静默**。daemon 默认 daemon 化（`fork` 之后 fd 0/1/2 全指向
+  `/dev/null`），启动期的致命错误以前只随 anyhow 打进 `/dev/null` —— 于是
+  `qxync daemon start` 永远只报一句「socket 未就绪」，用户拿不到任何原因（本次就是被这个
+  坑住的）。现在三处一起补：
+  ① daemon 把启动失败写进 `<state>/log/qxyncd.log*`；
+  ② `qxync daemon start` 派生后 socket 起不来时，把日志尾部带回前台；
+  ③ CLI 在派生**之前**先核对 link 配置，缺了就直接说「还没有配置 NAS 连接」并给出
+  `login` 命令（GUI 的 `daemon_start` 早就有这道前置检查，CLI 这边补齐）。
+- **GUI 空态提示指向真正缺的那一步**：连不上 daemon 时不再一律说「先 `qxync daemon start`」
+  —— 还没有任何连接配置时改说「还没有配置 NAS 连接，先在「设置 → 连接」里保存
+  （或跑 `qxync --host … login`）」。全新安装下照旧提示只会让人再撞一次墙。
+- daemon 的「创建配置 / 数据 / 日志目录」与「创建 / 授权 socket 目录」补上 anyhow 上下文，
+  日志里能一眼看出卡在哪一步。
+
 ### 其它
 
 - **UA 与登录体**：`client_agent` 从硬编码的 `QSyncLinux/0.1` 改成 `qxync/<真实版本>`

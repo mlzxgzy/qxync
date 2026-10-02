@@ -135,13 +135,17 @@ pub(crate) struct State {
 
 pub async fn run(opts: Options) -> Result<()> {
     let paths = ConfigPaths::discover()?;
-    paths.ensure_dirs()?;
+    paths
+        .ensure_dirs()
+        .with_context(|| "创建配置 / 数据 / 日志目录失败")?;
     let link = LinkConfig::load(&paths, &opts.link_id)
         .with_context(|| format!("读取连接配置失败（先 `qxync --host ... login`）"))?;
 
     if let Some(dir) = opts.socket.parent() {
-        std::fs::create_dir_all(dir)?;
-        qxync_core::config::restrict_perms(dir, 0o700)?;
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("创建 socket 目录失败: {}", dir.display()))?;
+        qxync_core::config::restrict_perms(dir, 0o700)
+            .with_context(|| format!("设置 socket 目录权限失败: {}", dir.display()))?;
     }
     if opts.socket.exists() {
         if ping_socket(&opts.socket).await.is_ok() {

@@ -92,12 +92,19 @@ fn main() -> Result<()> {
             std::env::var("QXNYC_TASK_RESTORE").ok().as_deref(),
             Some("1") | Some("true") | Some("yes")
         );
-    rt.block_on(daemon::run(daemon::Options {
+    let res = rt.block_on(daemon::run(daemon::Options {
         link_id: args.link,
         socket,
         auto_login: args.auto_login,
         restore_tasks: restore,
-    }))
+    }));
+    // ★ daemon 化之后 fd 0/1/2 全都指向 `/dev/null`（见 [`daemonize`]），所以启动期的
+    //   致命错误如果不写进日志文件就**彻底不可见** —— 用户只会看到 `qxync daemon start`
+    //   报「socket 未就绪」，查不到任何原因。这一行就是那条线索，别删。
+    if let Err(e) = &res {
+        tracing::error!("qxyncd 启动失败: {e:#}");
+    }
+    res
 }
 
 /// fork + setsid + 重定向标准流（日志走文件，见 [`init_logging`]）。

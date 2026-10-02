@@ -39,6 +39,48 @@ pub async fn available(socket: &Path) -> bool {
     )
 }
 
+/// ★ 连不上 daemon 时该给的**下一步**。
+///
+/// 不能一律说「先 `qxync daemon start`」：全新安装下压根还没有连接配置，而 `qxyncd`
+/// 会在后台直接退出（fork 之后 fd 0/1/2 → `/dev/null`，错误只进日志文件），用户照着
+/// 这句提示跑一遍也只会再撞一次墙。所以先看一眼有没有 link 配置，把「缺的是哪一步」说准。
+fn not_running_message(socket: &Path, err: &str) -> String {
+    hint(socket, err, has_any_link())
+}
+
+/// 有没有任何一份连接配置（`<config>/links/*.json`）。
+fn has_any_link() -> bool {
+    qxync_core::ConfigPaths::discover()
+        .ok()
+        .map(|p| {
+            std::fs::read_dir(p.config_dir.join("links"))
+                .map(|rd| {
+                    rd.flatten().any(|e| {
+                        e.path()
+                            .extension()
+                            .map(|x| x.eq_ignore_ascii_case("json"))
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
+/// 提示正文。把「有没有 link」当参数传进来，是为了能不起进程、不动环境变量地测它。
+fn hint(socket: &Path, err: &str, has_link: bool) -> String {
+    let base = format!("连不上 daemon（{}）: {err}", socket.display());
+    if has_link {
+        format!("{base}；先 `qxync daemon start`（或点界面上的「启动」）")
+    } else {
+        format!(
+            "{base}；还没有配置 NAS 连接 —— 先在「设置 → 连接」里填好并保存\
+             （或跑 `qxync --host <NAS地址> --port 9834 --insecure --user <用户> login`），\
+             再启动 daemon"
+        )
+    }
+}
+
 /// 把错误包装成**响应信封**（前端只需要处理一种形状：`{v,ok,data,error}`）。
 pub fn err_response(kind: ErrorKind, message: impl Into<String>) -> Value {
     serde_json::to_value(Response::err(kind, message))
@@ -50,10 +92,7 @@ async fn call_inner(socket: &Path, req: Request) -> Result<Response, IpcError> {
     let stream = UnixStream::connect(socket).await.map_err(|e| {
         IpcError::new(
             ErrorKind::NotRunning,
-            format!(
-                "连不上 daemon（{}）: {e}；先 `qxync daemon start`",
-                socket.display()
-            ),
+            not_running_message(socket, &e.to_string()),
         )
     })?;
     let (rd, mut wr) = stream.into_split();
@@ -89,4 +128,31 @@ pub async fn call(socket: &Path, req: Request) -> Value {
 /// 发请求并解出 `data`（前端不方便直接用的强类型调用留给 Rust 侧）。
 pub async fn call_typed<T: DeserializeOwned>(socket: &Path, req: Request) -> Result<T, IpcError> {
     call_inner(socket, req).await?.into_result::<T>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 连不上 daemon 时，「下一步」必须指向**真正缺的那一步** —— 全新安装缺的是连接配置，
+    /// 照「先 daemon start」去跑只会再撞一次墙（daemon 会在后台静默退出）。
+    #[test]
+    fn hint_points_at_the_step_that_is_actually_missing() {
+        let socket = Path::new("/run/user/1000/qxync/qxyncd.sock");
+
+        let with_link = hint(socket, "No such file or directory", true);
+        assert!(with_link.contains("qxync daemon start"), "{with_link}");
+        assert!(!with_link.contains("还没有配置 NAS 连接"), "{with_link}");
+
+        let without_link = hint(socket, "No such file or directory", false);
+        assert!(
+            without_link.contains("还没有配置 NAS 连接"),
+            "{without_link}"
+        );
+        assert!(without_link.contains("qxync --host"), "{without_link}");
+        assert!(
+            !without_link.contains("daemon start"),
+            "缺连接配置时不该再让人去 start：{without_link}"
+        );
+    }
 }

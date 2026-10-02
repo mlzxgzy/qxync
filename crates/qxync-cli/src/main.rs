@@ -2199,12 +2199,62 @@ fn print_status(st: &StatusData) {
     };
 }
 
+/// 取 daemon 日志的尾部（`<state>/log/qxyncd.log*` 里最新的那一个）。
+///
+/// 为什么需要它：`qxyncd` 默认 daemon 化，fork 之后 fd 0/1/2 都指向 `/dev/null`，
+/// 所以它的启动失败**不会**出现在调用方的终端上 —— 唯一的线索就在日志文件里。
+/// 读不到就如实说读不到，不要假装没有线索。
+fn daemon_log_tail() -> String {
+    let dir = qxync_core::ipc::default_log_dir();
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            if !e.file_name().to_string_lossy().starts_with("qxyncd.log") {
+                continue;
+            }
+            if let Ok(t) = e.metadata().and_then(|m| m.modified()) {
+                if newest.as_ref().is_none_or(|(bt, _)| t > *bt) {
+                    newest = Some((t, e.path()));
+                }
+            }
+        }
+    }
+    let Some((_, path)) = newest else {
+        return format!("（读不到 daemon 日志目录 {}）", dir.display());
+    };
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let tail: Vec<&str> = text.lines().rev().take(8).collect();
+    if tail.is_empty() {
+        return format!("（daemon 日志 {} 还是空的）", path.display());
+    }
+    let mut out = format!("后台 daemon 日志尾部（{}）：", path.display());
+    for line in tail.into_iter().rev() {
+        out.push_str("\n    ");
+        out.push_str(line);
+    }
+    out
+}
+
 async fn daemon_cmd(cli: &Cli, socket: &std::path::Path, action: &DaemonAction) -> Result<()> {
     match action {
         DaemonAction::Start => {
             if ipc_client::available(socket).await {
                 println!("✅ qxyncd 已在运行（{}）", socket.display());
                 return Ok(());
+            }
+            // ★ 先自己核对一遍 link 配置：daemon 会 fork 到后台（fd 0/1/2 → /dev/null），
+            //   少了这个文件它会在后台**静默退出**，用户只看到「socket 未就绪」。
+            //   GUI 的 `daemon_start` 早就有这道前置检查，CLI 这边补齐。
+            let paths = ConfigPaths::discover()?;
+            let link_file = paths.link_file(&cli.link);
+            if let Err(e) = LinkConfig::load(&paths, &cli.link) {
+                bail!(
+                    "还没有配置 NAS 连接「{}」（{}）：\n  {e}\n\
+                     先登录一次（会同时写 link 与凭据），或在 GUI 的登录页保存连接：\n  \
+                     qxync --host <NAS地址> --port 9834 --insecure --user <用户> login",
+                    cli.link,
+                    link_file.display()
+                );
             }
             let exe = daemon_binary()?;
             let mut cmd = std::process::Command::new(&exe);
@@ -2222,7 +2272,12 @@ async fn daemon_cmd(cli: &Cli, socket: &std::path::Path, action: &DaemonAction) 
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
             if !ready {
-                bail!("qxyncd 已派生但 socket 未就绪：{}", socket.display());
+                // 兜底：把后台日志的尾部带回来。daemon 起不来时唯一的线索在日志文件里。
+                bail!(
+                    "qxyncd 已派生但 socket 未就绪：{}\n{}",
+                    socket.display(),
+                    daemon_log_tail()
+                );
             }
             let p: PingData = ipc_client::call(socket, Request::Ping)
                 .await
