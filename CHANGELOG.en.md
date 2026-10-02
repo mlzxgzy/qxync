@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-02
+
+**Only how qxync reaches users changed — client behaviour is identical to v0.1.0**: there are
+**no Rust code changes** between `v0.1.0` and `v0.1.1` (`git diff --stat v0.1.0 HEAD -- '*.rs'`
+is empty).
+
 ### Added
 
 - **Automated release artifacts**: pushing a `v*` tag (or manually running the `Release`
@@ -107,5 +113,6 @@ Verified on **QNAP TS-464C / QTS 5.2.9 / Qsync QPKG 5.0.0.7 (build 20260723)**.
 - Acceptance results were split out of the README into [`docs/验收记录.md`](docs/验收记录.md).
 - Dual-licensed under **MIT OR Apache-2.0** (`LICENSE-MIT` / `LICENSE-APACHE`).
 
-[Unreleased]: https://github.com/mlzxgzy/qxync/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/mlzxgzy/qxync/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/mlzxgzy/qxync/releases/tag/v0.1.1
 [0.1.0]: https://github.com/mlzxgzy/qxync/releases/tag/v0.1.0
