@@ -869,7 +869,7 @@
 
   // ============================================================ 更新中心 / 错误列表（M8.3）
   var KIND_LABEL = {
-    remote_change: '远端改动',
+    remote_change: 'NAS 上的改动',
     upload: '上传',
     download: '下载',
     conflict: '冲突副本',
@@ -2188,7 +2188,7 @@
 
   function doRemovePath(full) {
     if (!requireDaemon()) { return; }
-    if (!window.confirm('确定删除远端条目？\n' + full)) { return; }
+    if (!window.confirm('确定删除 NAS 上的条目？\n' + full)) { return; }
     withBusy({ spinners: ['files-busy'] }, function () {
       return ipc({ method: 'rm', dir: state.files.dir, name: pathBase(full) });
     }).then(function (r) {
@@ -2416,7 +2416,7 @@
     if (!requireDaemon()) { return; }
     var base = state.home || '';
     var guess = base ? pathJoin(base, e.filename) : e.filename;
-    openModal('下载到本地', '远端：' + pathJoin(state.files.dir, e.filename) + '（大文件可能较久，daemon 超时 600s）', guess)
+    openModal('下载到本地', 'NAS：' + pathJoin(state.files.dir, e.filename) + '（大文件可能较久，daemon 超时 600s）', guess)
       .then(function (dest) {
         if (!dest) { return null; }
         var target = str(dest).trim();
@@ -2489,7 +2489,7 @@
       return;
     }
     var name = pathBase(full);
-    if (!window.confirm('确定删除远端条目？\n' + full)) { return; }
+    if (!window.confirm('确定删除 NAS 上的条目？\n' + full)) { return; }
     withBusy({ spinners: ['files-busy'], buttons: ['btn-rm'] }, function () {
       return ipc({ method: 'rm', dir: state.files.dir, name: name });
     }).then(function (r) {
@@ -3098,7 +3098,7 @@
   function doMatchPreview() {
     var p = str($('flt-match') ? $('flt-match').value : '').trim();
     if (!p) {
-      renderError('flt-match-result', '参数错误', '请输入一条远端绝对路径，例如 /home/qxync-test/secret.bin');
+      renderError('flt-match-result', '参数错误', '请输入一条 NAS 绝对路径，例如 /home/qxync-test/secret.bin');
       return Promise.resolve(null);
     }
     return ipc({ method: 'rules', match_path: p }).then(function (r) {
@@ -3128,7 +3128,7 @@
   function conflictLabel(v) {
     if (v === 'ask') { return '每个文件都问我'; }
     if (v === 'rename_remote') { return '重命名 NAS 上的文件'; }
-    if (v === 'replace_remote') { return '用本地文件替换 NAS 上的文件（⚠ 会丢远端改动）'; }
+    if (v === 'replace_remote') { return '用本地文件替换 NAS 上的文件（⚠ 会丢 NAS 上的改动）'; }
     if (v === 'replace_local') { return '用 NAS 上的文件替换本地文件（⚠ 会丢本地改动）'; }
     return '重命名本地文件（默认，双方都不丢）';
   }
@@ -3208,9 +3208,9 @@
     var card = el('div', 'task-card');
     var body = el('div', 'task-body');
     body.appendChild(el('div', 'task-state', pathBase(str(x.path)) + (x.resolution ? '（已裁决，待执行）' : '（待裁决）')));
-    body.appendChild(el('div', 'task-meta', '远端 ' + str(x.path)));
+    body.appendChild(el('div', 'task-meta', 'NAS ' + str(x.path)));
     body.appendChild(el('div', 'task-meta',
-      '本地 ' + humanSize(num(x.local_size, 0)) + ' / 远端 ' + humanSize(num(x.remote_size, 0)) +
+      '本地 ' + humanSize(num(x.local_size, 0)) + ' / NAS ' + humanSize(num(x.remote_size, 0)) +
       ' · 发现于 ' + clock(num(x.created_unix, 0) * 1000)));
     card.appendChild(body);
 

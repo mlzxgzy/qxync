@@ -41,7 +41,7 @@
         <span data-i18n="nav.tasks">任务</span>
       </button>
       <button type="button" class="rail-item" data-page="files"
-              title="文件（远端浏览 / 节省空间模式）" data-i18n-title="nav.files_title">
+              title="文件（浏览 NAS / 节省空间模式）" data-i18n-title="nav.files_title">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
         <span data-i18n="nav.files">文件</span>
       </button>
@@ -193,10 +193,10 @@
             <div class="row-2">
               <label>冲突策略（Conflict policies）
                 <select id="t-conflict">
-                  <option value="rename_local">重命名本地文件（默认；远端占原名，本地另存冲突副本）</option>
+                  <option value="rename_local">重命名本地文件（默认；NAS 上的文件占原名，本地另存冲突副本）</option>
                   <option value="ask">每个文件都问我（进待裁决队列）</option>
                   <option value="rename_remote">重命名 NAS 上的文件（本地内容占原名）</option>
-                  <option value="replace_remote">用本地文件替换 NAS 上的文件（⚠ 远端那份会丢）</option>
+                  <option value="replace_remote">用本地文件替换 NAS 上的文件（⚠ NAS 上那份会丢）</option>
                   <option value="replace_local">用 NAS 上的文件替换本地文件（⚠ 本地那份会丢）</option>
                 </select>
               </label>
@@ -234,7 +234,7 @@
       <!-- ======================= 页面 3：文件 ======================= -->
       <section class="page" id="page-files">
         <div class="card">
-          <h2>远端目录</h2>
+          <h2>NAS 上的目录</h2>
           <form id="form-path" class="pathbar" autocomplete="off">
             <input type="text" id="fp-path" value="/home" spellcheck="false" class="mono">
             <button type="submit" id="btn-path-go">打开</button>
@@ -474,7 +474,7 @@
               <button type="button" id="btn-flt-save" class="primary">保存筛选器</button>
               <button type="button" id="btn-flt-reload">重新读取</button>
             </div>
-            <h3 class="sub">实时预览（判定一条远端路径）</h3>
+            <h3 class="sub">实时预览（判定一条 NAS 路径）</h3>
             <div class="toolbar">
               <input type="text" id="flt-match" class="mono" spellcheck="false" placeholder="/home/qxync-test/secret.bin">
               <button type="button" id="btn-flt-match">判定</button>
@@ -487,7 +487,7 @@
             <h2>冲突策略（Conflict policies）</h2>
             <p class="hint">
               策略挂在**任务**上（不是全局）。没配过的任务默认 <code>rename_local</code>，也就是 M2c 一直以来的行为
-              「远端占原名、本地内容另存 <code>xxx (conflicted copy from …)</code>」。
+              「NAS 上的文件占原名、本地内容另存 <code>xxx (conflicted copy from …)</code>」。
               <code>replace_*</code> 两个选项会**丢一边的改动**，界面上有显式警告。
             </p>
             <dl class="kv kv-inline" id="conflict-kv"></dl>
@@ -858,8 +858,8 @@
   <button type="button" class="ctx-item" role="menuitem" data-act="free" data-i18n="menu.free">⤓ 释放空间（Free up space）</button>
   <div class="ctx-sep" role="separator"></div>
   <button type="button" class="ctx-item" role="menuitem" data-act="get" data-i18n="menu.get">下载到本地…</button>
-  <button type="button" class="ctx-item" role="menuitem" data-act="copy" data-i18n="menu.copy">复制远端路径</button>
-  <button type="button" class="ctx-item danger" role="menuitem" data-act="rm" data-i18n="menu.rm">删除（远端）</button>
+  <button type="button" class="ctx-item" role="menuitem" data-act="copy" data-i18n="menu.copy">复制 NAS 路径</button>
+  <button type="button" class="ctx-item danger" role="menuitem" data-act="rm" data-i18n="menu.rm">删除（NAS 上的）</button>
 </div>
 
 <!-- ============================= 通用输入弹窗 ============================= -->
