@@ -150,6 +150,22 @@ note prints both paths. The only things you must update are your own scripts:
 > unconfigured); as soon as a connection is saved it switches to sync mode by itself — so
 > "run the daemon in the background now" and "log in later" are no longer in conflict.
 
+### 2.6 Upgrading from 0.2.x (one-to-many is gone)
+
+**0.3.0 is a breaking release**: "one mount point / one task against several NAS folders" is no
+longer supported. What was removed and why is in the [CHANGELOG](CHANGELOG.en.md#030---2026-10-02)
+and [release notes v0.3.0](docs/发布说明-v0.3.0.md). There is very little to change:
+
+| Old (≤0.2.3) | New (0.3.0+) |
+|---|---|
+| `qxync mount ~/mnt --remote /home --remote /Public` | create two mounts, or two tasks (one mount point = one NAS folder) |
+| `"roots": ["/home"]` in a task JSON | `"root": "/home"` (a single `roots` entry migrates automatically; **several are reported as a bad task file**, telling you to split the task) |
+| `roots` / `home_root` in the link config | both are gone (unknown fields are ignored); the home directory is fixed to `/home` in the Qsync protocol |
+| the Connection page "Advanced" section | removed; the form is host/port/user/password/https/insecure/ipv4-only |
+
+Nothing on the NAS — data, cache, baseline, credentials — is affected. If a multi-root mount is
+still mounted, `qxync umount <mountpoint>` before upgrading, then re-create it one-to-one.
+
 ### 3. First login
 
 Credentials are written to `~/.config/qxync/credentials.json` (mode `0600`).
@@ -223,7 +239,7 @@ The GUI issues no HTTP itself — **everything goes through the daemon's IPC**.
 qxync status                     # session + server + cursors + hydration stats + mounts
 qxync ls /home                   # list a directory (auto-paginates)
 qxync store [--integrity|--json] # state-store snapshot (cursors / baseline / pin / upload queue)
-qxync roots [--json]             # overview of remote roots + read/write verdicts
+qxync roots [--json]             # sync folders registered on the NAS (the NAS folders you can pair)
 qxync rules [--match <path>]     # selective-sync rule verdict (visible / excluded / temp / outside-roots)
 qxync sync [--once]              # change-discovery status; --force-deletes releases bulk deletes
 qxync task list|add|pause|resume|rm
