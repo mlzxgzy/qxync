@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/mlzxgzy/qxync/actions/workflows/ci.yml/badge.svg)](https://github.com/mlzxgzy/qxync/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](Cargo.toml)
+[![Rust](https://img.shields.io/badge/rust-1.90%2B-orange.svg)](Cargo.toml)
 [![Platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](#quick-start)
 
 [中文](README.md) · **English** · [Disclaimer](DISCLAIMER.md) · [Changelog](CHANGELOG.md) · [Acceptance log](docs/验收记录.md)
@@ -77,7 +77,7 @@ against a real NAS.
 
 ### 1. Dependencies
 
-- **Rust 1.85+** (see `rust-version` in [`Cargo.toml`](Cargo.toml))
+- **Rust 1.90+** (see `rust-version` in [`Cargo.toml`](Cargo.toml))
 - **FUSE 3**: the kernel's `/dev/fuse` + `fusermount3` (installing `fuse3` is enough on most distributions)
 - **The GUI additionally needs** the WebKitGTK 4.1 and GTK 3 development packages
   (e.g. `libwebkit2gtk-4.1-dev` + `libgtk-3-dev` on Debian/Ubuntu;

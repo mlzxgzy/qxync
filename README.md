@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/mlzxgzy/qxync/actions/workflows/ci.yml/badge.svg)](https://github.com/mlzxgzy/qxync/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#许可证)
-[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](Cargo.toml)
+[![Rust](https://img.shields.io/badge/rust-1.90%2B-orange.svg)](Cargo.toml)
 [![Platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](#快速开始)
 
 **中文** · [English](README.en.md) · [免责声明](DISCLAIMER.md) · [变更日志](CHANGELOG.md) · [验收记录](docs/验收记录.md)
@@ -72,7 +72,7 @@ NAS 上的文件在本地只是一个「占位符」，`ls -l` 显示真实大�
 
 ### 1. 依赖
 
-- **Rust 1.85+**（`rust-version` 见 [`Cargo.toml`](Cargo.toml)）
+- **Rust 1.90+**（`rust-version` 见 [`Cargo.toml`](Cargo.toml)）
 - **FUSE 3**：内核 `/dev/fuse` + `fusermount3`（大多数发行版装 `fuse3` 即可）
 - **GUI 额外需要** WebKitGTK 4.1 与 GTK 3 的开发包
   （如 Debian/Ubuntu 的 `libwebkit2gtk-4.1-dev` + `libgtk-3-dev`；

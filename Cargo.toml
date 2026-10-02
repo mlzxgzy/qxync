@@ -13,7 +13,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.90"
 
 # 双许可：MIT 或 Apache-2.0 任选其一（Rust 生态惯例）。
 # ⚠️ 该许可只覆盖本仓库的原创代码；被逆向分析的 QNAP 软件不在此列，见 DISCLAIMER.md。
