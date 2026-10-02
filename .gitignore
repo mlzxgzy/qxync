@@ -13,9 +13,15 @@ report/probe/probe-out/
 # ===== Rust =====
 target/
 **/*.rs.bk
-Cargo.lock
-# 注意：workspace 打包发布时 Cargo.lock 需要提交（bin 项目），
-# 目前纯本地开发阶段先忽略，第一次发布前移除此行。
+# Cargo.lock **要提交**，不要加回这里：
+# 本项目产出的是二进制（qsync / qxyncd / qxync-gui），锁定依赖版本才能保证
+# 「同一份源码 → 同一份依赖 → 可复现的构建」。
+# （2026-10 发版准备时从 .gitignore 移除，见 docs/发布清单-v0.1.0.md）
+
+# ===== Python（report/ 与 report/probe 的逆向/探测脚本）=====
+__pycache__/
+*.py[cod]
+.venv/
 
 # ===== 本地杂项 =====
 .workbuddy/

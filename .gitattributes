@@ -1,0 +1,23 @@
+# 仓库内统一按 LF 存储，检出时由 git 按平台决定（Windows 上为 CRLF）。
+* text=auto
+
+# 这些文件在任何平台上都必须是 LF：否则 Linux/macOS 下 shebang 会失效、
+# 验收矩阵脚本无法直接执行。
+*.sh  text eol=lf
+*.py  text eol=lf
+*.rs  text eol=lf
+*.toml text eol=lf
+*.json text eol=lf
+
+# 二进制资源不做换行转换
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.webp binary
+
+# GitHub 语言统计：逆向分析报告与设计文档不计入「代码」占比
+# （本项目的代码主体是 crates/ 下的 Rust 与 crates/qxync-gui/ui 下的前端三件套）
+report/** linguist-documentation
+docs/**   linguist-documentation

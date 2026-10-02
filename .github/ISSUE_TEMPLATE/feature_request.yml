@@ -1,0 +1,65 @@
+name: 功能请求 / Feature request
+description: 提出一个功能或改进 / Suggest a feature or improvement
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        先看一下 [README 的「它不是什么」](https://github.com/mlzxgzy/qxync/blob/master/README.md#这是什么) ——
+        云账号 / QID 登录、Windows/macOS 支持、与官方客户端 WebSocket 通道互通这几项
+        **已经明确不做**。以下类型的请求也会被直接关闭：
+
+        - 要求绕过授权、破解、批量抓取他人 NAS 内容
+        - 要求削弱安全措施（自签证书用 `--insecure` 是**有意设计**，不是待修项）
+        - 要求分发 QNAP 的二进制 / 安装包 / 反编译产物
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已读过 README 的「它不是什么」，这个请求不在明确不做的范围内
+          required: true
+        - label: 我已搜索过现有 Issue 与 docs/，确认这不是已有计划的重复项
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你想解决什么问题
+      description: 请描述**场景与痛点**，而不是直接给出实现方案。
+      placeholder: |
+        我在多台机器之间同步 20 万个小文件，
+        现在每轮对账都要……，我希望……
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 你设想的方案（可选）
+      description: 如果你对实现有想法，写在这里；也欢迎说明你考虑过的替代方案。
+    validations:
+      required: false
+
+  - type: textarea
+    id: risk
+    attributes:
+      label: 对「两条铁则」的影响
+      description: |
+        如果这个功能涉及 FUSE 读路径、写回、脱水或冲突处理，请说明它会不会影响
+        README 里的[两条铁则](https://github.com/mlzxgzy/qxync/blob/master/README.md#两条铁则)。
+        不涉及的话写「不涉及」即可。
+      placeholder: 不涉及 / 会影响第 X 条，理由是……
+    validations:
+      required: true
+
+  - type: dropdown
+    id: willingness
+    attributes:
+      label: 你愿意自己实现吗
+      options:
+        - 愿意提 PR
+        - 可以帮忙测试
+        - 只是提需求
+    validations:
+      required: true

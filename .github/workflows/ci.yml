@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支上的旧跑批直接取消，省 CI 额度
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ---------------------------------------------------------------- 构建 + 测试
+  test:
+    name: build + test (ubuntu-22.04)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装系统依赖（FUSE3 + Tauri/GUI 的 WebKitGTK）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            fuse3 libfuse3-dev \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+            libssl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      # --locked：Cargo.lock 已入库，构建必须严格按锁定的依赖版本走
+      - name: cargo build --workspace
+        run: cargo build --workspace --locked
+
+      - name: cargo test --workspace
+        run: cargo test --workspace --locked
+
+      # 真机测试必须保持 #[ignore]：它们是手动跑的，绝不能因为 CI 恰好有网就误连真实设备。
+      # 这里把「ignored 用例数」钉死，谁把 #[ignore] 去掉就会在这里失败。
+      - name: 确认真机测试仍是 #[ignore]（应为 10 条）
+        run: |
+          n="$(cargo test -p qxync-proto-test -- --list --ignored | grep -cE ': test$')"
+          echo "ignored tests = $n"
+          [ "$n" = "10" ] || { echo "❌ 期望 10 条 ignored 真机测试，实际 $n 条"; exit 1; }
+
+      # 只跑 clippy、不 -D warnings：本仓库尚未做告警清零，
+      # 先把「编译级错误」挡住；收紧到 -D warnings 是后续独立的一步。
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked
+
+  # ---------------------------------------------------------------- MSRV（非阻断）
+  msrv:
+    name: MSRV check (rust 1.85, advisory)
+    runs-on: ubuntu-22.04
+    # ⚠️ 非阻断：workspace 声明了 rust-version = "1.85"，但这条**尚未在 1.85 上实测过**
+    #（开发机是 nightly）。首次跑通 CI 后，如果 1.85 确实编得过，就把它改成阻断；
+    # 如果编不过，就把 workspace 的 rust-version 抬到实际下限。
+    # 见 docs/发布清单-v0.1.0.md。
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config fuse3 libfuse3-dev
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      # GUI 依赖 WebKitGTK，MSRV 检查里先排除它（它的下限由 Tauri 决定）
+      - name: cargo check (rust-version = 1.85)
+        run: cargo check --workspace --exclude qxync-gui --locked
+
+  # ---------------------------------------------------------------- 格式（非阻断）
+  fmt:
+    name: cargo fmt (advisory)
+    runs-on: ubuntu-22.04
+    # ⚠️ 本仓库尚未整体 cargo fmt（约 21 个文件 / 200+ 处差异），格式收口会单独作为一个
+    # commit 落地。在那之前这里**不阻断** CI，详情见 CONTRIBUTING.md §7「已知格式债」。
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
