@@ -50,10 +50,13 @@ mounts and multi-root task arrays no longer exist (see below).
 
 ### Changed
 
-- **Anything that is not the home directory is forced read-only**: with one-to-many gone a single
-  root can also be a shared folder, so `daemon::mount()` decides writability by "is this
-  `home_root`" (the server really does refuse uploads to non-Qsync sync folders, `status:20`), and
-  a requested `--rw` is downgraded to read-only with a warning.
+- **The client no longer pre-judges writability**: the old guard cut everything that was not the
+  home directory down to read-only, which was the wrong test — writability is decided by the NAS
+  (whether the folder is registered as a Qsync sync folder, see `qbox_get_syncing_folder_list`),
+  and registered folders outside home are writable too. Ticking "read-write" now mounts
+  read-write; if the server refuses (`status:20`) the upload queue and the Updates / Errors page
+  report it verbatim. The GUI dropdown marks "NAS sync folder" candidates and the hint spells out
+  this boundary.
 - `qxync roots` now lists only "home directory + sync folders registered on the NAS" (no more
   per-root readability probing, no more "configured roots"); each NAS sync folder line prints the
   **client path** (`client_path`), falling back to the share path with an explicit note.

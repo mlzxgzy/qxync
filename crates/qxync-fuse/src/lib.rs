@@ -179,7 +179,7 @@ pub struct LocalNode {
 pub trait LocalView: Send + Sync {
     /// 挂载根（`/home`）。
     fn remote_root(&self) -> &str;
-    /// ★ M6：挂载暴露的全部远端根（单根时就是那一个）。
+    /// 挂载暴露的远端根列表（一对一：永远只有一个）。
     ///
     /// 默认实现向后兼容（旧的实现者/测试替身只需实现 `remote_root`）。
     fn remote_roots(&self) -> Vec<String> {
@@ -219,7 +219,7 @@ pub struct FsHandle {
     cache_dir: PathBuf,
     chunk_size: u64,
     remote_root: String,
-    /// ★ M6：全部远端根（单根时长度 1）。
+    /// 全部远端根（一对一：长度恒为 1）。
     roots: Vec<String>,
     upload: Option<Arc<UploadQueue>>,
     delete_guard: Arc<DeleteGuard>,
@@ -266,7 +266,7 @@ impl FsHandle {
         self.read_only
     }
 
-    /// ★ M6：挂载暴露的全部远端根（远端路径列表；单根时就是那一个）。
+    /// 挂载暴露的远端根（远端路径列表；一对一：只有一个）。
     pub fn remote_roots(&self) -> Vec<String> {
         self.roots.clone()
     }
@@ -543,7 +543,7 @@ impl LocalView for FsHandle {
         &self.remote_root
     }
 
-    /// ★ M6：句柄拿到的是真实的多根列表，而不是默认实现的「只有 remote_root」。
+    /// 句柄拿到的是真实的远端根列表（一对一：一个元素），而不是默认实现的空列表。
     fn remote_roots(&self) -> Vec<String> {
         self.roots.clone()
     }
@@ -1951,7 +1951,9 @@ impl Filesystem for QxyncFs {
         if self.read_only && flags.acc_mode() != OpenAccMode::O_RDONLY {
             return reply.error(fuser::Errno::EACCES);
         }
-        // ★ M6：带写意图打开非家目录根下的文件 → EROFS（与挂载级 read_only 检查并存）
+        // 写意图打开时只做两件事：排除路径回 ENOENT（纵深防御）、其余放行。
+        // ★ 不再有「非家目录根 → EROFS」：能不能写由 NAS 决定（登记成 Qsync 同步文件夹的
+        //   目录可写），客户端不预判；服务端拒绝会在上传队列 / 错误列表里如实出现。
         if flags.acc_mode() != OpenAccMode::O_RDONLY {
             let remote = match self.remote_of(ino) {
                 Ok(r) => r,
@@ -2127,7 +2129,7 @@ impl Filesystem for QxyncFs {
         if self.read_only && (size.is_some() || mtime.is_some()) {
             return reply.error(fuser::Errno::EROFS);
         }
-        // ★ M6：size/mtime 是写操作 —— 非家目录根下的节点直接 EROFS
+        // size/mtime 是写操作：只读挂载已在上面挡掉，这里只需要防排除路径
         if size.is_some() || mtime.is_some() {
             let remote = match self.remote_of(ino) {
                 Ok(r) => r,

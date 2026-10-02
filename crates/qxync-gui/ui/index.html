@@ -192,9 +192,12 @@
             <p class="hint">
               ★ **一对一**：本地文件夹 ⇄ 这**一个** NAS 文件夹；挂载点里**直接**就是它的内容，
               不会再套一层目录名（NAS 选 <code>/home</code>，挂载点里就是家目录，不是
-              <code>挂载点/home</code>）。候选来自「NAS 上登记的 Qsync 同步文件夹」和已配置的
-              NAS 目录；选不到就点「浏览…」逐层挑，或选「手动输入」。要同步多个 NAS 文件夹
-              → 建多个任务（提交时会检查本地文件夹重复/嵌套、NAS 目录重复）。
+              <code>挂载点/home</code>）。候选来自「NAS 上登记的 Qsync 同步文件夹」与家目录；
+              选不到就点「浏览…」逐层挑，或选「手动输入」。要同步多个 NAS 文件夹 → 建多个任务
+              （提交时会检查本地文件夹重复/嵌套、NAS 文件夹重复）。
+              <strong>能不能写由 NAS 决定</strong>：Qsync 里登记成同步文件夹的目录可以写，
+              没登记过的共享文件夹会被服务端拒绝（<code>status:20</code>）—— 勾了「读写」仍失败的话，
+              错误会进「更新 / 错误」页，客户端不会替你改只读。
             </p>
             <label>水合缓存目录（留空 = 默认 <code>~/.local/share/qxync/cache</code>）
               <input type="text" id="t-cache-dir" class="mono" spellcheck="false"
@@ -775,7 +778,7 @@
                 <label>删除熔断阈值 delete_limit
                   <input type="number" id="m-delete-limit" min="0" step="1" value="100">
                 </label>
-                <label class="check"><input type="checkbox" id="m-read-write"> 读写挂载（否则只读）</label>
+                <label class="check"><input type="checkbox" id="m-read-write"> 读写挂载（否则只读；能否写入由 NAS 决定：未登记为 Qsync 同步文件夹的共享文件夹会被服务端拒绝 status:20）</label>
               </div>
               <label class="check"><input type="checkbox" id="m-auto-unmount" checked> 异常退出时自动卸载 auto_unmount</label>
               <div class="btn-row">
