@@ -122,8 +122,8 @@ fn same_link(a: &qxync_core::ipc::LinkInfo, b: &LinkConfig) -> bool {
         && a.https == b.https
         && a.user == b.user
         && a.ipv4_only == b.ipv4_only
-        // ★ M6：roots 变了也必须重启 daemon（daemon 只在启动时读 link 文件）
-        && a.roots == b.roots()
+        // home_root 变了也要重启 daemon（daemon 只在启动时读 link 文件）
+        && qxync_core::normalize_root(&a.home_root) == b.root()
 }
 
 /// 前端的连接表单（字段都可省，省了就用默认值/已有 link）。
@@ -141,9 +141,6 @@ struct LinkInput {
     user: String,
     #[serde(default = "default_home_root")]
     home_root: String,
-    /// ★ M6：多根 / 共享文件夹（空 = 只用 home_root）
-    #[serde(default)]
-    roots: Vec<String>,
     #[serde(default)]
     ipv4_only: bool,
     /// ★ M7：选择性同步规则（GUI 暂不编辑；保存时**保留已有值**，不能被 GUI 抹掉）
@@ -187,12 +184,6 @@ impl LinkInput {
                 HOME_ROOT.to_string()
             } else {
                 self.home_root.trim().to_string()
-            },
-            // 空行 = 没配；有内容才归一化（归一化会把空输入变成 /home，那是「生效根」的语义）
-            roots: if self.roots.iter().all(|r| r.trim().is_empty()) {
-                Vec::new()
-            } else {
-                qxync_core::normalize_roots(&self.roots)
             },
             ipv4_only: self.ipv4_only,
             // 前端没给就先用默认；真正保存时由 `link_with_existing` 用已有值补齐
@@ -730,27 +721,22 @@ mod tests {
         assert!(link.https);
         assert!(!link.insecure);
         assert_eq!(link.home_root, HOME_ROOT);
-        assert!(link.roots.is_empty(), "没传 roots 就是空 = 只用 home_root");
+        assert_eq!(link.root(), "/home", "生效根就是归一化后的 home_root");
     }
 
+    /// 空的 / 带空白的 `home_root` 落回 `/home`（不能写出一个空根）。
     #[test]
-    fn link_input_roots_are_normalized() {
-        // ★ M6：roots 传了就归一化（补前导 /、去尾斜杠、去重）
+    fn link_input_home_root_defaults() {
         let li: LinkInput = serde_json::from_value(json!({
-            "host": "nas.local", "user": "test1",
-            "roots": [" /home/ ", "Public", "/home", ""]
+            "host": "nas.local", "user": "test1", "home_root": "  "
         }))
         .unwrap();
-        assert_eq!(
-            li.link().roots,
-            vec!["/home".to_string(), "/Public".to_string()]
-        );
-        // 没传（或全是空白）= 空 = 只用 home_root，行为与 M5 之前一致
-        let li2: LinkInput = serde_json::from_value(
-            json!({"host": "nas.local", "user": "test1", "roots": ["  ", ""]}),
-        )
+        assert_eq!(li.link().home_root, HOME_ROOT);
+        let li2: LinkInput = serde_json::from_value(json!({
+            "host": "nas.local", "user": "test1", "home_root": "/home/test1/"
+        }))
         .unwrap();
-        assert!(li2.link().roots.is_empty());
+        assert_eq!(li2.link().root(), "/home/test1", "归一化（去尾斜杠）");
     }
 
     #[test]
@@ -762,7 +748,7 @@ mod tests {
             https: true,
             user: "test1".into(),
             ipv4_only: false,
-            roots: vec!["/home".into()],
+            home_root: "/home".into(),
         };
         let mut link = LinkConfig {
             id: "default".into(),
@@ -772,7 +758,6 @@ mod tests {
             insecure: true,
             user: "test1".into(),
             home_root: "/home".into(),
-            roots: Vec::new(),
             ipv4_only: false,
             exclude: Vec::new(),
             filter_temp: true,
@@ -782,10 +767,10 @@ mod tests {
         assert!(same_link(&info, &link));
         link.user = "other".into();
         assert!(!same_link(&info, &link));
-        // ★ M6：只改 roots 也要能识别出来（否则「保存并登录」不会重启 daemon，roots 不生效）
+        // home_root 变了也要能识别（否则「保存并登录」不会重启 daemon，新根不生效）
         link.user = "test1".into();
-        link.roots = vec!["/home".into(), "/Public".into()];
-        assert!(!same_link(&info, &link), "roots 变了必须被判为不同");
+        link.home_root = "/home/test1".into();
+        assert!(!same_link(&info, &link), "home_root 变了必须被判为不同");
     }
 
     #[test]

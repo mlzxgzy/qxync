@@ -57,9 +57,9 @@ cargo test --workspace
 | FUSE 读 / 写 / 水合 / 脱水 | `xtask/tests/fuse-matrix.sh` |
 | 同步引擎 / 游标 / 冲突 / 删除保护 | `xtask/tests/fuse-matrix.sh`（含 M2c 段） |
 | 状态库 schema / 迁移 | `xtask/tests/m5-matrix.sh`、`xtask/tests/m83-matrix.sh` |
-| 多根 / 只读规则 | `xtask/tests/m6-matrix.sh` |
 | 排除规则 / LAN 对等 | `xtask/tests/m7-matrix.sh`（`--no-nas` 可先自测） |
 | 任务登记 / 恢复 | `xtask/tests/m82-matrix.sh` |
+| 一对一配对 / 目的地冲突 | `xtask/tests/pair-1to1.sh`（不需要 NAS） |
 | 设置 / 代理 / 托盘 / 释放空间 | `xtask/tests/m84-matrix.sh` |
 | `ui/` 任意文件 | `xtask/tests/gui-matrix.sh`（无 DISPLAY 用 `--no-window`） |
 
@@ -161,7 +161,6 @@ cargo test --workspace
 | FUSE read / write / hydrate / dehydrate | `xtask/tests/fuse-matrix.sh` |
 | Sync engine / cursors / conflicts / delete protection | `xtask/tests/fuse-matrix.sh` (M2c section) |
 | State store schema / migration | `xtask/tests/m5-matrix.sh`, `xtask/tests/m83-matrix.sh` |
-| Multi-root / read-only rules | `xtask/tests/m6-matrix.sh` |
 | Exclude rules / LAN peer | `xtask/tests/m7-matrix.sh` (`--no-nas` for a quick local pass) |
 | Task registry / restore | `xtask/tests/m82-matrix.sh` |
 | Settings / proxy / tray / free-up-space | `xtask/tests/m84-matrix.sh` |

@@ -152,7 +152,7 @@ check "$([ "$(rj '.patterns|length')" = "2" ] && echo 0 || echo 1)" "规则编�
 check "$([ "$(rj '.bad|length')" = "1" ] && echo 0 || echo 1)" "坏规则被点名（bad=$(rj '.bad|join(",")')）"
 check "$([ "$(rj '.filter_temp')" = "true" ] && echo 0 || echo 1)" "内置临时文件过滤默认开"
 check "$([ "$(rj '.temp_patterns|length')" -ge 5 ] && echo 0 || echo 1)" "内置临时规则 $(rj '.temp_patterns|length') 条"
-check "$([ "$(rj '.roots|join(",")')" = "/home" ] && echo 0 || echo 1)" "远端根 = /home"
+check "$([ "$(rj '.roots|join(",")')" = "/home" ] && echo 0 || echo 1)" "远端根只有一个 /home"
 
 qa rules --match "$SHARE_DIR/$HIDDEN_FILE" --json >"$M7/m1.json" 2>/dev/null
 check "$([ "$(jq -r '.match_hidden' "$M7/m1.json")" = "true" ] && echo 0 || echo 1)" "--match 被排除文件 → hidden=true"

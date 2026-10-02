@@ -53,7 +53,7 @@ against a real NAS.
 | **Change discovery** | three-cursor polling + three-way baseline reconciliation; conflicts produce a **conflicted copy**, and bulk remote deletes are guarded by a **circuit breaker** | [M2c](docs/M2c-变更发现.md) |
 | **Dehydration (free up space)** | the full safety-check chain (pin / unuploaded changes / open fd / mmap'd / currently hydrating / recently accessed) must pass before local content is dropped | [M3](docs/M3-脱水.md) |
 | **Local state store** | SQLite carries cursors / baseline / pin / upload queue, persisted in **one and the same transaction**; librsync-compatible delta codec + capability gating | [M5](docs/M5-SQLite与delta.md) |
-| **Multi-root / shared folders** | `roots` configures multiple roots; the home directory is read-write, non-home roots return `EROFS` straight from the FUSE layer | [M6](docs/M6-多根与共享文件夹.md) |
+| **Shared folders (read-only)** | NAS folders are paired **one-to-one** onto local folders; the home directory is read-write, non-home folders (shared folders) are read-only | [M6](docs/M6-多根与共享文件夹.md) · [CHANGELOG](CHANGELOG.en.md) |
 | **Selective sync** | gitignore-flavoured `exclude` rules (anchoring / `**` / negation / subtree pruning) + built-in temporary-file filtering | [M7](docs/M7-选择性同步与LAN直连.md) |
 | **LAN direct** | qxync↔qxync peer protocol: device pairing, event fast path, direct local range transfer (any failure silently falls back to the NAS) | [M7](docs/M7-选择性同步与LAN直连.md) |
 | **Sync tasks** | mount registrations persisted in `tasks/<id>.json`, pause/resume per task, restorable after a restart with `--restore-tasks` | [M8](docs/M8-向Qsync-Client-6靠拢.md) |
@@ -254,7 +254,7 @@ qxync-gui ────┘                              ├── sync engine (po
 
 ```
 crates/
-├── qxync-core/        shared types + config layout + state store (SQLite) + delta codec + multi-root layout + rule engine
+├── qxync-core/        shared types + config layout + state store (SQLite) + delta codec + single-root normalization + rule engine
 ├── qxync-client/      NAS HTTP API wrapper (login / metadata / upload & download) + LAN peer protocol
 ├── qxync-fuse/        FUSE layer: read-only/read-write mounts + range hydration + dehydration (incl. the upload queue)
 ├── qxync-daemon/      the qxyncd binary: long-running process + IPC server + sync engine + peer listener
@@ -304,17 +304,17 @@ the two `rename` calls produced "cursor advanced, baseline not". The old
 `cursors.json`/`baseline.json` are migrated automatically on first start and archived as
 `*.json.migrated` (backups kept, idempotent).
 
-**Multi-root only adds a name mapping at the mount-point layer**: the link's `roots` config
-(defaults to `["/home"]`); with multiple roots, each root's name appears at the top level of the
-mount point (`home/`, `Public/`), while **every layer below (cache/baseline/pin/xattr/upload queue)
-still keys by remote path**. A single root is **passthrough** (the mount point *is* that root) and
-M1–M5 behaviour is unchanged down to the letter — `roots.rs` keeps a dedicated
-"a single root must still be passthrough" assertion guarding exactly this.
+**One-to-one: one mount point = one NAS folder.** The mount point *is* that folder's content
+(pair `/home` and you see the home directory directly — no extra `home/` level). Cache / baseline /
+pin / xattr / upload queue all key by remote path; the link's `home_root` is only the default used
+when no NAS folder is given.
 
-> ★ A **paired folder** (a GUI task / `qxync task`) is **one-to-one**: one local folder ⇄ one NAS
-> folder, and the mount point *is* that NAS folder (no extra `home/` level). Multi-root mounts
-> live only on the `qxync mount --remote A --remote B` path and are **never registered as tasks**;
-> to sync several NAS folders, create several tasks.
+> ★ 2026-10-02: **one-to-many (multi-root) mounts were removed entirely** (the `roots` config,
+> `--remote A --remote B`, the FUSE virtual root, and the legacy multi-root `roots` array in task
+> files). To sync several NAS folders, create several tasks — one task = one local folder + one NAS
+> folder. A legacy file with a single `roots` entry migrates to `root` automatically; several
+> entries are reported as a bad task file (telling you to split it) instead of silently narrowing
+> the sync scope.
 
 ## Known limitations
 
@@ -456,46 +456,25 @@ these are the ones most likely to bite you while writing code:
     discriminator is "**are there historical versions**", and looking only at endpoint existence
     leads to a completely wrong conclusion.
 
-**Multi-root & shared folders**
+**Shared folders & NAS folders**
 
-30. **Shared folders are readable but not writable**: as long as the account has read permission, a
-    plain `sid` is enough to list / stat / download (`/Public` and `/Multimedia` both passed on a
+30. **Shared folders are readable but not writable**: as long as the account has read permission,
+    a plain `sid` is enough to list / stat / download (`/Public` and `/Multimedia` both passed on a
     real NAS), and `auth_data` AES is **not** needed; but an upload requires a Qsync sync folder,
-    otherwise the server just answers with a vague `status:20`. So non-home roots are always treated
-    as read-only, and write operations are answered with `EROFS` directly at the FUSE layer.
+    otherwise the server answers with a vague `status:20`. So **anything that is not the home
+    directory is read-only**: a task paired to a shared folder is forced to mount read-only
+    (`daemon::mount()` checks `remote != home_root`).
 31. **The top-level share list cannot be enumerated**: `get_list /` returns `status:5` for a regular
-    user, and `qbox_get_syncing_folder_list` returns "folders registered for sync on the NAS" →
-    roots can only be configured by the user, never auto-discovered. An endpoint returning 200 with
-    an empty array is not an error.
-32. **Multi-root must never touch the single-root path**: all multi-root logic is gated on
-    `multi_root`; otherwise the M1–M5 FUSE matrix breaks wholesale.
-33. **Dehydration candidates and mmap mappings must be expanded per root**: otherwise the same file is
-    counted once for every root (`freed_bytes` doubles), and worse, a wrong mmap mapping makes the
-    "mmap'd files are not dehydrated" safety check fail open — a direct violation of the dehydration
-    iron rule.
-
-**GUI**
-
-34. **The `hidden` attribute loses to `display` in author styles**: `.env-banner { display: flex }`
-    makes `<div hidden>` **permanently visible** in Tauri — the symptom being that IPC works fine
-    throughout while a red "not running in Tauri" bar sits on top. Add a global
-    `[hidden] { display: none !important; }` (loading/empty-state/result-box and similar elements
-    benefit too).
-35. **Switching tabs before the first `status` comes back → empty state**: `requireLogin()` depends on
-    `state.lastStatus`, which is `null` while the page is just coming up, so the `ls` on the
-    "Files / pin" page is skipped outright. The fix: refresh the current tab once more after the
-    first status response arrives.
-36. Tauri 2 command arguments are **camelCase** (Rust `link_id` → JS `{linkId}`), but the **fields
-    inside the object you pass are still snake_case** (`home_root`/`force_deletes`/`cache_mode`/
-    `hydrate_timeout_secs`…); `frontendDist` is embedded **at compile time**, so changing `ui/`
-    requires a fresh `cargo build` (the `ui_assets` byte count in `--self-test` is exactly the
-    discriminator for "did the assets really make it into the binary").
-37. **A failed mount panics the daemon's IPC worker**: dropping the tokio `Runtime` inside `QxyncFs`
-    in an async context triggers
-    `Cannot drop a runtime in a context where blocking is not allowed`.
-    The fix: wrap it in `FsRuntime` and pick the route by context (use `shutdown_background()` inside
-    tokio). The regression test `dropping_fs_inside_async_context_does_not_panic` is a permanent part
-    of `cargo test`.
+    user; the only enumerable source is `qbox_get_syncing_folder_list` (folders registered for sync
+    on the NAS) → the "NAS folder" must be **chosen by the user** (dropdown + level-by-level `ls`
+    browsing + manual entry), never auto-discovered. An endpoint returning 200 with an empty array
+    is not an error.
+32. **One-to-one**: one mount point = one NAS folder. "One-to-many" was **removed entirely** on
+    2026-10-02 (the `roots` config, the multi-root virtual root, the legacy multi-root array in task
+    files); see the CHANGELOG for why and what it affects.
+33. **Parse real-NAS fields as they really are**: `qbox_get_syncing_folder_list` returns
+    `name` / `path` / `privilege`, not the imagined `folder` / `permission` the early parser read —
+    reading the wrong fields turns "listable" into "cannot list", leaving a working feature unused.
 
 ## Two iron rules
 
@@ -520,11 +499,10 @@ cargo test --workspace                                   # unit tests + doc test
 xtask/tests/fuse-matrix.sh            # 68 items: range hydration / write path / change discovery / dehydration / state store (~12min)
 xtask/tests/fuse-matrix.sh --big      #    adds a 128 MiB full read + concurrent dedup
 xtask/tests/m5-matrix.sh              # 30 items
-xtask/tests/m6-matrix.sh              # 29 items (real multi-root mounts)
 xtask/tests/m7-matrix.sh              # 60 items (rules / FUSE filtering / LAN pairing·events·direct transfer)
 xtask/tests/m7-matrix.sh --no-nas     #    no NAS needed: unit tests + loopback between two real daemons
 xtask/tests/m82-matrix.sh             # 37 items (task registration / restart recovery)
-xtask/tests/pair-1to1.sh              # 15 items (one-to-one pairing + destination conflicts; no NAS needed)
+xtask/tests/pair-1to1.sh              # 17 items (one-to-one pairing + destination conflicts; no NAS needed)
 xtask/tests/m83-matrix.sh             # 27 items (journal schema migration / filtering / rotation)
 xtask/tests/m84-matrix.sh             # 92 items (settings / proxy / tray / free up space / conflict policy)
 xtask/tests/gui-matrix.sh             # 148 items (real-window screenshots of 9 destinations + ui_spec static self-check)
@@ -559,7 +537,7 @@ cargo test -p qxync-daemon -- --ignored --test-threads=1 --nocapture     # M2c e
 | [`docs/M3-脱水.md`](docs/M3-脱水.md) | Safety-check chain, the `inval_inode` ordering iron rule, idle/quota, cache-mode |
 | [`docs/M4-GUI.md`](docs/M4-GUI.md) | GUI boundaries, command surface, page structure, acceptance and pitfalls |
 | [`docs/M5-SQLite与delta.md`](docs/M5-SQLite与delta.md) | State-store schema/migration/single transaction, real-NAS versioning probing, delta capability gating |
-| [`docs/M6-多根与共享文件夹.md`](docs/M6-多根与共享文件夹.md) | Multi-root layout/read-only rules, real-NAS shared-folder probing, FUSE virtual root |
+| [`docs/M6-多根与共享文件夹.md`](docs/M6-多根与共享文件夹.md) | **Historical**: multi-root layout (removed), read-only rules, real-NAS shared-folder probing |
 | [`docs/M7-选择性同步与LAN直连.md`](docs/M7-选择性同步与LAN直连.md) | exclude rule engine, peer protocol wire format, event fast path, direct transfer |
 | [`docs/M8-向Qsync-Client-6靠拢.md`](docs/M8-向Qsync-Client-6靠拢.md) | GUI rework research + M8.1–M8.6 execution plan and decision log |
 | [`docs/验收记录.md`](docs/验收记录.md) | Milestone-level acceptance conclusions (what was run, what the result was) |

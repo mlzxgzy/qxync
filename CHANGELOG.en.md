@@ -7,40 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-**Paired folders are one-to-one now**: one local folder ⇄ one NAS folder, and the mount point
-*is* that NAS folder (no extra `home/` level inside it). The NAS side became a dropdown whose
-candidates come from the Qsync sync folders registered on the NAS plus the configured NAS
-folders; you can still browse level by level or type a path. Destination conflicts are checked
-on submit.
+**One-to-many removed entirely; one-to-one only**: one mount point = one NAS folder, and the mount
+point *is* that folder's content (pair `/home` and you see the home directory directly — no extra
+`home/` level). The NAS side became a dropdown (candidates = the Qsync sync folders registered on
+the NAS + the home directory); you can still browse level by level or type a path. Destination
+conflicts are checked on submit. **No compatibility is kept**: the old `roots` config, multi-root
+mounts and multi-root task arrays no longer exist (see below).
+
+### Removed (breaking)
+
+- **The one-to-many (multi-root) capability is gone**, including every entry point it had:
+  * `roots` in the link config (the "Advanced: sync scope" box on the Connection page is gone;
+    only `home_root` remains);
+  * `qxync mount --remote A --remote B` — `--remote` (and `--root`) can now be given only once;
+  * the FUSE **virtual root** (`ViewLayout::Multi` / `RootSpec` / `QxyncFs::new_multi` /
+    `multi_root` branches), plus `MountInfo.roots` and `RootsData.configured` / `roots`;
+  * `Task.roots: Vec<String>` → `root: Option<String>` (one NAS folder per task).
+- **Legacy multi-root task files**: none are preserved. A file with a single `roots` entry is
+  migrated to `root` automatically; several entries are reported as a `bad_file` in the task list
+  ("old multi-root format — create one task per NAS folder"). The sync scope is **never silently
+  narrowed**.
+- `xtask/tests/m6-matrix.sh` (29 multi-root items) went away with the feature;
+  `docs/M6-多根与共享文件夹.md` is marked historical (the still-valid finding "shared folders are
+  readable but not writable" lives on in README §pitfalls 30–33).
 
 ### Added
 
 - **"NAS folder" dropdown + "Browse…" picker.** It used to be a textarea (one NAS folder per
   line): you could not see what the NAS actually offers, and nobody should have to type remote
   paths by hand. Now:
-  * candidate source 1: Qsync sync folders registered on the NAS
+  * candidates: Qsync sync folders registered on the NAS
     (`qbox_get_syncing_folder_list&detail=1`), with the share path mapped to the client path
-    (`/share/homes/<user>/x` → `/home/x`, backed by a real-machine HAR);
-  * candidate source 2: the NAS folders already configured under
-    Connection → Advanced → sync scope;
+    (`/share/homes/<user>/x` → `/home/x`, backed by a real-machine HAR) + the home directory;
   * "Browse…" walks the tree (reusing the Files page `ls`), and "type manually" is the fallback.
 - **GUI static-compliance unit test** (`ui_spec_is_green`, run by `cargo test -p qxync-gui`):
   i18n keys present, no HTML string building, a11y and four-state markers — forgetting an i18n
   key now fails a test.
-- **`xtask/tests/pair-1to1.sh` (15 items, no NAS / no FUSE required)**: boots a private daemon
-  (fake link, only the `tasks save` path) and verifies the one-to-one rejection of multiple
-  roots, the error/warning split for destination conflicts, and that legacy multi-root tasks
-  still load.
+- **`xtask/tests/pair-1to1.sh` (17 items, no NAS / no FUSE required)**: boots a private daemon
+  (fake link, only the `tasks save` path) and verifies one-to-one registration, that a repeated
+  `--root` is rejected, the error/warning split for destination conflicts, and that a legacy file
+  with one `roots` entry migrates while several entries error out.
 
 ### Changed
 
-- **A paired folder is a one-to-one mapping.** A task accepts exactly **one** NAS folder.
-  Multi-root mounts (`qxync mount --remote /home --remote /Public`, M6) still work but are
-  **no longer registered as tasks** — the task layer only expresses "one local folder ⇄ one NAS
-  folder". Existing multi-root task files still load, mount and pause (an upgrade never turns a
-  task into a broken file); the UI warns about them and one save collapses them to one folder.
-- `qxync roots` now prints the **client path** (`client_path`) for each NAS sync folder, falling
-  back to the share path with an explicit note when it cannot be mapped.
+- **Anything that is not the home directory is forced read-only**: with one-to-many gone a single
+  root can also be a shared folder, so `daemon::mount()` decides writability by "is this
+  `home_root`" (the server really does refuse uploads to non-Qsync sync folders, `status:20`), and
+  a requested `--rw` is downgraded to read-only with a warning.
+- `qxync roots` now lists only "home directory + sync folders registered on the NAS" (no more
+  per-root readability probing, no more "configured roots"); each NAS sync folder line prints the
+  **client path** (`client_path`), falling back to the share path with an explicit note.
 
 ### Fixed
 
@@ -50,10 +66,10 @@ on submit.
   showed "empty name + 0 permission" and mistook "listable" for "not listable". Both spellings
   are accepted now (real-machine fields first), with a HAR-verbatim regression test
   (`syncing_folders_real_machine_response_is_not_lost`).
-- **An empty task `roots` did not actually follow the link's `home_root`.** The GUI result rows
-  and the `Task` doc comment both said "decided by the link", but the daemon used the
-  compile-time constant `/home` (the default in `mount()`); anyone who had changed `home_root`
-  was silently mounted at `/home`. It now really uses `link.home_root`.
+- **A task's default NAS folder was not the link's `home_root`.** The GUI result rows and the
+  `Task` doc comment both said "decided by the link", but the daemon used the compile-time
+  constant `/home` (the default in `mount()`); anyone who had changed `home_root` was silently
+  mounted at `/home`. It now goes through `Task::effective_root(link.home_root)`.
 - **Destination conflicts are checked on submit**: a local folder that duplicates or nests inside
   another task's folder is **rejected** with the conflicting task named (nested mounts hide each
   other); the same NAS folder used by another task is a **warning** (read-only mounts of one NAS

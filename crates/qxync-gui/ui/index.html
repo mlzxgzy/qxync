@@ -189,7 +189,6 @@
               <input type="text" id="t-nas-manual" class="mono" spellcheck="false"
                      placeholder="/home/.Qsync">
             </label>
-            <p class="note" id="t-nas-legacy" hidden></p>
             <p class="hint">
               ★ **一对一**：本地文件夹 ⇄ 这**一个** NAS 文件夹；挂载点里**直接**就是它的内容，
               不会再套一层目录名（NAS 选 <code>/home</code>，挂载点里就是家目录，不是
@@ -381,18 +380,8 @@
                      所以收进 <details> 默认折叠，免得普通用户对着看不懂的字段发愣。
                      输入框在收起状态下依然可读可写（details 不会 disable 控件）。 -->
                 <details class="adv">
-                  <summary>高级：同步范围（默认只同步家目录，一般不用改）</summary>
+                  <summary>高级：家目录的名字（默认 /home，一般不用改）</summary>
                   <div class="adv-body">
-                    <label>要同步哪些 NAS 目录（每行一个）
-                      <textarea id="f-roots" rows="3" class="mono" spellcheck="false" placeholder="/home"></textarea>
-                    </label>
-                    <p class="hint">
-                      留空 = 只同步家目录（<code>/home</code>）。要连共享文件夹就一行写一个
-                      （如 <code>/Public</code>）；写了两行以上时，挂载点顶层会多出每个目录的名字
-                      （<code>home/</code>、<code>Public/</code>…），而且家目录以外的目录默认只读。
-                      （配置文件里这个字段叫 <code>roots</code>。）
-                    </p>
-
                     <label>家目录的名字
                       <input type="text" id="f-home-root" placeholder="/home" spellcheck="false" class="mono">
                     </label>
@@ -727,12 +716,10 @@
           </div>
 
           <div class="card">
-            <h2>要同步的 NAS 目录 <span class="count" id="roots-count"></span>
+            <h2>NAS 上的同步文件夹 <span class="count" id="roots-count"></span>
               <button type="button" class="mini" id="btn-roots-refresh">刷新</button>
             </h2>
             <dl class="kv mono" id="roots-summary-kv"></dl>
-            <ul class="root-list" id="roots-list"></ul>
-            <p class="empty-hint" id="roots-empty" hidden data-state="ready" data-i18n="roots.empty">尚未读取要同步的 NAS 目录（点右上「刷新」）。</p>
             <p class="note" id="roots-note" hidden></p>
             <h3 class="sub">NAS 同步文件夹</h3>
             <ul class="root-list mono" id="roots-folders"></ul>
@@ -767,8 +754,8 @@
               <label>挂载点（本地目录，会被创建）
                 <input type="text" id="m-mountpoint" spellcheck="false" class="mono">
               </label>
-              <label>NAS 上要挂载的目录（每行一个，第一个是默认）
-                <textarea id="m-remote" rows="3" class="mono" spellcheck="false" placeholder="/home">/home</textarea>
+              <label>NAS 上的目录（一对一：一个挂载点 = 一个 NAS 目录）
+                <input type="text" id="m-remote" class="mono" spellcheck="false" placeholder="/home" value="/home">
               </label>
               <div class="row-2">
                 <label>缓存模式

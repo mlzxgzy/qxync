@@ -120,9 +120,16 @@ pub struct Task {
     /// ⚠️ 这是**父目录**：daemon 会 `cache_dir.join(<nas host>)`，见 `daemon.rs::mount()`。
     #[serde(default)]
     pub cache_dir: Option<PathBuf>,
-    /// 远端根（`/home`、`/Public`…）；空 = 由 link 的 home_root 决定。
+    /// ★ 这一个任务的 NAS 文件夹（一对一）：`/home`、`/Public`…
+    /// `None` = 没指定 → 用 link 的 `home_root`。
     #[serde(default)]
-    pub roots: Vec<String>,
+    pub root: Option<String>,
+    /// ⚠️ **只读的旧格式探测**：多根时代文件里的 `roots` 数组。
+    ///
+    /// 不参与任何同步逻辑，只在 [`Task::normalize`] 里用来**报错**：一对多已删除，
+    /// 直接忽略会让用户以为多个目录还在同步（静默缩小同步范围）。保存时不写回。
+    #[serde(default, rename = "roots", skip_serializing)]
+    pub legacy_roots: Vec<String>,
     /// 读写挂载（默认只读，与 M1–M7 一致）。
     #[serde(default)]
     pub read_write: bool,
@@ -171,7 +178,8 @@ impl Default for Task {
             enabled: false,
             mountpoint: PathBuf::new(),
             cache_dir: None,
-            roots: Vec::new(),
+            root: None,
+            legacy_roots: Vec::new(),
             read_write: false,
             cache_mode: default_cache_mode(),
             threads: None,
@@ -194,7 +202,7 @@ impl Task {
     pub fn from_mount(
         id: Option<String>,
         mountpoint: PathBuf,
-        roots: Vec<String>,
+        root: Option<String>,
         read_write: bool,
         cache_mode: Option<String>,
         threads: Option<usize>,
@@ -211,7 +219,8 @@ impl Task {
             enabled: true,
             mountpoint,
             cache_dir: None,
-            roots,
+            root: root.filter(|r| !r.trim().is_empty()),
+            legacy_roots: Vec::new(),
             read_write,
             cache_mode: cache_mode.unwrap_or_else(default_cache_mode),
             threads,
@@ -305,10 +314,29 @@ impl Task {
         if self.space_saving {
             self.smart_delete = false;
         }
-        // 归一化 roots：补前导 /、去尾斜杠、去重（与 link 的 roots 同一套规则）
-        if !self.roots.is_empty() {
-            self.roots = crate::roots::normalize_roots(&self.roots);
+        // ★ 旧格式（多根时代的 `roots` 数组）：一对一已删除，**不静默忽略** ——
+        //   一个根就迁移成 `root`；多个根直接报错，让用户自己拆成多个任务。
+        if !self.legacy_roots.is_empty() {
+            if self.legacy_roots.len() > 1 {
+                return Err(Error::Io(format!(
+                    "任务「{}」是旧的多根格式（roots = {}）：一对多同步已删除，\
+                     请为每个 NAS 文件夹各建一个任务（一个任务 = 一个本地文件夹 + 一个 NAS 文件夹）",
+                    self.id,
+                    self.legacy_roots.join("、")
+                )));
+            }
+            if self.root.is_none() {
+                self.root = Some(crate::roots::normalize_root(&self.legacy_roots[0]));
+            }
+            // 迁移是一次性的：读进来处理完就丢掉（`skip_serializing` 也保证不写回）
+            self.legacy_roots.clear();
         }
+        // 归一化这一个根：补前导 /、去尾斜杠；空 = 没指定（用 link 的 home_root）
+        self.root = self
+            .root
+            .take()
+            .map(|r| crate::roots::normalize_root(&r))
+            .filter(|r| !r.is_empty());
         Ok(())
     }
 
@@ -316,34 +344,15 @@ impl Task {
     //
     // 用户反馈（2026-10-02）：本地 `/home/user/qsync` 配 NAS `/home` 之后，里面又出现了
     // 一层 `home/` —— 那是 M6 的**多根视图**（挂载点当虚拟根，每个远端根一个目录）。
-    // 「配对文件夹」在 Qsync 里是**一对一**的：本地文件夹就是 NAS 文件夹本身。
-    // 所以任务层从此只接受**一个** NAS 目录；多根挂载仍可用 `qxync mount --remote A --remote B`
-    // （M6 矩阵不动），只是**不再登记成任务**。
+    // 按「一对多直接删除、只留一对一」的要求，任务层现在只有**一个** NAS 文件夹，
+    // 挂载点里直接就是它；`mount --remote A --remote B` 这种多根挂载也一并删掉了。
 
-    /// ★ 一对一铁律：一个配对文件夹 = 一个本地文件夹 + 一个 NAS 文件夹。
-    ///
-    /// 只在**创建 / 编辑**路径上调用（daemon `tasks save`、`mount --task` 登记、
-    /// CLI `task add`）。旧的多根任务文件**照样能读、能挂、能暂停**，否则升级会
-    /// 直接把用户已有任务变成「坏文件」；但它一被编辑保存就会收敛成一个目录。
-    pub fn ensure_one_root(&self) -> Result<()> {
-        if self.roots.len() > 1 {
-            return Err(Error::Io(format!(
-                "一个配对文件夹只能有一个 NAS 目录（一对一映射）：任务「{}」填了 {} 个（{}）。\
-                 要同步多个 NAS 目录，请分建多个任务（每个任务一个本地文件夹）。",
-                self.id,
-                self.roots.len(),
-                self.roots.join("、")
-            )));
+    /// 这一个任务实际生效的 NAS 文件夹：没写 → link 的 `home_root`。
+    pub fn effective_root(&self, home_root: &str) -> String {
+        match &self.root {
+            Some(r) => crate::roots::normalize_root(r),
+            None => crate::roots::normalize_root(home_root),
         }
-        Ok(())
-    }
-
-    /// 这个任务生效的**单个** NAS 目录（`roots` 为空 = 家目录，与旧行为一致）。
-    pub fn single_root(&self) -> String {
-        self.roots
-            .first()
-            .cloned()
-            .unwrap_or_else(|| crate::HOME_ROOT.to_string())
     }
 
     /// 本地文件夹的**比较键**：只做词法规范化（`.`/`..`/多余分隔符），
@@ -383,31 +392,28 @@ impl Task {
         out
     }
 
-    /// NAS 目录与别的任务重叠 —— **只提示、不拦**。
+    /// NAS 文件夹与别的任务重复 —— **只提示、不拦**。
     ///
-    /// 为什么不当错误：只读地把同一个 NAS 目录挂到两个本地文件夹是完全合理的用法
+    /// 为什么不当错误：只读地把同一个 NAS 文件夹挂到两个本地文件夹是完全合理的用法
     /// （`xtask/tests/m82-matrix.sh` 就靠这个建 t1/t2）。真正的风险是**两边都读写**，
     /// 那由调用方决定怎么呈现；core 只负责把事实说清楚。
-    pub fn nas_overlaps_with(&self, other: &Task) -> Vec<String> {
+    pub fn nas_overlaps_with(&self, other: &Task, home_root: &str) -> Vec<String> {
         let mut out = Vec::new();
         if other.id == self.id {
             return out;
         }
-        // 空 roots 的语义是家目录，所以两边都走同一套归一化
-        let mine = crate::roots::normalize_roots(&self.roots);
-        let theirs = crate::roots::normalize_roots(&other.roots);
-        for r in &mine {
-            if theirs.iter().any(|t| t == r) {
-                out.push(format!(
-                    "NAS 目录 {r} 也配给了任务「{}」{}",
-                    other.id,
-                    if self.read_write && other.read_write {
-                        "（两个任务都是读写：同一个 NAS 目录被双向写会打架）"
-                    } else {
-                        "（只是提示；只读挂载通常没问题）"
-                    }
-                ));
-            }
+        let mine = self.effective_root(home_root);
+        let theirs = other.effective_root(home_root);
+        if mine == theirs {
+            out.push(format!(
+                "NAS 文件夹 {mine} 也配给了任务「{}」{}",
+                other.id,
+                if self.read_write && other.read_write {
+                    "（两个任务都是读写：同一个 NAS 文件夹被双向写会打架）"
+                } else {
+                    "（只是提示；只读挂载通常没问题）"
+                }
+            ));
         }
         out
     }
@@ -415,12 +421,12 @@ impl Task {
     /// 与一组已有任务比对：返回（**会拦保存的错误**，**只提示的警告**）。
     ///
     /// 调用方负责把「自己」从 `others` 里排除，或依赖 id 去重（同 id 直接跳过）。
-    pub fn conflict_report(&self, others: &[Task]) -> (Vec<String>, Vec<String>) {
+    pub fn conflict_report(&self, others: &[Task], home_root: &str) -> (Vec<String>, Vec<String>) {
         let mut errors = Vec::new();
         let mut warnings = Vec::new();
         for o in others {
             errors.extend(self.destination_conflicts_with(o));
-            warnings.extend(self.nas_overlaps_with(o));
+            warnings.extend(self.nas_overlaps_with(o, home_root));
         }
         (errors, warnings)
     }
@@ -507,7 +513,9 @@ impl Task {
             enabled: false,
             mountpoint: PathBuf::new(),
             cache_dir: None,
-            roots: link.roots(),
+            // 没显式写 NAS 文件夹 → 用 link 的 home_root（由调用方算 effective_root）
+            root: None,
+            legacy_roots: Vec::new(),
             read_write: false,
             cache_mode: default_cache_mode(),
             threads: None,
@@ -530,10 +538,9 @@ impl Task {
             self.id,
             if self.enabled { "启用" } else { "停用" },
             self.mountpoint.display(),
-            if self.roots.is_empty() {
-                "(由 link home_root 决定)".to_string()
-            } else {
-                self.roots.join(",")
+            match &self.root {
+                Some(r) => r.clone(),
+                None => "(跟 link 的 home_root)".to_string(),
             },
             self.cache_mode
         ) + &match &self.cache_dir {
@@ -574,32 +581,6 @@ pub fn has_any_task(paths: &ConfigPaths) -> bool {
             .any(|e| e.path().extension().and_then(|s| s.to_str()) == Some("json")),
         Err(_) => false,
     }
-}
-
-/// 给 CLI/GUI 用：把一个任务解析成 `Request::Mount` 的参数包。
-/// （不直接构造 `Request`，避免 core 依赖 ipc 的具体形状。）
-pub fn mount_args(
-    t: &Task,
-) -> (
-    PathBuf,
-    Vec<String>,
-    bool,
-    String,
-    Option<usize>,
-    Option<u64>,
-    Option<usize>,
-    bool,
-) {
-    (
-        t.mountpoint.clone(),
-        t.roots.clone(),
-        t.read_write,
-        t.cache_mode.clone(),
-        t.threads,
-        t.hydrate_timeout_secs,
-        t.delete_limit,
-        t.auto_unmount,
-    )
 }
 
 /// 是否认为该路径是任务文件（内部工具）。
@@ -645,7 +626,7 @@ mod tests {
         let mut t = Task::from_mount(
             None,
             PathBuf::from("/tmp/qxync-mnt"),
-            vec!["/home".into(), "/Public".into()],
+            Some("/home".into()),
             true,
             Some("direct".into()),
             Some(8),
@@ -663,7 +644,7 @@ mod tests {
         let got = Task::load(&p, "default").unwrap();
         assert_eq!(got.id, "default");
         assert_eq!(got.mountpoint, PathBuf::from("/tmp/qxync-mnt"));
-        assert_eq!(got.roots, vec!["/home".to_string(), "/Public".to_string()]);
+        assert_eq!(got.root.as_deref(), Some("/home"));
         assert!(got.read_write);
         assert_eq!(got.cache_mode, "direct");
         assert_eq!(got.threads, Some(8));
@@ -680,7 +661,7 @@ mod tests {
             let mut t = Task::from_mount(
                 Some(id.into()),
                 PathBuf::from("/tmp/m"),
-                vec!["/home".into()],
+                Some("/home".into()),
                 false,
                 None,
                 None,
@@ -704,7 +685,7 @@ mod tests {
         let mut t = Task::from_mount(
             Some("t1".into()),
             PathBuf::from("/tmp/m"),
-            vec!["/home".into()],
+            Some("/home".into()),
             false,
             None,
             None,
@@ -725,7 +706,7 @@ mod tests {
         let mut t = Task::from_mount(
             None,
             PathBuf::from("/tmp/m"),
-            vec!["/home".into()],
+            Some("/home".into()),
             false,
             None,
             None,
@@ -748,7 +729,7 @@ mod tests {
         let mut t = Task::from_mount(
             None,
             PathBuf::from("/tmp/m"),
-            vec![],
+            None,
             false,
             Some("nonsense".into()),
             None,
@@ -767,7 +748,7 @@ mod tests {
         let mut t = Task::from_mount(
             None,
             PathBuf::from("relative/mnt"),
-            vec![],
+            None,
             false,
             None,
             None,
@@ -779,16 +760,11 @@ mod tests {
     }
 
     #[test]
-    fn roots_are_normalized() {
+    fn the_one_root_is_normalized() {
         let mut t = Task::from_mount(
             None,
             PathBuf::from("/mnt"),
-            vec![
-                " /home/ ".into(),
-                "Public".into(),
-                "/home".into(),
-                "".into(),
-            ],
+            Some("  Public/  ".into()),
             false,
             None,
             None,
@@ -797,63 +773,65 @@ mod tests {
             None,
         );
         t.normalize().unwrap();
-        // ⚠️ 结构性归一化**仍然允许多个根**：旧文件要读得出来（不然升级即坏文件）。
-        //    「一对一」是**创建/编辑**路径上的校验，见 `ensure_one_root`。
-        assert_eq!(t.roots, vec!["/home".to_string(), "/Public".to_string()]);
+        assert_eq!(t.root.as_deref(), Some("/Public"));
+
+        // 不写 NAS 文件夹 → 跟 link 的 home_root
+        let mut none = Task::from_mount(
+            None,
+            PathBuf::from("/mnt"),
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        none.normalize().unwrap();
+        assert!(none.root.is_none());
+        assert_eq!(none.effective_root("/home"), "/home");
+        assert_eq!(none.effective_root("/home/test1/"), "/home/test1");
     }
 
     // ------------------------------------------------------------ ★ 一对一 + 目的地冲突
 
+    /// 多根时代的 `roots` 数组：一个根 → 迁移成 `root`；多个根 → **报错**（不静默缩小范围）。
     #[test]
-    fn one_to_one_rejects_multiple_roots_but_allows_legacy_reads() {
-        let t = Task::from_mount(
-            Some("pair".into()),
-            PathBuf::from("/mnt"),
-            vec!["/home".into(), "/Public".into()],
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
-        let e = t.ensure_one_root().unwrap_err().to_string();
-        assert!(e.contains("只能有一个 NAS 目录"), "{e}");
+    fn legacy_roots_array_migrates_or_errors_loudly() {
+        let p = tmp_paths("legacy-roots");
+        std::fs::create_dir_all(Task::tasks_dir(&p)).unwrap();
+
+        std::fs::write(
+            Task::file(&p, "one"),
+            r#"{"id":"one","mountpoint":"/tmp/m","roots":["/home/"]}"#,
+        )
+        .unwrap();
+        let t = Task::load(&p, "one").unwrap();
+        assert_eq!(t.root.as_deref(), Some("/home"), "单个旧根自动迁移");
+        assert!(t.legacy_roots.is_empty(), "迁移后不该再留着旧字段");
+
+        std::fs::write(
+            Task::file(&p, "many"),
+            r#"{"id":"many","mountpoint":"/tmp/m","roots":["/home","/Public"]}"#,
+        )
+        .unwrap();
+        let e = Task::load(&p, "many").unwrap_err().to_string();
+        assert!(e.contains("旧的多根格式"), "{e}");
         assert!(e.contains("/Public"), "错误里要说清是哪几个：{e}");
 
-        // 单根 / 空根（= 家目录）都放行
-        let one = Task::from_mount(
-            Some("pair".into()),
-            PathBuf::from("/mnt"),
-            vec!["/home".into()],
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
-        assert!(one.ensure_one_root().is_ok());
-        let none = Task::from_mount(
-            Some("pair".into()),
-            PathBuf::from("/mnt"),
-            vec![],
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
-        assert!(none.ensure_one_root().is_ok());
-        assert_eq!(none.single_root(), "/home", "空 roots 的语义 = 家目录");
+        // 存回去只写 `root`，不会再写出 `roots`
+        let mut t = Task::load(&p, "one").unwrap();
+        t.save(&p).unwrap();
+        let raw = std::fs::read_to_string(Task::file(&p, "one")).unwrap();
+        assert!(raw.contains("\"root\""), "{raw}");
+        assert!(!raw.contains("\"roots\""), "旧字段不许再写回：{raw}");
     }
 
     fn mk(id: &str, mp: &str, root: &str) -> Task {
         Task::from_mount(
             Some(id.into()),
             PathBuf::from(mp),
-            vec![root.into()],
+            Some(root.into()),
             false,
             None,
             None,
@@ -882,62 +860,56 @@ mod tests {
         // ③ NAS 目录相同 → **只警告不拦**（m82 矩阵靠它建 t1/t2；只读挂载合法）
         let same_remote = mk("b", "/home/user/other", "/home");
         assert!(mine.destination_conflicts_with(&same_remote).is_empty());
-        let w = mine.nas_overlaps_with(&same_remote);
+        let w = mine.nas_overlaps_with(&same_remote, "/home");
         assert_eq!(w.len(), 1, "{w:?}");
-        assert!(w[0].contains("NAS 目录 /home") && w[0].contains("「b」"), "{w:?}");
+        assert!(w[0].contains("NAS 文件夹 /home") && w[0].contains("「b」"), "{w:?}");
 
         // 两个都读写时，警告里要说明「双写打架」
         let mut rw = same_remote.clone();
         rw.read_write = true;
         let mut me_rw = mine.clone();
         me_rw.read_write = true;
-        assert!(me_rw.nas_overlaps_with(&rw)[0].contains("双向写"), "{w:?}");
+        assert!(
+            me_rw.nas_overlaps_with(&rw, "/home")[0].contains("双向写"),
+            "{w:?}"
+        );
         // 一读一写 → 只提示，不提双写
-        assert!(me_rw.nas_overlaps_with(&same_remote)[0].contains("只读挂载"));
+        assert!(me_rw.nas_overlaps_with(&same_remote, "/home")[0].contains("只读挂载"));
 
         // 自己跟自己不算冲突（编辑保存时最常见）
         assert!(mine.destination_conflicts_with(&mine).is_empty());
-        assert!(mine.nas_overlaps_with(&mine).is_empty());
-        let (e, w2) = mine.conflict_report(&[mine.clone(), same_local.clone(), same_remote.clone()]);
+        assert!(mine.nas_overlaps_with(&mine, "/home").is_empty());
+        let (e, w2) =
+            mine.conflict_report(&[mine.clone(), same_local.clone(), same_remote.clone()], "/home");
         assert_eq!(e.len(), 1, "两两比：只有 same_local 是硬冲突：{e:?}");
         assert_eq!(w2.len(), 1, "只有 same_remote 是警告：{w2:?}");
 
         // 互不打扰的另一个任务 → 干净
         let ok = mk("c", "/home/user/other", "/Public");
-        let (e, w) = mine.conflict_report(&[ok]);
+        let (e, w) = mine.conflict_report(&[ok], "/home");
         assert!(e.is_empty() && w.is_empty(), "{e:?} {w:?}");
     }
 
     #[test]
-    fn destination_conflicts_handle_dots_and_legacy_multi_root() {
+    fn destination_conflicts_handle_dots_and_home_root_default() {
         // `/mnt/./x/..` 与 `/mnt` 是同一个文件夹（词法规范化，不碰文件系统）
         let a = mk("a", "/mnt", "/home");
         let b = mk("b", "/mnt/./x/..", "/Public");
         let c = a.destination_conflicts_with(&b);
         assert_eq!(c.len(), 1, "{c:?}");
 
-        // 空 roots（旧文件）= 家目录 → 与显式 /home 重叠（挂载点特意不嵌套，隔离出这一条）
-        let mut legacy = mk("b", "/srv/other", "/Public");
-        legacy.roots.clear();
-        let (e, w) = a.conflict_report(&[legacy]);
+        // 没写 NAS 文件夹（`root = None`）= link 的 home_root → 与显式 /home 重叠
+        let mut implicit = mk("b", "/srv/other", "/Public");
+        implicit.root = None;
+        let (e, w) = a.conflict_report(&[implicit], "/home");
         assert!(e.is_empty(), "挂载点不嵌套 → 没有目的地冲突：{e:?}");
-        assert_eq!(w.len(), 1, "空 roots 的语义是家目录，必须提示：{w:?}");
+        assert_eq!(w.len(), 1, "没写 NAS 文件夹时语义是 home_root，必须提示：{w:?}");
 
-        // 旧的多根任务：任一重叠都算 NAS 侧提示
-        let multi = Task::from_mount(
-            Some("b".into()),
-            PathBuf::from("/srv/other"),
-            vec!["/Public".into(), "/home".into()],
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
-        let (e, w) = a.conflict_report(&[multi]);
-        assert!(e.is_empty());
-        assert_eq!(w.len(), 1, "多根任务里含 /home：{w:?}");
+        // home_root 变了，隐式根跟着变 → 不再与 /home 重叠
+        let mut implicit2 = mk("b", "/srv/other", "/Public");
+        implicit2.root = None;
+        let (e, w) = a.conflict_report(&[implicit2], "/home/test1");
+        assert!(e.is_empty() && w.is_empty(), "{e:?} {w:?}");
     }
 
     #[test]
@@ -957,6 +929,7 @@ mod tests {
         let legacy = r#"{"id":"old","mountpoint":"/tmp/m","roots":["/home"]}"#;
         std::fs::write(Task::file(&p, "old"), legacy).unwrap();
         let t = Task::load(&p, "old").unwrap();
+        assert_eq!(t.root.as_deref(), Some("/home"), "旧的单个 roots 迁移成 root");
         assert_eq!(t.name, "old", "name 缺省回填 id");
         assert!(t.enabled, "enabled 缺省 true");
         assert_eq!(t.cache_mode, CACHE_PAGECACHE);
@@ -966,7 +939,7 @@ mod tests {
 
     #[test]
     fn legacy_from_link_is_disabled_and_carries_excludes() {
-        let mut link = crate::config::LinkConfig {
+        let link = crate::config::LinkConfig {
             id: "default".into(),
             host: "nas".into(),
             port: 9834,
@@ -974,18 +947,17 @@ mod tests {
             insecure: true,
             user: "u".into(),
             home_root: "/home".into(),
-            roots: vec!["/home".into(), "/Public".into()],
             ipv4_only: false,
             exclude: vec!["*.iso".into()],
             filter_temp: true,
             peer_listen: None,
             peer_name: None,
         };
-        link.roots = vec!["/home".into(), "/Public".into()];
         let t = Task::legacy_from_link(&link);
         assert_eq!(t.id, "default");
         assert!(!t.enabled, "推导出来的任务必须是停用的，不能凭空触发挂载");
-        assert_eq!(t.roots, vec!["/home".to_string(), "/Public".to_string()]);
+        assert!(t.root.is_none(), "没显式 NAS 文件夹 → 跟 link 的 home_root");
+        assert_eq!(t.effective_root(&link.home_root), "/home");
         assert_eq!(t.exclude, vec!["*.iso".to_string()]);
     }
 
@@ -995,7 +967,7 @@ mod tests {
         let mut t = Task::from_mount(
             Some("c1".into()),
             PathBuf::from("/tmp/m"),
-            vec!["/home".into()],
+            Some("/home".into()),
             false,
             None,
             None,
@@ -1016,7 +988,7 @@ mod tests {
         let mut bad = Task::from_mount(
             Some("c2".into()),
             PathBuf::from("/tmp/m"),
-            vec![],
+            None,
             false,
             None,
             None,
@@ -1031,7 +1003,7 @@ mod tests {
         let d = Task::from_mount(
             None,
             PathBuf::from("/tmp/m"),
-            vec![],
+            None,
             false,
             None,
             None,
@@ -1057,7 +1029,7 @@ mod tests {
         let mut t = Task::from_mount(
             None,
             PathBuf::from("/tmp/m"),
-            vec![],
+            None,
             false,
             None,
             None,

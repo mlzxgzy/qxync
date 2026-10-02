@@ -27,7 +27,6 @@ pub use fuser::{BackgroundSession, Notifier};
 use qxync_client::peer::{self, ContentSource, PeerConfig, PeerHead};
 use qxync_client::Client;
 use qxync_core::dehydrate::{Block, Candidate, Policy};
-use qxync_core::roots::RootSpec;
 use qxync_core::rules::{HideReason, Rules};
 use qxync_core::DirEntry;
 use std::collections::{HashMap, VecDeque};
@@ -945,12 +944,9 @@ impl Drop for FsRuntime {
 pub struct QxyncFs {
     rt: FsRuntime,
     client: Arc<Client>,
-    /// 远端挂载根（普通用户家目录 = `/home`）。多根时是**第一个**根的远端路径。
+    /// 远端挂载根（= 这一个 NAS 文件夹，如 `/home`、`/Public`）。
+    /// 一对多是删除过的：一个挂载点只对应一个远端路径。
     remote_root: String,
-    /// ★ M6：全部远端根（单根时只有 `remote_root` 一个，`view_name` 为空）。
-    roots: Vec<RootSpec>,
-    /// ★ M6：挂载点是不是「虚拟根 + 每个根一个合成目录」的多根视图。
-    multi_root: bool,
     cache_dir: PathBuf,
     uid: u32,
     gid: u32,
@@ -1057,13 +1053,6 @@ impl QxyncFs {
             rt: FsRuntime::new(rt),
             client,
             remote_root: remote_root.clone(),
-            // ★ M6：单根 = 直通（M1–M5 行为一字不改）：只有一个根，挂载点**就是**它。
-            roots: vec![RootSpec {
-                remote: remote_root.clone(),
-                view_name: String::new(),
-                writable: true,
-            }],
-            multi_root: false,
             cache_dir,
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
@@ -1087,125 +1076,6 @@ impl QxyncFs {
         })
     }
 
-    /// ★ M6：多根视图。挂载点是**虚拟根**，每个远端根是它的一个合成目录：
-    ///     ~/mnt/home/qxync-test/x  →  /home/qxync-test/x
-    ///     ~/mnt/Public/a.txt       →  /Public/a.txt
-    /// 单根请继续用 `new()`（行为与 M1–M5 完全一致）。
-    ///
-    /// 只有**挂载点这一层**多了一次名字映射：节点表以下的缓存/水合/上传仍全用远端路径做键。
-    pub fn new_multi(
-        client: Arc<Client>,
-        entries: Vec<RootSpec>,
-        cache_dir: impl Into<PathBuf>,
-    ) -> std::io::Result<Self> {
-        if entries.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "多根挂载至少需要一个远端根",
-            ));
-        }
-        let cache_dir = cache_dir.into();
-        std::fs::create_dir_all(&cache_dir)?;
-
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()?;
-
-        let uid = unsafe { libc::getuid() };
-        let gid = unsafe { libc::getgid() };
-        let dir_attr = |ino: INodeNo| FileAttr {
-            ino,
-            size: 0,
-            blocks: 0,
-            atime: UNIX_EPOCH,
-            mtime: UNIX_EPOCH,
-            ctime: UNIX_EPOCH,
-            crtime: UNIX_EPOCH,
-            kind: FileType::Directory,
-            perm: 0o755,
-            nlink: 2,
-            uid,
-            gid,
-            rdev: 0,
-            blksize: 4096,
-            flags: 0,
-        };
-        // 虚拟根：`remote = ""` —— 它**不是**有效远端路径，任何远端调用都不得拿它当参数。
-        let root = Node {
-            ino: INodeNo::ROOT,
-            parent: INodeNo::ROOT,
-            name: String::new(),
-            remote: String::new(),
-            attr: dir_attr(INodeNo::ROOT),
-            cache: None,
-            chunks_done: Vec::new(),
-            dirty: false,
-            open_count: 0,
-            last_access: UNIX_EPOCH,
-            op_lock: Arc::new(Mutex::new(())),
-        };
-        let mut nodes = HashMap::new();
-        let mut by_remote = HashMap::new();
-        nodes.insert(INodeNo::ROOT, root);
-        by_remote.insert(String::new(), INodeNo::ROOT);
-
-        // 每个远端根预插入一个合成目录节点（名字 = view_name），不访问 NAS。
-        let mut next_ino = 2u64;
-        let mut roots = Vec::with_capacity(entries.len());
-        for entry in entries {
-            let ino = INodeNo(next_ino);
-            next_ino += 1;
-            nodes.insert(
-                ino,
-                Node {
-                    ino,
-                    parent: INodeNo::ROOT,
-                    name: entry.view_name.clone(),
-                    remote: entry.remote.clone(),
-                    attr: dir_attr(ino),
-                    cache: None,
-                    chunks_done: Vec::new(),
-                    dirty: false,
-                    open_count: 0,
-                    last_access: UNIX_EPOCH,
-                    op_lock: Arc::new(Mutex::new(())),
-                },
-            );
-            by_remote.insert(entry.remote.clone(), ino);
-            roots.push(entry);
-        }
-        let remote_root = roots.first().map(|r| r.remote.clone()).unwrap_or_default();
-
-        Ok(Self {
-            rt: FsRuntime::new(rt),
-            client,
-            remote_root,
-            roots,
-            multi_root: true,
-            cache_dir,
-            uid,
-            gid,
-            read_only: true,
-            upload: None,
-            chunk_size: DEFAULT_CHUNK_SIZE,
-            hydrate_timeout: HYDRATE_TIMEOUT,
-            hydro: Arc::new(HydroCounters::default()),
-            pins: Arc::new(Mutex::new(HashMap::new())),
-            inner: Arc::new(Mutex::new(Inner {
-                nodes,
-                by_remote,
-                next_ino,
-                inflight_chunks: HashMap::new(),
-            })),
-            delete_guard: DeleteGuard::new(DEFAULT_DELETE_LIMIT, DEFAULT_DELETE_WINDOW),
-            cache_mode: CacheMode::PageCache,
-            rules: Arc::new(Rules::temp_only(true)),
-            lan_peers: Arc::new(Mutex::new(Vec::new())),
-            lan_stats: Arc::new(LanStats::default()),
-        })
-    }
-
     /// 覆盖水合超时（大文件 + 慢链路时可以放大；M1 是整文件水合，M2 改成区间后就不敏感了）。
     pub fn with_hydrate_timeout(mut self, d: Duration) -> Self {
         self.hydrate_timeout = d;
@@ -1216,9 +1086,10 @@ impl QxyncFs {
         &self.remote_root
     }
 
-    /// ★ M6：全部远端根（远端路径列表，保持挂载顺序）。单根时就是 `[remote_root]`。
+    /// 远端根列表（**单根：永远只有一个**）。
+    /// 保留列表签名是给规则引擎 / 同步引擎用的（它们按「一组根」写的）。
     pub fn remote_roots(&self) -> Vec<String> {
-        self.roots.iter().map(|r| r.remote.clone()).collect()
+        vec![self.remote_root.clone()]
     }
 
     /// 观测用：(水合次数, 已水合字节数)。拿到 daemon 后仍可继续读。
@@ -1431,13 +1302,10 @@ impl QxyncFs {
 
     /// ★ M7：规则判定 —— 被排除 / 是临时文件的路径在挂载点里**根本不存在**。
     ///
-    /// 多根虚拟根（`remote == ""`）与合成目录不参与判定（它们是挂载视图本身）。
+    /// 空路径（不该出现）不参与判定，避免拿 `""` 去比规则。
     fn hide_reason(&self, remote: &str, is_dir: bool) -> Option<HideReason> {
         if remote.is_empty() {
             return None;
-        }
-        if self.multi_root && self.roots.iter().any(|r| r.remote == remote) {
-            return None; // 根目录本身是视图的一部分
         }
         self.rules
             .hides_in_roots(&self.remote_roots(), remote, is_dir)
@@ -1460,17 +1328,6 @@ impl QxyncFs {
 
     /// 在目录里查一个名字（不水合）。返回节点克隆。
     fn lookup_child(&self, parent: INodeNo, name: &str) -> Result<Node, fuser::Errno> {
-        // ★ M6：虚拟根不映射任何远端路径 —— 只在节点表里找合成目录，
-        //   绝不能拿 `""` 去 `client.stat("", name)`（那会打到 NAS 根上）。
-        if self.multi_root && parent == INodeNo::ROOT {
-            let g = self.inner.lock().unwrap();
-            return g
-                .nodes
-                .values()
-                .find(|n| n.ino != INodeNo::ROOT && n.parent == INodeNo::ROOT && n.name == name)
-                .cloned()
-                .ok_or(fuser::Errno::ENOENT);
-        }
         let parent_remote = {
             let g = self.inner.lock().unwrap();
             g.nodes
@@ -1539,16 +1396,6 @@ impl QxyncFs {
 
     /// 列一个目录（不水合），并把子节点的元数据灌进表里。
     fn load_children(&self, ino: INodeNo) -> Result<Vec<Node>, fuser::Errno> {
-        // ★ M6：虚拟根的子节点是预插入的合成目录 —— **不访问 NAS**。
-        if self.multi_root && ino == INodeNo::ROOT {
-            let g = self.inner.lock().unwrap();
-            return Ok(g
-                .nodes
-                .values()
-                .filter(|n| n.ino != INodeNo::ROOT && n.parent == INodeNo::ROOT)
-                .cloned()
-                .collect());
-        }
         let remote = {
             let g = self.inner.lock().unwrap();
             g.nodes
@@ -1598,28 +1445,6 @@ impl QxyncFs {
             .rsplit_once('/')
             .map(|(d, _)| d.to_string())
             .unwrap_or_else(|| self.remote_root.clone())
-    }
-
-    /// 多根挂载时非家目录的根只读（实测：普通账号向共享文件夹上传会被服务端拒绝 status 20）。
-    /// 单根直通时永远 Ok（挂载级 read_only 已经管住了）。
-    ///
-    /// 规则：先把 `remote` 归属到某个根（`remote == root` 或以 `root + "/"` 开头），
-    /// 该根 `writable` 才放行；找不到归属的根（例如虚拟根下新建的路径）也一律 `EROFS`。
-    fn ensure_writable(&self, remote: &str) -> Result<(), fuser::Errno> {
-        if !self.multi_root {
-            return Ok(());
-        }
-        for r in &self.roots {
-            let prefix = format!("{}/", r.remote.trim_end_matches('/'));
-            if remote == r.remote || remote.starts_with(&prefix) {
-                return if r.writable {
-                    Ok(())
-                } else {
-                    Err(fuser::Errno::EROFS)
-                };
-            }
-        }
-        Err(fuser::Errno::EROFS)
     }
 
     /// 该 ino 对应的远端路径（节点不存在 → `ENOENT`）；给写路径的只读检查用。
@@ -1717,16 +1542,8 @@ impl QxyncFs {
                 .unwrap_or(false);
             (p.remote.clone(), ino, dirty)
         };
-        // ★ M6：虚拟根的直接子节点是合成目录（挂载视图本身），只能靠卸载移除。
-        if self.multi_root && parent == INodeNo::ROOT {
-            return reply.error(fuser::Errno::EROFS);
-        }
         // ★ M7：被排除的路径在挂载点里不存在 —— 删除它同样回 ENOENT
         if let Err(e) = self.deny_hidden(&join_path(&parent_remote, name), is_dir) {
-            return reply.error(e);
-        }
-        // ★ M6：非家目录根只读 —— 共享文件夹里删除的直接回 EROFS。
-        if let Err(e) = self.ensure_writable(&join_path(&parent_remote, name)) {
             return reply.error(e);
         }
         // ★ M2c：本地大批删除熔断。`rm -rf` 超过阈值后拒绝继续删，
@@ -2144,9 +1961,6 @@ impl Filesystem for QxyncFs {
             if let Err(e) = self.deny_hidden(&remote, false) {
                 return reply.error(e);
             }
-            if let Err(e) = self.ensure_writable(&remote) {
-                return reply.error(e);
-            }
         }
         // ★ M3：缓存模式决定是否绕过内核 page cache
         let fopen = match self.cache_mode {
@@ -2225,7 +2039,6 @@ impl Filesystem for QxyncFs {
         if self.read_only {
             return reply.error(fuser::Errno::EROFS);
         }
-        // ★ M6：非家目录根只读（用该文件节点自己的远端路径归属到根）
         {
             let remote = match self.remote_of(ino) {
                 Ok(r) => r,
@@ -2233,9 +2046,6 @@ impl Filesystem for QxyncFs {
             };
             // ★ M7：绝不把内容写进被排除的路径
             if let Err(e) = self.deny_hidden(&remote, false) {
-                return reply.error(e);
-            }
-            if let Err(e) = self.ensure_writable(&remote) {
                 return reply.error(e);
             }
         }
@@ -2325,9 +2135,6 @@ impl Filesystem for QxyncFs {
             };
             // ★ M7：截断/改 mtime 也是写操作 —— 排除路径一律 ENOENT
             if let Err(e) = self.deny_hidden(&remote, false) {
-                return reply.error(e);
-            }
-            if let Err(e) = self.ensure_writable(&remote) {
                 return reply.error(e);
             }
         }
@@ -2450,10 +2257,6 @@ impl Filesystem for QxyncFs {
         if let Err(e) = self.deny_hidden(&remote, false) {
             return reply.error(e);
         }
-        // ★ M6：非家目录根只读；虚拟根下新建（remote 不属于任何根）同样是 EROFS
-        if let Err(e) = self.ensure_writable(&remote) {
-            return reply.error(e);
-        }
         let entry = DirEntry::local(name, false, 0, Self::epoch_of(SystemTime::now()));
         let node = self.insert_node(parent, name, &remote, &entry);
         if let Err(e) = self.cache_file_for(node.ino) {
@@ -2497,10 +2300,6 @@ impl Filesystem for QxyncFs {
         let remote = join_path(&parent_remote, name);
         // ★ M7：排除路径不可建目录（否则会在 NAS 上凭空造出一个被排除的目录）
         if let Err(e) = self.deny_hidden(&remote, true) {
-            return reply.error(e);
-        }
-        // ★ M6：非家目录根只读；虚拟根下 `mkdir ~/mnt/NewDir` 也自然回 EROFS
-        if let Err(e) = self.ensure_writable(&remote) {
             return reply.error(e);
         }
         let client = self.client.clone();
@@ -2553,22 +2352,11 @@ impl Filesystem for QxyncFs {
             (old, new, p.remote.clone(), np.remote.clone(), ino, dirty)
         };
 
-        // ★ M6：虚拟根的直接子节点是合成目录（挂载视图本身），不允许改名/挪走。
-        if self.multi_root && (parent == INodeNo::ROOT || newparent == INodeNo::ROOT) {
-            return reply.error(fuser::Errno::EROFS);
-        }
         // ★ M7：改名的两端都不能落在被排除的路径上（挪进去/挪出来都算写）
         if let Err(e) = self.deny_hidden(&old_remote, false) {
             return reply.error(e);
         }
         if let Err(e) = self.deny_hidden(&new_remote, false) {
-            return reply.error(e);
-        }
-        // ★ M6：改名的**两端**都要可写 —— 从 /Public 挪出、或挪进 /Public 都回 EROFS。
-        if let Err(e) = self.ensure_writable(&old_remote) {
-            return reply.error(e);
-        }
-        if let Err(e) = self.ensure_writable(&new_remote) {
             return reply.error(e);
         }
 
@@ -3013,7 +2801,6 @@ mod tests {
             insecure: true,
             user: "test1".into(),
             home_root: "/home".into(),
-            roots: Vec::new(),
             ipv4_only: false,
             exclude: Vec::new(),
             filter_temp: true,
@@ -3142,41 +2929,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// ★ M7：多根时每个根目录本身是「挂载视图」，绝不能被规则隐藏。
+    /// ★ M7：远端根**本身**绝不能被规则隐藏（隐藏它 = 挂载点直接空掉）。
     #[test]
-    fn m7_rules_never_hide_mount_roots() {
+    fn m7_rules_never_hide_the_mount_root() {
         let dir = m7_tmpdir("roots");
-        let client = Arc::new(Client::new(&test_link()).unwrap());
-        let fs = QxyncFs::new_multi(
-            client,
-            vec![
-                RootSpec {
-                    remote: "/home".into(),
-                    view_name: "home".into(),
-                    writable: true,
-                },
-                RootSpec {
-                    remote: "/Public".into(),
-                    view_name: "Public".into(),
-                    writable: false,
-                },
-            ],
-            &dir,
-        )
-        .unwrap()
-        .with_rules(m7_rules(&["/tailscale.txt"], true));
+        let fs = test_fs(&dir, false).with_rules(m7_rules(&["/tailscale.txt"], true));
 
-        assert_eq!(fs.hide_reason("/Public", true), None, "根本身不能被隐藏");
         assert_eq!(fs.hide_reason("/home", true), None, "根本身不能被隐藏");
-        // 规则是**根相对**的：同一条规则对每个根都生效（文档 §1.2 的已知取舍）
-        assert_eq!(
-            fs.hide_reason("/Public/tailscale.txt", false),
-            Some(HideReason::Excluded),
-            "根里面的内容照常按规则隐藏"
-        );
         assert_eq!(
             fs.hide_reason("/home/tailscale.txt", false),
-            Some(HideReason::Excluded)
+            Some(HideReason::Excluded),
+            "根里面的内容照常按规则隐藏"
         );
         assert_eq!(fs.hide_reason("/home/a.txt", false), None);
         let _ = std::fs::remove_dir_all(&dir);
@@ -3788,184 +3551,20 @@ mod tests {
         assert_eq!(CacheMode::Direct.as_str(), "direct");
     }
 
-    // ------------------------------------------------------------ M6 多根视图单测
-    //
-    // 本会话没有 `/dev/fuse`，挂不上真 FUSE —— 这里只验「虚拟根 → 各远端根」的映射逻辑；
-    // 真机挂载由 `xtask/tests/fuse-matrix.sh` 覆盖。
-
-    fn multi_fs(dir: &Path) -> QxyncFs {
-        let client = Arc::new(Client::new(&test_link()).unwrap());
-        QxyncFs::new_multi(
-            client,
-            vec![
-                RootSpec {
-                    remote: "/home".into(),
-                    view_name: "home".into(),
-                    writable: true,
-                },
-                RootSpec {
-                    remote: "/Public".into(),
-                    view_name: "Public".into(),
-                    writable: false,
-                },
-            ],
-            dir,
-        )
-        .unwrap()
-    }
-
-    /// `Result<(), Errno>` → 错误码（`Errno` 本身没实现 `PartialEq`）。
-    fn errno_code(r: Result<(), fuser::Errno>) -> Option<i32> {
-        r.err().map(|e| e.code())
-    }
-
-    fn m6_tmp(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("qxync-fuse-m6-{tag}-{}", std::process::id()))
-    }
-
-    #[test]
-    fn multi_root_virtual_lookup_and_readdir() {
-        let dir = m6_tmp("view");
-        let _ = std::fs::remove_dir_all(&dir);
-        let fs = multi_fs(&dir);
-
-        // 全部根 + 第一个根（兼容老调用方的 `remote_root()`）
-        assert!(fs.multi_root);
-        assert_eq!(
-            fs.remote_roots(),
-            vec!["/home".to_string(), "/Public".to_string()]
-        );
-        assert_eq!(fs.remote_root(), "/home");
-
-        // 每个 RootSpec 都预插入了目录节点，且都在虚拟根下
-        let home = fs.node_by_remote("/home").expect("home 目录节点");
-        let public = fs.node_by_remote("/Public").expect("Public 目录节点");
-        assert_eq!(home.parent, INodeNo::ROOT);
-        assert_eq!(public.parent, INodeNo::ROOT);
-        assert_eq!(
-            (home.name.as_str(), public.name.as_str()),
-            ("home", "Public")
-        );
-        for n in [&home, &public] {
-            assert_eq!(n.attr.kind, FileType::Directory);
-            assert_eq!(n.attr.perm, 0o755);
-            assert_eq!(n.attr.size, 0);
-            assert_eq!(n.attr.nlink, 2);
-        }
-        // 虚拟根自己：remote = ""（**不是**有效远端路径），且不是任何合成目录
-        let root = fs.node_by_remote("").expect("虚拟根");
-        assert_eq!(root.ino, INodeNo::ROOT);
-        assert_ne!(root.ino, home.ino);
-
-        // 虚拟根 readdir：不访问 NAS，直接返回两个合成目录
-        let children = fs
-            .load_children(INodeNo::ROOT)
-            .expect("虚拟根 readdir 不该碰 NAS");
-        assert_eq!(children.len(), 2, "{children:?}");
-        for want in ["home", "Public"] {
-            assert!(
-                children.iter().any(|n| n.name == want),
-                "缺 {want}: {children:?}"
-            );
-        }
-        assert!(children.iter().any(|n| n.remote == "/home"));
-        assert!(children.iter().any(|n| n.remote == "/Public"));
-
-        // 虚拟根 lookup：命中同一个节点；未知名 → ENOENT（绝不拿 "" 去 stat）
-        let got = fs
-            .lookup_child(INodeNo::ROOT, "Public")
-            .expect("lookup Public");
-        assert_eq!(got.ino, public.ino);
-        assert_eq!(got.remote, "/Public");
-        assert_eq!(
-            fs.lookup_child(INodeNo::ROOT, "nope")
-                .err()
-                .map(|e| e.code()),
-            Some(libc::ENOENT)
-        );
-
-        // 句柄也要带多根（daemon 的同步引擎靠它）
-        let h = fs.handle();
-        assert_eq!(
-            h.remote_roots(),
-            vec!["/home".to_string(), "/Public".to_string()]
-        );
-        assert_eq!(h.remote_root(), "/home");
-        assert!(h.known_dirs().iter().any(|d| d == "/home"));
-        assert!(h.known_dirs().iter().any(|d| d == "/Public"));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn new_multi_rejects_empty_roots() {
-        let dir = m6_tmp("empty");
-        let client = Arc::new(Client::new(&test_link()).unwrap());
-        let err = match QxyncFs::new_multi(client, Vec::new(), &dir) {
-            Ok(_) => panic!("空 entries 必须报 InvalidInput"),
-            Err(e) => e,
-        };
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-        assert!(err.to_string().contains("多根挂载至少需要一个远端根"));
-    }
-
-    #[test]
-    fn multi_root_writability_follows_root_spec() {
-        let dir = m6_tmp("rw");
-        let _ = std::fs::remove_dir_all(&dir);
-        let fs = multi_fs(&dir);
-
-        // 家目录根可写（根本身与它下面的任意深度路径都算）
-        assert_eq!(errno_code(fs.ensure_writable("/home")), None);
-        assert_eq!(errno_code(fs.ensure_writable("/home/a.txt")), None);
-        assert_eq!(errno_code(fs.ensure_writable("/home/deep/x/y.bin")), None);
-        // 共享文件夹根只读（实测服务端拒绝 status 20）
-        assert_eq!(errno_code(fs.ensure_writable("/Public")), Some(libc::EROFS));
-        assert_eq!(
-            errno_code(fs.ensure_writable("/Public/a.txt")),
-            Some(libc::EROFS)
-        );
-        assert_eq!(
-            errno_code(fs.ensure_writable("/Public/deep/x")),
-            Some(libc::EROFS)
-        );
-        // 不属于任何根（虚拟根下新建 / 未知路径）→ 也回 EROFS
-        assert_eq!(
-            errno_code(fs.ensure_writable("/Unknown/x")),
-            Some(libc::EROFS)
-        );
-        assert_eq!(
-            errno_code(fs.ensure_writable("/homework/x")),
-            Some(libc::EROFS)
-        );
-        assert_eq!(errno_code(fs.ensure_writable("")), Some(libc::EROFS));
-
-        // 单根直通：永远 Ok（挂载级 read_only 已经管住），任何路径都不做归属判定
-        let single_dir = m6_tmp("single-rw");
-        let _ = std::fs::remove_dir_all(&single_dir);
-        let single = test_fs(&single_dir, true);
-        assert!(!single.multi_root);
-        assert_eq!(errno_code(single.ensure_writable("/home/a.txt")), None);
-        assert_eq!(errno_code(single.ensure_writable("/Public/a.txt")), None);
-        assert_eq!(errno_code(single.ensure_writable("")), None);
-
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&single_dir);
+    fn root_tmp(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("qxync-fuse-root-{tag}-{}", std::process::id()))
     }
 
     #[test]
     fn single_root_passthrough_unchanged() {
-        let dir = m6_tmp("passthrough");
+        let dir = root_tmp("passthrough");
         let _ = std::fs::remove_dir_all(&dir);
         let fs = test_fs(&dir, false);
 
-        // 单根：roots 只有一个（view_name 空），multi_root = false
-        assert!(!fs.multi_root);
+        // 单根：只有一个远端根，挂载点**就是**它，ROOT 节点就是远端根
         assert_eq!(fs.remote_roots(), vec!["/home".to_string()]);
         assert_eq!(fs.remote_root(), "/home");
         assert_eq!(fs.handle().remote_roots(), vec!["/home".to_string()]);
-        assert_eq!(fs.roots[0].view_name, "");
-        // ★ 兼容性关键：挂载点**就是** /home（不是虚拟根），ROOT 节点就是远端根
         assert_eq!(
             fs.node_by_remote("/home").expect("/home 就是 ROOT").ino,
             INodeNo::ROOT

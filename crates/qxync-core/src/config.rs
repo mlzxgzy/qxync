@@ -220,13 +220,9 @@ pub struct LinkConfig {
     #[serde(default)]
     pub insecure: bool,
     pub user: String,
-    /// Qsync 家目录根：普通用户固定 `/home`。
+    /// Qsync 家目录根：普通用户固定 `/home`。也是「没指定 NAS 文件夹」时的默认根。
     #[serde(default = "default_home_root")]
     pub home_root: String,
-    /// ★ M6：要暴露 / 同步的远端根（多根挂载、共享文件夹）。
-    /// 空 = 只用 `home_root`（与 M1–M5 完全一致）。
-    #[serde(default)]
-    pub roots: Vec<String>,
     /// 强制只用 IPv4：对端同时发布 AAAA 但 IPv6 路由不通时非常有用
     /// （实测遇到过：`Network is unreachable` / 传输中途 body 解码失败）。
     #[serde(default)]
@@ -261,13 +257,12 @@ impl LinkConfig {
         format!("{}://{}:{}", scheme, self.host, self.port)
     }
 
-    /// ★ M6：实际生效的远端根（归一化 + 去重）；没配 `roots` 就退回家目录。
-    pub fn roots(&self) -> Vec<String> {
-        if self.roots.is_empty() {
-            crate::roots::normalize_roots(&[self.home_root.clone()])
-        } else {
-            crate::roots::normalize_roots(&self.roots)
-        }
+    /// ★ 唯一的 NAS 起点：`home_root` 归一化后的单根（默认 `/home`）。
+    ///
+    /// 一对多是删除过的：一个挂载点/任务只对应**一个** NAS 文件夹，所以 link 层不再有
+    /// `roots` 列表 —— 只留这一个默认值，给「没写 NAS 文件夹」的 `mount` 兜底。
+    pub fn root(&self) -> String {
+        crate::roots::normalize_root(&self.home_root)
     }
 
     /// ★ M7：编译好的选择性同步规则（坏规则由调用方打日志，不静默）。
@@ -453,7 +448,6 @@ mod tests {
             insecure: true,
             user: "test1".into(),
             home_root: "/home".into(),
-            roots: vec![],
             ipv4_only: false,
             exclude: vec!["/secret".into()],
             filter_temp: true,
@@ -492,7 +486,7 @@ mod tests {
         assert!(link.exclude.is_empty());
         assert!(link.filter_temp, "临时文件过滤默认开");
         assert!(link.peer_listen.is_none(), "LAN 监听默认关");
-        assert_eq!(link.roots(), vec!["/home".to_string()]);
+        assert_eq!(link.root(), "/home");
         let parsed = link.rules();
         assert!(parsed.rules.is_empty());
         assert!(parsed.bad.is_empty());

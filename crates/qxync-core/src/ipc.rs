@@ -90,12 +90,10 @@ pub enum Request {
     },
     Mount {
         mountpoint: PathBuf,
-        /// 单根（M1–M5 的字段；`roots` 省略时用它）
+        /// ★ 这一个 NAS 文件夹（省略 = link 的 `home_root`）。
+        /// 一对多是删除过的：一次挂载只对应**一个**远端路径。
         #[serde(default)]
         remote: Option<String>,
-        /// ★ M6：多根 / 共享文件夹（省略或空 = 用 `remote`/`home_root`）
-        #[serde(default)]
-        roots: Option<Vec<String>>,
         #[serde(default)]
         cache_dir: Option<PathBuf>,
         #[serde(default)]
@@ -146,7 +144,7 @@ pub enum Request {
         #[serde(default)]
         task: Option<crate::tasks::Task>,
     },
-    /// ★ M6：远端根一览（配置的 roots + NAS 上的同步文件夹 + 可读/可写判定）。
+    /// NAS 目录信息：家目录根 + NAS 上登记的 Qsync 同步文件夹（就是下拉的候选来源）。
     Roots,
     /// ★ M7：选择性同步规则（`exclude` 编译结果 + 可选单路径判定）。
     Rules {
@@ -477,10 +475,15 @@ pub struct LinkInfo {
     pub https: bool,
     pub user: String,
     pub ipv4_only: bool,
-    /// ★ M6：这个 link 暴露的远端根（空 = 只用 `home_root`）。
-    /// 有了它，GUI/CLI 才能判断「只改了 roots」也需要重启 daemon 才生效。
-    #[serde(default)]
-    pub roots: Vec<String>,
+    /// ★ 这个 link 的家目录根（默认 `/home`）。
+    /// 有了它，GUI/CLI 才能判断「只改了 `home_root`」也需要重启 daemon 才生效。
+    #[serde(default = "default_ipc_home_root")]
+    pub home_root: String,
+}
+
+/// `LinkInfo.home_root` 的 serde 默认值（与 `LinkConfig` 保持同一个常量）。
+fn default_ipc_home_root() -> String {
+    crate::HOME_ROOT.to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -529,12 +532,9 @@ pub struct UploadInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MountInfo {
     pub mountpoint: PathBuf,
-    /// 兼容字段：单根时是那个根；多根时是第一个根。
+    /// 这个挂载点对应的**那一个** NAS 文件夹。
     pub remote: String,
     pub readonly: bool,
-    /// ★ M6：这个挂载点覆盖的全部远端根。
-    #[serde(default)]
-    pub roots: Vec<String>,
 }
 
 /// 三个持久化游标（M2c；对应 Windows 版注册表里的 `QSYNC_PROCESSED_MAX_*_LOG_INDEX_64`）。
@@ -655,22 +655,7 @@ pub struct StatusData {
     pub mounts: Vec<MountInfo>,
 }
 
-/// ★ M6：一个远端根的状态（`roots` 请求）。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct RootInfo {
-    pub remote: String,
-    /// 多根挂载时在挂载点里的目录名（单根时为空 = 直通）。
-    pub view_name: String,
-    /// 当前是否允许写（只有家目录根默认可写；共享文件夹实测服务端拒绝写）。
-    pub writable: bool,
-    /// 探测结果：这个根是否可读（`get_list` 能否列出）。
-    pub readable: bool,
-    /// 可读性探测失败的原因（不可读时给用户看）。
-    pub note: Option<String>,
-}
-
-/// ★ M6：`qbox_get_syncing_folder_list` 的一项（NAS 侧登记的 Qsync 同步文件夹）。
+/// ★ `qbox_get_syncing_folder_list` 的一项（NAS 侧登记的 Qsync 同步文件夹）。
 ///
 /// ★ 真机字段（2026-10-02 HAR，`detail=1`）是 `name` / `path` / `privilege` /
 /// `realpath`，**不是** `folder` / `permission`：解析在 `qxync-client`（两边都认）。
@@ -691,18 +676,14 @@ pub struct SyncingFolderInfo {
     pub volume_id: Option<String>,
 }
 
-/// ★ M6：`roots` 请求的返回。
+/// ★ `roots` 请求的返回：家目录根 + NAS 上登记的同步文件夹（= 一对一配对时可选的 NAS 文件夹）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RootsData {
     pub home_root: String,
-    /// link 配置里配的（或推导出的）根。
-    pub configured: Vec<String>,
-    /// 每个根的视图名 / 可写性 / 可读性。
-    pub roots: Vec<RootInfo>,
     /// NAS 上报的 Qsync 同步文件夹（普通账号没配对时是空数组 —— 实测如此）。
     pub syncing_folders: Vec<SyncingFolderInfo>,
-    /// 一句话解释（例如「非家目录根默认只读」或「未登录，未探测可读性」）。
+    /// 一句话解释（例如「未登录时拿不到同步文件夹列表」）。
     pub note: Option<String>,
 }
 
@@ -1108,7 +1089,6 @@ mod tests {
         let e = RequestEnvelope::new(Request::Mount {
             mountpoint: "/home/me/mnt".into(),
             remote: Some("/home".into()),
-            roots: Some(vec!["/home".into(), "/Public".into()]),
             cache_dir: None,
             threads: Some(4),
             auto_unmount: Some(true),
@@ -1127,7 +1107,6 @@ mod tests {
                 threads,
                 hydrate_timeout_secs,
                 remote,
-                roots,
                 delete_limit,
                 cache_mode,
                 ..
@@ -1135,10 +1114,6 @@ mod tests {
                 assert_eq!(threads, Some(4));
                 assert_eq!(hydrate_timeout_secs, Some(600));
                 assert_eq!(remote.as_deref(), Some("/home"));
-                assert_eq!(
-                    roots,
-                    Some(vec!["/home".to_string(), "/Public".to_string()])
-                );
                 assert_eq!(delete_limit, Some(0));
                 assert_eq!(cache_mode.as_deref(), Some("direct"));
             }
@@ -1220,12 +1195,18 @@ mod tests {
         assert_eq!(back.req, Request::Roots);
         // 老客户端不看新字段、新客户端不看老字段：默认值都要能解析
         let d: RootsData = serde_json::from_str("{}").unwrap();
-        assert!(d.roots.is_empty() && d.configured.is_empty() && d.syncing_folders.is_empty());
         assert_eq!(d.home_root, "");
+        assert!(d.syncing_folders.is_empty());
         let m: MountInfo =
             serde_json::from_str(r#"{"mountpoint":"/m","remote":"/home","readonly":true}"#)
                 .unwrap();
-        assert!(m.roots.is_empty(), "老响应没有 roots 字段也要能解析");
+        assert_eq!(m.remote, "/home");
+        // ★ LinkInfo：老响应没有 home_root 字段 → 默认家目录
+        let li: LinkInfo = serde_json::from_str(
+            r#"{"id":"default","host":"nas","port":9834,"https":true,"user":"u","ipv4_only":false}"#,
+        )
+        .unwrap();
+        assert_eq!(li.home_root, "/home", "缺 home_root 时回默认 /home");
     }
 
     #[test]
