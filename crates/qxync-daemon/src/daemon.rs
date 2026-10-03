@@ -56,6 +56,13 @@ fn journal_trim_secs() -> u64 {
         .max(1)
 }
 
+/// ★ M10：挂载点等「重登回复」的最长时间（FUSE 线程会同步阻塞在这里）。
+const SESSION_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
+/// ★ M10：两次重登之间的最小间隔 —— 多个挂载点同时撞上会话失效时只登一次。
+const SESSION_REFRESH_DEDUP: Duration = Duration::from_secs(3);
+/// ★ M10：会话保活探测间隔（`QXNYC_SESSION_KEEPALIVE=0` 关掉）。
+const DEFAULT_KEEPALIVE_SECS: u64 = 120;
+
 pub struct Options {
     pub link_id: String,
     pub socket: PathBuf,
@@ -70,6 +77,13 @@ pub struct Options {
 
 pub(crate) struct MountEntry {
     info: MountInfo,
+    /// ★ M10：这个挂载点自己的 NAS 客户端（sid 与 daemon 主体那份**热同步**）。
+    ///
+    /// 读写挂载的上传队列也共用它，所以推一次 sid 两处都生效。
+    client: Arc<Client>,
+    /// ★ M10：挂载时用的是哪个账号 —— 同 link 换账号登录时**不能**把新 sid 推给旧挂载点
+    /// （节点表/缓存还是上一个账号的树，推过去会张冠李戴）。
+    user: String,
     /// ★ M3：fuser 的后台会话（`umount` 时 join）。
     session: Option<qxync_fuse::BackgroundSession>,
     /// ★ M3：脱水要用的内核通知句柄（`inval_inode`）。
@@ -97,6 +111,8 @@ pub(crate) struct State {
     pub(crate) mounts: StdMutex<HashMap<PathBuf, MountEntry>>,
     /// ★ M2c：引擎专用的 HTTP 客户端（不抢 `client` 的锁，长轮询不阻塞 IPC 命令）。
     engine_client: Mutex<Option<Arc<Client>>>,
+    /// ★ M10：挂载点在 FUSE 线程里遇到鉴权失败时，同步要一个新 sid（见 `spawn_session_broker`）。
+    sid_refresher: StdMutex<Option<qxync_fuse::SidRefresher>>,
     /// 游标 + baseline（原子落盘）。
     sync_store: StdMutex<SyncState>,
     /// 引擎计数器。
@@ -460,6 +476,7 @@ pub async fn run(opts: Options) -> Result<()> {
         pins: Arc::new(StdMutex::new(pins_seed)),
         mounts: StdMutex::new(HashMap::new()),
         engine_client: Mutex::new(None),
+        sid_refresher: StdMutex::new(None),
         sync_store: StdMutex::new(sync_store),
         sync_stats: Arc::new(SyncStats::default()),
         sync_cfg: StdMutex::new(SyncConfig::default()),
@@ -512,6 +529,13 @@ pub async fn run(opts: Options) -> Result<()> {
             Err(e) => tracing::warn!("自动登录失败（可稍后 `qxync login`）: {}", e.message),
         }
     }
+
+    // ★ M10：会话热更新 —— 挂载点遇到鉴权失败时同步要新 sid（经纪人）+ 定时保活
+    {
+        let refresher = spawn_session_broker(&state);
+        *state.sid_refresher.lock().unwrap() = Some(refresher);
+    }
+    spawn_session_keeper(state.clone());
 
     // ★ M8.3：journal 后台落库（批量 + 轮转）
     spawn_journal_flusher(state.clone());
@@ -826,25 +850,27 @@ fn to_value<T: serde::Serialize>(v: T) -> Result<serde_json::Value, IpcError> {
 }
 
 fn map_err(e: CoreError) -> IpcError {
-    let kind = match &e {
-        CoreError::Auth(_) => ErrorKind::Auth,
-        CoreError::Transport(_) => ErrorKind::Transport,
-        CoreError::Status { .. } => ErrorKind::Status,
-        CoreError::Parse(_) => ErrorKind::Parse,
-        CoreError::Io(_) => ErrorKind::Io,
-        CoreError::Db(_) => ErrorKind::Io,
-        CoreError::Unsupported(_) => ErrorKind::Unsupported,
+    // ★ M10：先按「是不是会话失效」判定（Auth，或服务端回 4/5 号 status）——
+    //   调用方靠这个 kind 决定要不要重登重试。
+    let kind = if e.is_auth() {
+        ErrorKind::Auth
+    } else {
+        match &e {
+            CoreError::Auth(_) => ErrorKind::Auth,
+            CoreError::Transport(_) => ErrorKind::Transport,
+            CoreError::Status { .. } => ErrorKind::Status,
+            CoreError::Parse(_) => ErrorKind::Parse,
+            CoreError::Io(_) => ErrorKind::Io,
+            CoreError::Db(_) => ErrorKind::Io,
+            CoreError::Unsupported(_) => ErrorKind::Unsupported,
+        }
     };
     IpcError::new(kind, e.to_string())
 }
 
-/// 会话失效的两种表现：`Auth`，或 `get_list`/`stat` 回 status 4/5。
+/// 会话失效的两种表现：`Auth`，或 `get_list`/`stat` 回 status 4/5（判定在 core，三层共用）。
 fn is_auth_error(e: &CoreError) -> bool {
-    match e {
-        CoreError::Auth(_) => true,
-        CoreError::Status { status, .. } => matches!(status.0, 4 | 5),
-        _ => false,
-    }
+    e.is_auth()
 }
 
 // ---------------------------------------------------------------- 会话
@@ -900,6 +926,9 @@ async fn login_internal(
         tracing::warn!("NAS 状态：{reason}（同步应暂停）");
     }
     *state.session.lock().await = Some(session.clone());
+    // ★ M10：把新 sid **热推**给所有挂载点。挂载点各自持有自己的 `Client`，
+    //   挂载时拷的是当时那个 sid；不推的话它会一直 EIO 到重新挂载。
+    push_sid_to_mounts(state, &session.sid, &session.username);
     // 凭据回写（如果这次是从命令行传进来的）
     let _ = Credentials {
         host: state.link.host.clone(),
@@ -921,7 +950,181 @@ async fn logout(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
         let _ = client.logout().await;
     }
     *state.session.lock().await = None;
+    // ★ M10：挂载点的 sid 一并作废（下一次访问会按凭据重登，与 IPC 的懒登录一致）
+    for c in mount_clients(state) {
+        c.clear_sid();
+    }
     to_value(serde_json::json!({}))
+}
+
+// ---------------------------------------------------------------- ★ M10 会话热更新
+
+/// 当前所有挂载点自己的 NAS 客户端。
+fn mount_clients(state: &Arc<State>) -> Vec<Arc<Client>> {
+    let g = state.mounts.lock().unwrap();
+    g.values().map(|m| m.client.clone()).collect()
+}
+
+/// 把 sid 推给「同一个账号」的挂载点（sid 已经一致的跳过）。返回真正改了几个。
+///
+/// 换账号（同一 link 不同 user）的挂载点**不推**：它的节点表/缓存还是上一个账号的树，
+/// 推过去会张冠李戴 —— 只告警并让用户重新挂载。
+fn push_sid_to_mounts(state: &Arc<State>, sid: &str, user: &str) -> usize {
+    let (clients, other) = {
+        let g = state.mounts.lock().unwrap();
+        sid_push_targets(g.values().map(|m| (m.user.clone(), m.client.clone())), user)
+    };
+    if other > 0 {
+        tracing::warn!(
+            "账号已切换（当前 {user}）：{other} 个挂载点属于旧账号，未推新 sid —— 请重新挂载"
+        );
+    }
+    let n = push_sid_to(sid, clients.into_iter());
+    if n > 0 {
+        tracing::info!("会话已热更新到 {n} 个挂载点（sid={}）", mask_sid(sid));
+    }
+    n
+}
+
+/// 该把新 sid 推给哪些挂载点：只推**同账号**的（`user` 为空 = 挂载时还没会话，按同账号处理）。
+///
+/// 返回 `(要推的客户端, 因换账号跳过的挂载点数)`。
+fn sid_push_targets(
+    mounts: impl Iterator<Item = (String, Arc<Client>)>,
+    user: &str,
+) -> (Vec<Arc<Client>>, usize) {
+    let mut same = Vec::new();
+    let mut other = 0usize;
+    for (muser, client) in mounts {
+        if muser.is_empty() || muser == user {
+            same.push(client);
+        } else {
+            other += 1;
+        }
+    }
+    (same, other)
+}
+
+/// 纯函数版本（可单测）：只给 sid 还不一样的客户端推。
+fn push_sid_to(sid: &str, clients: impl Iterator<Item = Arc<Client>>) -> usize {
+    let mut n = 0;
+    for c in clients {
+        if c.sid().as_deref() != Some(sid) {
+            c.set_sid(sid);
+            n += 1;
+        }
+    }
+    n
+}
+
+/// ★ M10：会话经纪人 —— 挂载点在 FUSE 线程里**同步**要一个新 sid。
+///
+/// 同步侧通过 `std::sync::mpsc` 发请求并等回复；异步侧用 daemon 的 runtime 串行重登，
+/// 避免多个挂载点同时打登录接口（真机上并发登录会被 NAS 风控）。重登成功后
+/// `login_internal` 已经负责把 sid 推给所有挂载点。
+fn spawn_session_broker(state: &Arc<State>) -> qxync_fuse::SidRefresher {
+    let (tx, mut rx) = mpsc::unbounded_channel::<std::sync::mpsc::SyncSender<Option<String>>>();
+    let st = state.clone();
+    tokio::spawn(async move {
+        let mut last_ok: Option<Instant> = None;
+        while let Some(reply) = rx.recv().await {
+            // 刚登过就复用当前 sid（多个挂载点同时失效时不要再登一遍）
+            if let Some(t) = last_ok {
+                if t.elapsed() < SESSION_REFRESH_DEDUP {
+                    let sid = st.client.lock().await.sid();
+                    if sid.is_some() {
+                        let _ = reply.send(sid);
+                        continue;
+                    }
+                }
+            }
+            match login_internal(&st, None, None).await {
+                Ok(s) => {
+                    last_ok = Some(Instant::now());
+                    let _ = reply.send(Some(s.sid));
+                }
+                Err(e) => {
+                    tracing::warn!("挂载点请求重登失败: {}", e.message);
+                    let _ = reply.send(None);
+                }
+            }
+        }
+    });
+    Arc::new(move || {
+        // 容量 1：回复那边永远不阻塞（超时丢弃也不会把 broker 卡住）
+        let (rtx, rrx) = std::sync::mpsc::sync_channel::<Option<String>>(1);
+        if tx.send(rtx).is_err() {
+            return None;
+        }
+        rrx.recv_timeout(SESSION_REFRESH_TIMEOUT).ok().flatten()
+    })
+}
+
+/// ★ M10：保活一轮该做什么（抽成纯函数，方便单测 —— 真机上很难稳定造出「sid 被服务端踢掉」）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeeperStep {
+    /// 还没登录过 —— 不主动碰 NAS（保持「懒登录」语义）
+    Idle,
+    /// sid 还活着，什么都不用做
+    Ok,
+    /// 探测说「已经失效」→ 重登一次（`login_internal` 会把新 sid 推给挂载点）
+    Relogin,
+    /// 探测本身失败（网络抖动）→ 这轮不动，下一轮再探（不要在断网时反复打登录接口）
+    ProbeFailed,
+}
+
+fn keeper_step(has_sid: bool, probe: &std::result::Result<bool, CoreError>) -> KeeperStep {
+    if !has_sid {
+        return KeeperStep::Idle;
+    }
+    match probe {
+        Ok(true) => KeeperStep::Ok,
+        Ok(false) => KeeperStep::Relogin,
+        Err(_) => KeeperStep::ProbeFailed,
+    }
+}
+
+/// ★ M10：会话保活 —— 定期探一次；sid 失效就重登，并把新 sid 推给所有挂载点。
+///
+/// 以前只有 IPC 命令会重登（`with_client!`），挂载点与同步引擎都不会：
+/// sid 一过期，挂载点 `ls` 直接 EIO、轮询一直报错，直到用户手动重挂。
+fn spawn_session_keeper(state: Arc<State>) {
+    let secs = std::env::var("QXNYC_SESSION_KEEPALIVE")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_KEEPALIVE_SECS);
+    if secs == 0 {
+        tracing::info!("会话保活已禁用（QXNYC_SESSION_KEEPALIVE=0）");
+        return;
+    }
+    tracing::info!("会话保活已启动：每 {secs}s 探一次（QXNYC_SESSION_KEEPALIVE 可调）");
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(secs.max(1))).await;
+            let (has_sid, probe) = {
+                let c = state.client.lock().await;
+                let has = c.sid().is_some();
+                let probe = if has {
+                    c.check_alive().await
+                } else {
+                    Ok(false)
+                };
+                (has, probe)
+            };
+            match keeper_step(has_sid, &probe) {
+                KeeperStep::Idle | KeeperStep::Ok => {}
+                KeeperStep::ProbeFailed => {
+                    tracing::debug!("会话保活探测失败（{probe:?}），下一轮再试");
+                }
+                KeeperStep::Relogin => {
+                    tracing::warn!("会话保活：sid 已失效（{probe:?}），重登并推给挂载点");
+                    if let Err(e) = login_internal(&state, None, None).await {
+                        tracing::warn!("会话保活重登失败: {}", e.message);
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// 拿客户端锁执行；遇会话失效自动重登重试一次。
@@ -1368,6 +1571,11 @@ async fn mount(
 ) -> Result<serde_json::Value, IpcError> {
     ensure_session(state).await?;
     let sid = require_sid(state).await?;
+    // ★ M10：记下这个挂载点用的是哪个账号（换账号时靠它决定推不推新 sid）
+    let mount_user = current_session(state)
+        .await
+        .map(|s| s.username)
+        .unwrap_or_default();
     let mp = std::fs::canonicalize(&mountpoint).map_err(|e| {
         IpcError::new(
             ErrorKind::Io,
@@ -1412,7 +1620,7 @@ async fn mount(
 
     // 给 FUSE 一个独立 Client（只带 sid），避免和 daemon 主体抢同一把锁
     // ★ M8.4：FUSE 的客户端也要走设置里的代理（否则挂载后水合直连、绕开代理）
-    let mut fuse_client =
+    let fuse_client =
         Client::new_with_proxy(&state.link, Some(&state.settings.lock().unwrap().proxy))
             .map_err(map_err)?;
     fuse_client.set_sid(sid);
@@ -1483,6 +1691,11 @@ async fn mount(
         let n = notifier.clone();
         handle.set_invalidator(std::sync::Arc::new(move |ino| n.inval_inode(ino, 0, 0)));
     }
+    // ★ M10：sid 过期时，让挂载点能**同步**要一个新 sid 并原地重试
+    //   （不注入的话 `ls`/`cat` 会一直 EIO 到重新挂载）。
+    if let Some(f) = state.sid_refresher.lock().unwrap().clone() {
+        handle.set_sid_refresher(f);
+    }
 
     // 等挂载生效（Session::new 已同步挂上，这里只是兜底）
     let mut mounted = false;
@@ -1517,6 +1730,8 @@ async fn mount(
         mp.clone(),
         MountEntry {
             info: info.clone(),
+            client: fuse_client.clone(),
+            user: mount_user.clone(),
             session: Some(session),
             notifier,
             counters,
@@ -1708,12 +1923,11 @@ async fn engine_client(state: &Arc<State>) -> Result<Arc<Client>, IpcError> {
     let mut g = state.engine_client.lock().await;
     let stale = g
         .as_ref()
-        .map(|c| c.sid() != Some(sid.as_str()))
+        .map(|c| c.sid().as_deref() != Some(sid.as_str()))
         .unwrap_or(true);
     if stale {
-        let mut c =
-            Client::new_with_proxy(&state.link, Some(&state.settings.lock().unwrap().proxy))
-                .map_err(map_err)?;
+        let c = Client::new_with_proxy(&state.link, Some(&state.settings.lock().unwrap().proxy))
+            .map_err(map_err)?;
         c.set_sid(sid);
         *g = Some(Arc::new(c));
     }
@@ -1872,6 +2086,14 @@ fn spawn_poller(state: Arc<State>) {
                 Err(e) => {
                     tracing::warn!("轮询失败: {}", e.message);
                     *state.sync_stats.last_error.lock().unwrap() = Some(e.message.clone());
+                    // ★ M10：会话失效 → 重登（`login_internal` 会把新 sid 推给挂载点）。
+                    //   以前这里只是记一条错误，sid 死了就每一轮都失败。
+                    if e.kind == ErrorKind::Auth {
+                        tracing::warn!("轮询遇会话失效，重登后下一轮继续");
+                        if let Err(e2) = login_internal(&state, None, None).await {
+                            tracing::warn!("轮询重登失败: {}", e2.message);
+                        }
+                    }
                 }
             }
         }
@@ -3247,4 +3469,111 @@ async fn space_cmd(state: &Arc<State>, now: bool) -> Result<serde_json::Value, I
         "脱水永远走 M3 的安全检查链：dirty / 待上传 / pinned / excluded / 打开中 / mmap / 传输中 一律跳过".into()
     });
     to_value(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn client_with_sid(sid: Option<&str>) -> Arc<Client> {
+        let link = LinkConfig {
+            id: "t".into(),
+            host: "nas.invalid".into(),
+            port: 9834,
+            https: true,
+            insecure: true,
+            user: "test1".into(),
+            ipv4_only: false,
+            exclude: Vec::new(),
+            filter_temp: true,
+            peer_listen: None,
+            peer_name: None,
+        };
+        let c = Client::new(&link).unwrap();
+        if let Some(s) = sid {
+            c.set_sid(s);
+        }
+        Arc::new(c)
+    }
+
+    /// ★ M10：只给「sid 还不一样」的客户端推 —— 相同的不要重复推（也别谎报推了几个）。
+    #[test]
+    fn push_sid_only_touches_stale_clients() {
+        let fresh = client_with_sid(Some("new"));
+        let stale = client_with_sid(Some("old"));
+        let empty = client_with_sid(None);
+        let pushed = push_sid_to(
+            "new",
+            vec![fresh.clone(), stale.clone(), empty.clone()].into_iter(),
+        );
+        assert_eq!(pushed, 2, "只有 old / none 需要推");
+        assert_eq!(fresh.sid().as_deref(), Some("new"));
+        assert_eq!(stale.sid().as_deref(), Some("new"));
+        assert_eq!(empty.sid().as_deref(), Some("new"));
+
+        // 再推一次：应该一个都不动
+        assert_eq!(
+            push_sid_to(
+                "new",
+                vec![fresh.clone(), stale.clone(), empty.clone()].into_iter()
+            ),
+            0
+        );
+
+        // 登出：挂载点的 sid 被清掉
+        stale.clear_sid();
+        assert_eq!(stale.sid(), None);
+    }
+
+    /// ★ M10：换账号时不能把新 sid 推给旧账号的挂载点（节点表还是旧账号的树）。
+    #[test]
+    fn sid_push_targets_skips_mounts_of_another_account() {
+        let mine = client_with_sid(Some("old"));
+        let theirs = client_with_sid(Some("old"));
+        let unknown = client_with_sid(Some("old"));
+        let (targets, skipped) = sid_push_targets(
+            vec![
+                ("test1".to_string(), mine.clone()),
+                ("other".to_string(), theirs.clone()),
+                (String::new(), unknown.clone()),
+            ]
+            .into_iter(),
+            "test1",
+        );
+        assert_eq!(targets.len(), 2, "同账号 + 未知账号都要推");
+        assert_eq!(skipped, 1, "另一个账号的要跳过");
+        assert_eq!(push_sid_to("new", targets.into_iter()), 2);
+        assert_eq!(mine.sid().as_deref(), Some("new"));
+        assert_eq!(unknown.sid().as_deref(), Some("new"));
+        assert_eq!(theirs.sid().as_deref(), Some("old"), "别人的 sid 不许动");
+    }
+
+    /// ★ M10：保活的分支 —— 没登录不碰 NAS；活着不动；失效就重登；网络抖动别把登录接口打爆。
+    #[test]
+    fn keeper_step_branches() {
+        assert_eq!(keeper_step(false, &Ok(false)), KeeperStep::Idle);
+        assert_eq!(
+            keeper_step(false, &Err(CoreError::Transport("断网".into()))),
+            KeeperStep::Idle
+        );
+        assert_eq!(keeper_step(true, &Ok(true)), KeeperStep::Ok);
+        assert_eq!(keeper_step(true, &Ok(false)), KeeperStep::Relogin);
+        assert_eq!(
+            keeper_step(true, &Err(CoreError::Transport("断网".into()))),
+            KeeperStep::ProbeFailed
+        );
+    }
+
+    /// ★ M10：4/5 号 status 也要被认成「会话失效」——`map_err` 把它归到 `ErrorKind::Auth`，
+    /// 轮询据此决定重登（以前它落进泛化的 `Status`，sid 死了就每轮都失败）。
+    #[test]
+    fn map_err_marks_session_status_as_auth() {
+        let e = map_err(CoreError::status(4, "get_list"));
+        assert_eq!(e.kind, ErrorKind::Auth);
+        let e = map_err(CoreError::status(5, "stat"));
+        assert_eq!(e.kind, ErrorKind::Auth);
+        // 日志缺失（-17）不是鉴权问题
+        let e = map_err(CoreError::status(-17, "qbox_get_sync_log"));
+        assert_eq!(e.kind, ErrorKind::Status);
+    }
 }
