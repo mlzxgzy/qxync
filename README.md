@@ -55,7 +55,7 @@ NAS 上的文件在本地只是一个「占位符」，`ls -l` 显示真实大�
 | **LAN 直连** | qxync↔qxync 自研对等协议：设备配对、事件快路径、本地区间直传（失败一律静默回落 NAS） | [M7](docs/M7-选择性同步与LAN直连.md) |
 | **同步任务** | `tasks/<id>.json` 持久化的挂载登记，逐任务暂停/继续，重启可 `--restore-tasks` 恢复 | [M8](docs/M8-向Qsync-Client-6靠拢.md) |
 | **同步日志** | `sync.db` 的 `journal` 表 + 后台批量落库与轮转，驱动 GUI 的「文件更新中心 / 错误列表」 | [M8](docs/M8-向Qsync-Client-6靠拢.md) |
-| **桌面 GUI** | 主页 / 任务 / 文件 / 更新 / 错误 / 设置 / 诊断；托盘 + 通知 + 开机自启 + 文件选择器 | [M4](docs/M4-GUI.md) · [M8](docs/M8-向Qsync-Client-6靠拢.md) |
+| **桌面 GUI** | 主页 / 任务 / 文件 / 更新 / 错误 / 设置 / 诊断；托盘 + 通知 + 开机自启 + 文件选择器 + **任务卡「打开目录」**（用系统里用户自己配的默认目录工具打开本地挂载点） | [M4](docs/M4-GUI.md) · [M8](docs/M8-向Qsync-Client-6靠拢.md) |
 | **设置中心** | 代理三模式（Auto-detect / No proxy / Manual）、自动释放空间、冲突策略五选、文件三态 | [M8](docs/M8-向Qsync-Client-6靠拢.md) |
 
 ## 截图
@@ -220,6 +220,12 @@ qxync daemon start
 
 界面左侧是图标栏：**主页 / 任务 / 文件 / 更新 / 错误 / 设置 / 诊断**。
 GUI 自己不发 HTTP，**全部经 daemon 的 IPC**。
+
+任务卡上的「**打开目录**」用**系统里你自己配的默认目录工具**（KDE Dolphin / GNOME Files /
+Thunar…）打开该任务的本地挂载点：先按 `xdg-mime` 查出默认目录工具的桌面项，再解析出它
+`Exec=` 里真正的程序名来启动（`xdg-mime` 返回的是桌面项 ID，直接当程序名跑会失败）。
+没有配默认目录工具时回落到 `xdg-open` 那条链。详见
+[`docs/M4-GUI.md`](docs/M4-GUI.md) §4.1.1。
 
 ### 6. 常用命令速查
 

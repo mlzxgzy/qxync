@@ -60,7 +60,7 @@ against a real NAS.
 | **LAN direct** | qxync↔qxync peer protocol: device pairing, event fast path, direct local range transfer (any failure silently falls back to the NAS) | [M7](docs/M7-选择性同步与LAN直连.md) |
 | **Sync tasks** | mount registrations persisted in `tasks/<id>.json`, pause/resume per task, restorable after a restart with `--restore-tasks` | [M8](docs/M8-向Qsync-Client-6靠拢.md) |
 | **Sync log** | the `journal` table of `sync.db` plus background batched writes and rotation, driving the GUI's "File Update Center / error list" | [M8](docs/M8-向Qsync-Client-6靠拢.md) |
-| **Desktop GUI** | Home / Tasks / Files / Updates / Errors / Settings / Diagnostics; tray + notifications + autostart + file picker | [M4](docs/M4-GUI.md) · [M8](docs/M8-向Qsync-Client-6靠拢.md) |
+| **Desktop GUI** | Home / Tasks / Files / Updates / Errors / Settings / Diagnostics; tray + notifications + autostart + file picker + **"Open folder"** on task cards (opens the local mount point with the desktop's default directory tool) | [M4](docs/M4-GUI.md) · [M8](docs/M8-向Qsync-Client-6靠拢.md) |
 | **Settings center** | three proxy modes (Auto-detect / No proxy / Manual), automatic space freeing, five conflict policies, three file states | [M8](docs/M8-向Qsync-Client-6靠拢.md) |
 
 ## Screenshots
@@ -234,6 +234,13 @@ qxync daemon start
 
 The left edge of the window is an icon bar: **Home / Tasks / Files / Updates / Errors / Settings / Diagnostics**.
 The GUI issues no HTTP itself — **everything goes through the daemon's IPC**.
+
+The **"Open folder"** button on a task card opens that task's local mount point with the
+**default file manager you configured for directories** (KDE Dolphin / GNOME Files / Thunar…):
+it looks up the desktop entry via `xdg-mime`, then resolves the *real* executable from that
+entry's `Exec=` line before launching (the ID `xdg-mime` prints is not an executable — running
+it as-is fails). With no default directory handler configured, it falls back to the `xdg-open`
+chain. See [`docs/M4-GUI.md`](docs/M4-GUI.md) §4.1.1.
 
 ### 6. Common commands cheat sheet
 
