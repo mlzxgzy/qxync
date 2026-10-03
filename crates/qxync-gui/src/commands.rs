@@ -729,7 +729,10 @@ fn parse_desktop_id(stdout: &[u8]) -> Option<String> {
     let s = std::str::from_utf8(stdout).unwrap_or("");
     for line in s.lines().map(str::trim).filter(|l| !l.is_empty()) {
         // 跳过「已注册的应用程序：」这类小节标题行（它们不是 ID 那一行）。
-        let tail = match line.rsplit(['：', ' ', '\t']).find(|t| t.ends_with(".desktop")) {
+        let tail = match line
+            .rsplit(['：', ' ', '\t'])
+            .find(|t| t.ends_with(".desktop"))
+        {
             Some(t) => t,
             None => continue,
         };
@@ -918,7 +921,10 @@ fn spawn_detached(prog: &str, path: &PathBuf) -> std::io::Result<()> {
         cmd.pre_exec(|| {
             if libc::setsid() != 0 {
                 // 只是没能独立成会话，不影响程序被拉起来 —— 如实记一笔，别当致命错误。
-                tracing::debug!("★ M10.7：setsid 失败（目录窗口将与 GUI 同会话）: {}", std::io::Error::last_os_error());
+                tracing::debug!(
+                    "★ M10.7：setsid 失败（目录窗口将与 GUI 同会话）: {}",
+                    std::io::Error::last_os_error()
+                );
             }
             Ok(())
         });
@@ -1084,9 +1090,11 @@ mod tests {
         // ★ `gio mime inode/directory` 的真实输出：第一行是**带前缀**的自然语言。
         //   解析器必须剥到 ID 上，剥不掉就会拿整句当程序名去 spawn。
         assert_eq!(
-            parse_desktop_id("用于“inode/directory”的默认应用程序：org.kde.dolphin.desktop\n\
+            parse_desktop_id(
+                "用于“inode/directory”的默认应用程序：org.kde.dolphin.desktop\n\
                               已注册的应用程序：\n\torg.kde.kate.desktop\n"
-                .as_bytes())
+                    .as_bytes()
+            )
             .as_deref(),
             Some("org.kde.dolphin")
         );
@@ -1096,7 +1104,10 @@ mod tests {
         // 不是桌面项的一律不认（那多半是类型名）
         assert_eq!(parse_desktop_id(b"inode/directory\n"), None);
         // 路径形态的输出不是 ID
-        assert_eq!(parse_desktop_id(b"/usr/share/applications/foo.desktop\n"), None);
+        assert_eq!(
+            parse_desktop_id(b"/usr/share/applications/foo.desktop\n"),
+            None
+        );
         // 非 UTF-8 也不能 panic
         assert_eq!(parse_desktop_id(&[0xff, 0xfe]), None);
     }
@@ -1106,13 +1117,19 @@ mod tests {
     fn exec_program_extraction() {
         // ★ 开发机实测：org.kde.dolphin.desktop 的 Exec=dolphin %u
         assert_eq!(exec_program("dolphin %u").as_deref(), Some("dolphin"));
-        assert_eq!(exec_program("nautilus --browser %U").as_deref(), Some("nautilus"));
+        assert_eq!(
+            exec_program("nautilus --browser %U").as_deref(),
+            Some("nautilus")
+        );
         // 引号与转义（桌面项规范允许）
         assert_eq!(
             exec_program("\"/opt/My Files/dolphin\" %U").as_deref(),
             Some("/opt/My Files/dolphin")
         );
-        assert_eq!(exec_program("C:\\\\dolphin.exe %U").as_deref(), Some("C:\\dolphin.exe"));
+        assert_eq!(
+            exec_program("C:\\\\dolphin.exe %U").as_deref(),
+            Some("C:\\dolphin.exe")
+        );
         // 只有字段码 / 空 → 没有程序名
         assert_eq!(exec_program("%U"), None);
         assert_eq!(exec_program("   "), None);
@@ -1183,7 +1200,10 @@ mod tests {
         let script = format!("exec -a \"$0\" sleep 30");
         let r = spawn_detached(
             sh.to_str().unwrap(),
-            &PathBuf::from(format!("-c {script} {}", shell_quote(&mnt.display().to_string()))),
+            &PathBuf::from(format!(
+                "-c {script} {}",
+                shell_quote(&mnt.display().to_string())
+            )),
         );
         assert!(r.is_ok(), "spawn_detached 不应因 setsid 失败而报错: {r:?}");
         // 从 /proc 找到刚起的那个孩子，验证它的 cmdline 里确实带着目录
