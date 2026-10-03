@@ -70,6 +70,61 @@
 - `login_internal` 成功后把新 sid 推给**同账号**的挂载点（换账号只告警，避免张冠李戴）；
   `logout` 顺手清掉挂载点的 sid。
 
+## [0.4.1] - 2026-10-03
+
+**服务端错误可读 + 就绪状态显式化**：把服务端明明说了却被丢掉的 `msg` 透传出来
+（`Qsync Central is initializing. Please wait a few minutes and try again.`），
+把 `qbox_get_max_log` 自带的四个就绪字段与限流信息解析并接线。
+
+### 修复
+
+- **服务端说了原因，用户只看到「未知状态码」**：`Error::Status` 现在带 `msg`，
+  原样进 `Display`（`— 服务端 msg: …`）。`get_list` / `stat` / `qbox_get_max_log`
+  的失败响应都能读到服务端原文。
+- **服务端未就绪被当成普通错误**：逆向确证服务端唯一的业务 status 是 `8`
+  （`qbox_*` 私有路径，msg 为 `Qsync Central is initializing…`）。现在由
+  `Error::is_server_busy()` 识别，**归入「等一等」而非「出错」**——
+  不计入同步错误、不触发重登（重登无用，只能等 `qsyncsrv_metad` / `qsyncsrvd` 就绪）。
+  判据按 `msg` 文本而非写死码值，服务端将来换码仍认得出。
+- **NAS 迁移 / 恢复 / 备份还原时白白全量重扫**：这些状态下 `max_log` 可能短暂偏小，
+  过去会被 `should_reset` 判成「游标回退」而触发一次全量重扫。现在读
+  `is_migrating` / `is_recovering` / `is_backuping_restoring` / `is_booting`
+  前置短路，本轮跳过。
+
+### 新增
+
+- `qbox_get_max_log` 解析 `is_booting` / `is_migrating` / `is_recovering` /
+  `is_backuping_restoring` 与 `server_limit` / `cgi_number`，并提供
+  `MaxLog::busy_reason()` / `advised_interval_secs()`。
+- **批量大小改按服务端自报的 `server_limit` 夹住**（真机实测 256），不再写死 200。
+  写死会在上限较低的机型上被服务端截断，导致「以为拉完了其实没拉完」。
+  `sync_signal == 2`（降速）时按 `slowdown_seconds` 给出退避建议。
+- `qxync status` 增加限流 / 降速 / 就绪状态输出。
+- `Client::qsync_probe()` / `raw_get()`：按原始键值打任意 CGI，不做解析或 status 判定，
+  供真机探针使用（业务代码请走有语义的封装）。
+
+### 实测结论（推翻既有逆向结论）
+
+- **`get_meta` / `get_meta_profile` 不可用**，路线 B 的元数据方案回退到 `get_list` 递归。
+  真机（QPKG 5.0.0.7 build 20260723）实测：`get_meta` 在 `qsyncsrv.cgi` 上
+  **恒 HTTP 500**（Apache HTML 错误页），16 种参数形态无一例外；`get_meta_profile`
+  恒 `status: 19` 且无任何数据字段。在 `filemanager/utilRequest.cgi` 上两者均为
+  `status: 20`，而该入口对**瞎编的** func 也回 `status: 20`，说明在 File Station
+  命名空间同样不存在。
+  500 是 CGI 自身崩溃而非参数名不对——同端点上瞎编的 func 回 `200` 空体，
+  `get_tree` / `get_list` 也正常，证明分发链路通畅。详见
+  [`docs/get_meta-实测证伪.md`](docs/get_meta-实测证伪.md)。
+- `get_list` 递归成本实测：11 次请求 / 17 个条目，单次往返约 157–430 ms，
+  **耗时几乎全在往返次数上**——提速方向是减少往返（缓存 / 映射）而非换接口。
+- 按需同步的可行性**未被推翻**：服务端 `qsyncsrv_metad` 生成的 `{share}/.qsync/meta/`
+  仍然真实存在，只是没有可用的 CGI 出口。
+
+### 文档
+
+- 新增 [`docs/get_meta-实测证伪.md`](docs/get_meta-实测证伪.md)：
+  `get_meta` 的实机证伪过程、判据与回归护栏。
+- 脱敏：已入库文档里残留的真实 NAS 域名改为指向本地（不入库）的测试环境文档。
+
 ## [0.3.0] - 2026-10-02
 
 **一对多整体删除，只留一对一**：一个挂载点 = 一个 NAS 文件夹，挂载点里**直接**就是那个
@@ -400,6 +455,7 @@ NAS 设置名 `QSYNC_FOLDERPAIR_USE_SPACE_SAVING`、Windows 客户端注册表�
 - 验收结论从 README 抽出为 [`docs/验收记录.md`](docs/验收记录.md)。
 - 采用 **MIT OR Apache-2.0** 双许可（`LICENSE-MIT` / `LICENSE-APACHE`）。
 
+[0.4.1]: https://github.com/mlzxgzy/qxync/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/mlzxgzy/qxync/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/mlzxgzy/qxync/compare/v0.2.3...v0.3.0
 [0.2.3]: https://github.com/mlzxgzy/qxync/compare/v0.2.2...v0.2.3
