@@ -133,6 +133,7 @@
     'task.act_pause': '暂停',
     'task.act_mount': '挂载',
     'task.act_manage': '管理',
+    'task.act_open_dir': '打开目录',
     'task.act_sync_now': '立即同步',
     'task.act_add': '＋ 添加任务',
     'task.act_add_pair': '＋ 添加配对文件夹',

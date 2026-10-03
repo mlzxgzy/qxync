@@ -827,6 +827,21 @@
     bOpen.addEventListener('click', function () { switchPage('diag', 'mounts'); });
     act.appendChild(bOpen);
 
+    // ★ M10.7：「打开目录」—— 用系统里**用户自己配的默认目录工具**打开本地挂载点
+    // （走 `open_path` 命令，见 commands.rs：优先 `xdg-mime`/`gio` 查到的默认程序）。
+    // 开的是**本地**那一侧（NAS 侧在网络上，没有可交给本地目录工具的路径）。
+    var bDir = el('button', 'mini', T('task.act_open_dir'));
+    bDir.type = 'button';
+    bDir.setAttribute('title', mp || T('task.not_set'));
+    if (!mp) {
+      // 没有本地挂载点就没法开：禁用并说清原因，别让按钮点了没反应。
+      bDir.disabled = true;
+      bDir.setAttribute('aria-disabled', 'true');
+    } else {
+      bDir.addEventListener('click', function () { openTaskDir(mp, bDir); });
+    }
+    act.appendChild(bDir);
+
     var bSync = el('button', 'mini primary', T('task.act_sync_now'));
     bSync.type = 'button';
     bSync.addEventListener('click', function () { doSync({ once: true }, [], '立即同步'); });
@@ -1118,6 +1133,39 @@
         logErr(label + ' ' + id + ' 失败：' + str(r.error));
       }
       return refreshTasks().then(function () { return refreshStatus(true); }).then(function () { return r; });
+    });
+  }
+
+  /**
+   * ★ M10.7：用系统默认目录工具打开一个任务的本地挂载点。
+   *
+   * 用 `doOpen('path', …)`（→ `open_path` 命令）而不是在 JS 里发起请求：命令里已经处理了
+   * 「查 `xdg-mime`/`gio` 默认目录工具 → 起不来回落插件 opener → 把实际走的哪条路回报给前端」。
+   *
+   * ⚠️ 挂载点**没挂上**时目录可能根本不存在（比如 NAS 掉了、任务被停用后自动卸载）：
+   * 这时如实报「路径不存在」，而不是去 `mkdir` 造一个空目录 —— 造出来会让用户以为
+   * 文件真的在本地，恰好掩盖掉最该看见的故障。
+   */
+  function openTaskDir(mountpoint, btn) {
+    // 连点两下会开两个目录窗口，这里直接挡掉第二次。
+    if (btn && btn.disabled) { return Promise.resolve({ ok: false, error: '已在打开中' }); }
+    if (btn) { btn.disabled = true; }
+    return doOpen('path', mountpoint).then(function (r) {
+      var d = (r && r.ok && isObj(r.data)) ? r.data : null;
+      // `via` 如实反映走了哪条路：查到的默认目录程序（xdg-mime / gio）还是回落；
+      // `program` 是**真正被执行的程序名**（不是桌面项 ID —— 那个往往不是可执行文件）。
+      if (d && d.ok === true && d.via) {
+        logOk('已用 ' + str(d.via) + (d.program ? '（' + str(d.program) + '）' : '') +
+          ' 打开 ' + mountpoint);
+      }
+      return r;
+    }, function (e) {
+      return { ok: false, error: e };
+    }).then(function (r) {
+      // 无论成败都恢复按钮：目录工具是**脱离**本进程起的，调用本身很快返回，
+      // 一直禁着会让用户以为按钮坏了。
+      if (btn) { btn.disabled = false; btn.removeAttribute('aria-disabled'); }
+      return r;
     });
   }
 

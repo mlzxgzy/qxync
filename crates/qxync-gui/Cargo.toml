@@ -56,3 +56,6 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-appender = "0.2"
+# ★ M10.7：拉起「用户自己配的默认目录工具」时用 `setsid` 让它独立于 GUI
+# （workspace 里 qxync-core / daemon / fuse 都已直接依赖 libc，不是新依赖）。
+libc = "0.2"

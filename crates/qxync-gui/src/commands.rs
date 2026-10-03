@@ -10,7 +10,7 @@ use qxync_core::ipc::{ErrorKind, PingData, Request, RequestEnvelope, StatusData,
 use qxync_core::{ConfigPaths, Credentials, LinkConfig, Settings};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 // ★ M8.4：`get_webview_window` 来自 `Manager`。
@@ -603,6 +603,21 @@ async fn pick_with(
 ///
 /// 路径不存在时**明确报错**而不是静默成功：静默的话用户点了按钮什么也没发生，
 /// 根本不知道是自己删了目录还是程序坏了。
+///
+/// ★ M10.7：**目录**优先走「用户自己配的默认目录工具」。
+///
+/// `tauri-plugin-opener` 底层是 `open::that_detached`，它在 Unix 上是
+/// `xdg-open` → `gio open` → `gnome-open` → `kde-open` **挨个试**。
+/// 问题在 `xdg-open`：它把「目录」当成一种 mime 类型去查默认处理程序，而不少桌面
+/// **没有为 `inode/directory` 登记** Desktop Entry；此时 `xdg-open` 解析出空、
+/// 返回成功却**一个窗口都不弹**，也不会去试后面的 `gio` —— 表现就是「点了没反应」。
+///
+/// 所以目录先显式查一次用户配置：`xdg-mime query default inode/directory`。
+/// ⚠️ 它返回的是**桌面项 ID**（`org.kde.dolphin.desktop`），**不是可执行文件名**
+/// （真正能跑的是 `dolphin`）。直接把 ID 当程序名去 spawn 会**必然失败**
+/// —— 这一点在开发机上实测确认过，所以必须解析出 `.desktop` 的 `Exec=` 再取程序名。
+/// 解析不出来就回落到插件那条链，并把实际走了哪条路回报给前端（`via`），
+/// 免得界面上「点开目录」没反应却看不出到底走了哪条路。
 #[tauri::command]
 pub async fn open_path(app: tauri::AppHandle, path: String) -> Result<Value, String> {
     use tauri_plugin_opener::OpenerExt as _;
@@ -610,10 +625,305 @@ pub async fn open_path(app: tauri::AppHandle, path: String) -> Result<Value, Str
     if !p.exists() {
         return Ok(json!({"ok": false, "error": "路径不存在", "path": path}));
     }
+    if p.is_dir() {
+        if let Some((prog, desktop_id, via)) = default_dir_handler() {
+            match spawn_detached(&prog, &p) {
+                Ok(()) => {
+                    return Ok(json!({
+                        "ok": true, "path": path,
+                        "via": via, "program": prog, "desktop_id": desktop_id,
+                    }))
+                }
+                Err(e) => {
+                    // 查到了默认程序却起不来（程序被卸载、desktop 文件残留…）：
+                    // 如实说清楚，并继续走插件那条链，别让按钮彻底没用。
+                    tracing::warn!(
+                        "★ M10.7：默认目录程序 {prog}（{desktop_id}，{via}）启动失败: {e}；回落到插件 opener"
+                    );
+                    return match app.opener().open_path(path.clone(), None::<&str>) {
+                        Ok(()) => Ok(json!({
+                            "ok": true, "path": path, "via": "plugin-fallback",
+                            "program": prog, "desktop_id": desktop_id, "fallback_reason": e.to_string(),
+                        })),
+                        Err(e2) => Ok(json!({
+                            "ok": false, "path": path, "via": "plugin-fallback",
+                            "program": prog, "desktop_id": desktop_id,
+                            "error": format!("打开失败（默认程序 {prog}：{e}；回落后：{e2}）"),
+                        })),
+                    };
+                }
+            }
+        }
+    }
     match app.opener().open_path(path.clone(), None::<&str>) {
-        Ok(()) => Ok(json!({"ok": true, "path": path})),
+        Ok(()) => Ok(json!({"ok": true, "path": path, "via": "plugin"})),
         Err(e) => Ok(json!({"ok": false, "error": format!("打开失败: {e}"), "path": path})),
     }
+}
+
+/// 查「用户配的默认目录工具」并**解析成可执行程序**。返回 `(程序名, 桌面项 ID, 来源)`。
+///
+/// 步骤（都是只读的，不改用户的 `mimeapps.list`）：
+/// 1. `xdg-mime query default inode/directory` → 桌面项 ID（如 `org.kde.dolphin.desktop`）；
+///    `gio mime inode/directory` 作补充（**不带** `--handler`：本机 glib 版本不认这个
+///    选项，带了会退化成「打印用法 + 退出码 1」，反而把 `xdg-mime` 之外的线索也断掉）；
+/// 2. 拿 ID 去找 `.desktop` 文件（`XDG_DATA_HOME` 下的 `applications/` 优先，
+///    再依次查每个 `XDG_DATA_DIRS`），读它的 `Exec=` 取**真正的程序名**。
+///
+/// 三种情况都返回 `None`（由调用方回落到插件 opener），而不是猜一个程序：
+/// * 没配（`xdg-mime` 在没登记时是**退出码 0 + 空输出**）；
+/// * 找到了 `.desktop` 但 `Exec=` 解析不出程序名；
+/// * 程序名不在 `PATH` 里（桌面项残留 / 程序被卸载）。
+fn default_dir_handler() -> Option<(String, String, &'static str)> {
+    let (desktop_id, via) = xdg_default_desktop_id()?;
+    let exec = read_desktop_exec(&desktop_id)?;
+    let prog = exec_program(&exec)?;
+    if which(&prog).is_none() {
+        tracing::warn!(
+            "★ M10.7：{desktop_id} 的 Exec={prog:?} 不在 PATH 里（桌面项可能已失效）；回落到插件 opener"
+        );
+        return None;
+    }
+    Some((prog, desktop_id, via))
+}
+
+/// 问「用户配的默认目录工具」是哪个**桌面项**。返回 `(桌面项 ID, 来源)`。
+fn xdg_default_desktop_id() -> Option<(String, &'static str)> {
+    for (prog, args, via) in [
+        (
+            "xdg-mime",
+            vec!["query", "default", "inode/directory"],
+            "xdg-mime",
+        ),
+        // 只作补充：老 glib 没有 `--handler`，有的话它在第二行起会列候选，
+        // 第一行是「默认应用程序：xxx.desktop」，同样交给解析函数剥前缀。
+        ("gio", vec!["mime", "inode/directory"], "gio"),
+    ] {
+        let Ok(o) = std::process::Command::new(prog)
+            .args(&args)
+            .stdin(Stdio::null())
+            .output()
+        else {
+            continue;
+        };
+        if !o.status.success() {
+            continue;
+        }
+        if let Some(id) = parse_desktop_id(&o.stdout) {
+            return Some((id, via));
+        }
+    }
+    None
+}
+
+/// 从 `xdg-mime` / `gio mime` 的输出里解析出**桌面项 ID**；解析不出返回 `None`。
+///
+/// 要挡掉的「看起来像成功、实则没结果」的情况：
+/// 1. 空输出 —— `xdg-mime` 没登记时是**退出码 0 + 空输出**，不是报错；
+/// 2. 只有空行/空白；
+/// 3. `gio mime` 的输出**第一行是带前缀的自然语言**（本机实测：
+///    `用于"inode/directory"的默认应用程序：org.kde.dolphin.desktop`），
+///    必须剥到最后一个 `：` / 空格后面，不能整行当 ID；
+/// 4. 含 `/` 的不是 ID（那是路径），非 `.desktop` 结尾的也不是（那是类型名）。
+fn parse_desktop_id(stdout: &[u8]) -> Option<String> {
+    let s = std::str::from_utf8(stdout).unwrap_or("");
+    for line in s.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        // 跳过「已注册的应用程序：」这类小节标题行（它们不是 ID 那一行）。
+        let tail = match line.rsplit(['：', ' ', '\t']).find(|t| t.ends_with(".desktop")) {
+            Some(t) => t,
+            None => continue,
+        };
+        if tail.contains('/') || !tail.ends_with(".desktop") {
+            continue;
+        }
+        let id = tail.trim_end_matches(".desktop");
+        if id.is_empty() {
+            continue;
+        }
+        return Some(id.to_string());
+    }
+    None
+}
+
+/// 找出桌面项 `.desktop` 文件的内容路径。
+///
+/// 按 XDG 规范找 `$XDG_DATA_HOME/applications`（缺省 `~/.local/share/applications`）
+/// 与每个 `$XDG_DATA_DIRS/applications`（缺省 `/usr/local/share` + `/usr/share`）。
+/// 用户目录必须在系统目录**前面**查：用户自己装的扁平化/改过的桌面项优先。
+fn read_desktop_exec(desktop_id: &str) -> Option<String> {
+    // 桌面项 ID 里带 `/` 是路径穿越/绝对路径的形态，不是合法的 ID。
+    if desktop_id.is_empty() || desktop_id.contains('/') {
+        return None;
+    }
+    let name = format!("{desktop_id}.desktop");
+    for dir in xdg_data_dirs() {
+        if let Some(exec) = read_exec_in(&dir.join("applications").join(&name)) {
+            return Some(exec);
+        }
+    }
+    None
+}
+
+/// 在一个具体目录里找 `<desktop_id>.desktop` 的 `Exec=`。便于测试与复用。
+fn read_exec_in(file: &Path) -> Option<String> {
+    if !file.is_file() {
+        return None;
+    }
+    // 桌面项文件损坏/非 UTF-8 时读不出 Exec —— 当「这个目录没找到」继续往下找，
+    // 免得一个坏文件就废掉整条解析。
+    match std::fs::read_to_string(file) {
+        Ok(s) => parse_exec_field(&s),
+        Err(e) => {
+            tracing::warn!("★ M10.7：读 {} 失败: {e}", file.display());
+            None
+        }
+    }
+}
+
+/// `$XDG_DATA_HOME` + `$XDG_DATA_DIRS`（空项/空变量按规范跳过，用户目录在前）。
+fn xdg_data_dirs() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut push = |p: PathBuf| {
+        if p.as_os_str().is_empty() {
+            return;
+        }
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    };
+    if let Some(h) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
+        push(PathBuf::from(h));
+    } else if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+        push(PathBuf::from(home).join(".local").join("share"));
+    }
+    // 规范规定 `XDG_DATA_DIRS` 为空/未设时用这两个默认值。
+    let dirs: Vec<PathBuf> = match std::env::var_os("XDG_DATA_DIRS") {
+        Some(v) if !v.is_empty() => std::env::split_paths(&v).collect(),
+        _ => vec![
+            PathBuf::from("/usr/local/share"),
+            PathBuf::from("/usr/share"),
+        ],
+    };
+    for d in dirs {
+        push(d);
+    }
+    out
+}
+
+/// 从桌面项文件里取 `Exec=` 的值（取 `[Desktop Entry]` 组里的那一条）。
+///
+/// 刻意**不**处理 `Hidden=true` / `TryExec=` / 本地化后的 `Name[xx]=`：
+/// 那是完整的 XDG 校验，交给 `gio`/`xdg-open` 去做；这里只要能拿到程序名就够了。
+/// 找不到 `[Desktop Entry]` 组里的 `Exec=` 就返回 `None`（**不能**误取
+/// `[Desktop Action Foo]` 里的 `Exec=`，那会打开一个动作而不是程序本体）。
+fn parse_exec_field(desktop: &str) -> Option<String> {
+    let mut in_group = false;
+    for line in desktop.lines() {
+        let line = line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            in_group = line == "[Desktop Entry]";
+            continue;
+        }
+        if !in_group {
+            continue;
+        }
+        if let Some(v) = line.strip_prefix("Exec=") {
+            let v = v.trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// 从 `Exec=` 里取**程序名**。
+///
+/// 桌面项的 `Exec` 允许引号、百分号（`%u`/`%U`/`%f`/`%F`/`%i`/`%c`/`%k`）和反斜杠转义，
+/// 所以不能简单 `split_whitespace().next()`（`"C:\...\dolphin.exe %U"` 这类会解析错）。
+/// 这里按桌面项规范做「反斜杠转义 + 引号 + 字段码终止」的逐字符解析。
+///
+/// 关键：**遇到引号外的空白就停**（程序名是 `Exec` 的第一个*参数*，不可能含未加引号的
+/// 空格）。`nautilus --browser %U` 的程序名是 `nautilus` 而不是 `nautilus --browser`
+/// —— 后者会被当成一个不存在的文件名去 spawn。
+fn exec_program(exec: &str) -> Option<String> {
+    let mut prog = String::new();
+    let mut chars = exec.chars().peekable();
+    let mut in_quotes = false;
+    while let Some(c) = chars.next() {
+        match c {
+            // 字段码：程序名到此为止（`%` 后必须有码字符；裸 `%` 属于保留）
+            '%' => break,
+            // 转义下一个字符（规范：`\\` `\"` `\s` `\t` `\n` `\r` `\\`）
+            '\\' => {
+                if let Some(n) = chars.next() {
+                    prog.push(n);
+                }
+            }
+            '"' if !in_quotes => in_quotes = true,
+            // 引号内的空白属于程序名的一部分；引号本身不是程序名的字符
+            '"' => in_quotes = false,
+            // 引号外的空白 = 参数分隔：程序名结束
+            c if c.is_whitespace() && !in_quotes => break,
+            // 桌面项里单引号不是引号，直接当普通字符
+            c => prog.push(c),
+        }
+    }
+    let prog = prog.trim().to_string();
+    if prog.is_empty() {
+        None
+    } else {
+        Some(prog)
+    }
+}
+
+/// 在 `PATH` 里找程序（`contains('/')` 的当绝对/相对路径直接查）。
+fn which(prog: &str) -> Option<PathBuf> {
+    if prog.contains('/') {
+        let p = PathBuf::from(prog);
+        return if p.is_file() { Some(p) } else { None };
+    }
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let cand = dir.join(prog);
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+/// 拉起默认目录程序并与本进程**脱离**（不因它退出/报错而影响 GUI）。
+///
+/// 只传路径一个参数：桌面项 `Exec` 里那些 `%u`/`%U`/`%f` 字段码是「用条目打开」用的，
+/// 打开目录不需要，硬拼反而会让某些程序多开一个窗口。
+///
+/// ⚠️ `setsid()` 是**尽力而为**，失败也照样把程序拉起来。
+/// 这一点是实测逼出来的：`setsid` 在**已经是进程组组长**的进程里会返回 `EPERM`，
+/// 而 `fork` 出来的子进程**有可能**仍然是组长（父进程本身是组长时，子进程继承其 pgid，
+/// 而 pid 恰好等于 pgid 就构成组长）。若把它的失败当成致命错误，按钮就会在
+/// **某些环境下必然点不开** —— 一个「脱离会话」的需求完全不该让功能整体不可用。
+/// 顶多退化成「目录窗口与 GUI 共享会话」，这与 opener 插件的行为一致，可以接受。
+fn spawn_detached(prog: &str, path: &PathBuf) -> std::io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = std::process::Command::new(prog);
+    cmd.arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() != 0 {
+                // 只是没能独立成会话，不影响程序被拉起来 —— 如实记一笔，别当致命错误。
+                tracing::debug!("★ M10.7：setsid 失败（目录窗口将与 GUI 同会话）: {}", std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    cmd.spawn().map(|_| ())
 }
 
 /// ★ M8.4：用系统默认浏览器打开 URL（前端「帮助/官网」链接用）。
@@ -756,5 +1066,154 @@ mod tests {
         let v = ipc::err_response(ErrorKind::BadRequest, "x");
         assert_eq!(v["ok"], json!(false));
         assert_eq!(v["error"]["kind"], json!("bad_request"));
+    }
+
+    /// ★ M10.7：默认目录工具的解析链（桌面项 ID → 真程序名 → Exec 取程序名）。
+    ///
+    /// 这里每一组输入都是**开发机上真实出现过的形状**，不是假想的：
+    /// `xdg-mime` 没登记目录处理器时是「退出码 0 + 空输出」；`gio mime` 的第一行
+    /// 是带前缀的自然语言；KDE 的 `org.kde.dolphin.desktop` 的 `Exec` 是 `dolphin %u`
+    /// ——**桌面项 ID 不是可执行文件名**（这一点是踩过才知道的）。
+    #[test]
+    fn dir_handler_parsing() {
+        // 正常：`xdg-mime query default inode/directory`
+        assert_eq!(
+            parse_desktop_id(b"org.gnome.Nautilus.desktop\n").as_deref(),
+            Some("org.gnome.Nautilus")
+        );
+        // ★ `gio mime inode/directory` 的真实输出：第一行是**带前缀**的自然语言。
+        //   解析器必须剥到 ID 上，剥不掉就会拿整句当程序名去 spawn。
+        assert_eq!(
+            parse_desktop_id("用于“inode/directory”的默认应用程序：org.kde.dolphin.desktop\n\
+                              已注册的应用程序：\n\torg.kde.kate.desktop\n"
+                .as_bytes())
+            .as_deref(),
+            Some("org.kde.dolphin")
+        );
+        // ★ 没登记时是**空输出 + 退出码 0**，不能当成程序名（空串 spawn 必失败）
+        assert_eq!(parse_desktop_id(b""), None);
+        assert_eq!(parse_desktop_id(b"\n  \n"), None);
+        // 不是桌面项的一律不认（那多半是类型名）
+        assert_eq!(parse_desktop_id(b"inode/directory\n"), None);
+        // 路径形态的输出不是 ID
+        assert_eq!(parse_desktop_id(b"/usr/share/applications/foo.desktop\n"), None);
+        // 非 UTF-8 也不能 panic
+        assert_eq!(parse_desktop_id(&[0xff, 0xfe]), None);
+    }
+
+    /// 桌面项 ID **不是**可执行文件名：必须从 `Exec=` 取。
+    #[test]
+    fn exec_program_extraction() {
+        // ★ 开发机实测：org.kde.dolphin.desktop 的 Exec=dolphin %u
+        assert_eq!(exec_program("dolphin %u").as_deref(), Some("dolphin"));
+        assert_eq!(exec_program("nautilus --browser %U").as_deref(), Some("nautilus"));
+        // 引号与转义（桌面项规范允许）
+        assert_eq!(
+            exec_program("\"/opt/My Files/dolphin\" %U").as_deref(),
+            Some("/opt/My Files/dolphin")
+        );
+        assert_eq!(exec_program("C:\\\\dolphin.exe %U").as_deref(), Some("C:\\dolphin.exe"));
+        // 只有字段码 / 空 → 没有程序名
+        assert_eq!(exec_program("%U"), None);
+        assert_eq!(exec_program("   "), None);
+        assert_eq!(exec_program(""), None);
+    }
+
+    /// `Exec=` 只认 `[Desktop Entry]` 组里的那条，不能误取动作组的。
+    #[test]
+    fn exec_field_only_from_desktop_entry_group() {
+        let f = "[Desktop Entry]\nType=Application\nName=Dolphin\nExec=dolphin %u\n\
+                 [Desktop Action open-in-terminal]\nName=在终端中打开\nExec=dolphin-open %U\n";
+        assert_eq!(parse_exec_field(f).as_deref(), Some("dolphin %u"));
+        // 动作组在前、Desktop Entry 里没有 Exec → 不能拿动作的 Exec 当程序
+        let g = "[Desktop Entry]\nType=Application\nName=X\n[Desktop Action a]\nExec=b %U\n";
+        assert_eq!(parse_exec_field(g), None);
+        // 损坏/空文件
+        assert_eq!(parse_exec_field(""), None);
+        assert_eq!(parse_exec_field("[Desktop Entry]\nExec=\n"), None);
+    }
+
+    /// 端到端（不打真程序）：临时 `.desktop` → 解析出真程序名。
+    ///
+    /// 覆盖「桌面项 ID 与 `Exec` 里的程序名不是一回事」——`org.example.MyFiles`
+    /// 这个 ID 拿去 spawn 必然失败，真程序是 `Exec=` 里的 `myfiles`。
+    /// 刻意**不改环境变量**（`XDG_DATA_HOME` 是进程全局的，并行跑测试会互相干扰），
+    /// 直接测文件解析那一层。
+    #[test]
+    fn desktop_id_resolves_to_real_program() {
+        let tmp = std::env::temp_dir().join(format!("qxync-dt-{}", std::process::id()));
+        let apps = tmp.join("applications");
+        std::fs::create_dir_all(&apps).unwrap();
+        let entry = apps.join("org.example.MyFiles.desktop");
+        std::fs::write(
+            &entry,
+            "[Desktop Entry]\nType=Application\nName=MyFiles\nExec=myfiles --open %U\n",
+        )
+        .unwrap();
+
+        let exec = read_exec_in(&entry).unwrap();
+        assert_eq!(exec, "myfiles --open %U");
+        // 关键：ID `org.example.MyFiles` 本身不是程序，程序是 Exec 里的 `myfiles`
+        assert_eq!(exec_program(&exec).as_deref(), Some("myfiles"));
+        // 桌面项 ID 里带 `/` 一律拒掉（路径穿越 / 绝对路径形态都不是合法 ID）
+        assert_eq!(read_desktop_exec("../../etc/passwd"), None);
+        assert_eq!(read_desktop_exec(""), None);
+        // 不存在的 ID → None（不是 panic）
+        assert_eq!(read_exec_in(&apps.join("org.example.Nope.desktop")), None);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// ★ M10.7：`spawn_detached` **一定会把程序拉起来**。
+    ///
+    /// 这条守的是实测踩到的坑：原本 `setsid()` 失败被当成致命错误直接返回 `Err`，
+    /// 于是在 `setsid` 返回 `EPERM` 的环境（进程已是进程组组长时）按钮**必然点不开**。
+    /// 「脱离会话」只是锦上添花，不该决定功能可用性。
+    ///
+    /// 用 `sh -c` 起一个**把参数写进自己进程标题**的孩子，再从 `/proc` 读回它的
+    /// `cmdline` 来验证「孩子真的跑了、且收到的是要打开的目录」。走 `/proc` 是为了
+    /// 不依赖 `sh` 的 quoting 细节。
+    #[cfg(unix)]
+    #[test]
+    fn spawn_detached_runs_even_when_setsid_is_unavailable() {
+        let mnt = std::env::temp_dir().join(format!("qxync-spawn-mnt-{}", std::process::id()));
+        std::fs::create_dir_all(&mnt).unwrap();
+        let sh = which("sh").expect("PATH 里应有 sh");
+        // `spawn_detached` 只会追加**一个**参数（要打开的目录），所以用 `sh -c` 时
+        // 「脚本」得由 `sh` 自己在 `-c` 之后的位置取 —— 追加的目录会落到 `$0`，用 `$0` 读。
+        let script = format!("exec -a \"$0\" sleep 30");
+        let r = spawn_detached(
+            sh.to_str().unwrap(),
+            &PathBuf::from(format!("-c {script} {}", shell_quote(&mnt.display().to_string()))),
+        );
+        assert!(r.is_ok(), "spawn_detached 不应因 setsid 失败而报错: {r:?}");
+        // 从 /proc 找到刚起的那个孩子，验证它的 cmdline 里确实带着目录
+        let target = mnt.display().to_string();
+        let mut found = false;
+        for _ in 0..40 {
+            if let Ok(rd) = std::fs::read_dir("/proc") {
+                for e in rd.flatten() {
+                    let cmdline = e.path().join("cmdline");
+                    if let Ok(b) = std::fs::read(&cmdline) {
+                        let s = String::from_utf8_lossy(&b).replace('\0', " ");
+                        if s.contains(&target) && s.contains("sleep") {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if found {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(found, "被拉起的程序应带着要打开的目录 {target}");
+        let _ = std::fs::remove_dir_all(&mnt);
+    }
+
+    /// 给 `sh -c` 用的单引号转义（测试辅助）。
+    #[cfg(unix)]
+    fn shell_quote(s: &str) -> String {
+        format!("'{}'", s.replace('\'', r"'\''"))
     }
 }
