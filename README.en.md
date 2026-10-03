@@ -50,6 +50,7 @@ against a real NAS.
 |---|---|---|
 | **On-demand hydration** | placeholder + **128 KiB range** downloads on demand (`head -c 100 big.bin` fetches exactly 1 range, not the whole file) | [M1.5](docs/M1.5-设计.md) |
 | **Cache first** | content already on disk is **adopted as-is** (the hydration bitmap is persisted next to it), so a cache-hit `cat` makes **zero NAS round trips**; `ls`/`lookup` are served from a local snapshot of the NAS file list (refreshed on a timer) instead of waiting on the network every time | [M9](docs/M9-缓存优先与映射.md) |
+| **Session self-healing** | the sid is **hot-swappable**: on an auth failure a mount asks the daemon to log in again, takes the new sid and retries in place; a successful login **pushes the new sid to every mount of the same account**, with a periodic keepalive as a safety net (no more "sid expires → EIO until remount") | [M10](docs/M10-会话热更新.md) |
 | **Read-write mount** | after `--rw`, local changes are pushed back to the NAS through an upload queue; writes are **read-modify-write**, so a range that was never fetched is never uploaded as zeros | [M2b](docs/M2b-写路径.md) |
 | **Change discovery** | three-cursor polling + three-way baseline reconciliation; conflicts produce a **conflicted copy**, and bulk remote deletes are guarded by a **circuit breaker** | [M2c](docs/M2c-变更发现.md) |
 | **Dehydration (free up space)** | the full safety-check chain (pin / unuploaded changes / open fd / mmap'd / currently hydrating / recently accessed) must pass before local content is dropped | [M3](docs/M3-脱水.md) |
@@ -557,6 +558,7 @@ cargo test -p qxync-daemon -- --ignored --test-threads=1 --nocapture     # M2c e
 | [`docs/M2c-变更发现.md`](docs/M2c-变更发现.md) | Three-cursor/event contract, three-way decision table, conflicted copy, delete protection |
 | [`docs/M3-脱水.md`](docs/M3-脱水.md) | Safety-check chain, the `inval_inode` ordering iron rule, idle/quota, cache-mode |
 | [`docs/M9-缓存优先与映射.md`](docs/M9-缓存优先与映射.md) | the NAS → cache → mapping model, the persisted hydration bitmap and cache adoption, directory-listing snapshots, remote-change semantics and the on-device latency comparison |
+| [`docs/M10-会话热更新.md`](docs/M10-会话热更新.md) | sid hot-update, in-place retry on auth failure, pushing re-logins to mounts, session keepalive, and the on-device logout reproduction |
 | [`docs/M4-GUI.md`](docs/M4-GUI.md) | GUI boundaries, command surface, page structure, acceptance and pitfalls |
 | [`docs/M5-SQLite与delta.md`](docs/M5-SQLite与delta.md) | State-store schema/migration/single transaction, real-NAS versioning probing, delta capability gating |
 | [`docs/M6-多根与共享文件夹.md`](docs/M6-多根与共享文件夹.md) | **Historical**: multi-root layout (removed), read-only rules, real-NAS shared-folder probing |

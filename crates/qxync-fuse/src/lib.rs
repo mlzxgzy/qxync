@@ -407,9 +407,11 @@ struct FetchCtx {
     hydro: Arc<HydroCounters>,
 }
 
-/// 区间下载失败的两种形态（日志要分得清「超时」还是「NAS 报错」）。
+/// 区间下载失败的形态（日志要分得清「超时」「会话失效」还是「NAS 报错」）。
 enum ChunkFetchError {
     Timeout,
+    /// ★ M10：鉴权失败 —— 调用方会重登一次、热更新 sid，再重试一次。
+    Auth(String),
     Nas(String),
 }
 
@@ -417,6 +419,7 @@ impl std::fmt::Display for ChunkFetchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Timeout => write!(f, "超时"),
+            Self::Auth(e) => write!(f, "会话失效: {e}"),
             Self::Nas(e) => write!(f, "{e}"),
         }
     }
@@ -473,6 +476,7 @@ async fn fetch_chunk_bytes(
     .await
     {
         Err(_) => Err(ChunkFetchError::Timeout),
+        Ok(Err(e)) if e.is_auth() => Err(ChunkFetchError::Auth(e.to_string())),
         Ok(Err(e)) => Err(ChunkFetchError::Nas(e.to_string())),
         Ok(Ok(d)) => {
             ctx.hydro.record(d.len() as u64);
@@ -702,12 +706,30 @@ pub struct FsHandle {
     hydrate_timeout: Duration,
     lan_peers: Arc<Mutex<Vec<PeerConfig>>>,
     hydro: Arc<HydroCounters>,
-    /// ★ M9：新内容换上之后让内核丢掉旧 page cache 的回调（daemon 挂载后注入）。
-    invalidator: Arc<Mutex<Option<Invalidator>>>,
+    /// ★ M9/M10：daemon 挂载后注入的运行时回调（内核失效 + 会话热更新）。
+    hooks: Hooks,
 }
 
 /// 「把某个 inode 的内核缓存作废」的回调（daemon 挂载后注入 `fuser::Notifier`）。
 pub type Invalidator = Arc<dyn Fn(INodeNo) -> io::Result<()> + Send + Sync>;
+
+/// ★ M10：「会话没了 → 给我一个新的 sid」回调（daemon 注入；`None` = 这次没拿到）。
+///
+/// 挂载点持有自己的 [`Client`]，而 sid 是**挂载那一刻**拷进来的。以前它过期以后没人
+/// 续期，整个挂载点会一直 `EIO` 到重新挂载为止（`ls` 直接「输入/输出错误」）。
+/// 有了这个回调，读/列目录遇到鉴权失败时就能让 daemon 重登一次、把新 sid 热塞回这个
+/// client，然后**原地重试一次**。
+pub type SidRefresher = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
+/// daemon 挂载成功后注入的运行时回调。
+///
+/// [`QxyncFs`] 与 [`FsHandle`] 各持一份 `Hooks`（里面是同一批 `Arc`），
+/// 所以 `set_invalidator` / `set_sid_refresher` 之后两边都立刻看得到。
+#[derive(Clone, Default)]
+struct Hooks {
+    invalidator: Arc<Mutex<Option<Invalidator>>>,
+    sid_refresher: Arc<Mutex<Option<SidRefresher>>>,
+}
 
 /// 缓存占用统计（`status` / 限额判定用）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -739,7 +761,12 @@ impl FsHandle {
     /// ★ M9：注入「内核缓存失效」回调。挂载成功后 daemon 把 `fuser::Notifier` 塞进来，
     /// 这样后台把新内容换上去时能顺手让内核丢掉旧的 page cache。
     pub fn set_invalidator(&self, f: Invalidator) {
-        *self.invalidator.lock().unwrap() = Some(f);
+        *self.hooks.invalidator.lock().unwrap() = Some(f);
+    }
+
+    /// ★ M10：注入「重登拿新 sid」回调。挂载点遇到鉴权失败时用它热更新 sid 并重试。
+    pub fn set_sid_refresher(&self, f: SidRefresher) {
+        *self.hooks.sid_refresher.lock().unwrap() = Some(f);
     }
 
     /// ★ M9：当前缓存了几份目录清单（观测 / 单测用）。
@@ -1315,7 +1342,7 @@ impl LocalView for FsHandle {
             hydro: self.hydro.clone(),
         };
         let inner = self.inner.clone();
-        let invalidator = self.invalidator.clone();
+        let invalidator = self.hooks.invalidator.clone();
         let remote = remote.to_string();
         tracing::info!("后台刷新内容 {remote}（{size} 字节）");
         self.rt.spawn(async move {
@@ -1621,6 +1648,8 @@ pub struct QxyncFs {
     lan_stats: Arc<LanStats>,
     /// ★ M9：目录清单快照的保鲜期（过期只做后台补拉，`readdir` 不等）。
     dir_ttl: Duration,
+    /// ★ M10：daemon 挂载后注入的运行时回调（内核失效 / 会话热更新）。
+    hooks: Hooks,
 }
 
 /// ★ M7：LAN 快路径计数（`status` 里能看到省了多少次 NAS 请求）。
@@ -1727,6 +1756,7 @@ impl QxyncFs {
             lan_peers: Arc::new(Mutex::new(Vec::new())),
             lan_stats: Arc::new(LanStats::default()),
             dir_ttl: DEFAULT_DIR_TTL,
+            hooks: Hooks::default(),
         })
     }
 
@@ -1812,7 +1842,7 @@ impl QxyncFs {
             hydrate_timeout: self.hydrate_timeout,
             lan_peers: self.lan_peers.clone(),
             hydro: self.hydro.clone(),
-            invalidator: Arc::new(Mutex::new(None)),
+            hooks: self.hooks.clone(),
         }
     }
 
@@ -1835,6 +1865,39 @@ impl QxyncFs {
     pub fn with_peers(mut self, peers: Arc<Mutex<Vec<PeerConfig>>>) -> Self {
         self.lan_peers = peers;
         self
+    }
+
+    /// ★ M10：让 daemon 重登一次，并把新 sid 热塞进本挂载点用的 client。
+    ///
+    /// 返回 false = 这次没拿到新 sid（没注入回调 / 重登失败），调用方按原错误处理。
+    fn refresh_sid(&self) -> bool {
+        let f = self.hooks.sid_refresher.lock().unwrap().clone();
+        match f.and_then(|f| f()) {
+            Some(sid) => {
+                self.client.set_sid(sid);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// ★ M10：NAS 调用遇「会话失效」→ 重登一次并**原地重试一次**。
+    ///
+    /// 只对鉴权类错误重试（[`qxync_core::Error::is_auth`]）：网络错误重试只会白等一轮。
+    fn with_session_retry<T>(
+        &self,
+        mut run: impl FnMut() -> std::result::Result<T, qxync_core::Error>,
+    ) -> std::result::Result<T, qxync_core::Error> {
+        match run() {
+            Err(e) if e.is_auth() => {
+                tracing::warn!("挂载点会话失效（{e}），请求 daemon 重登后重试");
+                if !self.refresh_sid() {
+                    return Err(e);
+                }
+                run()
+            }
+            other => other,
+        }
     }
 
     /// ★ M9：构造一次区间下载的上下文（前台水合与后台内容刷新共用同一套路径）。
@@ -1984,7 +2047,9 @@ impl QxyncFs {
             return Ok(self.insert_node(parent, name, &remote, &entry));
         }
         // 冷路径（这个目录还从没列过）：问一次 NAS stat，答案只影响这一个名字。
-        let entry = match self.rt.block_on(self.client.stat(&parent_remote, name)) {
+        let entry = match self
+            .with_session_retry(|| self.rt.block_on(self.client.stat(&parent_remote, name)))
+        {
             Ok(Some(e)) => e,
             Ok(None) => return Err(fuser::Errno::ENOENT),
             Err(e) => {
@@ -2077,7 +2142,8 @@ impl QxyncFs {
             }
             return Ok(list.entries);
         }
-        let entries = match self.rt.block_on(self.client.list(remote)) {
+        // ★ M10：会话失效 → 重登一次再重试（否则整个挂载点会一直 EIO 到重挂）
+        let entries = match self.with_session_retry(|| self.rt.block_on(self.client.list(remote))) {
             Ok(v) => v,
             Err(e) => {
                 tracing::error!("readdir {remote} 失败: {e}");
@@ -2228,12 +2294,14 @@ impl QxyncFs {
                 }
             }
         }
-        let client = self.client.clone();
-        let (dir, n) = (parent_remote.clone(), name.to_string());
-        if let Err(e) = self
-            .rt
-            .block_on(async move { client.delete_entry(&dir, &n).await })
-        {
+        // ★ M10：会话失效 → 重登一次再重试
+        let res = self.with_session_retry(|| {
+            let client = self.client.clone();
+            let (dir, n) = (parent_remote.clone(), name.to_string());
+            self.rt
+                .block_on(async move { client.delete_entry(&dir, &n).await })
+        });
+        if let Err(e) = res {
             tracing::warn!("delete 失败 {parent_remote}/{name}: {e}");
             return reply.error(fuser::Errno::EIO);
         }
@@ -2515,20 +2583,32 @@ impl QxyncFs {
         // ★ M7/M9：LAN 快路径 → NAS 回落，走同一套区间下载原语（后台内容刷新也用它）。
         let ctx = self.fetch_ctx();
         let timeout = self.hydrate_timeout;
-        let data = match self
-            .rt
-            .block_on(fetch_chunk_bytes(&ctx, &remote, start, end, total, mtime))
-        {
-            Ok(d) => d,
-            Err(ChunkFetchError::Timeout) => {
-                tracing::warn!("区间水合超时({timeout:?}): {remote} [{start}..={end}]");
-                self.inner.lock().unwrap().inflight_chunks.remove(&key);
-                return Err(fuser::Errno::EIO);
-            }
-            Err(e) => {
-                tracing::warn!("区间水合失败: {remote} [{start}..={end}]: {e}");
-                self.inner.lock().unwrap().inflight_chunks.remove(&key);
-                return Err(fuser::Errno::EIO);
+        let mut auth_retried = false;
+        let data = loop {
+            match self
+                .rt
+                .block_on(fetch_chunk_bytes(&ctx, &remote, start, end, total, mtime))
+            {
+                Ok(d) => break d,
+                // ★ M10：sid 过期 → 重登、热更新 sid、原地重试一次
+                Err(ChunkFetchError::Auth(msg)) if !auth_retried => {
+                    auth_retried = true;
+                    tracing::warn!("区间水合鉴权失败（{msg}），重登后重试: {remote}");
+                    if !self.refresh_sid() {
+                        self.inner.lock().unwrap().inflight_chunks.remove(&key);
+                        return Err(fuser::Errno::EACCES);
+                    }
+                }
+                Err(ChunkFetchError::Timeout) => {
+                    tracing::warn!("区间水合超时({timeout:?}): {remote} [{start}..={end}]");
+                    self.inner.lock().unwrap().inflight_chunks.remove(&key);
+                    return Err(fuser::Errno::EIO);
+                }
+                Err(e) => {
+                    tracing::warn!("区间水合失败: {remote} [{start}..={end}]: {e}");
+                    self.inner.lock().unwrap().inflight_chunks.remove(&key);
+                    return Err(fuser::Errno::EIO);
+                }
             }
         };
 
@@ -2933,10 +3013,12 @@ impl Filesystem for QxyncFs {
                         None => return reply.error(fuser::Errno::ENOENT),
                     }
                 };
-                let client = self.client.clone();
-                let res = self
-                    .rt
-                    .block_on(async move { client.set_mtime(&dir, &name, epoch).await });
+                let res = self.with_session_retry(|| {
+                    let client = self.client.clone();
+                    let (d, n) = (dir.clone(), name.clone());
+                    self.rt
+                        .block_on(async move { client.set_mtime(&d, &n, epoch).await })
+                });
                 if let Err(e) = res {
                     tracing::warn!("set_mtime 远端失败 {remote}: {e}");
                 }
@@ -3034,9 +3116,13 @@ impl Filesystem for QxyncFs {
         if let Err(e) = self.deny_hidden(&remote, true) {
             return reply.error(e);
         }
-        let client = self.client.clone();
-        let (p, n) = (parent_remote.clone(), name.to_string());
-        if let Err(e) = self.rt.block_on(async move { client.mkdir(&p, &n).await }) {
+        // ★ M10：会话失效 → 重登一次再重试
+        let res = self.with_session_retry(|| {
+            let client = self.client.clone();
+            let (p, n) = (parent_remote.clone(), name.to_string());
+            self.rt.block_on(async move { client.mkdir(&p, &n).await })
+        });
+        if let Err(e) = res {
             tracing::warn!("mkdir 失败 {parent_remote}/{name}: {e}");
             return reply.error(fuser::Errno::EIO);
         }
@@ -3104,33 +3190,37 @@ impl Filesystem for QxyncFs {
             }
         }
 
-        let client = self.client.clone();
-        let res = if parent_remote == newparent_remote {
-            // 同目录：FileStation rename（实测 body: path/source_name/dest_name；大小写改名可直接成功）
-            let (dir, from, to) = (parent_remote.clone(), name.to_string(), newname.to_string());
-            self.rt
-                .block_on(async move { client.rename(&dir, &from, &to).await })
-        } else {
-            // 跨目录：FileStation move 会**忽略 dest_file**（保持原名），
-            // 所以先搬过去，需要改名再在目标目录里 rename 一次。
-            let (fd, nn, td, tn) = (
-                parent_remote.clone(),
-                name.to_string(),
-                newparent_remote.clone(),
-                newname.to_string(),
-            );
-            let r = self
-                .rt
-                .block_on(async { client.move_into(&fd, &nn, &td).await });
-            if r.is_ok() && tn != nn {
-                let client2 = self.client.clone();
-                let (td2, nn2) = (td.clone(), nn.clone());
+        // ★ M10：会话失效 → 重登一次再重试（rename/move 都要）
+        let res = self.with_session_retry(|| {
+            let client = self.client.clone();
+            if parent_remote == newparent_remote {
+                // 同目录：FileStation rename（实测 body: path/source_name/dest_name；大小写改名可直接成功）
+                let (dir, from, to) =
+                    (parent_remote.clone(), name.to_string(), newname.to_string());
                 self.rt
-                    .block_on(async move { client2.rename(&td2, &nn2, &tn).await })
+                    .block_on(async move { client.rename(&dir, &from, &to).await })
             } else {
-                r
+                // 跨目录：FileStation move 会**忽略 dest_file**（保持原名），
+                // 所以先搬过去，需要改名再在目标目录里 rename 一次。
+                let (fd, nn, td, tn) = (
+                    parent_remote.clone(),
+                    name.to_string(),
+                    newparent_remote.clone(),
+                    newname.to_string(),
+                );
+                let r = self
+                    .rt
+                    .block_on(async { client.move_into(&fd, &nn, &td).await });
+                if r.is_ok() && tn != nn {
+                    let client2 = self.client.clone();
+                    let (td2, nn2) = (td.clone(), nn.clone());
+                    self.rt
+                        .block_on(async move { client2.rename(&td2, &nn2, &tn).await })
+                } else {
+                    r
+                }
             }
-        };
+        });
         if let Err(e) = res {
             tracing::warn!("rename 失败 {old_remote} -> {new_remote}: {e}");
             return reply.error(fuser::Errno::EIO);
@@ -4439,6 +4529,64 @@ mod tests {
             "签名不符必须回去问 NAS（这里必然失败）"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M10：会话失效 → 让 daemon 重登、把新 sid 热塞回这个 client、**原地重试一次**。
+    ///
+    /// 以前挂载点持有的是挂载那一刻拷贝的 sid，过期后整个挂载点一直 EIO 到重新挂载。
+    #[test]
+    fn auth_failure_refreshes_sid_and_retries_exactly_once() {
+        let dir = m7_tmpdir("m10-sid");
+        let fs = test_fs(&dir, false).with_hydrate_timeout(Duration::from_millis(200));
+        let refreshes = Arc::new(AtomicU64::new(0));
+        {
+            let n = refreshes.clone();
+            fs.handle().set_sid_refresher(Arc::new(move || {
+                n.fetch_add(1, Ordering::Relaxed);
+                Some("fresh-sid".into())
+            }));
+        }
+
+        // 第一次鉴权失败 → 刷新 sid → 第二次成功，且重试前新 sid 已经在 client 里
+        let calls = AtomicU64::new(0);
+        let out: std::result::Result<u32, qxync_core::Error> = fs.with_session_retry(|| {
+            let n = calls.fetch_add(1, Ordering::Relaxed);
+            if n == 0 {
+                Err(qxync_core::Error::status(4, "get_list"))
+            } else {
+                assert_eq!(
+                    fs.client.sid().as_deref(),
+                    Some("fresh-sid"),
+                    "重试之前必须把新 sid 塞回这个 client"
+                );
+                Ok(42)
+            }
+        });
+        assert_eq!(out.unwrap(), 42);
+        assert_eq!(calls.load(Ordering::Relaxed), 2, "只重试一次");
+        assert_eq!(refreshes.load(Ordering::Relaxed), 1);
+
+        // 非鉴权错误不重试（重试只会白等一轮）
+        let calls2 = AtomicU64::new(0);
+        let out2: std::result::Result<u32, qxync_core::Error> = fs.with_session_retry(|| {
+            calls2.fetch_add(1, Ordering::Relaxed);
+            Err(qxync_core::Error::Transport("连接超时".into()))
+        });
+        assert!(out2.is_err());
+        assert_eq!(calls2.load(Ordering::Relaxed), 1);
+
+        // 刷不出来（没注入 / 重登失败）→ 保留原错误，不再空转
+        let fs2 = test_fs(&dir.join("no-refresher"), false);
+        let calls3 = AtomicU64::new(0);
+        let out3: std::result::Result<u32, qxync_core::Error> = fs2.with_session_retry(|| {
+            calls3.fetch_add(1, Ordering::Relaxed);
+            Err(qxync_core::Error::Auth("没有 sid".into()))
+        });
+        assert!(out3.is_err());
+        assert_eq!(calls3.load(Ordering::Relaxed), 1);
+
+        let _ = refreshes.load(Ordering::Relaxed);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

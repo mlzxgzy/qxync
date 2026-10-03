@@ -18,6 +18,7 @@ use qxync_core::{
     parse_sync_log, DirEntry, Error, LinkConfig, Listing, MaxLog, NasUid, ProxySettings, ProxySpec,
     Result, ServerStatus, Settings, SyncLogBatch,
 };
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 /// `qbox_write_log` 的 action 码。
@@ -53,7 +54,12 @@ impl Session {
 pub struct Client {
     http: reqwest::Client,
     link: LinkConfig,
-    sid: Option<String>,
+    /// ★ M10：sid 放在 `Arc<RwLock<..>>` 里，**可热更新**。
+    ///
+    /// 挂载点持有的是同一个 [`Client`]（`Arc`）；daemon 重登之后把新 sid 直接塞回来，
+    /// 挂载点就不用重挂。以前 sid 是普通字段，挂载时拷贝一份、过期后无人更新 ——
+    /// 整个挂载点会一直 `EIO` 到重新挂载为止。
+    sid: Arc<RwLock<Option<String>>>,
 }
 
 impl Client {
@@ -111,7 +117,7 @@ impl Client {
         Ok(Self {
             http,
             link: link.clone(),
-            sid: None,
+            sid: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -119,18 +125,26 @@ impl Client {
         &self.link
     }
 
-    pub fn sid(&self) -> Option<&str> {
-        self.sid.as_deref()
+    /// 当前 sid（**克隆**出去，因为它是热更新的）。
+    pub fn sid(&self) -> Option<String> {
+        self.sid.read().unwrap().clone()
     }
 
-    /// 用已有 sid 续接会话（例如从 daemon 传来的）。
-    pub fn set_sid(&mut self, sid: impl Into<String>) {
-        self.sid = Some(sid.into());
+    /// 用已有 sid 续接会话（例如从 daemon 传来的）。`&self`：可以在 `Arc<Client>` 上热更新。
+    pub fn set_sid(&self, sid: impl Into<String>) {
+        *self.sid.write().unwrap() = Some(sid.into());
     }
 
-    fn require_sid(&self) -> Result<&str> {
+    /// 丢掉当前 sid（登出）。
+    pub fn clear_sid(&self) {
+        *self.sid.write().unwrap() = None;
+    }
+
+    fn require_sid(&self) -> Result<String> {
         self.sid
-            .as_deref()
+            .read()
+            .unwrap()
+            .clone()
             .ok_or_else(|| Error::Auth("尚未登录（没有 sid）".into()))
     }
 
@@ -189,7 +203,7 @@ impl Client {
         let sid = xml_text(&text, "authSid")
             .ok_or_else(|| Error::Auth("authPassed=1 但响应里没有 authSid".into()))?
             .to_string();
-        self.sid = Some(sid.clone());
+        self.set_sid(sid.clone());
 
         let username = xml_text(&text, "username").unwrap_or(user).to_string();
 
@@ -206,7 +220,9 @@ impl Client {
 
     /// 登出（失败不视为错误）。
     pub async fn logout(&mut self) -> Result<()> {
-        if let Some(sid) = self.sid.take() {
+        // 先把 sid 摘掉（不持锁跨 await），再通知服务端
+        let taken = self.sid.write().unwrap().take();
+        if let Some(sid) = taken {
             let url = self.url(
                 "cgi-bin/qsync/qsyncsrv_logout.cgi",
                 &[("sid", sid.as_str()), ("logout", "1")],
@@ -1403,6 +1419,42 @@ mod tests {
             debug_query(&[("source_file", "空 格.txt")]),
             "source_file=%E7%A9%BA%20%E6%A0%BC.txt"
         );
+    }
+
+    /// ★ M10：sid 必须**热更新** —— 挂载点与 daemon 拿到的是同一个 `Arc<Client>`，
+    /// 一个地方 set_sid，另一个地方立刻看得到（否则重登后挂载点还在用旧 sid → 一直 EIO）。
+    #[test]
+    fn sid_hot_swap_is_visible_through_clones() {
+        let link = qxync_core::LinkConfig {
+            id: "t".into(),
+            host: "nas.invalid".into(),
+            port: 9834,
+            https: true,
+            insecure: true,
+            user: "test1".into(),
+            ipv4_only: false,
+            exclude: Vec::new(),
+            filter_temp: true,
+            peer_listen: None,
+            peer_name: None,
+        };
+        let c = Client::new(&link).unwrap();
+        assert_eq!(c.sid(), None);
+        c.set_sid("sid-1");
+        assert_eq!(c.sid().as_deref(), Some("sid-1"));
+
+        // 「挂载点」与「daemon」各持一份 handle，指向同一个 client
+        let shared = Arc::new(c);
+        let mount_side = shared.clone();
+        let daemon_side = shared.clone();
+        daemon_side.set_sid("sid-2");
+        assert_eq!(
+            mount_side.sid().as_deref(),
+            Some("sid-2"),
+            "热更新必须穿过 Arc 立刻可见"
+        );
+        daemon_side.clear_sid();
+        assert_eq!(mount_side.sid(), None);
     }
 
     #[test]

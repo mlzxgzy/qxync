@@ -56,6 +56,38 @@ See [`docs/M9-缓存优先与映射.md`](docs/M9-缓存优先与映射.md) for t
   metadata consistency of the atomic swap, aborting when the node changed, and the fallback after
   repeated refresh failures.
 
+**Session hot-update (M10)**: after the sid expires, a mount point no longer stays `EIO` until it is
+remounted — the sid is hot-swappable, and on an auth failure a mount asks the daemon to log in again,
+takes the new sid and **retries in place**; a successful login **pushes the new sid to every mount of
+the same account** (including the upload queue of read-write mounts), with a periodic keepalive as a
+safety net. See [`docs/M10-会话热更新.md`](docs/M10-会话热更新.md).
+
+### Fixed (session hot-update)
+
+- **An expired sid meant a permanently `EIO` mount**: `Client.sid` was a plain field that was copied
+  into the FUSE client at mount time and never refreshed; "re-login on auth failure" existed only in
+  the IPC macro, so neither mounts nor the sync engine used it. On-device acceptance: after `logout`,
+  a cold `ls` on the mount succeeds in 0.50 s and `cat` returns 1024 bytes, with the log showing
+  "mount session expired → session hot-updated to 1 mount → login ok".
+- **Change polling failed on every round once the session died**: `map_err` flattened server status
+  4/5 into `ErrorKind::Status`, so callers could not tell "session expired" from other statuses; 4/5
+  now map to `ErrorKind::Auth` and the poller re-logs in.
+
+### Added (session hot-update)
+
+- `Client`'s sid is now `Arc<RwLock<..>>` with `set_sid(&self)` / `clear_sid()`, hot-swappable across
+  `Arc<Client>` handles; `qxync_core::Error::is_auth()` is the single "session expired" predicate used
+  by client, daemon and FUSE.
+- FUSE gets a `SidRefresher`: `readdir` / `lookup` / range hydration / `mkdir` / `unlink` /
+  `set_mtime` / `rename` re-login on an auth failure and **retry exactly once**.
+- Session broker: FUSE threads request a new sid synchronously while the daemon performs logins
+  serially (deduplicated within 3 s).
+- Session keepalive: probes every `QXNYC_SESSION_KEEPALIVE` seconds (default 120, `0` disables),
+  re-logging in and pushing to mounts when the sid is gone; a failed probe (network blip) waits for
+  the next round instead of hammering the login endpoint.
+- A successful `login_internal` pushes the new sid to mounts of the **same account** (an account
+  switch only logs a warning, to avoid mixing trees); `logout` also clears the mounts' sid.
+
 ## [0.3.0] - 2026-10-02
 
 **One-to-many removed entirely; one-to-one only**: one mount point = one NAS folder, and the mount
