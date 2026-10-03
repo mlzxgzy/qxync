@@ -5,7 +5,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [中文](CHANGELOG.md) · [README](README.en.md) · [Acceptance log](docs/验收记录.md)
 
-## [Unreleased]
+## [0.4.0] - 2026-10-03
 
 **Cache first + local mapping**: content already cached on disk is **adopted as-is** after a node is
 recreated (the hydration bitmap is persisted next to it), so a cache-hit `cat` makes no NAS round
@@ -477,6 +477,7 @@ Verified on **QNAP TS-464C / QTS 5.2.9 / Qsync QPKG 5.0.0.7 (build 20260723)**.
 - Acceptance results were split out of the README into [`docs/验收记录.md`](docs/验收记录.md).
 - Dual-licensed under **MIT OR Apache-2.0** (`LICENSE-MIT` / `LICENSE-APACHE`).
 
+[0.4.0]: https://github.com/mlzxgzy/qxync/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/mlzxgzy/qxync/compare/v0.2.3...v0.3.0
 [0.2.3]: https://github.com/mlzxgzy/qxync/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/mlzxgzy/qxync/releases/tag/v0.2.2

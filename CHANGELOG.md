@@ -5,7 +5,7 @@
 
 [English](CHANGELOG.en.md) · [README](README.md) · [验收记录](docs/验收记录.md)
 
-## [未发布]
+## [0.4.0] - 2026-10-03
 
 **缓存优先 + 映射本地化**：磁盘上已经缓存好的内容，重建节点后**认领即用**
 （水合位图随内容落盘），缓存命中的 `cat` 不再有 NAS 往返；`ls`/`lookup` 改吃
@@ -400,6 +400,7 @@ NAS 设置名 `QSYNC_FOLDERPAIR_USE_SPACE_SAVING`、Windows 客户端注册表�
 - 验收结论从 README 抽出为 [`docs/验收记录.md`](docs/验收记录.md)。
 - 采用 **MIT OR Apache-2.0** 双许可（`LICENSE-MIT` / `LICENSE-APACHE`）。
 
+[0.4.0]: https://github.com/mlzxgzy/qxync/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/mlzxgzy/qxync/compare/v0.2.3...v0.3.0
 [0.2.3]: https://github.com/mlzxgzy/qxync/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/mlzxgzy/qxync/releases/tag/v0.2.2
