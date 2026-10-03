@@ -49,6 +49,7 @@ against a real NAS.
 | Capability | Description | Docs |
 |---|---|---|
 | **On-demand hydration** | placeholder + **128 KiB range** downloads on demand (`head -c 100 big.bin` fetches exactly 1 range, not the whole file) | [M1.5](docs/M1.5-设计.md) |
+| **Cache first** | content already on disk is **adopted as-is** (the hydration bitmap is persisted next to it), so a cache-hit `cat` makes **zero NAS round trips**; `ls`/`lookup` are served from a local snapshot of the NAS file list (refreshed on a timer) instead of waiting on the network every time | [M9](docs/M9-缓存优先与映射.md) |
 | **Read-write mount** | after `--rw`, local changes are pushed back to the NAS through an upload queue; writes are **read-modify-write**, so a range that was never fetched is never uploaded as zeros | [M2b](docs/M2b-写路径.md) |
 | **Change discovery** | three-cursor polling + three-way baseline reconciliation; conflicts produce a **conflicted copy**, and bulk remote deletes are guarded by a **circuit breaker** | [M2c](docs/M2c-变更发现.md) |
 | **Dehydration (free up space)** | the full safety-check chain (pin / unuploaded changes / open fd / mmap'd / currently hydrating / recently accessed) must pass before local content is dropped | [M3](docs/M3-脱水.md) |
@@ -307,10 +308,12 @@ cache (dehydration becomes inherently safe, at the cost of no readahead and no m
 **Change discovery treats baseline reconciliation as the main path**: the daemon runs a round of
 "three cursors + baseline reconciliation" every 30s (`QXNYC_POLL_INTERVAL` is adjustable) — taking
 the event fast path first, then falling back to "list the known directories + baseline difference".
-A remote change → refresh metadata and **invalidate the local cache** (the next read hydrates the new
-content on demand); both sides changed → a **conflicted copy** (the remote keeps the original name,
-the local content is stored as `xxx (conflicted copy from <device> <date>).txt` and uploaded);
-bulk remote deletes → **circuit breaker** (only `qxync sync --force-deletes` lets them through).
+A remote change → if the file is **hydrated** the old content stays readable while the new version is
+downloaded in the background and **atomically swapped in** (until the swap, `cat` returns the complete
+old version, and `stat` reports its size); if the file is **dehydrated** only metadata is refreshed;
+both sides changed → a **conflicted copy** (the remote keeps the original name, the local content is
+stored as `xxx (conflicted copy from <device> <date>).txt` and uploaded); bulk remote deletes →
+**circuit breaker** (only `qxync sync --force-deletes` lets them through).
 
 **State moved into SQLite** (`qxync-core/src/store.rs`): `<data>/sync/<host>/sync.db` carries the
 three event cursors + baseline + **pin** (previously in memory only, so a daemon restart lost it →
@@ -553,6 +556,7 @@ cargo test -p qxync-daemon -- --ignored --test-threads=1 --nocapture     # M2c e
 | [`docs/M2b-写路径.md`](docs/M2b-写路径.md) | Write path: real-NAS write API contract, the read-modify-write iron rule, upload queue |
 | [`docs/M2c-变更发现.md`](docs/M2c-变更发现.md) | Three-cursor/event contract, three-way decision table, conflicted copy, delete protection |
 | [`docs/M3-脱水.md`](docs/M3-脱水.md) | Safety-check chain, the `inval_inode` ordering iron rule, idle/quota, cache-mode |
+| [`docs/M9-缓存优先与映射.md`](docs/M9-缓存优先与映射.md) | the NAS → cache → mapping model, the persisted hydration bitmap and cache adoption, directory-listing snapshots, remote-change semantics and the on-device latency comparison |
 | [`docs/M4-GUI.md`](docs/M4-GUI.md) | GUI boundaries, command surface, page structure, acceptance and pitfalls |
 | [`docs/M5-SQLite与delta.md`](docs/M5-SQLite与delta.md) | State-store schema/migration/single transaction, real-NAS versioning probing, delta capability gating |
 | [`docs/M6-多根与共享文件夹.md`](docs/M6-多根与共享文件夹.md) | **Historical**: multi-root layout (removed), read-only rules, real-NAS shared-folder probing |

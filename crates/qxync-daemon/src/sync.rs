@@ -95,6 +95,8 @@ pub struct SyncReport {
     pub events: u64,
     pub events_skipped: u64,
     pub refreshed: u64,
+    /// ★ M9：本地有水、正在后台更新内容（baseline 等刷新落地再推进）的项数。
+    pub content_updating: u64,
     pub uploaded: u64,
     pub conflicts: u64,
     pub deleted: u64,
@@ -573,6 +575,9 @@ async fn reconcile_view(
         match client.list(dir).await {
             Ok(entries) => {
                 scanned += 1;
+                // ★ M9：把这份 NAS 文件列表推给挂载视图 —— 「映射」就是它的本地物化。
+                //   之后 `readdir`/`lookup` 都吃快照，不再每次往 NAS 跑（ls 不再等网）。
+                view.view.apply_listing(dir, &entries);
                 for e in &entries {
                     let path = join(dir, &e.filename);
                     // ★ M7：排除 / 临时文件不进远端签名表 —— 既不水合也不登记 baseline
@@ -585,6 +590,7 @@ async fn reconcile_view(
             Err(e) if is_not_found(&e) => {
                 // 目录本身没了 → 里面的候选在 remote_map 里缺失，自然按「远端不存在」处理
                 tracing::debug!("对账：目录已不存在 {dir}");
+                view.view.drop_listing(dir);
             }
             Err(e) => report.error(format!("对账列举 {dir} 失败: {e}")),
         }
@@ -690,17 +696,24 @@ async fn apply_decision(
             baseline.put(path, remote);
         }
         Decision::RefreshRemote => {
-            if view
-                .view
-                .apply_remote_meta(path, remote.is_dir, remote.size, remote.mtime)
-            {
-                report.refreshed += 1;
-                tracing::info!(
-                    "远端变更 {path}（{} 字节）→ 元数据已刷新、缓存已失效",
-                    remote.size
-                );
+            let existed =
+                view.view
+                    .apply_remote_meta(path, remote.is_dir, remote.size, remote.mtime);
+            // ★ M9：本地「有水」→ 远端那份先不急着覆盖本地内容：
+            //   旧内容继续可读（`cat` 立刻拿得到），同时后台把新版本整份拉下来、
+            //   原子换上。**baseline 这轮先不推进** —— 否则用户此刻基于旧内容改文件，
+            //   会被三向合并误判成「本地覆盖远端」，而不是该有的冲突。
+            if existed && view.view.pending_refresh(path) {
+                view.view.spawn_content_refresh(path);
+                report.content_updating += 1;
+                tracing::debug!("远端变更 {path} → 本地有水，后台更新内容");
+            } else {
+                if existed {
+                    report.refreshed += 1;
+                    tracing::info!("远端变更 {path}（{} 字节）→ 元数据已刷新", remote.size);
+                }
+                baseline.put(path, remote);
             }
-            baseline.put(path, remote);
         }
         Decision::UploadLocal | Decision::RecreateRemote => {
             if view.view.has_pending(path) {
@@ -787,10 +800,17 @@ async fn resolve_conflict(
                         baseline.put(path, r2);
                     }
                     Decision::RefreshRemote => {
-                        view.view
+                        let existed = view
+                            .view
                             .apply_remote_meta(path, r2.is_dir, r2.size, r2.mtime);
-                        baseline.put(path, r2);
-                        report.refreshed += 1;
+                        // ★ M9：本地有水时同样先留着旧内容、后台换新，baseline 等落地
+                        if existed && view.view.pending_refresh(path) {
+                            view.view.spawn_content_refresh(path);
+                            report.content_updating += 1;
+                        } else {
+                            baseline.put(path, r2);
+                            report.refreshed += 1;
+                        }
                     }
                     Decision::UploadLocal | Decision::RecreateRemote => {
                         if view.view.mark_dirty(path).is_ok() {

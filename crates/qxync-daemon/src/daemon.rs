@@ -1477,6 +1477,13 @@ async fn mount(
         qxync_fuse::spawn(fs, &mp, threads, auto_unmount, !read_write)
             .map_err(|e| IpcError::new(ErrorKind::Io, format!("挂载失败: {e}")))?;
 
+    // ★ M9：后台把远端新内容原子换上之后，必须让内核丢掉旧的 page cache ——
+    //   否则 pagecache 模式下 `cat` 会拿到内核里那份陈旧页。
+    {
+        let n = notifier.clone();
+        handle.set_invalidator(std::sync::Arc::new(move |ino| n.inval_inode(ino, 0, 0)));
+    }
+
     // 等挂载生效（Session::new 已同步挂上，这里只是兜底）
     let mut mounted = false;
     for _ in 0..40 {
@@ -1797,9 +1804,10 @@ async fn sync_cmd(
     if once {
         let report = run_sync_once(state).await?;
         tracing::info!(
-            "sync --once: events={} refreshed={} uploaded={} conflicts={} deleted={} blocked={}",
+            "sync --once: events={} refreshed={} updating={} uploaded={} conflicts={} deleted={} blocked={}",
             report.events,
             report.refreshed,
+            report.content_updating,
             report.uploaded,
             report.conflicts,
             report.deleted,
@@ -2547,6 +2555,20 @@ fn journal_record_sync(state: &Arc<State>, r: &sync::SyncReport) {
                 "remote_change",
                 "",
                 format!("远端改动刷新本地元数据 {} 项", r.refreshed),
+            ),
+        );
+        n += 1;
+    }
+    if r.content_updating > 0 {
+        journal_log(
+            state,
+            JournalEntry::ok(
+                "remote_change",
+                "",
+                format!(
+                    "远端改动、本地有水 {} 项：旧内容继续可读，后台更新新版本",
+                    r.content_updating
+                ),
             ),
         );
         n += 1;
