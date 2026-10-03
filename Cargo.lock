@@ -3198,6 +3198,7 @@ name = "qxync-gui"
 version = "0.4.1"
 dependencies = [
  "anyhow",
+ "libc",
  "qxync-core",
  "serde",
  "serde_json",
