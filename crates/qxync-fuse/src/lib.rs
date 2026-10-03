@@ -43,6 +43,15 @@ const ENTRY_TTL: Duration = Duration::from_millis(500);
 const HYDRATE_TIMEOUT: Duration = Duration::from_secs(60);
 /// 水合粒度：128 KiB（与 Qsync 的 CfAPI `FETCH_DATA` 对齐）。
 pub const DEFAULT_CHUNK_SIZE: u64 = 128 * 1024;
+/// ★ 并发取块的默认扇出。
+///
+/// 一次保存（read-modify-write）要把所有缺块取齐，串行时墙钟 = 块数 × RTT，
+/// 文件一大就非常明显（1 MB=8 块、4 MB=32 块）。8 路并发能把 4 MB 的
+/// 取数从 32 个 RTT 压到 4 个。
+///
+/// 保守取 8：NAS 和家用宽带对并发连接敏感，再高容易触发服务端限流/排队，
+/// 反而变慢。要调就 `QXYNC_HYDRATE_FANOUT=1..64`。
+pub const DEFAULT_HYDRATE_FANOUT: usize = 8;
 /// 目录列举分页上限（对应服务端 `Max_File_List`）。
 const LIST_LIMIT: usize = 200;
 /// ★ M2c：本地大批删除熔断的默认阈值（60 秒窗口内最多 100 次删除）。
@@ -2234,10 +2243,13 @@ impl QxyncFs {
         }
         let nchunks = total.div_ceil(chunk_size);
         let write = skip.filter(|(_, len)| *len > 0);
+        // 先算出真正要取的区间（`write` 完整覆盖的块不必取）。
+        //
+        // ★ 只有「写范围**完整覆盖**该区间」时才能跳过。
+        //   注意不能只看「写到了这个区间」：区间内只改几个字节时，
+        //   其余字节仍是远端原内容，跳过就会把它们当 0 上传（实测过：尾部追加把前 10 KB 清零）。
+        let mut todo: Vec<u64> = Vec::new();
         for idx in 0..nchunks {
-            // ★ 只有「写范围**完整覆盖**该区间」时才能跳过。
-            //   注意不能只看「写到了这个区间」：区间内只改几个字节时，
-            //   其余字节仍是远端原内容，跳过就会把它们当 0 上传（实测过：尾部追加把前 10 KB 清零）。
             let c_start = idx * chunk_size;
             let c_end = ((idx + 1) * chunk_size).min(total);
             if let Some((off, len)) = write {
@@ -2245,7 +2257,50 @@ impl QxyncFs {
                     continue;
                 }
             }
-            self.ensure_chunk(ino, idx)?;
+            if !self.chunk_ready(ino, idx) {
+                todo.push(idx);
+            }
+        }
+        if todo.is_empty() {
+            return Ok(());
+        }
+
+        // ★ 性能：并发取，而不是一段一段串行。
+        //   写路径要的是 read-modify-write，整文件都得先在本地齐了才敢落笔 ——
+        //   于是「一次保存」的开销 = 全部缺块 × RTT，**随文件大小线性增长**
+        //   （128 KiB 一块：1 MB 文件 8 个 RTT、4 MB 文件 32 个 RTT）。
+        //   这些块彼此独立，按并发扇出取回来，墙钟时间就从 O(nchunks×RTT)
+        //   降到 O(ceil(nchunks/并发)×RTT)。
+        //
+        //   正确性不受影响：每个块各自 `ensure_chunk`，内部有 per-chunk 去重锁
+        //   （`inflight_chunks`），且**内容先于位图落盘**（见 `ensure_chunk` 注释），
+        //   所以并发取块不会引入「位图说有、内容却是半截」的状态。
+        //   任一块失败：先等的那些块仍会正常落盘（只是本次写失败，可重试），
+        //   错误返回其中任意一个即可。
+        if todo.len() == 1 {
+            self.ensure_chunk(ino, todo[0])?;
+            return Ok(());
+        }
+        let fanout = hydrate_fanout().min(todo.len());
+        let first_err: Mutex<Option<fuser::Errno>> = Mutex::new(None);
+        let err_slot = &first_err;
+        std::thread::scope(|scope| {
+            for lane in todo.chunks(fanout) {
+                scope.spawn(move || {
+                    for idx in lane {
+                        if let Err(e) = self.ensure_chunk(ino, *idx) {
+                            tracing::warn!("区间 {idx} 水合失败: {e:?}");
+                            let mut slot = err_slot.lock().unwrap_or_else(|p| p.into_inner());
+                            if slot.is_none() {
+                                *slot = Some(e);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        if let Some(e) = first_err.into_inner().unwrap_or(None) {
+            return Err(e);
         }
         Ok(())
     }
@@ -2660,6 +2715,18 @@ fn epoch_secs(t: SystemTime) -> i64 {
     t.duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// 并发取块的扇出（`QXYNC_HYDRATE_FANOUT`，默认 [`DEFAULT_HYDRATE_FANOUT`]）。
+///
+/// 每次调用都读环境变量：测试要能临时改，daemon 也可能重启时调。
+/// 1 = 关掉并发（退回原来的串行行为），也是「并发取块出问题」时的逃生阀。
+fn hydrate_fanout() -> usize {
+    std::env::var("QXYNC_HYDRATE_FANOUT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|v| v.clamp(1, 64))
+        .unwrap_or(DEFAULT_HYDRATE_FANOUT)
 }
 
 /// FNV-1a 64 位：实现简单、跨版本稳定（不像 `DefaultHasher` 那样无保证）。
@@ -3568,6 +3635,55 @@ mod tests {
         assert_eq!(chunk_indices(c, 1, c), (1, 1));
         // 尾部
         assert_eq!(chunk_indices(3 * c + 7, 10, c), (3, 3));
+    }
+
+    /// 扇出默认 8，且 `QXYNC_HYDRATE_FANOUT=1` 能退回串行（逃生阀）。
+    ///
+    /// 这条守的是「保存很慢」的修复：并发的意义就是把 nchunks 个 RTT 压成
+    /// nchunks/fanout 个，扇出退化成 1 就等于把性能修复关掉了。
+    #[test]
+    fn hydrate_fanout_defaults_to_eight_and_honors_env() {
+        // 注意：环境变量是**进程级共享**的，这里只在自己没被别处改动时断言默认值。
+        if std::env::var_os("QXYNC_HYDRATE_FANOUT").is_none() {
+            assert_eq!(hydrate_fanout(), DEFAULT_HYDRATE_FANOUT);
+            assert_eq!(DEFAULT_HYDRATE_FANOUT, 8);
+        }
+        // 越界值要夹住（0 → 1；999 → 64），不能让「0 路」把水合卡死
+        for (raw, want) in [
+            ("1", 1usize),
+            ("4", 4),
+            ("0", 1),
+            ("999", 64),
+            ("abc", DEFAULT_HYDRATE_FANOUT),
+        ] {
+            std::env::set_var("QXYNC_HYDRATE_FANOUT", raw);
+            assert_eq!(hydrate_fanout(), want, "QXYNC_HYDRATE_FANOUT={raw}");
+        }
+        std::env::remove_var("QXYNC_HYDRATE_FANOUT");
+    }
+
+    /// 并发取块后，**每一块都必须真的就绪**（不能只回「跑完了」）。
+    ///
+    /// 覆盖的是并发改动最容易错的地方：线程没跑完 / 漏块 / 重复块。
+    /// 这里用 `todo.chunks(fanout)` 的分组语义直接验证「拼起来 == 全部」。
+    #[test]
+    fn concurrent_chunk_lanes_cover_every_chunk_exactly_once() {
+        for total in [1usize, 8, 9, 32, 33, 100] {
+            for fanout in [1usize, 4, 8, 16] {
+                let todo: Vec<u64> = (0..total as u64).collect();
+                let f = fanout.min(todo.len());
+                let mut seen: Vec<u64> = todo.chunks(f).flatten().copied().collect();
+                seen.sort_unstable();
+                assert_eq!(
+                    seen, todo,
+                    "total={total} fanout={f}: 并发分组必须恰好覆盖每个块一次"
+                );
+                // 每条 lane 非空（空 lane 说明扇出算错了，会白开线程）
+                for lane in todo.chunks(f) {
+                    assert!(!lane.is_empty(), "fanout 超过块数时不该产生空 lane");
+                }
+            }
+        }
     }
 
     #[test]
