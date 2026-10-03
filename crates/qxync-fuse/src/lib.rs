@@ -29,7 +29,7 @@ use qxync_client::Client;
 use qxync_core::dehydrate::{Block, Candidate, Policy};
 use qxync_core::rules::{HideReason, Rules};
 use qxync_core::DirEntry;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -49,6 +49,149 @@ const LIST_LIMIT: usize = 200;
 /// 超过就熔断并把后续删除回 `EACCES`；`qxync sync --force-deletes` 可解除。
 pub const DEFAULT_DELETE_LIMIT: usize = 100;
 pub const DEFAULT_DELETE_WINDOW: Duration = Duration::from_secs(60);
+/// ★ M9：目录清单快照的保鲜期。超过这个岁数、又有 `readdir`/`lookup` 打进来时，
+/// 后台补一次 NAS `list`（**调用方不等**）—— 定时刷新由 daemon 轮询推送（`apply_listing`）。
+pub const DEFAULT_DIR_TTL: Duration = Duration::from_secs(30);
+/// ★ M9：后台内容刷新连续失败多少次之后，退回「丢掉旧内容、读到时按需水合」。
+const REFRESH_MAX_ATTEMPTS: u32 = 3;
+
+// ---------------------------------------------------------------- 水合位图落盘
+//
+// ★ M9 的根因修复。`chunks_done` 以前只活在内存里：daemon 一重启、或者节点被重新
+// `lookup` 一遍，`cache_file_for` 就把区间表清成全 `false` —— 于是**磁盘上明明已经
+// 有内容**，`cat` 还是会重新去 NAS 逐个区间拉一遍（「缓存过的文件 cat 还要等几秒」
+// 就是这么来的）。位图落在缓存文件旁边（`<cache>.qxstate`），并带上「远端签名」
+// （size + mtime）：签名对不上（NAS 上那份变了）就整份作废，绝不拿旧内容冒充新内容。
+
+const STATE_MAGIC: [u8; 8] = *b"QXSTATE1";
+const STATE_VERSION: u32 = 1;
+/// 位图头：magic(8) + version(4) + chunk_size(8) + size(8) + mtime(8) + nchunks(8)。
+const STATE_HEAD: usize = 8 + 4 + 8 + 8 + 8 + 8;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChunkState {
+    chunk_size: u64,
+    size: u64,
+    mtime: i64,
+    done: Vec<bool>,
+}
+
+/// 缓存文件 → 位图文件（`<cache>.qxstate`；脱水/失效时和内容一起删）。
+fn state_path(cache: &Path) -> PathBuf {
+    sibling_path(cache, ".qxstate")
+}
+
+fn sibling_path(base: &Path, suffix: &str) -> PathBuf {
+    let mut s = base.as_os_str().to_owned();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+/// 删掉某个缓存文件的「内容 + 位图」两件套（幂等）。
+fn remove_cache_files(cache: &Path) {
+    if let Err(e) = std::fs::remove_file(cache) {
+        if e.kind() != io::ErrorKind::NotFound {
+            tracing::warn!("删除缓存文件失败 {}: {e}", cache.display());
+        }
+    }
+    let _ = std::fs::remove_file(state_path(cache));
+}
+
+/// 位图落盘（先写 `.tmp` 再 `rename`，原子替换）。
+///
+/// 顺序很关键：**先 pwrite 内容、后写位图**。崩在中间只会「位图比内容旧」
+/// （至多重下一次区间）；反过来就会把稀疏空洞里的 0 当成真数据。
+fn state_save(cache: &Path, st: &ChunkState) -> io::Result<()> {
+    let path = state_path(cache);
+    let tmp = sibling_path(cache, ".qxstate.tmp");
+    let mut buf = Vec::with_capacity(STATE_HEAD + st.done.len().div_ceil(8));
+    buf.extend_from_slice(&STATE_MAGIC);
+    buf.extend_from_slice(&STATE_VERSION.to_le_bytes());
+    buf.extend_from_slice(&st.chunk_size.to_le_bytes());
+    buf.extend_from_slice(&st.size.to_le_bytes());
+    buf.extend_from_slice(&st.mtime.to_le_bytes());
+    buf.extend_from_slice(&(st.done.len() as u64).to_le_bytes());
+    let mut bitmap = vec![0u8; st.done.len().div_ceil(8)];
+    for (i, d) in st.done.iter().enumerate() {
+        if *d {
+            bitmap[i / 8] |= 1 << (i % 8);
+        }
+    }
+    buf.extend_from_slice(&bitmap);
+    std::fs::write(&tmp, &buf)?;
+    std::fs::rename(&tmp, &path)
+}
+
+fn state_decode(buf: &[u8]) -> Option<ChunkState> {
+    if buf.len() < STATE_HEAD || buf[..8] != STATE_MAGIC {
+        return None;
+    }
+    let version = u32::from_le_bytes(buf[8..12].try_into().ok()?);
+    if version != STATE_VERSION {
+        return None;
+    }
+    let chunk_size = u64::from_le_bytes(buf[12..20].try_into().ok()?);
+    let size = u64::from_le_bytes(buf[20..28].try_into().ok()?);
+    let mtime = i64::from_le_bytes(buf[28..36].try_into().ok()?);
+    let nchunks = u64::from_le_bytes(buf[36..44].try_into().ok()?);
+    if chunk_size == 0 {
+        return None;
+    }
+    // 自洽性校验：区间数必须和 size/chunk_size 对得上（防损坏文件把内存撑爆）。
+    let expect = if size == 0 {
+        1
+    } else {
+        size.div_ceil(chunk_size)
+    };
+    if nchunks != expect {
+        return None;
+    }
+    let bits = (nchunks as usize).div_ceil(8);
+    if buf.len() < STATE_HEAD + bits {
+        return None;
+    }
+    let bitmap = &buf[STATE_HEAD..STATE_HEAD + bits];
+    let mut done = Vec::with_capacity(nchunks as usize);
+    for i in 0..nchunks as usize {
+        done.push(bitmap[i / 8] & (1 << (i % 8)) != 0);
+    }
+    Some(ChunkState {
+        chunk_size,
+        size,
+        mtime,
+        done,
+    })
+}
+
+fn state_load(cache: &Path) -> Option<ChunkState> {
+    let buf = std::fs::read(state_path(cache)).ok()?;
+    state_decode(&buf)
+}
+
+/// 把节点的水合位图落盘（内容已写过之后调用）。
+fn persist_chunk_state(inner: &Arc<Mutex<Inner>>, chunk_size: u64, ino: INodeNo) {
+    let (cache, st) = {
+        let g = inner.lock().unwrap();
+        let Some(n) = g.nodes.get(&ino) else {
+            return;
+        };
+        let Some(cache) = n.cache.clone() else {
+            return;
+        };
+        (
+            cache,
+            ChunkState {
+                chunk_size,
+                size: n.attr.size,
+                mtime: epoch_secs(n.attr.mtime),
+                done: n.chunks_done.clone(),
+            },
+        )
+    };
+    if let Err(e) = state_save(&cache, &st) {
+        tracing::warn!("水合位图落盘失败 {}: {e}", cache.display());
+    }
+}
 
 /// 一个远端节点。
 #[derive(Debug, Clone)]
@@ -72,6 +215,16 @@ struct Node {
     /// ★ M3：节点级操作锁 —— `read`/`write`/`setattr` 持锁；脱水用 `try_lock`，
     /// 拿不到就说明「正在水合/读写」，本轮跳过（报告 12 §8.1 的 in_progress）。
     op_lock: Arc<Mutex<()>>,
+    /// ★ M9：远端内容变了、但本地「有水」→ 先把新签名记在这儿。
+    ///
+    /// 此刻**旧内容继续可读**、`attr` 也保持旧的（内容和元数据不许打架）；后台把新
+    /// 版本整个拉进临时文件、`rename` 原子换上之后才一起更新。`read` 因此永远不吃
+    /// 半新半旧的文件，也不用为了「顺手更新」去等一次 NAS 往返。
+    pending: Option<(u64, i64)>,
+    /// ★ M9：后台内容刷新是否在飞（去重，一个节点同时只跑一个）。
+    refreshing: bool,
+    /// ★ M9：后台刷新连续失败次数；超过阈值就退回「丢掉旧内容、下次读按需水合」。
+    refresh_attempts: u32,
 }
 
 impl Node {
@@ -109,6 +262,20 @@ impl Node {
         sum
     }
 
+    /// ★ M9：把「待刷新」的新签名落到 `attr` 上。
+    ///
+    /// 内容被丢弃时（冲突解、脱水）元数据必须跟着远端走：否则节点留着旧 attr，
+    /// 而 baseline 已经是新签名，三向合并会判成 Noop，`ls -l` 就永远停在旧大小上。
+    fn apply_pending_sig(&mut self) {
+        if let Some((size, mtime)) = self.pending.take() {
+            self.attr.size = size;
+            self.attr.blocks = size.div_ceil(512);
+            let t = UNIX_EPOCH + Duration::from_secs(mtime.max(0) as u64);
+            self.attr.mtime = t;
+            self.attr.ctime = t;
+        }
+    }
+
     /// 给 xattr 用的状态串。
     fn state_str(&self) -> &'static str {
         if !self.is_partially_hydrated() {
@@ -127,6 +294,287 @@ struct Inner {
     next_ino: u64,
     /// 区间水合 single-flight：(ino, 区间下标) → 该次下载的锁。
     inflight_chunks: HashMap<(u64, u64), Arc<Mutex<()>>>,
+    /// ★ M9：目录清单快照（「映射」）—— NAS 文件列表的本地物化。
+    ///
+    /// 有了它 `readdir`/`lookup` 不再每次往 NAS 跑一趟；刷新由 daemon 的定时轮询
+    /// （[`FsHandle::apply_listing`]）推送，快照过期时只做**后台**补拉，绝不阻塞调用方。
+    dirs: HashMap<String, DirListing>,
+    /// 正在后台补清单的目录（去重，避免同一目录并发拉好几遍）。
+    listing_inflight: HashSet<String>,
+}
+
+/// 一个目录的 NAS 清单快照。
+#[derive(Debug, Clone)]
+struct DirListing {
+    entries: Arc<Vec<DirEntry>>,
+    fetched: Instant,
+}
+
+/// 读一个目录的清单快照。
+fn listing_get(inner: &Arc<Mutex<Inner>>, dir: &str) -> Option<DirListing> {
+    inner.lock().unwrap().dirs.get(dir).cloned()
+}
+
+/// 写入/替换一个目录的清单快照（定时刷新与冷路径加载共用）。
+fn listing_put(inner: &Arc<Mutex<Inner>>, dir: &str, entries: Arc<Vec<DirEntry>>) {
+    let mut g = inner.lock().unwrap();
+    g.dirs.insert(
+        dir.to_string(),
+        DirListing {
+            entries,
+            fetched: Instant::now(),
+        },
+    );
+}
+
+/// 丢掉一个目录的清单快照（远端目录没了 / 本地刚改过名字空间）。
+fn listing_drop(inner: &Arc<Mutex<Inner>>, dir: &str) {
+    inner.lock().unwrap().dirs.remove(dir);
+}
+
+/// 从目录清单快照里摘掉一个名字（本地删除后立刻生效，不用等下一轮轮询）。
+///
+/// 不做这一步的话：`rm a` 之后 `ls` 会把快照里还在的 `a` 重新物化成幽灵节点。
+fn listing_remove(inner: &Arc<Mutex<Inner>>, dir: &str, name: &str) {
+    let mut g = inner.lock().unwrap();
+    if let Some(list) = g.dirs.get_mut(dir) {
+        if list.entries.iter().any(|e| e.filename == name) {
+            let kept: Vec<DirEntry> = list
+                .entries
+                .iter()
+                .filter(|e| e.filename != name)
+                .cloned()
+                .collect();
+            list.entries = Arc::new(kept);
+        }
+    }
+}
+
+/// 把一个条目写进目录清单快照（本地新建 / 改名后立刻可见）。
+fn listing_upsert(inner: &Arc<Mutex<Inner>>, dir: &str, entry: &DirEntry) {
+    let mut g = inner.lock().unwrap();
+    if let Some(list) = g.dirs.get_mut(dir) {
+        let mut kept: Vec<DirEntry> = list
+            .entries
+            .iter()
+            .filter(|e| e.filename != entry.filename)
+            .cloned()
+            .collect();
+        kept.push(entry.clone());
+        list.entries = Arc::new(kept);
+    }
+}
+
+/// 在目录清单里查一个名字。
+///
+/// 返回 `None` = **没有这个目录的清单**（调用方该去问 NAS）；
+/// `Some(None)` = 有清单但没这个名字（可以放心回 `ENOENT`，不必再问 NAS）。
+fn listing_lookup(inner: &Arc<Mutex<Inner>>, dir: &str, name: &str) -> Option<Option<DirEntry>> {
+    let g = inner.lock().unwrap();
+    let list = g.dirs.get(dir)?;
+    Some(list.entries.iter().find(|e| e.filename == name).cloned())
+}
+
+/// 后台补一次目录清单（去重）；返回是否真的发起了。
+fn begin_listing_refresh(inner: &Arc<Mutex<Inner>>, dir: &str) -> bool {
+    inner
+        .lock()
+        .unwrap()
+        .listing_inflight
+        .insert(dir.to_string())
+}
+
+async fn run_listing_refresh(inner: Arc<Mutex<Inner>>, client: Arc<Client>, dir: String) {
+    match client.list(&dir).await {
+        Ok(entries) => {
+            tracing::debug!("后台刷新目录清单 {dir}（{} 项）", entries.len());
+            listing_put(&inner, &dir, Arc::new(entries));
+        }
+        Err(e) => tracing::debug!("后台刷新目录清单失败 {dir}: {e}"),
+    }
+    inner.lock().unwrap().listing_inflight.remove(&dir);
+}
+
+// ---------------------------------------------------------------- 区间下载（前台 / 后台共用）
+
+/// 一次区间下载需要的全部外部依赖。
+struct FetchCtx {
+    client: Arc<Client>,
+    peers: Arc<Mutex<Vec<PeerConfig>>>,
+    stats: Arc<LanStats>,
+    timeout: Duration,
+    /// 水合计数（前台水合与后台刷新都记在这儿）。
+    hydro: Arc<HydroCounters>,
+}
+
+/// 区间下载失败的两种形态（日志要分得清「超时」还是「NAS 报错」）。
+enum ChunkFetchError {
+    Timeout,
+    Nas(String),
+}
+
+impl std::fmt::Display for ChunkFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout => write!(f, "超时"),
+            Self::Nas(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// 下载闭区间 `[start, end]`：**先 LAN 快路径，再回落 NAS**。
+///
+/// ★ M7 的判据原样保留：对端 `head` 必须 `exists && hydrated`，且 `size`/`mtime`
+/// 与 NAS 签名一致 —— 只有「同一份内容」才敢用。★ M9 把它抽出来给后台内容刷新复用，
+/// 免得 LAN/NAS 的分支在仓库里有两份。
+async fn fetch_chunk_bytes(
+    ctx: &FetchCtx,
+    remote: &str,
+    start: u64,
+    end: u64,
+    total: u64,
+    mtime: i64,
+) -> Result<Vec<u8>, ChunkFetchError> {
+    let want = end - start + 1;
+    let peers = {
+        let g = ctx.peers.lock().unwrap();
+        if g.is_empty() {
+            Vec::new()
+        } else {
+            g.clone()
+        }
+    };
+    if !peers.is_empty() {
+        ctx.stats.attempts.fetch_add(1, Ordering::Relaxed);
+        if let Some(h) = peer::fetch_range(&peers, remote, start, want, total, mtime).await {
+            ctx.stats.hits.fetch_add(1, Ordering::Relaxed);
+            ctx.stats
+                .bytes
+                .fetch_add(h.data.len() as u64, Ordering::Relaxed);
+            tracing::info!(
+                "LAN 直传命中: {remote} [{start}..{}) ← {} ({:?})",
+                start + want,
+                h.peer,
+                h.took
+            );
+            ctx.hydro.record(h.data.len() as u64);
+            return Ok(h.data);
+        }
+        ctx.stats.mismatches.fetch_add(1, Ordering::Relaxed);
+    }
+    let (dir, name) = match remote.rsplit_once('/') {
+        Some((d, n)) => (d.to_string(), n.to_string()),
+        None => (String::new(), remote.to_string()),
+    };
+    match tokio::time::timeout(
+        ctx.timeout,
+        ctx.client.download_range(&dir, &name, start, end),
+    )
+    .await
+    {
+        Err(_) => Err(ChunkFetchError::Timeout),
+        Ok(Err(e)) => Err(ChunkFetchError::Nas(e.to_string())),
+        Ok(Ok(d)) => {
+            ctx.hydro.record(d.len() as u64);
+            Ok(d)
+        }
+    }
+}
+
+/// ★ M9：把一个文件的「远端新版本」整份下载到 `tmp`（**不碰正在服务的旧内容**）。
+///
+/// 下载完由调用方 `rename` 原子换上：换之前读到的是一份完整旧版本，换之后是完整新版本，
+/// 永远不会出现「前 10 个区间是新的、后面还是旧的」这种撕裂。
+async fn refresh_into(
+    ctx: &FetchCtx,
+    remote: &str,
+    tmp: &Path,
+    size: u64,
+    mtime: i64,
+    chunk_size: u64,
+) -> Result<(), String> {
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(tmp)
+        .map_err(|e| format!("创建刷新临时文件失败: {e}"))?;
+    f.set_len(size)
+        .map_err(|e| format!("设置刷新文件长度失败: {e}"))?;
+    if size == 0 {
+        return Ok(());
+    }
+    let nchunks = size.div_ceil(chunk_size);
+    for idx in 0..nchunks {
+        let start = idx * chunk_size;
+        let end = (start + chunk_size).min(size) - 1; // 闭区间，末块按文件尾截断
+        let want = end - start + 1;
+        let data = fetch_chunk_bytes(ctx, remote, start, end, size, mtime)
+            .await
+            .map_err(|e| e.to_string())?;
+        if data.len() as u64 != want {
+            return Err(format!(
+                "区间长度不符 [{start}..={end}] 期望 {want} 实得 {}",
+                data.len()
+            ));
+        }
+        f.write_all_at(&data, start)
+            .map_err(|e| format!("写刷新文件失败 @{start}: {e}"))?;
+    }
+    Ok(())
+}
+
+/// ★ M9：把刷新好的新内容**原子换上**（`rename` + `attr`/区间表一次切换）。
+///
+/// 返回 `None` = 这轮刷新作废（节点没了 / 被脱水 / 期间被改过 / 签名又变了 / 换失败）。
+/// 抽成独立函数是为了**不挂 NAS 也能单测**「换上去之后元数据和内容是一套」。
+#[allow(clippy::too_many_arguments)]
+fn install_refreshed(
+    inner: &Arc<Mutex<Inner>>,
+    remote: &str,
+    tmp: &Path,
+    cache: &Path,
+    size: u64,
+    mtime: i64,
+    chunk_size: u64,
+) -> Option<INodeNo> {
+    // ★ 与 read/write 互斥：读到一半把文件换成更小的一版会让读到越界 → EIO。
+    //   锁的获取顺序与 read/write/dehydrate 一致（节点锁 → 节点表锁），不会死锁。
+    let op_lock = {
+        let g = inner.lock().unwrap();
+        g.by_remote
+            .get(remote)
+            .and_then(|i| g.nodes.get(i))
+            .map(|n| n.op_lock.clone())?
+    };
+    let _guard = op_lock.lock().unwrap();
+    let ino = {
+        let mut g = inner.lock().unwrap();
+        let found = g.by_remote.get(remote).copied();
+        let n = found.and_then(|i| g.nodes.get_mut(&i))?;
+        n.refreshing = false;
+        // 用户在这期间改过 / 被脱水 / 远端又变了 / 缓存路径换了 → 这轮不要了
+        if n.pending != Some((size, mtime)) || n.dirty || n.cache.as_deref() != Some(cache) {
+            return None;
+        }
+        if let Err(e) = std::fs::rename(tmp, cache) {
+            tracing::error!("换上刷新内容失败 {remote}: {e}");
+            return None;
+        }
+        n.attr.size = size;
+        n.attr.blocks = size.div_ceil(512);
+        let t = UNIX_EPOCH + Duration::from_secs(mtime.max(0) as u64);
+        n.attr.mtime = t;
+        n.attr.ctime = t;
+        n.chunks_done = vec![true; n.chunk_count(chunk_size)];
+        n.pending = None;
+        n.refresh_attempts = 0;
+        n.ino
+    };
+    // 内容、元数据、区间表、位图必须一起切到新签名，否则下次挂载会认领到旧的那份
+    persist_chunk_state(inner, chunk_size, ino);
+    Some(ino)
 }
 
 /// 远端路径 → pin 状态（`pinned` / `unpinned` / `unspecified` / `excluded`）。
@@ -210,6 +658,21 @@ pub trait LocalView: Send + Sync {
         local: PathBuf,
         mtime: i64,
     ) -> std::io::Result<()>;
+
+    // ---------------------------------------------------------------- ★ M9
+    /// 把 NAS 某个目录的文件列表推给挂载视图（定时刷新「映射」）。
+    ///
+    /// daemon 的变更轮询每轮列完目录后调用；此后 `readdir`/`lookup` 吃本地快照，
+    /// 不再每次都往 NAS 跑。默认空实现（测试替身不需要）。
+    fn apply_listing(&self, _dir: &str, _entries: &[DirEntry]) {}
+    /// 远端目录已经不存在 → 丢掉清单快照。默认空实现。
+    fn drop_listing(&self, _dir: &str) {}
+    /// 该路径是否在等后台把远端新内容换上（此时 baseline 先别推进）。
+    fn pending_refresh(&self, _remote: &str) -> bool {
+        false
+    }
+    /// 有水文件的远端内容变了 → 后台整份刷新并原子换上。默认空实现。
+    fn spawn_content_refresh(&self, _remote: &str) {}
 }
 
 /// 挂载视图句柄：daemon 在把 [`QxyncFs`] 交给 FUSE 挂载线程后，用它继续操作节点表。
@@ -231,7 +694,20 @@ pub struct FsHandle {
     rules: Arc<Rules>,
     /// ★ M7：LAN 直传统计（daemon `peer status` 汇总展示）。
     lan_stats: Arc<LanStats>,
+    /// ★ M9：FUSE 自己的 NAS 客户端（后台补目录清单、后台刷新内容用）。
+    client: Arc<Client>,
+    /// ★ M9：后台任务用的 runtime 句柄（与 [`QxyncFs`] 同一个 runtime）。
+    rt: tokio::runtime::Handle,
+    /// ★ M9：后台内容刷新用（与 [`QxyncFs`] 同一套参数）。
+    hydrate_timeout: Duration,
+    lan_peers: Arc<Mutex<Vec<PeerConfig>>>,
+    hydro: Arc<HydroCounters>,
+    /// ★ M9：新内容换上之后让内核丢掉旧 page cache 的回调（daemon 挂载后注入）。
+    invalidator: Arc<Mutex<Option<Invalidator>>>,
 }
+
+/// 「把某个 inode 的内核缓存作废」的回调（daemon 挂载后注入 `fuser::Notifier`）。
+pub type Invalidator = Arc<dyn Fn(INodeNo) -> io::Result<()> + Send + Sync>;
 
 /// 缓存占用统计（`status` / 限额判定用）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -259,6 +735,18 @@ impl FsHandle {
     pub fn cache_dir(&self) -> &Path {
         &self.cache_dir
     }
+
+    /// ★ M9：注入「内核缓存失效」回调。挂载成功后 daemon 把 `fuser::Notifier` 塞进来，
+    /// 这样后台把新内容换上去时能顺手让内核丢掉旧的 page cache。
+    pub fn set_invalidator(&self, f: Invalidator) {
+        *self.invalidator.lock().unwrap() = Some(f);
+    }
+
+    /// ★ M9：当前缓存了几份目录清单（观测 / 单测用）。
+    pub fn listing_count(&self) -> usize {
+        self.inner.lock().unwrap().dirs.len()
+    }
+
     pub fn delete_guard(&self) -> Arc<DeleteGuard> {
         self.delete_guard.clone()
     }
@@ -324,10 +812,12 @@ impl FsHandle {
     }
 
     fn candidate_of(&self, g: &Inner, n: &Node, check_op_lock: bool) -> Candidate {
-        let in_flight = g
-            .inflight_chunks
-            .keys()
-            .any(|(i, _)| *i == u64::from(n.ino))
+        // ★ M9：后台内容刷新同样算「在途水合」—— 此时脱水会把刚拉下来的内容又清掉，
+        //   白烧一遍带宽。
+        let in_flight = n.refreshing
+            || g.inflight_chunks
+                .keys()
+                .any(|(i, _)| *i == u64::from(n.ino))
             || (check_op_lock && n.op_lock.try_lock().is_err());
         Candidate {
             remote: n.remote.clone(),
@@ -447,17 +937,15 @@ impl FsHandle {
             g.nodes.get_mut(&ino).and_then(|n| n.cache.take())
         };
         if let Some(p) = cache_path {
-            if let Err(e) = std::fs::remove_file(&p) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!("删除缓存文件失败 {}: {e}", p.display());
-                }
-            }
+            remove_cache_files(&p);
         }
         // ③ 再更新占位符状态
         {
             let mut g = self.inner.lock().unwrap();
             let chunk_size = self.chunk_size;
             if let Some(n) = g.nodes.get_mut(&ino) {
+                // 脱水之后没有内容 → 待刷新的新签名直接落到 attr 上
+                n.apply_pending_sig();
                 n.chunks_done = vec![false; n.chunk_count(chunk_size)];
                 n.dirty = false;
             }
@@ -586,8 +1074,30 @@ impl LocalView for FsHandle {
         };
         let was_dir = n.attr.kind == FileType::Directory;
         let kind_changed = was_dir != is_dir;
-        let content_changed =
-            !n.dirty && (n.attr.size != size || epoch_secs(n.attr.mtime) != mtime);
+        let sig_changed = kind_changed || n.attr.size != size || epoch_secs(n.attr.mtime) != mtime;
+        // 本地有未上传改动时本地就是权威（冲突由 sync 引擎按策略解），这里不动内容。
+        let content_changed = !n.dirty && sig_changed;
+
+        // ★ M9：远端又变回本地这一版了 → 取消待刷新的意图。
+        if !sig_changed {
+            n.pending = None;
+            return true;
+        }
+
+        // ★ M9：**有水**（整份都在本地）→ 旧内容继续留着可读，只记下新签名，
+        //   等 daemon 触发后台刷新把新版本整份拉下来再原子换上。
+        //   这期间 `attr` 也保持旧值：内容和元数据必须是一套，否则 `cat` 会读到
+        //   「stat 说 10 MB、实际只有 4 MB」这种自相矛盾的状态。
+        //   脱水（无内容）只更新元数据；部分水合最怕半新半旧 —— 照旧丢掉重下。
+        if content_changed && !kind_changed && n.is_fully_hydrated() {
+            if n.pending != Some((size, mtime)) {
+                n.pending = Some((size, mtime));
+                n.refresh_attempts = 0;
+            }
+            tracing::debug!("远端内容已变、本地有水 → 排队后台刷新 {remote}（{size} 字节）");
+            return true;
+        }
+
         n.attr.size = if is_dir { 0 } else { size };
         n.attr.blocks = n.attr.size.div_ceil(512);
         let t = UNIX_EPOCH + Duration::from_secs(mtime.max(0) as u64);
@@ -604,11 +1114,12 @@ impl LocalView for FsHandle {
             n.attr.size = if is_dir { 0 } else { size };
         }
         if content_changed || kind_changed {
-            // 缓存内容已过期：删掉稀疏缓存、清空区间表 → 下次 read 重新水合
+            // 脱水 / 部分水合 / 类型变了：丢掉旧内容，下次 read 按需水合新版本
             if let Some(p) = n.cache.take() {
-                let _ = std::fs::remove_file(p);
+                remove_cache_files(&p);
             }
             n.chunks_done = vec![false; n.chunk_count(chunk_size)];
+            n.pending = None;
         }
         true
     }
@@ -622,8 +1133,10 @@ impl LocalView for FsHandle {
         let Some(n) = g.nodes.get_mut(&ino) else {
             return false;
         };
+        // 内容要丢了 → 待刷新的新签名先落到 attr 上（元数据跟着远端走）
+        n.apply_pending_sig();
         if let Some(p) = n.cache.take() {
-            let _ = std::fs::remove_file(p);
+            remove_cache_files(&p);
         }
         n.chunks_done = vec![false; n.chunk_count(chunk_size)];
         n.dirty = false;
@@ -646,7 +1159,7 @@ impl LocalView for FsHandle {
             if let Some(n) = g.nodes.remove(&ino) {
                 g.by_remote.remove(&n.remote);
                 if let Some(p) = n.cache {
-                    let _ = std::fs::remove_file(p);
+                    remove_cache_files(&p);
                 }
             }
         }
@@ -668,6 +1181,8 @@ impl LocalView for FsHandle {
             };
             let n = g.nodes.get_mut(&ino).unwrap();
             n.dirty = true;
+            // 本地改动是权威：远端新内容的后台刷新意图作废
+            n.pending = None;
             let cache = n
                 .cache
                 .clone()
@@ -739,6 +1254,118 @@ impl LocalView for FsHandle {
             attempts: 0,
             ephemeral: true,
         })
+    }
+
+    fn apply_listing(&self, dir: &str, entries: &[DirEntry]) {
+        listing_put(&self.inner, dir, Arc::new(entries.to_vec()));
+    }
+
+    fn drop_listing(&self, dir: &str) {
+        listing_drop(&self.inner, dir);
+    }
+
+    /// ★ M9：该路径是否在等后台把远端的新内容换上。
+    ///
+    /// daemon 用它决定「baseline 先不推进」：内容还没真正换新之前，baseline 若先跑到
+    /// 新签名，用户此时基于旧内容改文件就会被误判成「本地覆盖远端」而不是冲突。
+    fn pending_refresh(&self, remote: &str) -> bool {
+        let g = self.inner.lock().unwrap();
+        g.by_remote
+            .get(remote)
+            .and_then(|i| g.nodes.get(i))
+            .map(|n| n.pending.is_some())
+            .unwrap_or(false)
+    }
+
+    /// ★ M9：把远端的新版本整份拉进缓存并**原子换上**（只对「有水」的文件有意义）。
+    ///
+    /// 下载写进 `<cache>.refresh`，全部到位后 `rename` 换上，再把 `attr`/区间表/位图
+    /// 一次性切到新签名。读路径**不等**这次下载：换文件是原子的，换之前读到的是一份
+    /// 完整旧版本、换之后是完整新版本，绝不会读到半新半旧。连续失败 3 次就退回
+    /// 「丢掉旧内容、读到时按需水合」。
+    fn spawn_content_refresh(&self, remote: &str) {
+        let (cache, sig, chunk_size) = {
+            let mut g = self.inner.lock().unwrap();
+            let Some(ino) = g.by_remote.get(remote).copied() else {
+                return;
+            };
+            let chunk_size = self.chunk_size;
+            let Some(n) = g.nodes.get_mut(&ino) else {
+                return;
+            };
+            let Some(sig) = n.pending else {
+                return;
+            };
+            if n.refreshing {
+                return;
+            }
+            let Some(cache) = n.cache.clone() else {
+                return;
+            };
+            n.refreshing = true;
+            (cache, sig, chunk_size)
+        };
+        let (size, mtime) = sig;
+        let tmp = sibling_path(&cache, ".refresh");
+        let ctx = FetchCtx {
+            client: self.client.clone(),
+            peers: self.lan_peers.clone(),
+            stats: self.lan_stats.clone(),
+            timeout: self.hydrate_timeout,
+            hydro: self.hydro.clone(),
+        };
+        let inner = self.inner.clone();
+        let invalidator = self.invalidator.clone();
+        let remote = remote.to_string();
+        tracing::info!("后台刷新内容 {remote}（{size} 字节）");
+        self.rt.spawn(async move {
+            if let Err(e) = refresh_into(&ctx, &remote, &tmp, size, mtime, chunk_size).await {
+                tracing::warn!("后台刷新内容失败 {remote}: {e}");
+                {
+                    let mut g = inner.lock().unwrap();
+                    let found = g.by_remote.get(&remote).copied();
+                    if let Some(n) = found.and_then(|i| g.nodes.get_mut(&i)) {
+                        n.refreshing = false;
+                        n.refresh_attempts = n.refresh_attempts.saturating_add(1);
+                        if n.refresh_attempts >= REFRESH_MAX_ATTEMPTS {
+                            tracing::warn!("后台刷新连续失败，退回按需水合: {remote}");
+                            if let Some(p) = n.cache.take() {
+                                remove_cache_files(&p);
+                            }
+                            n.chunks_done = vec![false; n.chunk_count(chunk_size)];
+                            n.pending = None;
+                            n.refresh_attempts = 0;
+                        }
+                    }
+                }
+                let _ = std::fs::remove_file(&tmp);
+                return;
+            }
+            // 安装：期间没人写过 / 没被脱水 / 签名没又变，才敢换。
+            // ★ 换文件要和 read/write 抢同一把节点锁，所以丢到 blocking 线程池去做 ——
+            //   直接在 async worker 上等一把可能被慢速水合占住几秒的锁会把 runtime 饿死。
+            let (r2, t2, c2) = (remote.clone(), tmp.clone(), cache.clone());
+            let inner2 = inner.clone();
+            let installed = tokio::task::spawn_blocking(move || {
+                install_refreshed(&inner2, &r2, &t2, &c2, size, mtime, chunk_size)
+            })
+            .await
+            .ok()
+            .flatten();
+            let Some(ino) = installed else {
+                // 这轮刷新作废（文件被删/被脱水/又被改/远端又变）
+                let _ = std::fs::remove_file(&tmp);
+                return;
+            };
+            // 内核 page cache 里可能还留着旧内容 —— 换完必须让内核丢掉
+            let f = invalidator.lock().unwrap().clone();
+            if let Some(f) = f {
+                if let Err(e) = f(ino) {
+                    tracing::debug!("刷新后 inval_inode 失败（不影响内容）: {e}");
+                }
+            }
+            tracing::info!("内容已更新到最新版本: {remote}（{size} 字节）");
+        });
     }
 }
 
@@ -928,6 +1555,25 @@ impl FsRuntime {
             .expect("QxyncFs 的 runtime 已关闭")
             .block_on(future)
     }
+
+    fn handle(&self) -> tokio::runtime::Handle {
+        self.0
+            .as_ref()
+            .expect("QxyncFs 的 runtime 已关闭")
+            .handle()
+            .clone()
+    }
+
+    /// 在 FUSE 自己的 runtime 上跑后台任务（补目录清单、后台刷新内容）。
+    fn spawn<F>(&self, future: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.0
+            .as_ref()
+            .expect("QxyncFs 的 runtime 已关闭")
+            .spawn(future);
+    }
 }
 
 impl Drop for FsRuntime {
@@ -973,6 +1619,8 @@ pub struct QxyncFs {
     lan_peers: Arc<Mutex<Vec<PeerConfig>>>,
     /// ★ M7：LAN 直传统计（命中区间数 / 字节 / 尝试次数）。
     lan_stats: Arc<LanStats>,
+    /// ★ M9：目录清单快照的保鲜期（过期只做后台补拉，`readdir` 不等）。
+    dir_ttl: Duration,
 }
 
 /// ★ M7：LAN 快路径计数（`status` 里能看到省了多少次 NAS 请求）。
@@ -1043,6 +1691,9 @@ impl QxyncFs {
             open_count: 0,
             last_access: UNIX_EPOCH,
             op_lock: Arc::new(Mutex::new(())),
+            pending: None,
+            refreshing: false,
+            refresh_attempts: 0,
         };
         let mut nodes = HashMap::new();
         let mut by_remote = HashMap::new();
@@ -1067,13 +1718,22 @@ impl QxyncFs {
                 by_remote,
                 next_ino: 2,
                 inflight_chunks: HashMap::new(),
+                dirs: HashMap::new(),
+                listing_inflight: HashSet::new(),
             })),
             delete_guard: DeleteGuard::new(DEFAULT_DELETE_LIMIT, DEFAULT_DELETE_WINDOW),
             cache_mode: CacheMode::PageCache,
             rules: Arc::new(Rules::temp_only(true)),
             lan_peers: Arc::new(Mutex::new(Vec::new())),
             lan_stats: Arc::new(LanStats::default()),
+            dir_ttl: DEFAULT_DIR_TTL,
         })
+    }
+
+    /// ★ M9：目录清单快照保鲜期（默认 30s；过期只在后台补拉）。
+    pub fn with_dir_ttl(mut self, d: Duration) -> Self {
+        self.dir_ttl = d;
+        self
     }
 
     /// 覆盖水合超时（大文件 + 慢链路时可以放大；M1 是整文件水合，M2 改成区间后就不敏感了）。
@@ -1147,6 +1807,12 @@ impl QxyncFs {
             cache_mode: self.cache_mode,
             rules: self.rules.clone(),
             lan_stats: self.lan_stats.clone(),
+            client: self.client.clone(),
+            rt: self.rt.handle(),
+            hydrate_timeout: self.hydrate_timeout,
+            lan_peers: self.lan_peers.clone(),
+            hydro: self.hydro.clone(),
+            invalidator: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1171,55 +1837,14 @@ impl QxyncFs {
         self
     }
 
-    /// ★ M7：一次区间水合先试 LAN。返回 `None` = 没有可用对端（调用方走 NAS）。
-    ///
-    /// 判据（与 `peer::fetch_range` 一致）：对端 `head` 必须 `exists && hydrated`，
-    /// 且 `size`/`mtime` 与本节点从 NAS `stat` 拿到的签名一致 —— 只有「同一份内容」才敢用。
-    fn lan_fetch_chunk(
-        &self,
-        remote: &str,
-        offset: u64,
-        len: u64,
-        expect_size: u64,
-        expect_mtime: i64,
-    ) -> Option<Vec<u8>> {
-        if len == 0 {
-            return None;
-        }
-        let peers = {
-            let g = self.lan_peers.lock().unwrap();
-            if g.is_empty() {
-                return None;
-            }
-            g.clone()
-        };
-        self.lan_stats.attempts.fetch_add(1, Ordering::Relaxed);
-        let hit = self.rt.block_on(peer::fetch_range(
-            &peers,
-            remote,
-            offset,
-            len,
-            expect_size,
-            expect_mtime,
-        ));
-        match hit {
-            Some(h) => {
-                self.lan_stats.hits.fetch_add(1, Ordering::Relaxed);
-                self.lan_stats
-                    .bytes
-                    .fetch_add(h.data.len() as u64, Ordering::Relaxed);
-                tracing::info!(
-                    "LAN 直传命中: {remote} [{offset}..{}) ← {} ({:?})",
-                    offset + len,
-                    h.peer,
-                    h.took
-                );
-                Some(h.data)
-            }
-            None => {
-                self.lan_stats.mismatches.fetch_add(1, Ordering::Relaxed);
-                None
-            }
+    /// ★ M9：构造一次区间下载的上下文（前台水合与后台内容刷新共用同一套路径）。
+    fn fetch_ctx(&self) -> FetchCtx {
+        FetchCtx {
+            client: self.client.clone(),
+            peers: self.lan_peers.clone(),
+            stats: self.lan_stats.clone(),
+            timeout: self.hydrate_timeout,
+            hydro: self.hydro.clone(),
         }
     }
 
@@ -1345,6 +1970,20 @@ impl QxyncFs {
         if let Some(node) = self.node_by_remote(&remote) {
             return Ok(node);
         }
+        // ★ M9：先看父目录的清单快照（= NAS 文件列表的本地映射）。
+        //   有快照就**不用问 NAS**：命中直接建节点，没命中直接 ENOENT。
+        //   快照过期只在后台补拉，绝不在这里等一次往返。
+        if let Some(hit) = listing_lookup(&self.inner, &parent_remote, name) {
+            let Some(entry) = hit else {
+                return Err(fuser::Errno::ENOENT);
+            };
+            // 目录限定规则（`/cache/`）要拿到实际类型才能判
+            if self.hide_reason(&remote, entry.isfolder).is_some() {
+                return Err(fuser::Errno::ENOENT);
+            }
+            return Ok(self.insert_node(parent, name, &remote, &entry));
+        }
+        // 冷路径（这个目录还从没列过）：问一次 NAS stat，答案只影响这一个名字。
         let entry = match self.rt.block_on(self.client.stat(&parent_remote, name)) {
             Ok(Some(e)) => e,
             Ok(None) => return Err(fuser::Errno::ENOENT),
@@ -1388,6 +2027,9 @@ impl QxyncFs {
             open_count: 0,
             last_access: SystemTime::now(),
             op_lock: Arc::new(Mutex::new(())),
+            pending: None,
+            refreshing: false,
+            refresh_attempts: 0,
         };
         g.nodes.insert(ino, node.clone());
         g.by_remote.insert(remote.to_string(), ino);
@@ -1404,13 +2046,7 @@ impl QxyncFs {
                 .remote
                 .clone()
         };
-        let entries = match self.rt.block_on(self.client.list(&remote)) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!("readdir {remote} 失败: {e}");
-                return Err(fuser::Errno::EIO);
-            }
-        };
+        let entries = self.dir_entries(&remote)?;
         let visible = self.filter_visible(&remote, &entries);
         let hidden = entries.len().saturating_sub(visible.len());
         let mut out = Vec::with_capacity(visible.len());
@@ -1422,6 +2058,35 @@ impl QxyncFs {
             tracing::debug!("readdir {remote}: 规则隐藏了 {hidden} 项");
         }
         Ok(out)
+    }
+
+    /// ★ M9：取一个目录的清单 —— **有本地快照就直接吃**，没有才同步问一次 NAS。
+    ///
+    /// 快照过期（超过 [`DEFAULT_DIR_TTL`]）时只丢一个后台补拉任务出去，调用方不等：
+    /// `ls` 该多快就多快。定时刷新由 daemon 轮询推送（[`FsHandle::apply_listing`]）。
+    fn dir_entries(&self, remote: &str) -> Result<Arc<Vec<DirEntry>>, fuser::Errno> {
+        if let Some(list) = listing_get(&self.inner, remote) {
+            if list.fetched.elapsed() >= self.dir_ttl && begin_listing_refresh(&self.inner, remote)
+            {
+                tracing::debug!("目录清单过期，后台补拉 {remote}");
+                self.rt.spawn(run_listing_refresh(
+                    self.inner.clone(),
+                    self.client.clone(),
+                    remote.to_string(),
+                ));
+            }
+            return Ok(list.entries);
+        }
+        let entries = match self.rt.block_on(self.client.list(remote)) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("readdir {remote} 失败: {e}");
+                return Err(fuser::Errno::EIO);
+            }
+        };
+        let arc = Arc::new(entries);
+        listing_put(&self.inner, remote, arc.clone());
+        Ok(arc)
     }
 
     /// ★ M7：readdir 的过滤闸门（抽出来是为了**不挂 FUSE 也能单测**）。
@@ -1575,10 +2240,25 @@ impl QxyncFs {
         {
             let mut g = self.inner.lock().unwrap();
             let remote = join_path(&parent_remote, name);
-            if let Some(i) = g.by_remote.remove(&remote) {
-                g.nodes.remove(&i);
+            let prefix = format!("{}/", remote.trim_end_matches('/'));
+            let victims: Vec<INodeNo> = g
+                .by_remote
+                .iter()
+                .filter(|(p, _)| p.as_str() == remote || p.starts_with(&prefix))
+                .map(|(_, ino)| *ino)
+                .collect();
+            for ino in victims {
+                if let Some(n) = g.nodes.remove(&ino) {
+                    g.by_remote.remove(&n.remote);
+                    // ★ M9：本地删除同时清掉「内容 + 位图」，别让同名新文件认领到旧内容
+                    if let Some(p) = n.cache {
+                        remove_cache_files(&p);
+                    }
+                }
             }
         }
+        // ★ M9：本地删除立刻从「映射」里摘掉，否则旧快照会把删掉的名字复活成幽灵节点
+        listing_remove(&self.inner, &parent_remote, name);
         tracing::debug!(
             "{} {}",
             if is_dir { "rmdir" } else { "unlink" },
@@ -1597,6 +2277,8 @@ impl QxyncFs {
             let mut g = self.inner.lock().unwrap();
             let n = g.nodes.get_mut(&ino).ok_or(fuser::Errno::ENOENT)?;
             n.dirty = true;
+            // 本地改动是权威：远端新内容的后台刷新意图作废
+            n.pending = None;
             let cache = n.cache.clone().ok_or(fuser::Errno::EIO)?;
             (
                 n.remote.clone(),
@@ -1650,23 +2332,34 @@ impl QxyncFs {
             return;
         }
         let chunk_size = self.chunk_size;
-        let mut g = self.inner.lock().unwrap();
-        if let Some(n) = g.nodes.get_mut(&ino) {
-            let want = n.chunk_count(chunk_size);
-            if n.chunks_done.len() < want {
-                n.chunks_done.resize(want, false);
-            }
-            let end = offset + len;
-            let (first, last) = chunk_indices(offset, len, chunk_size);
-            for idx in first..=last {
-                let c_start = idx * chunk_size;
-                let c_end = ((idx + 1) * chunk_size).min(n.attr.size);
-                if c_start >= offset && c_end <= end {
-                    if let Some(slot) = n.chunks_done.get_mut(idx as usize) {
-                        *slot = true;
+        let mut flipped = false;
+        {
+            let mut g = self.inner.lock().unwrap();
+            if let Some(n) = g.nodes.get_mut(&ino) {
+                let want = n.chunk_count(chunk_size);
+                if n.chunks_done.len() < want {
+                    n.chunks_done.resize(want, false);
+                }
+                let end = offset + len;
+                let (first, last) = chunk_indices(offset, len, chunk_size);
+                for idx in first..=last {
+                    let c_start = idx * chunk_size;
+                    let c_end = ((idx + 1) * chunk_size).min(n.attr.size);
+                    if c_start >= offset && c_end <= end {
+                        if let Some(slot) = n.chunks_done.get_mut(idx as usize) {
+                            if !*slot {
+                                *slot = true;
+                                flipped = true;
+                            }
+                        }
                     }
                 }
             }
+        }
+        // ★ M9：本地写入同样是「已有内容」。只在**真的有区间翻成就绪**时落盘：
+        //   4 KB 一块的小写不该每写一次就重写一遍位图（`release` 时还有一次兜底落盘）。
+        if flipped {
+            persist_chunk_state(&self.inner, chunk_size, ino);
         }
     }
 
@@ -1677,15 +2370,66 @@ impl QxyncFs {
     }
 
     /// 缓存文件（懒创建）：**apparent size = 文件大小**，用 `set_len` 造稀疏文件。
+    ///
+    /// ★ M9：**先认领磁盘上已有的缓存**。节点表是内存态，重建节点后 `chunks_done`
+    /// 本来是空的；如果缓存文件 + 位图（`.qxstate`）都还在、且远端签名（size/mtime）
+    /// 与本节点一致，就直接把区间表恢复出来 —— `read()` 于是完全不用问 NAS。
     fn cache_file_for(&self, ino: INodeNo) -> Result<PathBuf, fuser::Errno> {
-        let mut g = self.inner.lock().unwrap();
+        let (remote, name, size, mtime, existing) = {
+            let g = self.inner.lock().unwrap();
+            let n = g.nodes.get(&ino).ok_or(fuser::Errno::ENOENT)?;
+            (
+                n.remote.clone(),
+                n.name.clone(),
+                n.attr.size,
+                epoch_secs(n.attr.mtime),
+                n.cache.clone(),
+            )
+        };
+        if let Some(p) = existing {
+            return Ok(p);
+        }
         let chunk_size = self.chunk_size;
+        let path = self.cache_path(&remote, &name);
+
+        // ① 认领：位图签名与节点一致 + 内容文件长度对得上，才敢信。
+        let adopted = if path.is_file() {
+            state_load(&path).and_then(|st| {
+                let len_ok = std::fs::metadata(&path)
+                    .map(|m| m.len() == size)
+                    .unwrap_or(false);
+                if st.chunk_size == chunk_size && st.size == size && st.mtime == mtime && len_ok {
+                    Some(st.done)
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+
+        let mut g = self.inner.lock().unwrap();
         let n = g.nodes.get_mut(&ino).ok_or(fuser::Errno::ENOENT)?;
+        // 竞态兜底：拿锁期间别人可能已经建好了
         if let Some(p) = &n.cache {
             return Ok(p.clone());
         }
-        let remote = n.remote.clone();
-        let path = self.cache_path(&remote, &n.name);
+        let want = n.chunk_count(chunk_size);
+        if let Some(mut done) = adopted {
+            // size 在拿锁期间变了 → 认领作废
+            if n.attr.size == size {
+                done.resize(want, false);
+                tracing::debug!(
+                    "认领已有缓存 {remote}（{}/{} 区间已就绪）",
+                    done.iter().filter(|d| **d).count(),
+                    want
+                );
+                n.chunks_done = done;
+                n.cache = Some(path.clone());
+                return Ok(path);
+            }
+        }
+
         let f = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -1700,7 +2444,7 @@ impl QxyncFs {
             tracing::error!("设置缓存文件大小失败 {}: {e}", path.display());
             fuser::Errno::EIO
         })?;
-        n.chunks_done = vec![false; n.chunk_count(chunk_size)];
+        n.chunks_done = vec![false; want];
         n.cache = Some(path.clone());
         Ok(path)
     }
@@ -1749,13 +2493,12 @@ impl QxyncFs {
             return Ok(());
         }
 
-        let (remote, total, name, dest, mtime) = {
+        let (remote, total, dest, mtime) = {
             let g = self.inner.lock().unwrap();
             let n = g.nodes.get(&ino).ok_or(fuser::Errno::ENOENT)?;
             (
                 n.remote.clone(),
                 n.attr.size,
-                n.name.clone(),
                 n.cache.clone().ok_or(fuser::Errno::EIO)?,
                 Self::epoch_of(n.attr.mtime),
             )
@@ -1765,43 +2508,27 @@ impl QxyncFs {
             self.inner.lock().unwrap().inflight_chunks.remove(&key);
             return Err(fuser::Errno::EACCES);
         }
-        let dir = remote
-            .rsplit_once('/')
-            .map(|(d, _)| d.to_string())
-            .unwrap_or_else(|| self.remote_root.clone());
-
         let start = idx * self.chunk_size;
         let end = (start + self.chunk_size).min(total) - 1; // 闭区间，末块按文件尾截断
         let want = end - start + 1;
 
-        // ★ M7：LAN 快路径 —— 先问已配对的对端有没有这份内容（元数据必须与 NAS 签名一致）。
-        //   命中就完全跳过 NAS；没命中/对端不靠谱（长度不符）就走下面的 NAS 老路。
-        let data = match self.lan_fetch_chunk(&remote, start, want, total, mtime) {
-            Some(d) => {
-                tracing::debug!("LAN 直传命中: {remote} [{start}..={start}+{want})");
-                d
+        // ★ M7/M9：LAN 快路径 → NAS 回落，走同一套区间下载原语（后台内容刷新也用它）。
+        let ctx = self.fetch_ctx();
+        let timeout = self.hydrate_timeout;
+        let data = match self
+            .rt
+            .block_on(fetch_chunk_bytes(&ctx, &remote, start, end, total, mtime))
+        {
+            Ok(d) => d,
+            Err(ChunkFetchError::Timeout) => {
+                tracing::warn!("区间水合超时({timeout:?}): {remote} [{start}..={end}]");
+                self.inner.lock().unwrap().inflight_chunks.remove(&key);
+                return Err(fuser::Errno::EIO);
             }
-            None => {
-                let client = self.client.clone();
-                let (d2, n2) = (dir.clone(), name.clone());
-                let timeout = self.hydrate_timeout;
-                let res = self.rt.block_on(async move {
-                    tokio::time::timeout(timeout, client.download_range(&d2, &n2, start, end)).await
-                });
-
-                match res {
-                    Err(_) => {
-                        tracing::warn!("区间水合超时({timeout:?}): {remote} [{start}..={end}]");
-                        self.inner.lock().unwrap().inflight_chunks.remove(&key);
-                        return Err(fuser::Errno::EIO);
-                    }
-                    Ok(Err(e)) => {
-                        tracing::warn!("区间水合失败: {remote} [{start}..={end}]: {e}");
-                        self.inner.lock().unwrap().inflight_chunks.remove(&key);
-                        return Err(fuser::Errno::EIO);
-                    }
-                    Ok(Ok(d)) => d,
-                }
+            Err(e) => {
+                tracing::warn!("区间水合失败: {remote} [{start}..={end}]: {e}");
+                self.inner.lock().unwrap().inflight_chunks.remove(&key);
+                return Err(fuser::Errno::EIO);
             }
         };
 
@@ -1836,7 +2563,8 @@ impl QxyncFs {
             }
             g.inflight_chunks.remove(&key);
         }
-        self.hydro.record(data.len() as u64);
+        // ★ M9：位图落盘 —— 下次挂载/节点重建时这份内容才算「已经缓存过」。
+        persist_chunk_state(&self.inner, self.chunk_size, ino);
         tracing::debug!("区间就绪: {remote} [{start}..={end}] ({want} 字节)");
         Ok(())
     }
@@ -2261,6 +2989,8 @@ impl Filesystem for QxyncFs {
         }
         let entry = DirEntry::local(name, false, 0, Self::epoch_of(SystemTime::now()));
         let node = self.insert_node(parent, name, &remote, &entry);
+        // ★ M9：本地新建立刻进「映射」，不然下一次 readdir/lookup 又从旧快照里看不到它
+        listing_upsert(&self.inner, &parent_remote, &entry);
         if let Err(e) = self.cache_file_for(node.ino) {
             return reply.error(e);
         }
@@ -2312,6 +3042,8 @@ impl Filesystem for QxyncFs {
         }
         let entry = DirEntry::local(name, true, 0, Self::epoch_of(SystemTime::now()));
         let node = self.insert_node(parent, name, &remote, &entry);
+        // ★ M9：本地新建目录立刻进「映射」
+        listing_upsert(&self.inner, &parent_remote, &entry);
         reply.entry(&ENTRY_TTL, &node.attr, Generation(0));
     }
 
@@ -2409,10 +3141,41 @@ impl Filesystem for QxyncFs {
             g.by_remote.remove(&old_remote);
             g.by_remote.insert(new_remote.clone(), ino);
             if let Some(n) = g.nodes.get_mut(&ino) {
+                // ★ M9：缓存文件（+ 位图）跟着改名走，否则重启后新名字认领不到旧内容
+                if let Some(old_cache) = n.cache.clone() {
+                    let new_cache = self.cache_path(&new_remote, newname);
+                    if old_cache != new_cache {
+                        match std::fs::rename(&old_cache, &new_cache) {
+                            Ok(()) => {
+                                let _ =
+                                    std::fs::rename(state_path(&old_cache), state_path(&new_cache));
+                                n.cache = Some(new_cache);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "改名后迁移缓存失败 {} -> {}: {e}",
+                                    old_cache.display(),
+                                    new_cache.display()
+                                );
+                            }
+                        }
+                    }
+                }
                 n.name = newname.to_string();
                 n.remote = new_remote.clone();
                 n.parent = newparent;
             }
+        }
+        // ★ M9：改名同步到「映射」：旧名字摘掉、新名字补上
+        listing_remove(&self.inner, &parent_remote, name);
+        if let Some(node) = self.node_by_remote(&new_remote) {
+            let e = DirEntry::local(
+                newname,
+                node.attr.kind == FileType::Directory,
+                node.attr.size,
+                Self::epoch_of(node.attr.mtime),
+            );
+            listing_upsert(&self.inner, &newparent_remote, &e);
         }
         tracing::debug!("rename {old_remote} -> {new_remote}");
         reply.ok();
@@ -2563,6 +3326,9 @@ impl Filesystem for QxyncFs {
                 n.last_access = SystemTime::now();
             }
         }
+        // ★ M9：关文件时把位图按**最终**的 size/mtime 落一次盘 ——
+        //   本地改写过的文件在下次挂载时也能直接认领，不必重新拉一遍。
+        persist_chunk_state(&self.inner, self.chunk_size, ino);
         reply.ok();
     }
 
@@ -2745,6 +3511,9 @@ mod tests {
             open_count: 0,
             last_access: UNIX_EPOCH,
             op_lock: Arc::new(Mutex::new(())),
+            pending: None,
+            refreshing: false,
+            refresh_attempts: 0,
         };
         assert_eq!(n.state_str(), "placeholder");
         n.chunks_done[0] = true;
@@ -3578,6 +4347,330 @@ mod tests {
             Some(libc::EIO),
             "单根 ROOT 仍然走 NAS"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------ ★ M9：缓存优先 / 映射本地化
+
+    /// 位图编解码往返 + 损坏防护。
+    #[test]
+    fn chunk_state_roundtrip_and_rejects_corruption() {
+        let st = ChunkState {
+            chunk_size: 128 * 1024,
+            size: 300 * 1024,
+            mtime: 12345,
+            done: vec![true, false, true],
+        };
+        let buf = {
+            // 用和 state_save 一样的编码路径（写盘再读回）
+            let dir = m7_tmpdir("state-rt");
+            let cache = dir.join("c.bin");
+            std::fs::write(&cache, b"x").unwrap();
+            state_save(&cache, &st).unwrap();
+            let got = state_load(&cache).unwrap();
+            assert_eq!(got, st);
+            std::fs::read(state_path(&cache)).unwrap()
+        };
+        assert_eq!(state_decode(&buf).unwrap(), st);
+
+        // 区间数和 size/chunk_size 对不上（损坏/被截断）→ 一律不认
+        let mut bad = buf.clone();
+        bad[36] = 0xFF;
+        assert!(state_decode(&bad).is_none(), "自洽性校验必须挡住损坏位图");
+        assert!(state_decode(b"not a qxstate file").is_none());
+        assert!(state_decode(&buf[..STATE_HEAD]).is_none());
+    }
+
+    /// ★ M9 的核心回归：**磁盘上已经缓存好的内容，重建节点后仍然算数**。
+    ///
+    /// 修复前 `cache_file_for` 把区间表清成全 `false`，`read` 于是又去 NAS 拉一遍
+    /// （「缓存过的文件 cat 还要等几秒」）。这里用 `nas.invalid` 当 NAS：只要还去问
+    /// NAS 就一定失败，所以 `ensure_range` 成功 == 完全没碰网络。
+    #[test]
+    fn cached_content_is_reused_after_node_recreation() {
+        let dir = m7_tmpdir("m9-adopt");
+        let size = 300 * 1024u64;
+        let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        let entry = DirEntry::local("cached.bin", false, size, 777);
+
+        // 第一个「挂载会话」：把内容写到缓存文件 + 位图落盘
+        let cache = {
+            let fs = test_fs(&dir, false);
+            let node = fs.insert_node(INodeNo::ROOT, "cached.bin", "/home/cached.bin", &entry);
+            let cache = fs.cache_file_for(node.ino).unwrap();
+            std::fs::write(&cache, &payload).unwrap();
+            fs.mark_written_chunks(node.ino, 0, size);
+            {
+                let g = fs.inner.lock().unwrap();
+                assert!(
+                    g.nodes.get(&node.ino).unwrap().is_fully_hydrated(),
+                    "写完全文件后应当是全水合"
+                );
+            }
+            assert!(state_path(&cache).is_file(), "位图必须落盘");
+            cache
+        };
+        assert!(cache.is_file());
+
+        // 第二个「挂载会话」：节点表是空的（模拟 daemon 重启 / 重新 lookup）
+        let fs = test_fs(&dir, false);
+        let node = fs.insert_node(INodeNo::ROOT, "cached.bin", "/home/cached.bin", &entry);
+        // 认领发生在 cache_file_for 里
+        let path = fs.cache_file_for(node.ino).unwrap();
+        assert_eq!(
+            fs.node_state_for_test(node.ino),
+            "hydrated",
+            "必须认领已有位图"
+        );
+        assert_eq!(path, cache);
+        // 读区间完全走本地（nas.invalid 一旦被问到必然失败）
+        let got = fs.ensure_range(node.ino, 0, size).unwrap();
+        let bytes = std::fs::read(&got).unwrap();
+        assert_eq!(bytes, payload, "认领到的内容必须原样可读");
+
+        // 远端签名变了（mtime 不同）→ 位图作废，不许拿旧内容冒充新版本
+        let stale = DirEntry::local("cached.bin", false, size, 778);
+        let node2 = fs.insert_node(INodeNo::ROOT, "cached.bin", "/home/other.bin", &stale);
+        fs.cache_file_for(node2.ino).unwrap();
+        assert_eq!(fs.node_state_for_test(node2.ino), "placeholder");
+        assert!(
+            fs.ensure_chunk(node2.ino, 0).is_err(),
+            "签名不符必须回去问 NAS（这里必然失败）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M9：目录清单快照就是「映射」—— 有快照时 `readdir`/`lookup` 不再问 NAS。
+    #[test]
+    fn dir_listing_snapshot_serves_readdir_and_lookup_without_nas() {
+        let dir = m7_tmpdir("m9-dirlist");
+        let fs = test_fs(&dir, false);
+        let h = fs.handle();
+        assert_eq!(h.listing_count(), 0);
+
+        // 没有快照 → 只能问 NAS（nas.invalid）→ EIO
+        assert_eq!(
+            fs.load_children(INodeNo::ROOT).err().map(|e| e.code()),
+            Some(libc::EIO)
+        );
+
+        // daemon 的定时轮询把清单推进来
+        h.apply_listing(
+            "/home",
+            &[
+                DirEntry::local("a.txt", false, 10, 1),
+                DirEntry::local("d", true, 0, 1),
+            ],
+        );
+        assert_eq!(h.listing_count(), 1);
+
+        // 之后 readdir / lookup 全部吃本地快照（内容与 NAS 无关）
+        let kids = fs.load_children(INodeNo::ROOT).unwrap();
+        let mut names: Vec<String> = kids.iter().map(|n| n.name.clone()).collect();
+        names.sort();
+        assert_eq!(names, vec!["a.txt".to_string(), "d".to_string()]);
+
+        let n = fs.lookup_child(INodeNo::ROOT, "a.txt").unwrap();
+        assert_eq!((n.attr.size, n.attr.kind), (10, FileType::RegularFile));
+        // 清单里没有的名字 → 直接 ENOENT，同样不用问 NAS
+        assert_eq!(
+            fs.lookup_child(INodeNo::ROOT, "nope.txt")
+                .err()
+                .map(|e| e.code()),
+            Some(libc::ENOENT)
+        );
+
+        // 远端目录没了 → 丢快照（下一次访问重新问 NAS）
+        h.drop_listing("/home");
+        assert_eq!(h.listing_count(), 0);
+        assert!(fs.load_children(INodeNo::ROOT).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 造一个「整份都在本地」的节点：内容 + 位图都真落盘。
+    fn hydrated_node(
+        fs: &QxyncFs,
+        name: &str,
+        remote: &str,
+        payload: &[u8],
+        mtime: i64,
+    ) -> (INodeNo, PathBuf) {
+        let entry = DirEntry::local(name, false, payload.len() as u64, mtime);
+        let node = fs.insert_node(INodeNo::ROOT, name, remote, &entry);
+        let cache = fs.cache_file_for(node.ino).unwrap();
+        std::fs::write(&cache, payload).unwrap();
+        fs.mark_written_chunks(node.ino, 0, payload.len() as u64);
+        (node.ino, cache)
+    }
+
+    /// ★ M9：远端内容变了、本地有水 → **旧内容继续可读**（attr 也跟着旧，不许打架），
+    /// 只挂一个「待后台刷新」的意图出来；脱水文件则只更元数据。
+    #[test]
+    fn hydrated_node_keeps_serving_old_content_until_refresh_lands() {
+        let dir = m7_tmpdir("m9-pending");
+        let fs = test_fs(&dir, false);
+        let old: Vec<u8> = (0..300 * 1024u32).map(|i| (i % 253) as u8).collect();
+        let (ino, cache) = hydrated_node(&fs, "a.bin", "/home/a.bin", &old, 1000);
+        let h = fs.handle();
+
+        // 远端换成了 400 KiB 的新版本
+        assert!(h.apply_remote_meta("/home/a.bin", false, 400 * 1024, 2000));
+        let n = h.node("/home/a.bin").unwrap();
+        assert_eq!(
+            (n.size, n.mtime),
+            (300 * 1024, 1000),
+            "有水的文件在刷新落地前必须保持旧签名：内容与元数据得是一套"
+        );
+        assert!(h.pending_refresh("/home/a.bin"), "必须挂上待刷新意图");
+        assert!(cache.is_file(), "旧内容不能被提前删掉");
+
+        // 读路径完全走本地（nas.invalid 一被问到就必失败）
+        let got = std::fs::read(fs.ensure_range(ino, 0, old.len() as u64).unwrap()).unwrap();
+        assert_eq!(got, old);
+
+        // 远端又变回本地这一版 → 刷新意图取消
+        assert!(h.apply_remote_meta("/home/a.bin", false, 300 * 1024, 1000));
+        assert!(!h.pending_refresh("/home/a.bin"));
+
+        // 脱水文件（没有区间就绪）：直接吃新元数据，不排队刷新
+        let e = DirEntry::local("dry.bin", false, 10, 1);
+        let dry = fs.insert_node(INodeNo::ROOT, "dry.bin", "/home/dry.bin", &e);
+        fs.cache_file_for(dry.ino).unwrap();
+        assert!(h.apply_remote_meta("/home/dry.bin", false, 20, 2));
+        let n = h.node("/home/dry.bin").unwrap();
+        assert_eq!((n.size, n.mtime), (20, 2), "脱水文件只更元数据");
+        assert!(!h.pending_refresh("/home/dry.bin"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M9：后台刷新「原子换上」—— 内容、大小、mtime、区间表、位图一次切换；
+    /// 换完再挂载一次（新节点表）仍然认领得到这份新内容。
+    #[test]
+    fn install_refreshed_swaps_content_metadata_and_bitmap_atomically() {
+        let dir = m7_tmpdir("m9-install");
+        let old = vec![1u8; 300 * 1024];
+        let new = vec![2u8; 400 * 1024];
+        let (ino, cache) = {
+            let fs = test_fs(&dir, false);
+            let (ino, cache) = hydrated_node(&fs, "a.bin", "/home/a.bin", &old, 1000);
+            let h = fs.handle();
+            h.apply_remote_meta("/home/a.bin", false, new.len() as u64, 2000);
+            assert!(h.pending_refresh("/home/a.bin"));
+            // 后台下载好的「新版本」临时文件
+            let tmp = sibling_path(&cache, ".refresh");
+            std::fs::write(&tmp, &new).unwrap();
+            let installed = install_refreshed(
+                &fs.inner,
+                "/home/a.bin",
+                &tmp,
+                &cache,
+                new.len() as u64,
+                2000,
+                DEFAULT_CHUNK_SIZE,
+            );
+            assert_eq!(installed, Some(ino));
+            assert!(!tmp.exists(), "临时文件必须被 rename 掉");
+            assert!(!h.pending_refresh("/home/a.bin"));
+            let n = h.node("/home/a.bin").unwrap();
+            assert_eq!((n.size, n.mtime), (new.len() as u64, 2000));
+            assert_eq!(std::fs::read(&cache).unwrap(), new);
+            // 位图也切到了新签名
+            let st = state_load(&cache).unwrap();
+            assert_eq!((st.size, st.mtime), (new.len() as u64, 2000));
+            assert!(st.done.iter().all(|d| *d));
+            drop(fs);
+            (ino, cache)
+        };
+        let _ = ino;
+
+        // 新挂载会话：位图签名是新的 → 直接认领，读出来的就是新版本（不碰 NAS）
+        let fs2 = test_fs(&dir, false);
+        let e2 = DirEntry::local("a.bin", false, new.len() as u64, 2000);
+        let n2 = fs2.insert_node(INodeNo::ROOT, "a.bin", "/home/a.bin", &e2);
+        let p2 = fs2.cache_file_for(n2.ino).unwrap();
+        assert_eq!(p2, cache);
+        assert_eq!(fs2.node_state_for_test(n2.ino), "hydrated");
+        let got = std::fs::read(fs2.ensure_range(n2.ino, 0, new.len() as u64).unwrap()).unwrap();
+        assert_eq!(got, new);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M9：安装前节点变了（用户写了 / 被脱水）→ 这轮刷新作废，绝不覆盖用户改动。
+    #[test]
+    fn install_refreshed_aborts_when_node_changed() {
+        let dir = m7_tmpdir("m9-install-abort");
+        let fs = test_fs(&dir, false);
+        let old = vec![3u8; 300 * 1024];
+        let new = vec![4u8; 400 * 1024];
+        let (ino, cache) = hydrated_node(&fs, "a.bin", "/home/a.bin", &old, 1000);
+        let h = fs.handle();
+        h.apply_remote_meta("/home/a.bin", false, new.len() as u64, 2000);
+        let tmp = sibling_path(&cache, ".refresh");
+        std::fs::write(&tmp, &new).unwrap();
+
+        // 期间用户改了内容（dirty）→ 作废
+        {
+            let mut g = fs.inner.lock().unwrap();
+            g.nodes.get_mut(&ino).unwrap().dirty = true;
+        }
+        assert_eq!(
+            install_refreshed(
+                &fs.inner,
+                "/home/a.bin",
+                &tmp,
+                &cache,
+                new.len() as u64,
+                2000,
+                DEFAULT_CHUNK_SIZE
+            ),
+            None
+        );
+        assert_eq!(std::fs::read(&cache).unwrap(), old, "用户内容不许被覆盖");
+        assert!(tmp.exists(), "作废的临时文件留给调用方清理");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M9：后台刷新一直失败（NAS 不可达）→ 连续 3 次后退回「按需水合」，
+    /// 并且不能卡死 `refreshing` 标志。
+    #[test]
+    fn content_refresh_falls_back_to_on_demand_after_failures() {
+        let dir = m7_tmpdir("m9-refresh-fail");
+        let fs = test_fs(&dir, false).with_hydrate_timeout(Duration::from_millis(200));
+        let old = vec![5u8; 300 * 1024];
+        let (ino, cache) = hydrated_node(&fs, "a.bin", "/home/a.bin", &old, 1000);
+        let h = fs.handle();
+        h.apply_remote_meta("/home/a.bin", false, 400 * 1024, 2000);
+        assert!(h.pending_refresh("/home/a.bin"));
+
+        for _ in 0..6 {
+            h.spawn_content_refresh("/home/a.bin");
+            for _ in 0..200 {
+                let busy = {
+                    let g = fs.inner.lock().unwrap();
+                    g.nodes.get(&ino).map(|n| n.refreshing).unwrap_or(false)
+                };
+                if !busy {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            if fs.node_state_for_test(ino) == "placeholder" {
+                break;
+            }
+        }
+        assert_eq!(
+            fs.node_state_for_test(ino),
+            "placeholder",
+            "一直刷不动就该丢掉旧内容、退回按需水合"
+        );
+        assert!(!cache.exists());
+        assert!(!h.pending_refresh("/home/a.bin"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

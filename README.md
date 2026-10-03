@@ -44,6 +44,7 @@ NAS 上的文件在本地只是一个「占位符」，`ls -l` 显示真实大�
 | 能力 | 说明 | 文档 |
 |---|---|---|
 | **按需水合** | 占位符 + **128 KiB 区间**按需下载（`head -c 100 big.bin` 只取 1 个区间，不是整个文件） | [M1.5](docs/M1.5-设计.md) |
+| **缓存优先** | 磁盘上已有的内容**认领即用**（水合位图随内容落盘），缓存命中的 `cat` **零 NAS 往返**；`ls`/`lookup` 吃 NAS 文件列表的本地快照（定时刷新），不再每次等网 | [M9](docs/M9-缓存优先与映射.md) |
 | **读写挂载** | `--rw` 后本地改动经上传队列推回 NAS；写前 **read-modify-write**，绝不把没取回的区间当 0 上传 | [M2b](docs/M2b-写路径.md) |
 | **变更发现** | 三游标轮询 + baseline 三向对账；冲突生成**冲突副本**，远端批量删除有**熔断**保护 | [M2c](docs/M2c-变更发现.md) |
 | **脱水（释放空间）** | 完整安全检查链（pin / 未上传改动 / 打开的 fd / 被 mmap / 正在水合 / 刚访问过）后才清本地内容 | [M3](docs/M3-脱水.md) |
@@ -287,7 +288,8 @@ pin=pinned/excluded、未上传改动/队列在途、打开的 fd、被 mmap（�
 
 **变更发现以 baseline 对账为主路径**：daemon 每 30s（`QXNYC_POLL_INTERVAL` 可调）跑一轮
 「三游标 + baseline 对账」—— 先拉事件快路径，再按「已知目录列举 + baseline 差集」兜底。
-远端改动 → 刷新元数据并**失效本地缓存**（下次读按需水合新内容）；双方都改 → **冲突副本**
+远端改动 → 本地**有水**就留着旧内容继续可读、后台整份拉新版本**原子换上**（换上前 `cat` 拿到的是完整旧版本），
+**脱水**就只更元数据；双方都改 → **冲突副本**
 （远端占原名，本地内容存 `xxx (conflicted copy from <设备> <日期>).txt` 并上传）；
 远端批量删除 → **熔断**（`qxync sync --force-deletes` 才放行）。
 
@@ -512,6 +514,7 @@ cargo test -p qxync-daemon -- --ignored --test-threads=1 --nocapture     # M2c �
 | [`docs/M2b-写路径.md`](docs/M2b-写路径.md) | 写路径：真机写接口契约、read-modify-write 铁则、上传队列 |
 | [`docs/M2c-变更发现.md`](docs/M2c-变更发现.md) | 三游标/事件契约、三向决策表、冲突副本、删除保护 |
 | [`docs/M3-脱水.md`](docs/M3-脱水.md) | 安全检查链、`inval_inode` 顺序铁则、闲置/限额、cache-mode |
+| [`docs/M9-缓存优先与映射.md`](docs/M9-缓存优先与映射.md) | NAS → 缓存 → 映射三层、水合位图落盘与认领、目录清单快照、远端变更语义与真机延时对比 |
 | [`docs/M4-GUI.md`](docs/M4-GUI.md) | GUI 边界、命令面、页面结构、验收与踩坑 |
 | [`docs/M5-SQLite与delta.md`](docs/M5-SQLite与delta.md) | 状态库 schema/迁移/单事务、真机 versioning 探测、delta 能力门控 |
 | [`docs/M6-多根与共享文件夹.md`](docs/M6-多根与共享文件夹.md) | **历史文档**：多根布局（已删除）、只读规则、真机共享文件夹探测 |

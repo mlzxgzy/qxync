@@ -5,6 +5,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [中文](CHANGELOG.md) · [README](README.en.md) · [Acceptance log](docs/验收记录.md)
 
+## [Unreleased]
+
+**Cache first + local mapping**: content already cached on disk is **adopted as-is** after a node is
+recreated (the hydration bitmap is persisted next to it), so a cache-hit `cat` makes no NAS round
+trip; `ls`/`lookup` are served from a **local snapshot of the NAS file list** (refreshed by the
+change poll) instead of waiting on the network; when a remote file changes, a **hydrated** local file
+keeps serving its old content while the new version is fetched in the background and **atomically
+swapped in** (until the swap, `cat` returns the complete old version and `stat` reports its size),
+while a **dehydrated** file only gets refreshed metadata.
+See [`docs/M9-缓存优先与映射.md`](docs/M9-缓存优先与映射.md) for the design and the on-device numbers.
+
+### Fixed
+
+- **Content already cached on disk was treated as "not cached"**: the range bitmap (`chunks_done`)
+  lived only in memory, so after a daemon restart — or whenever a node was re-`lookup`ed —
+  `cache_file_for` reset it to all `false`, and `cat` re-fetched every range from the NAS even though
+  the bytes were right there. Measured on a real NAS with a 4 MiB file after a daemon restart:
+  **23.75 s → 0.115 s**.
+- **Every `ls` was a NAS round trip** (about 0.3–1 s) because `readdir`/`lookup` had no local
+  listing. Measured: second `ls` in the same session **0.50 s → 0.001 s**; second `ls` after a
+  restart **0.32 s → 0.001 s**.
+- **A remote change dropped the local cache immediately**: `apply_remote_meta` discarded the content,
+  so the next `read()` had to download the whole file again (blocking inside the read path). Hydrated
+  files now keep the old content readable while the new version is fetched in the background, and the
+  baseline is only advanced once the refresh lands — so a local edit based on the old version is
+  reported as a conflict instead of as "local overwrites remote".
+
+### Added
+
+- **Persisted hydration bitmap** `<cache>.qxstate` (magic/version/chunk_size/size/mtime/chunk count +
+  bit set): content is written before the bitmap, the bitmap goes through `.tmp` + `rename`, and
+  `release()` writes it once more with the final size/mtime. Dehydration, invalidation, remote
+  deletion, local unlink and renames all keep content and bitmap in sync.
+- **Directory-listing snapshot** (the "mapping"): the daemon's poll pushes each listed directory to the
+  mount view (`apply_listing` / `drop_listing`) and `readdir`/`lookup` are served from it; a stale
+  snapshot is only refreshed in the background; local `create`/`mkdir`/`unlink`/`rename` update the
+  snapshot immediately (no ghost nodes, no invisible new files).
+- **Background content refresh**: the new version is downloaded into `<cache>.refresh` and then
+  `rename`d into place, switching `attr`/range bitmap/state file in one step, followed by a kernel
+  page-cache invalidation (the daemon injects `Notifier::inval_inode`); after 3 consecutive failures
+  it falls back to on-demand hydration.
+- `sync --once` and the journal now report "hydrated locally → updating content in the background".
+
+### Tests
+
+- `qxync-fuse` unit tests **27 → 34**: bitmap round-trip and corruption rejection, adopting cached
+  content after a node is recreated, snapshot-served `readdir`/`lookup` (with `nas.invalid` as the NAS,
+  so **any** network access necessarily fails), the remote-change semantics for hydrated files,
+  metadata consistency of the atomic swap, aborting when the node changed, and the fallback after
+  repeated refresh failures.
+
 ## [0.3.0] - 2026-10-02
 
 **One-to-many removed entirely; one-to-one only**: one mount point = one NAS folder, and the mount
