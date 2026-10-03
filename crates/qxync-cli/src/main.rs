@@ -631,6 +631,19 @@ async fn main() -> Result<()> {
                 "max_log   : {}  notify={}  global_notify={}  sync_signal={}",
                 max_log.max_log, max_log.notify, max_log.global_notify, max_log.sync_signal
             );
+            // 逆向得到的就绪字段 + 限流信息（status=8 之外的"忙"信号都在这里）
+            let lim = |v: Option<u64>| v.map(|x| x.to_string()).unwrap_or_else(|| "-".into());
+            println!(
+                "限流      : server_limit={}  cgi_number={}",
+                lim(max_log.server_limit),
+                lim(max_log.cgi_number)
+            );
+            if let Some(secs) = max_log.advised_interval_secs() {
+                println!("降速      : sync_signal=2 → 建议下次轮询间隔 {secs}s");
+            }
+            if let Some(reason) = max_log.busy_reason() {
+                println!("⚠️  {reason}");
+            }
             println!(
                 "NAS       : MAC {} / Qsync {} / QPKG {} / build {}",
                 nas.mac0.as_deref().unwrap_or("-"),

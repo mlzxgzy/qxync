@@ -245,9 +245,15 @@ impl Client {
         if let Some(s) = m.status {
             let st = ServerStatus(s);
             if !st.is_success() {
-                return Err(Error::Status {
-                    status: st,
-                    context: "qbox_get_max_log".into(),
+                // ★ 服务端统一错误出口带 `msg`（status=8 时是
+                // "Qsync Central is initializing..."）—— 原样透传，别再丢掉。
+                return Err(match m.msg.clone() {
+                    Some(msg) => Error::status_msg(s, "qbox_get_max_log", msg),
+                    None => Error::Status {
+                        status: st,
+                        context: "qbox_get_max_log".into(),
+                        msg: None,
+                    },
                 });
             }
         }
@@ -328,7 +334,35 @@ impl Client {
         parse_notify(&body, "qbox_get_device_config_list")
     }
 
-    /// 调一个不带额外参数的 `qsyncsrv.cgi?func=…`。
+    /// 探针用：按**绝对 URL** 发一次 GET，返回 `(HTTP 状态码, 响应体)`。
+    ///
+    /// 用途是试那些"不确定该打哪个 CGI 入口"的接口（如 `get_meta`）——
+    /// 同一个 func 在不同入口下行为可能完全不同（实测 `get_meta` 在
+    /// `qsyncsrv.cgi` 上恒 500，需要换入口试）。
+    ///
+    /// 只做传输层的事：不注入 sid、不解析、不判 status。
+    /// 正常业务代码请用上面那些有语义的封装。
+    pub async fn raw_get(&self, url: &str) -> Result<(u16, Vec<u8>)> {
+        let resp = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| Error::Transport(format!("GET 失败: {e}")))?;
+        let code = resp.status().as_u16();
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| Error::Transport(e.to_string()))?;
+        Ok((code, body.to_vec()))
+    }
+
+    /// 把 query 拼到 `base_url()` 下某个 CGI 路径上（**不加** sid，调用方自己拼）。
+    pub fn cgi_url(&self, cgi: &str, query: &[(&str, &str)]) -> String {
+        self.url(cgi, query)
+    }
+
+    /// 调 `qsyncsrv.cgi?func=…`，按给定键值原样发出去。
     async fn qsync_func(&self, func: &str, extra: &[(&str, &str)]) -> Result<Vec<u8>> {
         let sid = self.require_sid()?.to_string();
         let mut q: Vec<(&str, &str)> = vec![("func", func), ("sid", sid.as_str())];
@@ -349,6 +383,33 @@ impl Client {
             return Err(Error::Transport(format!("{func}: HTTP {code}")));
         }
         Ok(body.to_vec())
+    }
+
+    /// ★ 探针用：按**原始键值**打一次 `qsyncsrv.cgi`，不做任何解析或 status 判定。
+    ///
+    /// 用途是实测那些签名未知的私有接口（如 `get_meta` / `get_meta_profile`）——
+    /// 参数名要靠实机试出来，先把原文拿回来再决定怎么封装。
+    /// 正常业务代码请用上面那些有语义的封装，别直接用这个。
+    pub async fn qsync_probe(&self, query: &[(&str, &str)]) -> Result<String> {
+        let sid = self.require_sid()?.to_string();
+        let mut q: Vec<(&str, &str)> = vec![("sid", sid.as_str())];
+        q.extend_from_slice(query);
+        let url = self.url("cgi-bin/qsync/qsyncsrv.cgi", &q);
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| Error::Transport(format!("probe: {e}")))?;
+        let code = resp.status();
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| Error::Transport(e.to_string()))?;
+        if !code.is_success() {
+            return Err(Error::Transport(format!("probe: HTTP {code}")));
+        }
+        Ok(String::from_utf8_lossy(&body).into_owned())
     }
 
     /// `func=get_list`，自动翻页（`start += len(datas)` 直到 `len < limit` 或 `start >= total`）。
@@ -1019,6 +1080,7 @@ impl Client {
             return Err(Error::Status {
                 status: ServerStatus(lock.status),
                 context: format!("versioning_lock {source_path}/{source_file}"),
+                msg: None,
             });
         }
         Ok(lock)
@@ -1299,6 +1361,7 @@ pub fn parse_upload_result(body: &[u8], filename: &str) -> Result<()> {
         return Err(Error::Status {
             status: ServerStatus(20),
             context: format!("upload {filename} 被拒绝（error={err}）"),
+            msg: None,
         });
     }
     Ok(())

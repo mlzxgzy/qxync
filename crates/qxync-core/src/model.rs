@@ -34,6 +34,10 @@ fn de_opt_i64_flex<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Optio
     Ok(Some(de_i64_flex(d)?))
 }
 
+fn de_opt_u64_flex<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Option<u64>, D::Error> {
+    Ok(Some(de_u64_flex(d)?))
+}
+
 fn de_bool_int<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<bool, D::Error> {
     use serde::de::Error as _;
     match serde_json::Value::deserialize(d)? {
@@ -129,17 +133,24 @@ pub struct Listing {
     /// 单文件 `stat` 时的存在性。
     #[serde(default, deserialize_with = "de_opt_i64_flex")]
     pub exist: Option<i64>,
+    /// 服务端统一错误出口的原文（仅失败时出现）。
+    #[serde(default, deserialize_with = "de_opt_string_flex")]
+    pub msg: Option<String>,
 }
 
 impl Listing {
-    /// 若响应带 `status` 且非成功 → 返回错误。
+    /// 若响应带 `status` 且非成功 → 返回错误（带服务端 `msg` 原文）。
     pub fn ensure_ok(&self, context: impl Into<String>) -> Result<&Self> {
         if let Some(s) = self.status {
             let status = ServerStatus(s);
             if !status.is_success() {
-                return Err(Error::Status {
-                    status,
-                    context: context.into(),
+                return Err(match self.msg.clone() {
+                    Some(msg) => Error::status_msg(s, context, msg),
+                    None => Error::Status {
+                        status,
+                        context: context.into(),
+                        msg: None,
+                    },
                 });
             }
         }
@@ -153,6 +164,10 @@ impl Listing {
 }
 
 /// `qbox_get_max_log` 响应（轮询入口）。
+///
+/// ★ 成功响应**没有 `status` 键** —— 判据是 `sync_signal` / `max_log`。
+/// 只有走服务端统一错误出口时才会带 `status`（当前唯一确认值：8 = 未就绪）。
+/// 逆向见 `.research/new/Qsync_API_返回码逆向.md` §1.1（handler 0xef6eb–0xf0f94）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct MaxLog {
     #[serde(default, deserialize_with = "de_u64_flex")]
@@ -161,16 +176,71 @@ pub struct MaxLog {
     pub notify: u64,
     #[serde(default, deserialize_with = "de_u64_flex")]
     pub global_notify: u64,
+    /// ★ 真正的判据：`1` = 有变更，`2` = 降速（附 `slowdown_seconds`）。
     #[serde(default, deserialize_with = "de_i64_flex")]
     pub sync_signal: i64,
+    /// `sync_signal == 2` 时服务端给出的建议等待秒数（= n*5）。
     #[serde(default, deserialize_with = "de_u64_flex")]
     pub slowdown_seconds: u64,
+    /// 服务端单次 `qbox_get_sync_log` 的条数上限（真机 256）。
+    /// 缺字段时为 `None` —— 表示"服务端没告诉 us"，别当成 0。
+    #[serde(default, deserialize_with = "de_opt_u64_flex")]
+    pub server_limit: Option<u64>,
+    /// CGI 并发数，服务端给客户端的压测信息。
+    #[serde(default, deserialize_with = "de_opt_u64_flex")]
+    pub cgi_number: Option<u64>,
+    // ---- 服务端就绪状态（逆向 §1.1 的四个自检字段）----
+    /// QPKG 仍在安装（`/etc/config/qpkg_job.conf` 里 internal_name != "null"）。
+    #[serde(default, deserialize_with = "de_bool_int")]
+    pub is_booting: bool,
+    /// 升级/迁移未完成（`<mount>/.QsyncServer_required` 仍存在）。
+    #[serde(default, deserialize_with = "de_bool_int")]
+    pub is_migrating: bool,
+    #[serde(default, deserialize_with = "de_bool_int")]
+    pub is_recovering: bool,
+    #[serde(default, deserialize_with = "de_bool_int")]
+    pub is_backuping_restoring: bool,
     #[serde(default, deserialize_with = "de_opt_i64_flex")]
     pub status: Option<i64>,
+    /// 服务端统一错误出口的原文（仅失败时出现）。
+    #[serde(default, deserialize_with = "de_opt_string_flex")]
+    pub msg: Option<String>,
     #[serde(default, deserialize_with = "de_opt_string_flex")]
     pub version: Option<String>,
     #[serde(default, deserialize_with = "de_opt_string_flex")]
     pub build: Option<String>,
+}
+
+impl MaxLog {
+    /// 服务端是否处于"忙但没坏"的状态 → 本轮应当**安静等待**，不要重登也不要全量重扫。
+    ///
+    /// 与 [`NasUid::busy_reason`] 同义，但走的是轮询响应自带的那份，
+    /// 省掉一次额外的 `qbox_get_nas_uid` 往返。
+    pub fn busy_reason(&self) -> Option<&'static str> {
+        if self.is_migrating {
+            Some("NAS 正在迁移")
+        } else if self.is_recovering {
+            Some("NAS 正在恢复")
+        } else if self.is_backuping_restoring {
+            Some("NAS 正在备份还原")
+        } else if self.is_booting {
+            Some("Qsync 服务仍在启动")
+        } else {
+            None
+        }
+    }
+
+    /// 服务端建议的轮询间隔（秒）。
+    ///
+    /// 逆向结论：`slowdown_seconds` 只在 `sync_signal == 2`（降速）时给出，
+    /// 值是 `n * 5`。这里按 `n*5` 直接当秒用；没有就返回 `None` 让调用方用默认值。
+    pub fn advised_interval_secs(&self) -> Option<u64> {
+        if self.sync_signal == 2 && self.slowdown_seconds > 0 {
+            Some(self.slowdown_seconds)
+        } else {
+            None
+        }
+    }
 }
 
 /// `qbox_get_nas_uid` 响应（替代已 404 的 `qsyncsrvPrepare.cgi`）。
@@ -300,6 +370,23 @@ mod tests {
         .unwrap();
         let e = l.ensure_ok("get_list /home/test1").unwrap_err();
         assert!(e.to_string().contains("status=5"), "{e}");
+        assert_eq!(e.server_msg(), None);
+    }
+
+    /// 服务端说了原因就要透传出来，别让用户只看到「未知状态码」。
+    #[test]
+    fn status_error_includes_server_msg() {
+        let l = parse_listing(
+            br#"{"status":8,"success":"true",
+                 "msg":"Qsync Central is initializing. Please wait a few minutes and try again."}"#,
+        )
+        .unwrap();
+        let e = l.ensure_ok("get_list /home/test1").unwrap_err();
+        assert!(e.is_server_busy());
+        assert!(!e.is_auth(), "未就绪不能被判成会话失效");
+        let s = e.to_string();
+        assert!(s.contains("status=8"), "{s}");
+        assert!(s.contains("initializing"), "msg 必须在 Display 里: {s}");
     }
 
     #[test]
@@ -308,6 +395,53 @@ mod tests {
         assert_eq!(m.max_log, 37);
         assert_eq!(m.global_notify, 177);
         assert_eq!(m.sync_signal, 1);
+    }
+
+    /// 逆向 §1.1：就绪字段与限流信息都从 `max_log` 响应自带，不必额外往返。
+    #[test]
+    fn max_log_carries_limit_and_readiness_fields() {
+        let m = parse_max_log(REAL_MAX_LOG.as_bytes()).unwrap();
+        assert_eq!(m.server_limit, Some(256));
+        assert_eq!(m.cgi_number, Some(1));
+        // 真机这次是正常态
+        assert!(m.busy_reason().is_none());
+        // sync_signal=1 不是降速
+        assert_eq!(m.advised_interval_secs(), None);
+
+        let busy = parse_max_log(
+            br#"{"max_log":"0","sync_signal":2,"slowdown_seconds":"15",
+                 "is_booting":0,"is_migrating":1}"#,
+        )
+        .unwrap();
+        assert_eq!(busy.busy_reason(), Some("NAS 正在迁移"));
+        // sync_signal=2 时按服务端给的秒数退避
+        assert_eq!(busy.advised_interval_secs(), Some(15));
+
+        let booting = parse_max_log(br#"{"max_log":"0","is_booting":1}"#).unwrap();
+        assert_eq!(booting.busy_reason(), Some("Qsync 服务仍在启动"));
+    }
+
+    /// 老 NAS 不回这些字段时不能崩，也不能把「没给」当成 0 上限。
+    #[test]
+    fn max_log_absent_fields_are_none_not_zero() {
+        let m = parse_max_log(br#"{"max_log":"37","sync_signal":1}"#).unwrap();
+        assert_eq!(m.server_limit, None);
+        assert_eq!(m.cgi_number, None);
+        assert!(m.busy_reason().is_none());
+    }
+
+    /// 失败响应里的 `msg` 必须能被读出来（status=8 排错全靠它）。
+    #[test]
+    fn max_log_error_carries_server_msg() {
+        let m = parse_max_log(
+            br#"{"version":"","build":"20260916","status":8,"success":"true",
+                 "msg":"Qsync Central is initializing. Please wait a few minutes and try again."}"#,
+        )
+        .unwrap();
+        assert_eq!(m.status, Some(8));
+        assert_eq!(m.server_limit, None);
+        assert!(ServerStatus(8).is_server_busy());
+        assert!(m.msg.as_deref().unwrap().contains("initializing"));
     }
 
     #[test]
