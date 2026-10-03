@@ -7,8 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-**Saving the same file twice in a row produced a bogus conflict copy, and saving was slow**:
-two independent bugs, both now fixed.
+## [0.4.2] - 2026-10-04
+
+**Two saves in a row no longer spawn a bogus conflict copy, and saving is faster**: this release
+fixes a false conflict a user can hit on the very first try (saving the same file twice produces an
+extra conflict copy), and cuts the wait for one save from **growing linearly with file size** to
+roughly 1/8 of it.
+
+### Fixed
 
 - **Why the conflict copy appeared (not "two saves should merge" — the baseline was
   never advanced)**: the baseline records the **remote** signature as of the last
@@ -50,30 +56,6 @@ two independent bugs, both now fixed.
   (`upload_one`'s return value). Also, if the local file changed again while the
   upload was in flight, the baseline is deliberately **not** advanced; the next
   version advances it when it lands.
-
-### Added
-
-- `QXYNC_HYDRATE_FANOUT`: chunk fetch fan-out (1–64, default 8).
-
-**"Open folder" button on every sync task card**: each task card (home and tasks page) now has an
-"Open folder" button that opens that task's local mount point with the **default file manager the
-user configured for directories**.
-
-### Added
-
-- **"Open folder" button on task cards**: queries the user's configured default directory handler
-  with `xdg-mime query default inode/directory`, locates the matching `.desktop` per the XDG spec,
-  reads its `Exec=` to get the **actual executable name**, and spawns it detached (`setsid`) with
-  the path. When no handler is configured or it fails to start, it falls back to the previous plugin
-  opener (`xdg-open` first) and reports which route was taken (`via`), so a dead button is
-  diagnosable instead of silent.
-- When a task has no local mount point the button is **disabled** with a reason instead of doing
-  nothing; when the mount point is missing (NAS offline, auto-unmounted after the task was disabled)
-  the error is reported honestly — it never `mkdir`s an empty directory, which would make the user
-  think the files are really local and hide exactly the failure they need to see.
-
-### Fixed
-
 - **Opening a folder with the desktop ID reported by `xdg-mime` always fails**: `xdg-mime` returns a
   **desktop entry ID** such as `org.kde.dolphin.desktop`, but the program that actually runs is the
   one named in its `Exec=` line (`dolphin`) — `org.kde.dolphin` does not exist in `PATH` at all.
@@ -84,6 +66,22 @@ user configured for directories**.
   made the button **impossible to press** in such environments. Detaching is now **best-effort**: if
   it fails the program is still launched (it just shares the GUI's session, matching what the opener
   plugin does).
+
+### Added
+
+- `QXYNC_HYDRATE_FANOUT`: chunk fetch fan-out (1–64, default 8).
+- **"Open folder" button on task cards**: every task card (home and tasks page) now has an
+  "Open folder" button that opens that task's **local mount point** with the **default file manager
+  the user configured for directories**. It queries the user's configured default directory handler
+  with `xdg-mime query default inode/directory`, locates the matching `.desktop` per the XDG spec,
+  reads its `Exec=` to get the **actual executable name**, and spawns it detached (`setsid`) with
+  the path. When no handler is configured or it fails to start, it falls back to the previous plugin
+  opener (`xdg-open` first) and reports which route was taken (`via`), so a dead button is
+  diagnosable instead of silent.
+- When a task has no local mount point the button is **disabled** with a reason instead of doing
+  nothing; when the mount point is missing (NAS offline, auto-unmounted after the task was disabled)
+  the error is reported honestly — it never `mkdir`s an empty directory, which would make the user
+  think the files are really local and hide exactly the failure they need to see.
 
 ## [0.4.0] - 2026-10-03
 
@@ -619,6 +617,7 @@ Verified on **QNAP TS-464C / QTS 5.2.9 / Qsync QPKG 5.0.0.7 (build 20260723)**.
 - Acceptance results were split out of the README into [`docs/验收记录.md`](docs/验收记录.md).
 - Dual-licensed under **MIT OR Apache-2.0** (`LICENSE-MIT` / `LICENSE-APACHE`).
 
+[0.4.2]: https://github.com/mlzxgzy/qxync/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/mlzxgzy/qxync/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/mlzxgzy/qxync/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/mlzxgzy/qxync/compare/v0.2.3...v0.3.0
