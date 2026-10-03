@@ -202,6 +202,7 @@ NAS 连接（可多个）  →  Task（同步任务 / 备份任务）  →  Pair
 | LAN 同步 | Enable LAN sync | `peer_listen`（M7 **自研**协议） | LAN 加速 |
 | 计算机名称 | Computer name | NAS 侧已有官方客户端注册的设备名（只读可列） | 此设备名称（只读） |
 | 立即与 NAS 同步 | Sync with NAS now | `sync --once` | 立即同步 |
+| 打开配对文件夹 | Open paired folder | 无（opener 插件对「目录」常静默失败） | 打开目录 —— 按 `xdg-mime` 查到的**默认目录工具**打开本地挂载点（见 `M4-GUI.md` §4.1.1） |
 | 单向 / 双向同步 | 1-way / 2-way sync | 仅双向 | 同步方向 |
 | 调试日志 / 发送日志 | Enable debug log / Send Logs | `RUST_LOG` + 滚动日志文件 | 调试日志 |
 | 开机自启 | Launch Qsync at startup | 无 | 开机自启 |
