@@ -240,6 +240,27 @@ impl SyncState {
         self.store.save_state(&self.cursors, &self.baseline)?;
         Ok(())
     }
+
+    /// ★ 我们自己上传成功后，把 baseline 直接推进到刚写上去的那个签名。
+    ///
+    /// 为什么必须在这里做（而不是等下一轮轮询的 `AdoptBaseline`）：
+    /// 上传落地到下一轮轮询之间有一个**最长 30s（`DEFAULT_POLL_INTERVAL_SECS`）的窗口**。
+    /// 窗口内用户再保存一次并等上传完成，节点会被 `clear_dirty` 标成干净，
+    /// 于是下一轮对账看到的是「本地 == 远端（都是新版本），baseline 还是老版本」：
+    /// `rc = true`（远端变了）、`lc = false`（本地没标脏），走进 `(false, true)` 分支，
+    /// 又因为本地签名 ≠ baseline 而被判成 **Conflict** —— 用户的连续两次保存
+    /// 凭空多出一个冲突副本。`decide` 的 `(true, true)` 分支里那句
+    /// 「远端 == 本地 → AdoptBaseline」要求 `dirty` 还为真才能命中，救不了这里。
+    ///
+    /// 幂等：重复推进同一个签名是 no-op（`put` 就是覆盖写）。
+    pub fn note_uploaded(&mut self, path: &str, size: u64, mtime: i64) -> Result<()> {
+        let sig = Sig::file(size, mtime);
+        if self.baseline.get(path).same_as(&sig) {
+            return Ok(());
+        }
+        self.baseline.put(path, sig);
+        self.save_all()
+    }
 }
 
 // ---------------------------------------------------------------- 主循环
@@ -472,7 +493,25 @@ pub async fn poll_once(
 fn persist(store: &Mutex<SyncState>, cursors: &Cursors, baseline: &Baseline) {
     let mut g = store.lock().unwrap();
     g.cursors = *cursors;
-    g.baseline = baseline.clone();
+    // ★ baseline 要**合并**，不能整份盖回去。
+    //
+    //   一轮轮询是「先克隆一份快照 → 跑很久的网络 IO → 最后落盘」。在这期间，
+    //   上传成功的 success hook 也会改 baseline（`note_uploaded`）—— 那是比轮询
+    //   **更新**的事实。若整份盖回这份开轮询时的旧快照，刚推上去的签名就被抹掉，
+    //   下一轮又变成「本地干净 / 远端变了 / 本地 ≠ baseline」→ 又判成冲突，
+    //   正好把本次修复撤销掉。
+    //
+    //   只接受**比内存里新**的条目（mtime 更大者为新）。mtime 相等时**保留内存里
+    //   那份**：epoch 秒粒度下同秒连改两次很常见，凭什么认定快照更权威？
+    //
+    //   删除方向不用管：`remove_baseline_tree` 只在**轮询自己那份**快照上调用，
+    //   hook 从不删条目。也就是说内存里不会出现「快照里没有」的条目，无需回补。
+    for (p, sig) in baseline.entries.iter() {
+        let cur = g.baseline.get(p);
+        if sig.mtime > cur.mtime {
+            g.baseline.put(p.clone(), *sig);
+        }
+    }
     if let Err(e) = g.save_all() {
         tracing::warn!("状态落盘失败（游标 + baseline 同一事务）: {e}");
     }
@@ -1462,6 +1501,189 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// ★ 回归（用户报的「连删两行就出冲突副本」）：
+    /// 自己的上传落地后**立刻**推进 baseline，连续保存就不该被判成冲突。
+    ///
+    /// 复现的正是修复前的时序：
+    ///   t0  base=local=remote=(100,1000)
+    ///   ①  保存一次 → local=(90,2000) dirty，上传落地 → remote=(90,2000)，
+    ///      节点被 `clear_dirty` 标干净，但 baseline 还停在 (100,1000)
+    ///   ②  紧接着再保存一次 → local=(85,2100) dirty，上传落地 → remote=(85,2100)
+    ///   ③  下一轮对账：修复前 base=(100,1000)、local/remote 已是 (85,2100)
+    ///      → `rc=true, lc=false` 且 `local != base` → **Conflict**
+    #[test]
+    fn own_upload_advances_baseline_so_rapid_saves_are_not_conflicts() {
+        let d = tmpdir("rapid-save");
+        let mut st = SyncState::load(&d).unwrap();
+        let path = "/home/notes.txt";
+
+        let base = Sig::file(100, 1000);
+        st.baseline.put(path, base);
+        st.save_all().unwrap();
+
+        // ① 第一版：上传落地 → 走 success hook 的路径推进 baseline
+        st.note_uploaded(path, 90, 2000).unwrap();
+        assert_eq!(
+            st.baseline.get(path),
+            Sig::file(90, 2000),
+            "上传成功后 baseline 应立刻等于刚落上去的签名"
+        );
+        // 紧接着第二次保存：本地改了、远端也等于上一版 → 正常上传，不是冲突
+        let d2 = decide(
+            &LocalSig {
+                sig: Sig::file(85, 2100),
+                dirty: true,
+            },
+            &st.baseline.get(path),
+            &Sig::file(90, 2000),
+        );
+        assert_eq!(d2, Decision::UploadLocal, "第二次保存应是增量上传");
+
+        // ② 第二版落地
+        st.note_uploaded(path, 85, 2100).unwrap();
+        assert_eq!(st.baseline.get(path), Sig::file(85, 2100));
+
+        // ③ 下一轮对账：本地干净 == 远端 == baseline → 无事可做
+        let d3 = decide(
+            &LocalSig {
+                sig: Sig::file(85, 2100),
+                dirty: false,
+            },
+            &st.baseline.get(path),
+            &Sig::file(85, 2100),
+        );
+        assert_eq!(d3, Decision::Noop, "两版都落地后应 Noop");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// ★ 对照组：证明上面那条 `Noop` 靠的是 hook 推进 baseline，而不是 `decide` 本身。
+    ///
+    /// 同样的时序，**不**推进 baseline 就会判成 Conflict —— 这正是修复前的行为。
+    #[test]
+    fn without_baseline_advance_rapid_saves_become_a_conflict() {
+        let stale = Sig::file(100, 1000); // 修复后仍停在旧签名
+        let remote = Sig::file(85, 2100);
+        let d = decide(
+            &LocalSig {
+                sig: Sig::file(85, 2100),
+                dirty: false,
+            },
+            &stale,
+            &remote,
+        );
+        assert_eq!(
+            d,
+            Decision::Conflict,
+            "baseline 不推进就是这个冲突 —— success hook 必须补上这一步"
+        );
+    }
+
+    /// `note_uploaded` 幂等：同一签名重复推进不报错、不变状态。
+    #[test]
+    fn note_uploaded_is_idempotent() {
+        let d = tmpdir("note-uploaded-idem");
+        let mut st = SyncState::load(&d).unwrap();
+        let path = "/home/a.txt";
+        st.note_uploaded(path, 42, 100).unwrap();
+        st.note_uploaded(path, 42, 100).unwrap();
+        assert_eq!(st.baseline.get(path), Sig::file(42, 100));
+        assert_eq!(st.baseline.len(), 1, "幂等推进不该多出条目");
+        // 落盘后重新加载，签名仍在（证明真的写进了状态库）
+        let re = SyncState::load(&d).unwrap();
+        assert_eq!(re.baseline.get(path), Sig::file(42, 100));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// ★ 回归：一轮轮询落盘时**不能抹掉**期间由 success hook 推上去的 baseline。
+    ///
+    /// 时序（一轮 poll 几十秒，其间用户一直在保存）：
+    ///   ① poll 开头克隆快照：baseline[a]=(100,1000)
+    ///   ② 轮询跑网络 IO 期间，a.txt 上传成功 → hook 推进到 (90,2000)
+    ///   ③ poll 结束时把**开轮询时的旧快照**落盘 → 旧逻辑整份盖回，
+    ///      (90,2000) 被抹成 (100,1000) —— 本次修复被自己撤销
+    #[test]
+    fn persist_merges_newer_hook_advances_instead_of_clobbering() {
+        let d = tmpdir("persist-merge");
+        let mut st = SyncState::load(&d).unwrap();
+        let path = "/home/a.txt";
+
+        // ① 轮询开头拿到的快照（陈旧）
+        let mut snapshot = st.baseline.clone();
+        snapshot.put(path, Sig::file(100, 1000));
+        st.baseline.put(path, Sig::file(100, 1000));
+
+        // ② 轮询期间上传成功，hook 推进（比快照新）
+        st.note_uploaded(path, 90, 2000).unwrap();
+        assert_eq!(st.baseline.get(path), Sig::file(90, 2000));
+
+        // ③ 轮询结束落盘那份陈旧快照
+        persist_test(&mut st, &snapshot);
+        assert_eq!(
+            st.baseline.get(path),
+            Sig::file(90, 2000),
+            "落盘旧快照不能把 hook 刚推进的签名倒退回去"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `persist` 的可测包装（真正的 `persist` 还吃全局 `Cursors`，这里只验 baseline 合并）。
+    fn persist_test(st: &mut SyncState, baseline: &Baseline) {
+        for (p, sig) in baseline.entries.iter() {
+            let cur = st.baseline.get(p);
+            if sig.mtime > cur.mtime {
+                st.baseline.put(p.clone(), *sig);
+            }
+        }
+        st.save_all().unwrap();
+    }
+
+    /// 同一秒内两次保存（mtime 相同、size 不同）时，**较新的那份要赢**。
+    ///
+    /// epoch 秒的粒度下，同一秒连改两次很常见（用户手快 / 脚本）。
+    /// 合并规则要能分辨「谁更新」，否则会退回旧版本。
+    #[test]
+    fn persist_prefers_newer_size_when_mtimes_collide() {
+        let d = tmpdir("persist-same-mtime");
+        let mut st = SyncState::load(&d).unwrap();
+        let p = "/home/a.txt";
+        // 内存里已经是第二版（同一秒）
+        st.baseline.put(p, Sig::file(85, 2000));
+        st.save_all().unwrap();
+        // 轮询快照是第一版（同一秒，但内容更旧）
+        let mut snapshot = st.baseline.clone();
+        snapshot.put(p, Sig::file(90, 2000));
+        persist_test(&mut st, &snapshot);
+        assert_eq!(
+            st.baseline.get(p),
+            Sig::file(85, 2000),
+            "同秒时应保留内存里较新的（mtime 相等则不覆盖）"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 合并**不能吞掉**轮询这一轮该落盘的真变化（远端真的变了、mtime 更大）。
+    ///
+    /// 上一条守「别倒退」，这条守「别什么都不做」—— 只认 mtime 大于的话，
+    /// 内存里那条会被永远钉住，正常的远端更新就推不上来了。
+    #[test]
+    fn persist_still_applies_genuinely_newer_remote_signatures() {
+        let d = tmpdir("persist-newer");
+        let mut st = SyncState::load(&d).unwrap();
+        let p = "/home/a.txt";
+        st.baseline.put(p, Sig::file(100, 1000));
+        st.save_all().unwrap();
+        // 轮询真的看到了远端的新版本
+        let mut snapshot = st.baseline.clone();
+        snapshot.put(p, Sig::file(120, 3000));
+        persist_test(&mut st, &snapshot);
+        assert_eq!(
+            st.baseline.get(p),
+            Sig::file(120, 3000),
+            "确实更新的远端签名必须能落进来"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// ★ 真机 M2c 引擎测试：远端刷新 / 冲突副本 / baseline / 删除保护 / 游标落盘。

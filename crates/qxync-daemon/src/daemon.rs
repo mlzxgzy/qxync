@@ -1670,11 +1670,36 @@ async fn mount(
     if let Some(q) = &upload_queue {
         let h = handle.clone();
         let peer = state.peer.lock().unwrap().clone();
-        q.set_success_hook(Arc::new(move |remote: &str| {
+        // 回调是 `'static` 的，捕获 `Arc<State>`（而不是那个 `StdMutex` 本身），
+        // 回调里现取锁 —— 上传 worker 线程只在这一小段持锁。
+        let st = state.clone();
+        q.set_success_hook(Arc::new(move |remote: &str, sig: (u64, i64)| {
+            let (size, mtime) = match h.node(remote) {
+                // 上传期间用户又改了这个文件 → 节点上已经不是刚传上去的那一版了。
+                // 此刻推进 baseline 到「刚传上去的签名」是**错的**：远端真有的是那
+                // 一版，而本地马上要传的还有下一版。把 baseline 停在旧版本，
+                // 下一版落地时再推一次，两次保存就都是各自的增量，不会互相打架。
+                // （节点不存在 = 已被删；此时推进反而会留下幽灵 baseline 条目。）
+                Some(n) if n.size == sig.0 && n.mtime == sig.1 => (n.size, n.mtime),
+                Some(_) => {
+                    tracing::debug!(
+                        "{remote}: 上传期间本地又变了，baseline 暂不推进（等下一版落地）"
+                    );
+                    return;
+                }
+                None => return,
+            };
             // 本地改动已经落到 NAS → 清 dirty，并让对端走事件快路径
-            let sig = h.node(remote).map(|n| (n.size, n.mtime));
             h.clear_dirty(remote);
-            if let (Some(host), Some((size, mtime))) = (peer.as_ref(), sig) {
+            // ★ 同时把 baseline 推进到刚写上去的签名：否则「上传落地 → 下轮轮询」
+            // 这段窗口里，用户再保存一次会被判成双方都改 → 凭空多一个冲突副本。
+            {
+                let mut g = st.sync_store.lock().unwrap();
+                if let Err(e) = g.note_uploaded(remote, size, mtime) {
+                    tracing::warn!("上传后推进 baseline 失败 {remote}: {e}");
+                }
+            }
+            if let (Some(host), Some((size, mtime))) = (peer.as_ref(), Some((size, mtime))) {
                 host.notify_async(remote.to_string(), size, mtime, "modified");
             }
         }));

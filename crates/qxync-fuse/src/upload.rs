@@ -104,7 +104,17 @@ pub struct UploadSnapshot {
 }
 
 /// 上传成功回调（M3：让 FUSE 节点清掉 `dirty`，否则脱水永远被 dirty 挡住）。
-pub type SuccessHook = Arc<dyn Fn(&str) + Send + Sync>;
+///
+/// 参数：远端路径 + **这次真正落到 NAS 上的签名**（size, mtime）。
+///
+/// ★ 为什么要签名（见 `qxync-daemon` 的 success hook）：上传落地后，远端已经是
+/// 「我们的新版本」了。baseline 必须在这一刻就跟着推进 —— 否则下一轮对账会看到
+/// 「本地 == 远端、但 baseline 还是旧签名」，`decide` 走进
+/// `(local 未标脏, remote 变了)` 那一格，又因为本地签名 ≠ baseline 而判成
+/// **Conflict**。用户视角就是「我连续改两次同一个文件，凭什么给我冲突副本」。
+/// 之前这里只传路径，daemon 只能 `clear_dirty`，baseline 要等下一轮轮询
+/// （默认 30s）才被 `AdoptBaseline` 补上 —— 那个窗口就是冲突的来源。
+pub type SuccessHook = Arc<dyn Fn(&str, (u64, i64)) + Send + Sync>;
 
 /// 调用成功回调 —— **回调 panic 绝不能打死上传 worker**。
 ///
@@ -113,11 +123,11 @@ pub type SuccessHook = Arc<dyn Fn(&str) + Send + Sync>;
 /// runtime"），worker 线程随之死掉 —— 表现是「上传队列永远卡住、drain 超时、
 /// 整个 daemon 像挂了」（fuse-matrix 的 M2c 冲突段卡了 3 分钟）。
 /// 这里把回调隔离起来：它只能坏它自己，队列必须继续跑。
-pub(crate) fn invoke_success_hook(hook: Option<SuccessHook>, remote: &str) {
+pub(crate) fn invoke_success_hook(hook: Option<SuccessHook>, remote: &str, sig: (u64, i64)) {
     let Some(hook) = hook else {
         return;
     };
-    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(remote))).is_err() {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(remote, sig))).is_err() {
         tracing::error!("上传成功回调 panic（已隔离，队列继续）: {remote}");
     }
 }
@@ -451,17 +461,21 @@ impl UploadQueue {
             }
 
             match self.rt.block_on(self.upload_one(&job)) {
-                Ok(()) => {
+                Ok(n) => {
                     self.persist_delete(&job.remote_path());
                     if job.ephemeral {
                         // 冲突副本的 stash 是一次性的：传完就删
                         let _ = std::fs::remove_file(&job.local);
                     }
+                    // 签名用**刚发出去**的字节数，不是此刻磁盘上的大小：
+                    // 两次保存挨得近时，作业取走之后用户可能又改了缓存文件，
+                    // 这时 `metadata(local)` 读到的是「下一版」的大小。
+                    // 把它当成这一版的 baseline，就会推进到一个远端并不拥有的签名上。
                     invoke_success_hook(
                         self.success_hook.lock().unwrap().clone(),
                         &job.remote_path(),
+                        (n, job.mtime),
                     );
-                    let n = std::fs::metadata(&job.local).map(|m| m.len()).unwrap_or(0);
                     self.stats.done.fetch_add(1, Ordering::Relaxed);
                     self.stats.bytes.fetch_add(n, Ordering::Relaxed);
                     tracing::info!("已上传 {} ({} 字节)", job.remote_path(), n);
@@ -503,8 +517,11 @@ impl UploadQueue {
     }
 
     /// 单个作业：上传内容 → 对齐 mtime → 记 write log（尽力而为）。
-    async fn upload_one(&self, job: &UploadJob) -> Result<(), CoreError> {
+    ///
+    /// 返回**真正发出去的字节数**（success hook 要用它把 baseline 推到准确签名）。
+    async fn upload_one(&self, job: &UploadJob) -> Result<u64, CoreError> {
         let bytes = std::fs::read(&job.local)?;
+        let n = bytes.len() as u64;
         self.client
             .upload_bytes(&job.remote_dir, &job.remote_name, bytes)
             .await?;
@@ -520,7 +537,7 @@ impl UploadQueue {
         {
             tracing::debug!("qbox_write_log 失败（不影响上传）: {e}");
         }
-        Ok(())
+        Ok(n)
     }
 
     /// 删除远端条目 + 记 write log（删除同样是「本地改动」）。
@@ -607,19 +624,21 @@ mod tests {
         let called = Arc::new(AtomicU64::new(0));
         let c1 = called.clone();
         invoke_success_hook(
-            Some(Arc::new(move |_| {
+            Some(Arc::new(move |_, _| {
                 c1.fetch_add(1, Ordering::Relaxed);
                 panic!("hook 里的 bug（真实场景：tokio::spawn 在非 tokio 线程）");
             })),
             "/home/boom.txt",
+            (10, 1000),
         );
         // 第一次 panic 被隔离 → 后续回调照常执行（worker 还活着）
         let c2 = called.clone();
         invoke_success_hook(
-            Some(Arc::new(move |_| {
+            Some(Arc::new(move |_, _| {
                 c2.fetch_add(1, Ordering::Relaxed);
             })),
             "/home/ok.txt",
+            (20, 2000),
         );
         assert_eq!(
             called.load(Ordering::Relaxed),
@@ -627,7 +646,33 @@ mod tests {
             "回调 panic 不能中断调用点"
         );
         // 没有回调也不能有事
-        invoke_success_hook(None, "/home/none.txt");
+        invoke_success_hook(None, "/home/none.txt", (0, 0));
+    }
+
+    /// ★ 回归：回调必须拿到**这一版真正发出去的字节数**。
+    ///
+    /// daemon 靠它把 baseline 推到准确签名；传错（哪怕只是取上传后磁盘上的
+    /// 大小）就会让 baseline 停在一个远端并不拥有的签名上。
+    #[test]
+    fn success_hook_receives_the_uploaded_signature() {
+        use std::sync::Mutex as M;
+        let got: Arc<M<Vec<(String, u64, i64)>>> = Arc::new(M::new(Vec::new()));
+        let g = got.clone();
+        let hook: SuccessHook = Arc::new(move |remote: &str, (size, mtime): (u64, i64)| {
+            g.lock().unwrap().push((remote.to_string(), size, mtime));
+        });
+        invoke_success_hook(Some(hook.clone()), "/home/a.txt", (90, 2000));
+        invoke_success_hook(Some(hook.clone()), "/home/b.txt", (1234, 5678));
+        invoke_success_hook(Some(hook), "/home/empty.txt", (0, 42));
+        assert_eq!(
+            *got.lock().unwrap(),
+            vec![
+                ("/home/a.txt".to_string(), 90, 2000),
+                ("/home/b.txt".to_string(), 1234, 5678),
+                ("/home/empty.txt".to_string(), 0, 42),
+            ],
+            "回调应逐次收到 (路径, 本次上传字节数, mtime)"
+        );
     }
 
     fn tmpdir(tag: &str) -> PathBuf {

@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+**Saving the same file twice in a row produced a bogus conflict copy, and saving was slow**:
+two independent bugs, both now fixed.
+
+- **Why the conflict copy appeared (not "two saves should merge" — the baseline was
+  never advanced)**: the baseline records the **remote** signature as of the last
+  successful sync, and previously only the sync engine advanced it, when a poll
+  round observed the remote. Our own successful upload only cleared `dirty` in the
+  success hook, leaving the baseline alone. That left a window of up to **30s**
+  (one poll interval) between "upload landed" and "next poll", in which local ==
+  remote == the new version while the baseline still held the old signature.
+  `decide` then saw "remote changed + local not dirty" and, because the local
+  signature differed from the baseline, concluded **Conflict** — so **saving twice
+  in a row grew a conflict copy after the second save settled**. The baseline is now
+  advanced to the signature just written the moment the upload succeeds
+  (`note_uploaded`), the window is gone, and each save is its own increment.
+  Genuine simultaneous edits are still detected as conflicts (the `decide` table is
+  unchanged).
+- **A reverse trap in the fix above, fixed together**: a poll round "clones a
+  baseline snapshot → runs long network IO → writes it back", and it used to write
+  back that **stale snapshot wholesale**, wiping signatures the hook had advanced
+  while the poll was running — undoing the very fix above. Persistence now
+  **merges**: only entries strictly newer than the in-memory ones are accepted
+  (larger mtime wins); on an mtime tie the in-memory entry is kept (two saves
+  within the same epoch second are common).
+- **Slow saves: before writing, every missing chunk of the file has to be fetched,
+  and they were fetched one at a time**. Read-modify-write requires the whole file
+  locally first (otherwise unfetched ranges read as 0 and the full-file upload
+  zeroes the remote), so the cost of one save was *all* missing chunks × RTT —
+  **growing linearly with file size** (128 KiB chunks: 8 round-trips for 1 MB,
+  32 for 4 MB). The chunks are independent, so they are now fetched with a
+  fan-out of 8, turning O(chunks×RTT) into O(⌈chunks/8⌉×RTT) — roughly 8× for
+  1 MB. Tune with `QXYNC_HYDRATE_FANOUT` (1–64, default 8; 1 restores serial
+  fetching). Correctness is unchanged: each chunk has its own dedup lock and
+  content is persisted before the bitmap, so no half-written chunk can ever be
+  marked ready.
+- Also fixed a race in the upload callback: the byte count used for stats was read
+  from disk **after** the upload, so with two rapid saves the job may already have
+  been dequeued and the read picked up the **next** version's size — and that
+  number is what advances the baseline, parking it on a signature the remote does
+  not have. The callback now receives the byte count **actually sent**
+  (`upload_one`'s return value). Also, if the local file changed again while the
+  upload was in flight, the baseline is deliberately **not** advanced; the next
+  version advances it when it lands.
+
+### Added
+
+- `QXYNC_HYDRATE_FANOUT`: chunk fetch fan-out (1–64, default 8).
+
 **"Open folder" button on every sync task card**: each task card (home and tasks page) now has an
 "Open folder" button that opens that task's local mount point with the **default file manager the
 user configured for directories**.
