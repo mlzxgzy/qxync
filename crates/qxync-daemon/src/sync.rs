@@ -268,6 +268,12 @@ pub async fn poll_once(
     let max: MaxLog = match client.max_log().await {
         Ok(m) => m,
         Err(e) => {
+            // ★ 服务端未就绪（status=8）：等就好，不是错误，更不该重登。
+            // 记进 notes 而不是 errors —— 它不该污染"同步出错"的计数和 last_error。
+            if e.is_server_busy() {
+                report.note(format!("服务端未就绪，稍后重试：{e}"));
+                return report;
+            }
             report.error(format!("qbox_get_max_log 失败: {e}"));
             *stats.last_error.lock().unwrap() = report.errors.last().cloned();
             return report;
@@ -275,6 +281,26 @@ pub async fn poll_once(
     };
     report.max_log = max.max_log;
     report.global_notify = max.global_notify;
+
+    // ---- ①' 服务端在忙（迁移/恢复/备份还原/启动中）→ 本轮什么都不做，等下一轮
+    //
+    // 这四种状态下服务端数据尚在变动，此时做增量对账容易拿到半成品；
+    // 官方客户端此时也是退避轮询而不是重登（逆向 §3.3 的 ERROR_CONNECTION_UNAVAIL → retry）。
+    // 顺带避免一个具体误判：这四种状态下 max_log 可能短暂偏小，
+    // 过去会被 `should_reset` 当成"游标回退"而白白触发一次全量重扫。
+    if let Some(reason) = max.busy_reason() {
+        report.note(format!("服务端就绪状态：{reason} → 本轮跳过，稍后重试"));
+        return report;
+    }
+
+    // ★ `sync_signal == 2` = 服务端要求降速（附 `slowdown_seconds`）。
+    // 先记下来给调度层看，别在忙碌状态下还照常轮询。
+    if let Some(secs) = max.advised_interval_secs() {
+        report.note(format!(
+            "服务端要求降速（sync_signal=2）→ 建议下次轮询间隔 {secs}s"
+        ));
+    }
+
     if cursors.should_reset(max.max_log) {
         report.note(format!(
             "max_log 回退（{} → {}）→ 游标归零 + 全量重扫",
@@ -285,9 +311,15 @@ pub async fn poll_once(
     cursors.max_log_seen = max.max_log;
 
     // ---- ② notify log：文件变更事件（先处理再推进游标）
+    // ★ 用服务端自报的 `server_limit`（真机 256）夹住本轮批量，而不是写死 200：
+    // 写死会在上限较低的机型上被服务端截断，导致"以为拉完了其实没拉完"。
+    let batch_n = match max.server_limit {
+        Some(limit) if limit > 0 => cfg.batch.min(limit as usize),
+        _ => cfg.batch,
+    };
     let mut lower = cursors.notify;
     while (lower.max(0) as u64) < max.max_log {
-        match client.sync_log(lower, cfg.batch, None).await {
+        match client.sync_log(lower, batch_n, None).await {
             Ok(batch) => {
                 if batch.events.is_empty() {
                     report.note(format!("qbox_get_sync_log lower={lower} 没有新事件"));
