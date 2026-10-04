@@ -115,7 +115,10 @@ impl MountsFile {
             Err(e) => {
                 return (
                     None,
-                    vec![format!("读挂载记录失败（本次不恢复挂载）{}: {e}", p.display())],
+                    vec![format!(
+                        "读挂载记录失败（本次不恢复挂载）{}: {e}",
+                        p.display()
+                    )],
                 )
             }
         };
@@ -317,7 +320,10 @@ mod tests {
         let m = &f.mounts[0];
         assert!(!m.read_write, "缺省应是只读（与 M1–M7 一致）");
         assert!(m.auto_unmount, "缺省应自动卸载");
-        assert_eq!(m.threads, 0, "缺省 0 = 让 daemon 用自己的默认（mount_task 那侧会兜）");
+        assert_eq!(
+            m.threads, 0,
+            "缺省 0 = 让 daemon 用自己的默认（mount_task 那侧会兜）"
+        );
     }
 
     /// 写盘是「先 tmp 再 rename」：崩在中间不会让主文件变成半截 JSON。

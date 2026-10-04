@@ -8,8 +8,8 @@
 #     systemctl --user enable --now qxyncd     # 登录即启动 + 现在就启动
 #     systemctl --user status qxyncd
 #     journalctl --user -u qxyncd -f           # 跟日志（daemon 的 stderr 进 journald）
-#     systemctl --user stop qxyncd             # 优雅停止（卸载 FUSE 挂载 + 删 socket/pid）
-#     systemctl --user restart qxyncd
+#     systemctl --user reload qxyncd           # ★ 重启同步（推荐：挂载点一秒都不中断）
+#     systemctl --user stop qxyncd             # 停（真卸载 FUSE 挂载 + 删 socket/pid）
 #
 # 想让它**不登录也常驻**（开机就起、注销也不停）：
 #     sudo loginctl enable-linger "$USER"
@@ -33,8 +33,23 @@ ExecStart=/usr/bin/qxyncd --foreground
 # 崩溃/被 OOM 杀掉才拉起；`systemctl stop` 是干净退出（exit 0）→ 不重启
 Restart=on-failure
 RestartSec=3
-# qxyncd 收到 SIGTERM 会卸载全部 FUSE 挂载点并删 socket/pid —— 给足时间做完这些，
-# 别到点就 SIGKILL（挂载点会留在 /proc/mounts 里）。
+
+# ★ M15/T6：reload = SIGHUP = **重载同步引擎（poller / 脱水 / 队列 / journal /
+#   会话保活），完全不碰 FUSE 会话**。reload 不终止进程，所以挂载点一秒都不中断。
+#   —— 「我想让同步重新跑起来」请用这条，别用 restart。
+ExecReload=/bin/kill -HUP $MAINPID
+
+# ★ M15/T6：`systemctl --user stop/restart` 发的是 SIGTERM，qxyncd 收到后
+#   **不再卸载 FUSE 挂载点**，而是「停同步、保留挂载」并留在挂载守护模式里继续
+#   应答内核（`ls` / `ls -l` / 读已下载的文件都还正常，见 docs/M15 附录 A.3）。
+#
+#   ⚠ **但 restart 仍会短暂断开挂载点，这是 systemd 的语义限制，不是 qxync 的问题**：
+#   restart 的流程是「stop 旧进程 → **等它退出** → start 新进程」，而守护进程
+#   按设计不会在 SIGTERM 后立刻退出，于是 stop 阶段会一直等到下面这个
+#   TimeoutStopSec，然后被 SIGKILL 杀掉 —— 挂载点照样断（被强杀，不是正常卸载）。
+#   断掉之后由 T5 的「启动自动重挂」恢复（mounts.json 记着现场）。
+#
+#   TimeoutStopSec 给到 30s：留出「停同步 + 写盘 + 把没发完的上传/删除排空」的余量。
 TimeoutStopSec=30
 # SIGTERM 只发给主进程，超时后 cgroup 里剩下的才 SIGKILL
 KillMode=mixed
