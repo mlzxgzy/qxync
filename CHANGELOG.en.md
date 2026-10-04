@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-10-04
+
+**No trash bin on the mount point, and deletes no longer block**: files landing in a trash
+bin and long waits on delete came from two different places; both are addressed here.
+
+### Fixed
+
+- **The mount point no longer hosts a trash bin**. The trash bin was never qxync's — there
+  is no trash logic in the code at all (KDE Dolphin follows the FDO per-volume trash
+  protocol, creates `.Trash-$UID/` *inside the mount point*, and its contents end up on
+  the NAS). FUSE write entry points now reject trash names (`.Trash` / `.Trash-<uid>` /
+  `@Recycle`) with `EPERM`: **the trash directory cannot be created, so KIO cannot enable
+  the volume trash and falls back to its built-in direct delete**. The guard covers
+  `mkdir` / `create` / `rename` / `unlink` / `rmdir`, and matching is **exact per path
+  segment** — so ordinary names like `.recent`, `.trash` or `a.Trash-1000.txt` are not
+  affected. (KIO 6.30 removed the `DisabledFor` key, so there is no configuration-level
+  switch; this has to be enforced at the filesystem layer.)
+- **`rm -rf` parent/child delete conflict**: the kernel hands both `rmdir(dir)` and
+  `unlink(dir/child)` to the delete queue at once. Once the parent is gone, deleting the
+  child necessarily fails with "not found", burning retries and inflating the failure
+  count. Children whose parent is deleted **in the same batch** are now dropped before
+  the request is sent, with prefix matching done on **whole path segments** (so a deleted
+  `victim` does not affect `victim2.txt`).
+- **Delete retry counts were being reset**: retries used to overwrite each item's counter
+  with the batch maximum, so an item that had already failed 4 times was knocked back to
+  1 and could never reach the give-up threshold. Counts now increment per item and each
+  item decides independently whether to give up.
+
+### Added
+
+- **A delete queue** (`qxync-fuse/src/delete.rs`): `unlink`/`rmdir` now **return
+  immediately**, and the remote delete is pushed by a background worker that coalesces
+  items into batches. Previously this was `rt.block_on(delete_entry(..))` — unlink waited
+  for the NAS to answer, so deleting N files meant N serial round trips.
+  - **Same-directory items are merged into one request**: `file_total` on
+    `qsyncsrv.cgi?func=delete` was always meant to be "number of items in this batch"
+    (`stat`/`set_mtime` hardcode it to `1` only because those handle one file per call).
+    Items are now grouped by directory, capped at 50 per batch, with a 200 ms coalescing
+    window.
+  - **Crash recovery**: jobs are persisted to a `deletes` state table (the same
+    `queue.db` as the upload queue) with identical semantics — **the table *is* the set of
+    unfinished jobs**, and they are re-queued on restart.
+  - `status` gains a "delete queue" line; it is drained for up to 120 s on unmount.
+  - **Matches official semantics**: the official Qsync client's delete (Smart Delete) is
+    *"deleted files on the local device are retained on the NAS"* — locally effective
+    immediately, advanced asynchronously server-side. This queue follows that shape.
+
+### Safety
+
+- **The delete circuit breaker still runs before enqueueing**: `DeleteGuard`
+  (100 items / 60 s) is unchanged and still returns `EACCES` past the threshold, so a
+  large accidental delete cannot slip into the queue just because deletes became async.
+- The trade-off of async deletion is "local is authoritative": enqueue returns
+  immediately, so if the remote delete fails the local file is already gone. Failures that
+  exhaust retries are reflected in the `status` failure count and the daemon log, so they
+  can be cleaned up manually.
+
 ## [0.4.2] - 2026-10-04
 
 **Two saves in a row no longer spawn a bogus conflict copy, and saving is faster**: this release
@@ -617,6 +674,7 @@ Verified on **QNAP TS-464C / QTS 5.2.9 / Qsync QPKG 5.0.0.7 (build 20260723)**.
 - Acceptance results were split out of the README into [`docs/验收记录.md`](docs/验收记录.md).
 - Dual-licensed under **MIT OR Apache-2.0** (`LICENSE-MIT` / `LICENSE-APACHE`).
 
+[0.4.3]: https://github.com/mlzxgzy/qxync/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/mlzxgzy/qxync/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/mlzxgzy/qxync/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/mlzxgzy/qxync/compare/v0.3.0...v0.4.0

@@ -7,6 +7,50 @@
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-10-04
+
+**挂载点不再有回收站 + 删除不再干等**：删文件时弹进回收站、删完要等半天，
+这两个问题来自两处，都在这一版解决。
+
+### 修复
+
+- **挂载点里的回收站被拒之门外**。回收站不是 qxync 建的 —— 代码里从来没有回收站
+  逻辑（KDE Dolphin 走 FDO 的卷内回收站协议，把 `.Trash-$UID/` 造在挂载点里，
+  内容最终落在 NAS 上）。现在 FUSE 写入口对回收站命名（`.Trash` / `.Trash-<uid>` /
+  `@Recycle`）一律回 `EPERM`：**回收站目录建不出来，KIO 就无法启用卷内回收站，
+  只能走它既定的「直接删除」回退路径**。守卫挂在 `mkdir` / `create` / `rename` /
+  `unlink` / `rmdir` 五个入口上，判定是**段级精确匹配** —— 不会误伤 `.recent`、
+  `.trash`、`a.Trash-1000.txt` 这类正常名字。
+  （KIO 6.30 已删除 `DisabledFor` 键，配置层面本就无解，只能在文件系统层挡。）
+- **`rm -rf` 父子删除冲突**：内核会同时把 `rmdir(dir)` 和 `unlink(dir/子)` 交给
+  删除队列。父目录删掉后再删子项必然报「不存在」，白重试到放弃、让失败计数虚高。
+  现在发请求前剔掉「父目录同批被删」的子项，前缀匹配按**完整路径段**判断
+  （所以 `victim` 被删不会影响 `victim2.txt`）。
+- **删除重试计数被重置**：原先重试时拿批内**最大**次数覆盖每项计数，已重试 4 次的项
+  会被打回 1 次，永远达不到放弃阈值。现在逐项 `+1`、各自判定放弃。
+
+### 新增
+
+- **删除队列**（`qxync-fuse/src/delete.rs`）：`unlink`/`rmdir` **立刻返回**，
+  远端删除由后台 worker 攒批推送。之前是 `rt.block_on(delete_entry(..))` ——
+  unlink 要等 NAS 回包才返回，删 N 个文件就是 N 次串行往返。
+  - **同目录合并成一次请求**：`qsyncsrv.cgi?func=delete` 的 `file_total` 本就是
+    「本批条目数」（`stat`/`set_mtime` 硬编码成 `1` 只因那些调用每次一个文件），
+    现在按目录分组、单批上限 50、攒批窗口 200ms。
+  - **崩溃恢复**：作业落 `deletes` 状态库（与上传队列同一个 `queue.db`），
+    语义一致 —— **表 = 未完成作业**，重启自动重新入队。
+  - `status` 新增一行「删除队列」；卸载时排空 120s。
+  - **对齐官方语义**：Qsync 官方客户端的删除（Smart Delete）是
+    *"deleted files on the local device are retained on the NAS"* —— 本地立即生效、
+    服务端侧异步推进。本队列就是照这个形态做的。
+
+### 安全性
+
+- **删除熔断仍在入队之前**：`DeleteGuard`（100 项 / 60s）照旧生效，超阈回 `EACCES`。
+  大批量误删不会因为改成异步就悄悄溜进队列。
+- 异步删除的取舍是「本地是权威」：入队即返回，远端失败时本地文件已消失。
+  失败重试到超限会记入 `status` 的失败计数与 daemon 日志，运维可据此人工补删。
+
 ## [0.4.2] - 2026-10-04
 
 **连着保存两次不再凭空出冲突副本 + 保存提速**：这一版修的是一个用户一眼就能撞上的
@@ -515,6 +559,7 @@ NAS 设置名 `QSYNC_FOLDERPAIR_USE_SPACE_SAVING`、Windows 客户端注册表�
 - 验收结论从 README 抽出为 [`docs/验收记录.md`](docs/验收记录.md)。
 - 采用 **MIT OR Apache-2.0** 双许可（`LICENSE-MIT` / `LICENSE-APACHE`）。
 
+[0.4.3]: https://github.com/mlzxgzy/qxync/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/mlzxgzy/qxync/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/mlzxgzy/qxync/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/mlzxgzy/qxync/compare/v0.3.0...v0.4.0
