@@ -13,11 +13,13 @@
 //! 因此数据面一律走 FileStation；这也意味着**只读 M0 不依赖 `q_token`**。
 
 use futures_util::StreamExt;
+use std::path::Path;
 use qxync_core::{
     build_query, encode_query_value, model::parse_listing, parse_max_log, parse_nas_uid,
     parse_sync_log, DirEntry, Error, LinkConfig, Listing, MaxLog, NasUid, ProxySettings, ProxySpec,
     Result, ServerStatus, Settings, SyncLogBatch,
 };
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -25,6 +27,13 @@ use std::time::Duration;
 ///
 /// 只是**单页**大小，不是目录容量上限 —— `list` 会按 `start` 一直翻到取全量。
 const LIST_LIMIT: usize = 200;
+
+/// ★ M15/T2：流式上传的读取块大小。
+///
+/// 只影响**内存占用**（O(块大小)）与读写 syscall 次数，不影响协议 ——
+/// multipart body 会被 reqwest 拼成同一个流。8 MB 是「syscall 少」与
+/// 「别把内存吃太多」之间的折中。
+const UPLOAD_CHUNK: usize = 8 * 1024 * 1024;
 
 /// `qbox_write_log` 的 action 码。
 ///
@@ -652,6 +661,9 @@ impl Client {
     }
 
     /// 上传一个文件：`POST /cgi-bin/qsync/upload.php`，multipart 字段名必须是 `files[]`。
+    ///
+    /// ⚠️ **整个文件已经在内存里**。大文件（4 GB）会把进程内存吃满。
+    /// 能走文件路径就用 [`Client::upload_file`]（流式，内存 O(块大小)）。
     pub async fn upload_bytes(
         &self,
         dest_path: &str,
@@ -685,6 +697,124 @@ impl Client {
             .await
             .map_err(|e| Error::Transport(e.to_string()))?;
         parse_upload_result(&body, filename)
+    }
+
+    /// ★ M15/T2：**流式**上传一个本地文件 —— 内存占用 O(块大小)，与文件大小无关。
+    ///
+    /// 为什么需要：`upload_bytes` 要调用方先把整个文件 `fs::read` 进内存，
+    /// 传 4 GB 文件就是 4 GB 内存，并发几个直接 OOM。这里改成按块读、
+    /// 读一块发一块（`unfold` 泵 + `Body::wrap_stream`）。
+    ///
+    /// ⚠️ **服务端不接受 chunked 编码**（真机实测，2026-10-04）：
+    /// 不带 `Content-Length` 的流式 body 会被 `upload.php` 拒成
+    /// `HTTP 411 Length Required`（回一个 HTML 错误页，不是 JSON）。
+    /// 所以**必须**用 `stream_with_length` 把长度告诉服务端 ——
+    /// 这正是 reqwest `Part::file` 内部做的事（`file.metadata()` 取 len）。
+    /// 代价是上传期间文件被截短/改名会让长度对不上（服务端要么拒绝、
+    /// 要么按错误长度收），这在「本地文件正被自己改」的场景下是既有风险，
+    /// 不是本次引入的。
+    ///
+    /// 与 `upload_bytes` 的**唯一**区别是数据来源；multipart 字段名、URL、
+    /// 返回值解析完全一致（真机实测服务端不关心 body 是怎么来的）。
+    ///
+    /// 返回**真正发出的字节数**。注意这不是「文件大小」：上传期间用户可能还在改
+    /// 同一个文件，流式读到的是**当时那部分内容**。调用方要用它推进 baseline
+    /// （见 `UploadQueue::upload_one` 的 success hook），所以必须精确。
+    ///
+    /// 注意：**不具备断点续传**。传到 90% 断网仍是从 0 重来
+    /// （重试语义由 `UploadQueue` 的 `max_attempts` 兜着）。
+    /// 分片续传要看服务端 `upload.php` 是否认分片索引 —— 见 M15/T4，
+    /// 实测 `versioning_support=0`，在确认前不要自己造轮次协议。
+    pub async fn upload_file(&self, dest_path: &str, local: &Path, filename: &str) -> Result<u64> {
+        // 长度必须**发之前**拿到：reqwest 据此决定发 Content-Length 还是 chunked。
+        let len = tokio::fs::metadata(local)
+            .await
+            .map_err(|e| {
+                Error::Transport(format!(
+                    "upload {filename}: stat {}: {e}",
+                    local.display()
+                ))
+            })?
+            .len();
+        let file = tokio::fs::File::open(local).await.map_err(|e| {
+            Error::Transport(format!(
+                "upload {filename}: 打开 {}: {e}",
+                local.display()
+            ))
+        })?;
+        self.upload_stream_sized(dest_path, filename, file, len).await
+    }
+
+    /// 同 [`Client::upload_file`]，但数据源是任意 [`AsyncRead`]，长度由调用方给。
+    ///
+    /// `expected_len` 必须是**实际会发出的字节数**：服务端不接受 chunked
+    /// （411Length Required），长度不对会导致上传失败或落地大小错。
+    /// 用 `filename` 作为 multipart 里的文件名（**不是**源文件的末段）。
+    pub async fn upload_stream_sized<R>(
+        &self,
+        dest_path: &str,
+        filename: &str,
+        reader: R,
+        expected_len: u64,
+    ) -> Result<u64>
+    where
+        R: tokio::io::AsyncRead + Send + Unpin + 'static,
+    {
+        let sid = self.require_sid()?.to_string();
+        let url = self.url(
+            "cgi-bin/qsync/upload.php",
+            &[
+                ("sid", sid.as_str()),
+                ("dest_path", dest_path),
+                ("overwrite", "1"),
+                ("type", "standard"),
+            ],
+        );
+        // 通用 `R: AsyncRead` → `Stream<Item = Result<Vec<u8>, io::Error>>` 的适配。
+        // `Body::wrap_stream` 要的是 `TryStream`（`Bytes: From<Item>`，`Vec<u8>` 满足），
+        // 而 `tokio::fs::File` 只实现 `AsyncRead` —— tokio 的 `File` **不**实现
+        // `Stream`，所以这里用 `unfold` 手动泵：每次 poll 读一块（`UPLOAD_CHUNK`），
+        // 读满即产出一块，内存占用因此是 O(块大小) 而非 O(文件大小)。
+        //
+        // `sent` 累加**真正读走**的字节数：上传期间用户可能还在改同一个文件，
+        // 调用方（`UploadQueue`）要用这个数把 baseline 推到准确签名，
+        // 所以不能用 `expected_len` 代替。
+        let sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let stream = futures_util::stream::unfold(
+            (reader, vec![0u8; UPLOAD_CHUNK], sent.clone()),
+            |(mut reader, mut buf, sent)| async move {
+                use tokio::io::AsyncReadExt;
+                let n = reader.read(&mut buf).await.ok()?;
+                if n == 0 {
+                    return None;
+                }
+                sent.fetch_add(n as u64, Ordering::Relaxed);
+                Some((Ok::<_, std::io::Error>(buf[..n].to_vec()), (reader, buf, sent)))
+            },
+        );
+        // ★ 必须是 `stream_with_length`：QNAP 的 upload.php 对 chunked（无
+        // Content-Length）直接回 `411 Length Required`。见 upload_file 的注释。
+        let part = reqwest::multipart::Part::stream_with_length(
+            reqwest::Body::wrap_stream(stream),
+            expected_len,
+        )
+        .file_name(filename.to_string())
+        .mime_str("application/octet-stream")
+        .map_err(|e| Error::Parse(e.to_string()))?;
+        let form = reqwest::multipart::Form::new().part("files[]", part);
+        let resp = self
+            .http
+            .post(&url)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| Error::Transport(format!("upload {filename}: {e}")))?;
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| Error::Transport(e.to_string()))?;
+        parse_upload_result(&body, filename)?;
+        Ok(sent.load(Ordering::Relaxed))
     }
 
     /// 上传后对齐 mtime（`stat&settime=1`），否则服务端会判定「未同步」。
@@ -1397,9 +1527,16 @@ pub fn parse_syncing_folders(raw: &serde_json::Value) -> Vec<qxync_core::ipc::Sy
 }
 
 /// 上传响应的判定：`{"status":"1","files":[{"status":"1",...}]}`。
+///
+/// 响应不是 JSON 时把**原文**带进错误里（截断到 200B）—— 服务端对被拒的
+/// 上传会回 HTML 错误页或空 body，只报「非 JSON」等于什么线索都没有。
 pub fn parse_upload_result(body: &[u8], filename: &str) -> Result<()> {
-    let v: serde_json::Value = serde_json::from_slice(body)
-        .map_err(|e| Error::Parse(format!("upload.php 非 JSON: {e}")))?;
+    let v: serde_json::Value = serde_json::from_slice(body).map_err(|e| {
+        Error::Parse(format!(
+            "upload.php 非 JSON: {e}；HTTP 响应前 200B: {}",
+            String::from_utf8_lossy(&body[..body.len().min(200)])
+        ))
+    })?;
     let file = v.get("files").and_then(|f| f.get(0));
     let ok = file
         .and_then(|f| f.get("status"))
