@@ -55,8 +55,6 @@ pub const DEFAULT_CHUNK_SIZE: u64 = 128 * 1024;
 /// 保守取 8：NAS 和家用宽带对并发连接敏感，再高容易触发服务端限流/排队，
 /// 反而变慢。要调就 `QXYNC_HYDRATE_FANOUT=1..64`。
 pub const DEFAULT_HYDRATE_FANOUT: usize = 8;
-/// 目录列举分页上限（对应服务端 `Max_File_List`）。
-const LIST_LIMIT: usize = 200;
 /// ★ M2c：本地大批删除熔断的默认阈值（60 秒窗口内最多 100 次删除）。
 /// 超过就熔断并把后续删除回 `EACCES`；`qxync sync --force-deletes` 可解除。
 pub const DEFAULT_DELETE_LIMIT: usize = 100;
@@ -2226,9 +2224,19 @@ impl QxyncFs {
     /// ★ M7：readdir 的过滤闸门（抽出来是为了**不挂 FUSE 也能单测**）。
     ///
     /// 返回 `(远端路径, 条目)`，被 `exclude` / 临时文件规则命中的直接丢掉。
+    ///
+    /// ★ M15/T1：**这里曾经有 `.take(LIST_LIMIT)`（硬截断 200 项），已删除。**
+    /// 那个截断的前提是「`Client::list` 只返回一页 200 条」，而这个前提是错的 ——
+    /// `list` 自己就带 `start`/`limit` 翻页循环（`qxync-client/src/lib.rs`），
+    /// 拿到的 `entries` 已经是**全量**。真机实测（2026-10-04，501 项目录）：
+    /// `limit=200&start=0` 返回 200 条且 `total=501`，按 `start` 翻 3 页
+    /// 拼回 501 条、**不重不漏**；`total` 是**目录总项数**而非本页条数。
+    /// 留着那个 `.take` 的后果就是：任何超过 200 项的目录 `ls` 永远只看得到前
+    /// 200 个，且不报错、不提示（`lookup` 的三级回退能兜住 `stat`，但 `ls`
+    /// 不做逐项 stat，用户看到的就是残缺目录）。
     fn filter_visible(&self, dir_remote: &str, entries: &[DirEntry]) -> Vec<(String, DirEntry)> {
         let mut out = Vec::with_capacity(entries.len());
-        for e in entries.iter().take(LIST_LIMIT) {
+        for e in entries.iter() {
             let child_remote = self.join_remote(dir_remote, &e.filename);
             if self.hide_reason(&child_remote, e.isfolder).is_some() {
                 continue;
@@ -4035,6 +4043,58 @@ mod tests {
         );
         let off = test_fs(&dir.join("off"), false).with_rules(m7_rules(&[], false));
         assert!(off.hide_reason("/home/a.crdownload", false).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M15/T1：`readdir` **不许**再按 200 项截断目录。
+    ///
+    /// 这条守的是那个静默 bug：`filter_visible` 曾经有 `.take(LIST_LIMIT)`，而
+    /// `LIST_LIMIT = 200` 只是服务端**单页**的容量（`Client::list` 自己会翻页，
+    /// 传进来的是全量）。于是任何 >200 项的目录 `ls` 永远只看得到前 200 个，
+    /// **且不报错**。
+    ///
+    /// 真机依据（2026-10-04，501 项目录）：`limit=200&start=0` → 200 条 / `total=501`，
+    /// 按 `start` 翻 3 页拼回 501 条、不重不漏。所以这里直接喂 500 条全量清单，
+    /// 断言一个不少。
+    #[test]
+    fn t1_readdir_is_not_truncated_at_200() {
+        let dir = m7_tmpdir("t1-bigdir");
+        let fs = test_fs(&dir, false);
+
+        // 500 个普通文件 + 1 个会被临时文件规则滤掉的，共 501 条
+        let mut entries: Vec<DirEntry> = (0..500)
+            .map(|i| DirEntry::local(&format!("f{i:04}.txt"), false, i, 1_700_000_000 + i as i64))
+            .collect();
+        entries.push(DirEntry::local("dl.crdownload", false, 9, 1));
+
+        let visible = fs.filter_visible("/home/big", &entries);
+        let names: Vec<&str> = visible.iter().map(|(_, e)| e.filename.as_str()).collect();
+        assert_eq!(
+            names.len(),
+            500,
+            "500 个普通文件必须全部可见（只有 .crdownload 被规则滤掉）"
+        );
+        assert_eq!(names.first(), Some(&"f0000.txt"));
+        assert_eq!(names.last(), Some(&"f0499.txt"));
+        assert!(
+            !names.contains(&"dl.crdownload"),
+            "临时文件仍应被 M7 规则滤掉"
+        );
+
+        // 边界：正好 200 项（旧的截断点）一个都不能少
+        let exact: Vec<DirEntry> = (0..200)
+            .map(|i| DirEntry::local(&format!("e{i:04}.txt"), false, i, 1_700_000_000 + i as i64))
+            .collect();
+        assert_eq!(fs.filter_visible("/home/big", &exact).len(), 200);
+
+        // 边界：201 项（跨过旧上限的那一项）也要在
+        let over: Vec<DirEntry> = (0..201)
+            .map(|i| DirEntry::local(&format!("o{i:04}.txt"), false, i, 1_700_000_000 + i as i64))
+            .collect();
+        let got = fs.filter_visible("/home/big", &over);
+        assert_eq!(got.len(), 201, "第 201 项不能被吃掉");
+        assert_eq!(got[200].1.filename, "o0200.txt");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

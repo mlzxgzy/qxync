@@ -397,3 +397,52 @@ async fn m2c_sync_log_and_notify_endpoints() {
         Err(e) => println!("device_config_list 出错（可容忍）: {e}"),
     }
 }
+
+/// ★ M15/T1：`Client::list` 的 `start`/`limit` 翻页能取回**超过单页 200** 的全量清单。
+///
+/// 这条守的是「>200 项的目录读不全」那个静默 bug 的**上游**：`list` 自己翻页，
+/// 下游 `qxync-fuse` 的 `filter_visible` 才能拿到全量（它历史上多截断了一次）。
+///
+/// 依赖 `xtask/probe/bigdir_probe.py` 造的 501 项目录：
+/// ```bash
+/// export QXYNC_TEST_BIGDIR=/home/bigdir-probe
+/// ```
+/// 未设置该变量 → 跳过。
+#[tokio::test]
+#[ignore = "需要真机 NAS + 500 项目录"]
+async fn list_paginates_past_200() {
+    let Some(client) = logged_in().await else {
+        return;
+    };
+    let Ok(dir) = std::env::var("QXYNC_TEST_BIGDIR") else {
+        println!("跳过：未设置 QXYNC_TEST_BIGDIR");
+        return;
+    };
+
+    let entries = client.list(&dir).await.expect("get_list 大目录");
+    let names: Vec<&str> = entries.iter().map(|e| e.filename.as_str()).collect();
+    println!("{dir} -> {} 项", names.len());
+
+    assert!(
+        names.len() > 200,
+        "必须超过单页 200 条，否则这条测试没意义（实际 {}）",
+        names.len()
+    );
+
+    // 不重：同名只应出现一次
+    let mut uniq = names.clone();
+    uniq.sort_unstable();
+    uniq.dedup();
+    assert_eq!(uniq.len(), names.len(), "翻页结果里有重复项");
+
+    // 不漏：拿单页大 limit 一次性取全量作对照基线
+    let all = client
+        .list_limit(&dir, 5000)
+        .await
+        .expect("get_list limit=5000");
+    println!("对照 limit=5000 -> {} 项", all.len());
+    assert_eq!(names.len(), all.len(), "分页结果与单页全量应一致（不漏项）");
+    for n in &names {
+        assert!(all.iter().any(|e| e.filename == *n), "缺项 {n}");
+    }
+}

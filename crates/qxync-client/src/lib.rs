@@ -21,6 +21,11 @@ use qxync_core::{
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+/// `get_list` 的默认单页容量（对应服务端 `Max_File_List`）。
+///
+/// 只是**单页**大小，不是目录容量上限 —— `list` 会按 `start` 一直翻到取全量。
+const LIST_LIMIT: usize = 200;
+
 /// `qbox_write_log` 的 action 码。
 ///
 /// **推断值**：报告未确认枚举；这里的取值来自真机 sync log 里观察到的真实事件
@@ -412,48 +417,35 @@ impl Client {
         Ok(String::from_utf8_lossy(&body).into_owned())
     }
 
-    /// `func=get_list`，自动翻页（`start += len(datas)` 直到 `len < limit` 或 `start >= total`）。
+    /// `func=get_list`，自动翻页（`start += len(datas)` 直到 `len < limit` 或已取满 `total`）。
+    ///
+    /// ★ M15/T1 真机实测（2026-10-04，QTS 5.2.9 / Qsync QPKG build 20260723）：
+    /// 服务端**确实支持 `start`/`limit` 分页**，且 `limit` 不被 `Max_File_List=200`
+    /// 夹住（实测 `limit=5000` 生效，单页拿回 501 项）。`total` / `real_total` 是
+    /// **目录总项数**（`limit=1` 时 `total` 仍是 3，不是本页的 1），所以下面
+    /// `out.len() >= total` 的退出条件是按「目录总数」写的，实测 501 项目录
+    /// 翻 3 页拼回 501 条、不重不漏。
+    ///
+    /// 也就是说：调用方拿到的 `entries` 已经是**全量**，下游**不要**再按 200 截断
+    /// （`qxync-fuse` 的 `filter_visible` 曾经这么干，导致 >200 项目录 `ls` 读不全）。
     pub async fn list(&self, path: &str) -> Result<Vec<DirEntry>> {
-        const LIMIT: usize = 200;
+        self.list_limit(path, LIST_LIMIT).await
+    }
+
+    /// 同 [`Client::list`]，但用**自定义单页容量** —— 仍然会翻页取全量。
+    ///
+    /// 服务端实测不把 `limit` 夹在 `Max_File_List=200`（`limit=5000` 生效，单页
+    /// 拿回 501 项），所以拿一个超大 `limit` 就能**一次**取全，作为分页结果的
+    /// 对照基线（见 `qxync-proto-test` 的 `list_paginates_past_200`）。
+    pub async fn list_limit(&self, path: &str, limit: usize) -> Result<Vec<DirEntry>> {
         let mut out: Vec<DirEntry> = Vec::new();
         let mut start = 0usize;
         loop {
-            let sid = self.require_sid()?.to_string();
-            let start_s = start.to_string();
-            let limit_s = LIMIT.to_string();
-            let url = self.url(
-                "cgi-bin/qsync/qsyncsrv.cgi",
-                &[
-                    ("func", "get_list"),
-                    ("sid", sid.as_str()),
-                    ("is_iso", "0"),
-                    ("list_mode", "all"),
-                    ("path", path),
-                    ("dir", "ASC"),
-                    ("limit", limit_s.as_str()),
-                    ("sort", "filename"),
-                    ("start", start_s.as_str()),
-                    ("no_sort", "0"),
-                    ("hidden_file", "1"),
-                ],
-            );
-            let resp = self
-                .http
-                .get(&url)
-                .send()
-                .await
-                .map_err(|e| Error::Transport(format!("get_list {path}: {e}")))?;
-            let body = resp
-                .bytes()
-                .await
-                .map_err(|e| Error::Transport(e.to_string()))?;
-            let listing: Listing = parse_listing(&body)?;
-            listing.ensure_ok(format!("get_list {path}"))?;
-
+            let listing = self.list_page(path, limit, start).await?;
             let got = listing.datas.len();
+            let total = listing.total;
             out.extend(listing.datas);
-            if got < LIMIT || (listing.total >= 0 && out.len() as i64 >= listing.total) || got == 0
-            {
+            if got == 0 || got < limit || (total >= 0 && out.len() as i64 >= total) {
                 break;
             }
             start += got;
@@ -462,6 +454,42 @@ impl Client {
             }
         }
         Ok(out)
+    }
+
+    /// 单页 `get_list`（不翻页）。`list` / `list_limit` 的公共一跳。
+    async fn list_page(&self, path: &str, limit: usize, start: usize) -> Result<Listing> {
+        let sid = self.require_sid()?.to_string();
+        let start_s = start.to_string();
+        let limit_s = limit.to_string();
+        let url = self.url(
+            "cgi-bin/qsync/qsyncsrv.cgi",
+            &[
+                ("func", "get_list"),
+                ("sid", sid.as_str()),
+                ("is_iso", "0"),
+                ("list_mode", "all"),
+                ("path", path),
+                ("dir", "ASC"),
+                ("limit", limit_s.as_str()),
+                ("sort", "filename"),
+                ("start", start_s.as_str()),
+                ("no_sort", "0"),
+                ("hidden_file", "1"),
+            ],
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| Error::Transport(format!("get_list {path}: {e}")))?;
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| Error::Transport(e.to_string()))?;
+        let listing: Listing = parse_listing(&body)?;
+        listing.ensure_ok(format!("get_list {path}"))?;
+        Ok(listing)
     }
 
     /// `func=stat`：**必须**是 `path=<所在目录>&file_name=<名字>&file_total=1`。
