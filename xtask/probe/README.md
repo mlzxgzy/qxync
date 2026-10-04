@@ -32,6 +32,7 @@
 | `qxstate_fixture.py` | **离线**造 v2 缓存（`.qxstate` + `.qxsum`），含「手工破坏某区间」，用来端到端验 `qxync verify`（M15/T3） |
 | `upload_stream_diag.py` | 诊断 `upload.php` 对「整块 body vs chunked body」的真实反应 —— 结论：**服务端不接受 chunked，必须带 Content-Length**（M15/T2 的关键前置） |
 | `upload_mem_probe.py` | 量「流式上传」与「整文件读内存」的**峰值 RSS 对照**（读 `/proc/<pid>/status` 的 `VmHWM`），M15/T2 验收依据 |
+| `upload_chunk_probe.py` | 验「服务端支不支持分片续传」—— ★ 结论：**服务端实现了，但只服务 Qbox 空间**，我们的家目录路径够不到 → M15/T4 取消（2026-10-04） |
 
 连接目标一律走环境变量或 `--host`，**默认值是指不到任何真实设备的占位符**：
 
@@ -118,6 +119,58 @@ qxync verify --path /tmp/qx-cache-demo              # 全部通过，退出码 0
 
 校验吞吐（256 MiB 实测，dev profile、缓存热）：**1212 MiB/s** → 10 GB 全量校验
 约 **8.4 s**，远低于 30 s 预算。
+
+## ★ 服务端分片上传：实现完整，但我们的路径够不到（2026-10-04，M15/T4）
+
+`upload_chunk_probe.py` 的结论，**推翻了 M15 原文「服务端不支持分片」的前提**
+（那条判断的依据只是 `versioning_support=0`，那是 **delta 增量上传**的前置，跟分片无关）。
+
+结论分两层，**两层都得说清，否则会做出错误的决定**：
+
+**① 服务端实现得很完整，不是「没做」**
+
+静态分析 `QsyncServer_5.0.0.8_20260916_x86_hal.qpkg` 里的 `cgi/qsyncsrv.cgi`
+（★ **是 ELF x86-64 二进制，不是 PHP**）。剥法：shell 头 + `tar.gz`（偏移 1827）
+→ `QsyncServer.tgz` → `cgi/`。`strings` + `objdump -d` 读出：
+
+| func | 处理函数 | 必需参数 |
+| --- | --- | --- |
+| `start_chunked_upload` | `0x6973c` | `ssid`、`upload_root_dir` |
+| `get_chunked_upload_status` | `0x6cae8` | `upload_id`、`upload_root_dir` |
+| `delete_chunked_upload_file` | `0x6d1c9` | 同上 |
+
+另有 5 个 `upload.c` 内部符号（`op_chunked_upload` 读 `offset`/`filesize`/`upload_id`/
+`upload_name`/`check_sum`、`op_combine_upload` 等）。分片落盘到
+`<upload_root_dir>/.@upload_cache/<upload_id>/`（`snprintf(buf,0x400,"%s/%s",root,".@upload_cache")`）。
+`upload_id` 约束是长度 `[2,32]` + `Is_Alphabet_Num`，服务端生成的是 `"tmp-"+8位随机`。
+
+**② 但那条通道只服务 Qbox 空间，我们的家目录路径进不去**
+
+| `upload_root_dir` | handler status |
+| --- | --- |
+| `/home/qxync-t4probe`（**存在**的普通目录） | **12** |
+| `/remote:/home/qxync-t4probe` | **46** |
+
+`start_chunked_upload` 走 `0x6927c` → `0x9d02a`（realpath + UID 校验，
+内部认 `/remote:` 前缀与 `@` 分隔的 `name@uid`）。而 `func=upload.php` 的
+`dest_path` 用的是**普通绝对路径** —— **两套路径空间不通**。
+Qsync 官方客户端能续传，是因为它对 Qbox 空间用分片、对普通家目录直接整传。
+
+### ★★ 顺带一个更隐蔽的坑：`qsyncsrv.cgi` 的响应是**两段 JSON**
+
+```
+{ "version": "", "build": "20260723", "status": 0,  ... }   ← 框架头，永远 0
+{ "version": "", "build": "20260723", "status": 12, ... }   ← handler 的真实结果
+```
+
+只 `re.search(r'"status":\s*(\d+)')` 会抓到框架头的 `0`，
+**看起来像「所有 func 都毫无反应」，其实全部正常返回**。
+探针里已封成 `handler_status()`（取最后一个非 0 值）。**打这个 CGI 都要注意。**
+
+```bash
+python3 upload_chunk_probe.py --host nas.example.com --port 9834 \
+    --user test1 --password 'xxx' --dir /home/qxync-t4probe
+```
 
 ## 建议的验证顺序
 
