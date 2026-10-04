@@ -2149,6 +2149,19 @@ fn print_status(st: &StatusData) {
             u.bytes
         );
     }
+    // ★ M11：删除队列。`pending>0` = 有删除还没推给 NAS（正常只会持续几百毫秒）；
+    // `failed>0` = 有删除重试超限被放弃了 —— 这时 NAS 上会残留文件，需要人工处理。
+    if let Some(d) = &st.deletes {
+        println!(
+            "删除队列  : 待删 {}｜推送中 {}｜已删 {}｜失败 {}｜重试 {}｜批次 {}",
+            d.pending,
+            if d.active { "yes" } else { "no" },
+            d.deleted,
+            d.failed,
+            d.retries,
+            d.batches
+        );
+    }
     if let Some(s) = &st.sync {
         print_sync(s);
     }

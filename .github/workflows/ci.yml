@@ -47,14 +47,15 @@ jobs:
       # 真机测试必须保持 #[ignore]：它们是手动跑的，绝不能因为 CI 恰好有网就误连真实设备。
       # 这里把「ignored 用例数」钉死，谁把 #[ignore] 去掉就会在这里失败。
       # ⚠️ 增删真机用例时**必须同步改这个数字**，否则 CI 会红。
-      #    现值 13 的构成（改动时请一并核对）：
-      #      nas.rs 7 + get_meta.rs 3 + daemon_ipc.rs 1 + syncing_folders.rs 1 + versioning.rs 1
-      - name: 确认真机测试仍是 #[ignore]（应为 13 条）
+      #    现值 14 的构成（改动时请一并核对）：
+      #      nas.rs 8 + get_meta.rs 3 + daemon_ipc.rs 1 + syncing_folders.rs 1 + versioning.rs 1
+      #    （v0.4.3 新增 nas.rs 的 m11_batch_delete_contract）
+      - name: 确认真机测试仍是 #[ignore]（应为 14 条）
         run: |
           n="$(cargo test -p qxync-proto-test -- --list --ignored | grep -cE ': test$')"
           echo "ignored tests = $n"
-          [ "$n" = "13" ] || {
-            echo "❌ 期望 13 条 ignored 真机测试，实际 $n 条"
+          [ "$n" = "14" ] || {
+            echo "❌ 期望 14 条 ignored 真机测试，实际 $n 条"
             echo "   若确实增删了真机用例，请同步更新本步骤的数字与上面的构成说明"
             exit 1
           }

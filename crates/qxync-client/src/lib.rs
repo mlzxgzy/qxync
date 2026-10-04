@@ -761,15 +761,37 @@ impl Client {
 
     /// 删除文件或目录：`qsyncsrv.cgi?func=delete`，body `{path, file_name, file_total=1}`（实测）。
     pub async fn delete_entry(&self, dir: &str, name: &str) -> Result<()> {
+        self.delete_entries(dir, &[name]).await
+    }
+
+    /// ★ M11：同一目录下的**批量删除**。
+    ///
+    /// `file_total` 本来就是「本批条目数」——`stat`/`set_mtime` 把它硬编码成 `1`
+    /// 只是因为那些调用每次只处理一个文件。删 N 个文件时把 N 个 `file_name`
+    /// 连同 `file_total=N` 一次发出去，N 次串行 RTT 塌缩成 1 次。
+    ///
+    /// 限制：**只能同目录**。`path` 只有一个，跨目录必须分组。
+    pub async fn delete_entries(&self, dir: &str, names: &[&str]) -> Result<()> {
+        if names.is_empty() {
+            return Ok(());
+        }
         let sid = self.require_sid()?.to_string();
         let url = self.url(
             "cgi-bin/qsync/qsyncsrv.cgi",
             &[("func", "delete"), ("sid", sid.as_str())],
         );
+        // `file_total` 必须等于本批实际条目数，否则服务端只处理前 N 个。
+        let mut form: Vec<(&str, String)> = vec![
+            ("path", dir.to_string()),
+            ("file_total", names.len().to_string()),
+        ];
+        for n in names {
+            form.push(("file_name", n.to_string()));
+        }
         let resp = self
             .http
             .post(&url)
-            .form(&[("path", dir), ("file_name", name), ("file_total", "1")])
+            .form(&form)
             .send()
             .await
             .map_err(|e| Error::Transport(format!("delete: {e}")))?;
@@ -777,7 +799,9 @@ impl Client {
             .bytes()
             .await
             .map_err(|e| Error::Transport(e.to_string()))?;
-        parse_listing(&body)?.ensure_ok(format!("delete {dir}/{name}"))?;
+        // 部分成功也要能看出是哪几个：ensure_ok 只报首个失败项。
+        let listing = parse_listing(&body)?;
+        listing.ensure_ok(format!("delete {dir}/{}", names.join(",")))?;
         Ok(())
     }
 

@@ -19,6 +19,7 @@ use qxync_core::settings::{ProxySpec, Settings};
 use qxync_core::store::JournalEntry;
 use qxync_core::tasks::{conflict_label, has_any_task, Task, CONFLICT_RENAME_LOCAL};
 use qxync_core::{ConfigPaths, Credentials, Error as CoreError, LinkConfig, PeerConfig};
+use qxync_fuse::delete::DeleteQueue;
 use qxync_fuse::upload::UploadQueue;
 use qxync_fuse::{CacheMode, FsHandle, HydroCounters, LocalView, MountHandle, PinMap, QxyncFs};
 use std::collections::HashMap;
@@ -91,6 +92,8 @@ pub(crate) struct MountEntry {
     counters: Arc<HydroCounters>,
     /// 读写挂载时的上传队列（卸载前要排空）。
     upload: Option<Arc<UploadQueue>>,
+    /// ★ M11：读写挂载时的删除队列（卸载前要排空，否则「本地已删、远端还在」）。
+    delete_queue: Option<Arc<DeleteQueue>>,
     /// ★ M2c：共享节点表句柄（同步引擎在挂载线程外刷新远端变更）。
     pub(crate) handle: FsHandle,
     /// ★ M3：缓存模式（pagecache / direct）。
@@ -364,6 +367,8 @@ fn idle_status(socket: &Path, started: Instant) -> StatusData {
         cursors: None,
         hydro: HydroStats::default(),
         uploads: None,
+        // ★ M11：待命状态没有挂载点，也就没有删除队列。
+        deletes: None,
         sync: None,
         cache: None,
         mounts: Vec::new(),
@@ -1180,7 +1185,7 @@ async fn status(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
         (None, None, false)
     };
 
-    let (mounts, hydro, uploads) = snapshot_mounts(state);
+    let (mounts, hydro, uploads, deletes) = snapshot_mounts(state);
     to_value(StatusData {
         daemon: DaemonInfo {
             version: state.version.to_string(),
@@ -1205,6 +1210,7 @@ async fn status(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
         cursors,
         hydro,
         uploads,
+        deletes,
         sync: Some(sync_info(state)),
         cache: Some(cache_info(state)),
         mounts,
@@ -1649,6 +1655,7 @@ async fn mount(
     };
     fs = fs.with_cache_mode(mode);
     let mut upload_queue = None;
+    let mut delete_queue = None;
     if read_write {
         let marker_dir = ConfigPaths::discover()
             .map(|p| p.data_dir.join("upload-queue"))
@@ -1656,13 +1663,28 @@ async fn mount(
         let q = UploadQueue::new(
             fuse_client.clone(),
             tokio::runtime::Handle::current(),
-            marker_dir,
+            marker_dir.clone(),
         )
         .map_err(|e| IpcError::new(ErrorKind::Io, format!("创建上传队列失败: {e}")))?;
         q.spawn_worker()
             .map_err(|e| IpcError::new(ErrorKind::Io, format!("启动上传 worker 失败: {e}")))?;
-        fs = fs.with_write_mode().with_upload_queue(q.clone());
+        // ★ M11：删除队列。与上传队列**共用同一个队列目录 / 同一个 queue.db**
+        // （表各自独立：`uploads` / `deletes`），不额外造一个库。
+        // 有了它，`unlink` 立刻返回、远端删除由 worker 同目录攒批推送。
+        let dq = DeleteQueue::new(
+            fuse_client.clone(),
+            tokio::runtime::Handle::current(),
+            marker_dir,
+        )
+        .map_err(|e| IpcError::new(ErrorKind::Io, format!("创建删除队列失败: {e}")))?;
+        dq.spawn_worker()
+            .map_err(|e| IpcError::new(ErrorKind::Io, format!("启动删除 worker 失败: {e}")))?;
+        fs = fs
+            .with_write_mode()
+            .with_upload_queue(q.clone())
+            .with_delete_queue(dq.clone());
         upload_queue = Some(q);
+        delete_queue = Some(dq);
     }
     // ★ M2c/M3：必须在 fs 被交给 fuser 之前取句柄，同步引擎与脱水都靠它
     let handle = fs.handle();
@@ -1761,6 +1783,7 @@ async fn mount(
             notifier,
             counters,
             upload: upload_queue,
+            delete_queue,
             handle,
             cache_mode: mode,
             conflict: conflict.clone(),
@@ -1791,6 +1814,15 @@ async fn umount(state: &Arc<State>, mountpoint: PathBuf) -> Result<serde_json::V
     if let Some(q) = &entry.upload {
         if !q.drain(Duration::from_secs(120)) {
             tracing::warn!("卸载前上传队列未排空（继续卸载，标记文件保留，下次启动会重试）");
+        }
+        q.shutdown();
+    }
+    // ★ M11：删除队列同理 —— 卸载时没发出去的删除必须做完，
+    // 否则会留下「本地已经删了、NAS 上还在」的空洞。
+    // 排不空也不阻塞卸载：`deletes` 表已持久化，下次启动会重新入队。
+    if let Some(q) = &entry.delete_queue {
+        if !q.drain(Duration::from_secs(120)) {
+            tracing::warn!("卸载前删除队列未排空（继续卸载，未发出的删除已入库，下次启动会重试）");
         }
         q.shutdown();
     }
@@ -1834,7 +1866,7 @@ async fn umount(state: &Arc<State>, mountpoint: PathBuf) -> Result<serde_json::V
 }
 
 fn mounts(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
-    let (list, _, _) = snapshot_mounts(state);
+    let (list, _, _, _) = snapshot_mounts(state);
     to_value(list)
 }
 
@@ -1844,11 +1876,14 @@ fn snapshot_mounts(
     Vec<MountInfo>,
     HydroStats,
     Option<qxync_core::ipc::UploadInfo>,
+    Option<qxync_core::ipc::DeleteInfo>,
 ) {
     let g = state.mounts.lock().unwrap();
     let list = g.values().map(|m| m.info.clone()).collect();
     let (mut count, mut bytes) = (0u64, 0u64);
     let mut uploads: Option<qxync_core::ipc::UploadInfo> = None;
+    // ★ M11：删除队列汇总。任一挂载点有删除队列就报（`pending>0` 说明还有没推完的删除）。
+    let mut deletes: Option<qxync_core::ipc::DeleteInfo> = None;
     for m in g.values() {
         let (c, b) = m.counters.snapshot();
         count += c;
@@ -1862,8 +1897,18 @@ fn snapshot_mounts(
             e.retries += u.retries;
             e.bytes += u.bytes;
         }
+        if let Some(d) = m.delete_queue.as_ref().map(|q| q.snapshot()) {
+            let e = deletes.get_or_insert_with(Default::default);
+            e.active = e.active || d.active;
+            e.pending += d.pending;
+            e.done += d.done;
+            e.failed += d.failed;
+            e.retries += d.retries;
+            e.batches += d.batches;
+            e.deleted += d.deleted;
+        }
     }
-    (list, HydroStats { count, bytes }, uploads)
+    (list, HydroStats { count, bytes }, uploads, deletes)
 }
 
 async fn shutdown_all_mounts(state: &Arc<State>) -> usize {
