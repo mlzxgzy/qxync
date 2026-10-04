@@ -248,6 +248,80 @@ async fn write_api_contract() {
         .is_none());
 }
 
+/// ★ M11：批量删除契约 —— `file_total=N` + N 个 `file_name` 能一次删掉同目录多项。
+///
+/// 这条是「删除异步化 + 攒批」收益的**前提**：如果服务端只认前 `file_total` 个，
+/// 或者只处理第一个 `file_name`，那批量删除就会**静默漏删**（用户以为删了，
+/// NAS 上还在），所以必须真机验证「N 个全部消失」。
+///
+/// 会在 `<fixture>/rust-batch-delete/` 下写入，跑完自己清理。
+#[tokio::test]
+#[ignore = "需要真机 NAS，且会写入 NAS"]
+async fn m11_batch_delete_contract() {
+    let Some(client) = logged_in().await else {
+        return;
+    };
+    let root = fixture_root();
+    let dir = format!("{root}/rust-batch-delete");
+    let _ = client.delete_entries(&root, &["rust-batch-delete"]).await; // 清掉上次残留
+    let _ = client.mkdir(&root, "rust-batch-delete").await;
+
+    // 造 5 个文件（数量刻意不取 1，才能证明「多」这条路径）
+    let names: Vec<String> = (0..5).map(|i| format!("b{i}.txt")).collect();
+    for n in &names {
+        client
+            .upload_bytes(&dir, n, b"batch\n".to_vec())
+            .await
+            .expect("upload");
+    }
+    // 前置断言：5 个都在
+    for n in &names {
+        assert!(
+            client.stat(&dir, n).await.unwrap().is_some(),
+            "前置条件：{n} 应当存在"
+        );
+    }
+
+    // 一次请求删全部
+    let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    client
+        .delete_entries(&dir, &refs)
+        .await
+        .expect("batch delete");
+
+    // 核心验收：N 个**全部**消失
+    for n in &names {
+        assert!(
+            client.stat(&dir, n).await.unwrap().is_none(),
+            "{n} 必须已被删除（批量删除不能漏项）"
+        );
+    }
+
+    // 空批次是合法的 no-op（worker 不该因空批白发一次请求）
+    client.delete_entries(&dir, &[]).await.expect("empty no-op");
+
+    // 混合：文件 + 目录同批。目录应一并消失。
+    let _ = client.mkdir(&dir, "bdir").await;
+    client
+        .upload_bytes(&dir, "keep1.txt", b"x\n".to_vec())
+        .await
+        .unwrap();
+    client
+        .delete_entries(&dir, &["keep1.txt", "bdir"])
+        .await
+        .expect("mixed batch");
+    assert!(client.stat(&dir, "keep1.txt").await.unwrap().is_none());
+    assert!(client.stat(&dir, "bdir").await.unwrap().is_none());
+
+    // 清理
+    let _ = client.delete_entries(&root, &["rust-batch-delete"]).await;
+    assert!(client
+        .stat(&root, "rust-batch-delete")
+        .await
+        .unwrap()
+        .is_none());
+}
+
 /// ★ M2c：变更发现三端点（`qbox_get_sync_log` / `qbox_query_notify` / `qbox_get_device_config_list`）。
 ///
 /// 验收点（真机）：

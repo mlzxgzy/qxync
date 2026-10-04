@@ -19,11 +19,14 @@ use fuser::{
     ReplyWrite, ReplyXattr, Request, TimeOrNow,
 };
 
+/// ★ M11：删除队列（unlink/rmdir 异步入队 + 同目录攒批推送）。
+pub mod delete;
 pub mod upload;
 
 // 脱水需要 daemon 持有 fuser 的会话/通知句柄；这里转出，避免 daemon 直接依赖 fuser。
 pub use fuser::{BackgroundSession, Notifier};
 
+use crate::delete::DeleteJob;
 use qxync_client::peer::{self, ContentSource, PeerConfig, PeerHead};
 use qxync_client::Client;
 use qxync_core::dehydrate::{Block, Candidate, Policy};
@@ -1659,6 +1662,10 @@ pub struct QxyncFs {
     dir_ttl: Duration,
     /// ★ M10：daemon 挂载后注入的运行时回调（内核失效 / 会话热更新）。
     hooks: Hooks,
+    /// ★ M11：当前用户的 uid —— 用来认 `.Trash-<uid>` 这个卷内回收站目录名。
+    trash_uid: u32,
+    /// ★ M11：删除队列（写模式必须提供）。`None` 时 `unlink` 退回同步删除。
+    delete_queue: Option<Arc<crate::delete::DeleteQueue>>,
 }
 
 /// ★ M7：LAN 快路径计数（`status` 里能看到省了多少次 NAS 请求）。
@@ -1766,6 +1773,8 @@ impl QxyncFs {
             lan_stats: Arc::new(LanStats::default()),
             dir_ttl: DEFAULT_DIR_TTL,
             hooks: Hooks::default(),
+            trash_uid: unsafe { libc::getuid() },
+            delete_queue: None,
         })
     }
 
@@ -1874,6 +1883,20 @@ impl QxyncFs {
     pub fn with_peers(mut self, peers: Arc<Mutex<Vec<PeerConfig>>>) -> Self {
         self.lan_peers = peers;
         self
+    }
+
+    /// ★ M11：注入删除队列 —— `unlink`/`rmdir` 从「阻塞打 NAS」改为「入队即返回」。
+    ///
+    /// 不注入时 [`Self::remove_entry`] 退回同步删除（语义仍是「删得掉」，
+    /// 只是慢）。写模式（`--rw`）的 daemon **必须**注入。
+    pub fn with_delete_queue(mut self, q: Arc<crate::delete::DeleteQueue>) -> Self {
+        self.delete_queue = Some(q);
+        self
+    }
+
+    /// ★ M11：删除队列快照（`status` 用；未注入时全零）。
+    pub fn delete_queue(&self) -> Option<Arc<crate::delete::DeleteQueue>> {
+        self.delete_queue.clone()
     }
 
     /// ★ M10：让 daemon 重登一次，并把新 sid 热塞进本挂载点用的 client。
@@ -2006,6 +2029,42 @@ impl QxyncFs {
         }
         self.rules
             .hides_in_roots(&self.remote_roots(), remote, is_dir)
+    }
+
+    /// ★ M11：**回收站目录**判定 —— 路径任一段命中回收站命名就返回 `true`。
+    ///
+    /// 为什么要挡：KDE Dolphin（`kio_trash.so`）删除文件时不去调 `unlink`，
+    /// 而是走 FDO 的卷内回收站协议：在**同一个卷**里造出
+    /// `.Trash-$UID/{files,info}`，把文件「搬」进去并写 `.trashinfo`。
+    /// 挂载点本身就是一个卷，于是回收站被造在挂载点里、
+    /// 内容最终落在 NAS 上。实测 `~/qxync-mnt/.Trash-1000/info/*.trashinfo` 里
+    /// 记着 `Path=qxync-test/...`（挂载点内的相对路径），正是这个机制。
+    ///
+    /// 挡掉之后 Dolphin 的建目录/写文件会拿到 `EPERM`，
+    /// KIO 无法创建回收站 → 退回「直接删除」（这是它的既定回退路径），
+    /// 用户要的「不进回收站、直接删」就达成了。
+    ///
+    /// 识别的命名（只认**段**级，不做前缀模糊匹配，避免误伤正常文件）：
+    /// * `.Trash`（管理员共享回收站）与 `.Trash-<uid>`（当前 uid）
+    /// * `@Recycle`（QNAP 自家回收站，`@` 是 QNAP 的隐藏标记前缀）
+    ///
+    /// 注意**只挡挂载点内的**这些名字。`hide_reason` 走的是用户 `exclude` 规则，
+    /// 两者是不同机制：这个是 qxync 的硬约束，删不得也覆盖不了。
+    fn is_trash_path(&self, remote: &str) -> bool {
+        remote
+            .split('/')
+            // 首段常是 ""（绝对路径开头），跳过
+            .filter(|s| !s.is_empty())
+            .any(|seg| is_trash_segment(seg, self.trash_uid))
+    }
+
+    /// 回收站守卫：命中就拒绝并打出可诊断的日志。
+    fn deny_trash(&self, remote: &str, op: &str) -> Result<(), fuser::Errno> {
+        if self.is_trash_path(remote) {
+            tracing::warn!("拒绝{op}回收站路径（挂载点不提供回收站，删除将直接生效）: {remote}");
+            return Err(fuser::Errno::EPERM);
+        }
+        Ok(())
     }
 
     /// ★ M7：被规则隐藏的路径**任何写操作都不许落地**（返回 `ENOENT`：它在挂载点里不存在）。
@@ -2328,8 +2387,13 @@ impl QxyncFs {
                 .unwrap_or(false);
             (p.remote.clone(), ino, dirty)
         };
+        let remote = join_path(&parent_remote, name);
         // ★ M7：被排除的路径在挂载点里不存在 —— 删除它同样回 ENOENT
-        if let Err(e) = self.deny_hidden(&join_path(&parent_remote, name), is_dir) {
+        if let Err(e) = self.deny_hidden(&remote, is_dir) {
+            return reply.error(e);
+        }
+        // ★ M11：不让桌面回收站长在挂载点里（KIO 会往 `.Trash-$UID` 搬文件 = 2~3 次往返/文件）
+        if let Err(e) = self.deny_trash(&remote, "删除") {
             return reply.error(e);
         }
         // ★ M2c：本地大批删除熔断。`rm -rf` 超过阈值后拒绝继续删，
@@ -2344,25 +2408,45 @@ impl QxyncFs {
         if dirty {
             if let Some(q) = &self.upload {
                 if !q.drain(Duration::from_secs(30)) {
-                    tracing::warn!("删除前排空上传队列超时: {parent_remote}/{name}");
+                    tracing::warn!("删除前排空上传队列超时: {remote}");
                     return reply.error(fuser::Errno::EBUSY);
                 }
             }
         }
-        // ★ M10：会话失效 → 重登一次再重试
-        let res = self.with_session_retry(|| {
-            let client = self.client.clone();
-            let (dir, n) = (parent_remote.clone(), name.to_string());
-            self.rt
-                .block_on(async move { client.delete_entry(&dir, &n).await })
-        });
-        if let Err(e) = res {
-            tracing::warn!("delete 失败 {parent_remote}/{name}: {e}");
-            return reply.error(fuser::Errno::EIO);
+        // ★ M11：**异步入队，立刻返回**。
+        //
+        // 改之前这里是 `rt.block_on(client.delete_entry(..))` —— unlink 要等 NAS 回包才返回，
+        // 删 N 个文件就是 N 次串行 RTT。现在与官方客户端的删除形态对齐
+        // （Smart Delete：本地立即生效，服务端侧异步推进）：
+        //   * 节点表 / 映射立即摘掉（本地视角文件已消失，用户不等网络）
+        //   * 远端删除由 `qxync-delete` worker 攒批推送（同目录合一次请求）
+        //   * 失败自动重试，超限则 `status` 的删除失败计数 + 日志告警
+        //
+        // 熔断在上面已经生效：**大批量误删仍然被 EACCES 挡住**，不会悄悄进队列。
+        if let Some(q) = &self.delete_queue {
+            q.enqueue(DeleteJob {
+                remote_dir: parent_remote.clone(),
+                remote_name: name.to_string(),
+                is_dir,
+                attempts: 0,
+            });
+        } else {
+            // 没有删除队列（只读模式本不该走到这里；写模式必须注入队列）→ 退回同步删除，
+            // 保证语义是「删得掉」而不是静默不删。
+            // ★ M10：会话失效 → 重登一次再重试
+            let res = self.with_session_retry(|| {
+                let client = self.client.clone();
+                let (dir, n) = (parent_remote.clone(), name.to_string());
+                self.rt
+                    .block_on(async move { client.delete_entry(&dir, &n).await })
+            });
+            if let Err(e) = res {
+                tracing::warn!("delete 失败 {remote}: {e}");
+                return reply.error(fuser::Errno::EIO);
+            }
         }
         {
             let mut g = self.inner.lock().unwrap();
-            let remote = join_path(&parent_remote, name);
             let prefix = format!("{}/", remote.trim_end_matches('/'));
             let victims: Vec<INodeNo> = g
                 .by_remote
@@ -2382,11 +2466,7 @@ impl QxyncFs {
         }
         // ★ M9：本地删除立刻从「映射」里摘掉，否则旧快照会把删掉的名字复活成幽灵节点
         listing_remove(&self.inner, &parent_remote, name);
-        tracing::debug!(
-            "{} {}",
-            if is_dir { "rmdir" } else { "unlink" },
-            join_path(&parent_remote, name)
-        );
+        tracing::debug!("{} {}", if is_dir { "rmdir" } else { "unlink" }, remote);
         reply.ok();
     }
 
@@ -2737,6 +2817,23 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
+}
+
+/// ★ M11：这个路径段是不是回收站目录名。
+///
+/// 认三种（**段级精确匹配**，不做前缀/子串匹配，避免误伤正常文件）：
+/// * `.Trash` —— FDO 规范的卷内共享回收站
+/// * `.Trash-<uid>` —— FDO 规范的卷内用户回收站（只认当前 uid，别人的不管）
+/// * `@Recycle` —— QNAP 自家回收站目录（`@` 前缀是 QTS 的隐藏标记）
+fn is_trash_segment(seg: &str, uid: u32) -> bool {
+    if seg == ".Trash" || seg == "@Recycle" {
+        return true;
+    }
+    if let Some(rest) = seg.strip_prefix(".Trash-") {
+        // `.Trash-1000` / `.Trash-0`，纯数字且等于当前 uid
+        return rest.parse::<u32>().map(|u| u == uid).unwrap_or(false);
+    }
+    false
 }
 
 /// `[offset, offset+len)` 覆盖的区间下标闭区间。
@@ -3136,6 +3233,10 @@ impl Filesystem for QxyncFs {
         if let Err(e) = self.deny_hidden(&remote, false) {
             return reply.error(e);
         }
+        // ★ M11：回收站里的文件也不许建（KIO 搬文件进回收站就是 create+rename）
+        if let Err(e) = self.deny_trash(&remote, "创建") {
+            return reply.error(e);
+        }
         let entry = DirEntry::local(name, false, 0, Self::epoch_of(SystemTime::now()));
         let node = self.insert_node(parent, name, &remote, &entry);
         // ★ M9：本地新建立刻进「映射」，不然下一次 readdir/lookup 又从旧快照里看不到它
@@ -3181,6 +3282,11 @@ impl Filesystem for QxyncFs {
         let remote = join_path(&parent_remote, name);
         // ★ M7：排除路径不可建目录（否则会在 NAS 上凭空造出一个被排除的目录）
         if let Err(e) = self.deny_hidden(&remote, true) {
+            return reply.error(e);
+        }
+        // ★ M11：回收站目录建不出来 → KIO 无法启用卷内回收站，退回「直接删除」。
+        //   这一条是让「挂载点不提供回收站」真正生效的关键（KIO 会先 mkdir `.Trash-$UID`）。
+        if let Err(e) = self.deny_trash(&remote, "创建目录") {
             return reply.error(e);
         }
         // ★ M10：会话失效 → 重登一次再重试
@@ -3244,6 +3350,15 @@ impl Filesystem for QxyncFs {
             return reply.error(e);
         }
         if let Err(e) = self.deny_hidden(&new_remote, false) {
+            return reply.error(e);
+        }
+        // ★ M11：改名**两端**都不能是回收站路径。KIO 把文件搬进 `.Trash-$UID/files/`
+        // 走的就是跨目录 move/rename —— 这里挡住，KIO 的回收站流程就彻底走不通，
+        // 只能退回「直接删除」。搬**出**回收站同样挡（不给回收站开后门）。
+        if let Err(e) = self.deny_trash(&old_remote, "改名") {
+            return reply.error(e);
+        }
+        if let Err(e) = self.deny_trash(&new_remote, "改名到") {
             return reply.error(e);
         }
 
@@ -3622,6 +3737,47 @@ pub fn mount(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ★ M11：回收站段识别 —— 认得该认的，**且不误伤正常文件**。
+    #[test]
+    fn trash_segment_recognition() {
+        let uid = 1000;
+        // 该挡的
+        assert!(is_trash_segment(".Trash", uid));
+        assert!(is_trash_segment(".Trash-1000", uid));
+        assert!(is_trash_segment("@Recycle", uid));
+        // 不该挡的（别误伤）
+        assert!(!is_trash_segment(".Trash-abc", uid), "非数字后缀");
+        assert!(!is_trash_segment(".Trash-1001", uid), "别人的 uid 不管");
+        assert!(!is_trash_segment("Trash", uid));
+        assert!(!is_trash_segment("@Recycled", uid), "不做前缀匹配");
+        assert!(!is_trash_segment("a.Trash-1000", uid), "不做子串匹配");
+        assert!(!is_trash_segment(".trash", uid), "大小写敏感");
+        assert!(!is_trash_segment("my.Trash-1000.txt", uid));
+    }
+
+    /// ★ M11：路径任一段命中回收站就该被拒（含深层）。
+    #[test]
+    fn is_trash_path_walks_every_segment() {
+        let fs_roots = 1000u32;
+        // 直接借用自由函数的路径判定：这里只验分段逻辑（QxyncFs 需要挂载环境）
+        let hits = |p: &str| {
+            p.split('/')
+                .filter(|s| !s.is_empty())
+                .any(|seg| is_trash_segment(seg, fs_roots))
+        };
+        assert!(hits("/home/.Trash-1000"));
+        assert!(hits("/home/.Trash-1000/files/a.txt"));
+        assert!(hits("/home/.Trash-1000/info/a.trashinfo"));
+        assert!(hits("/home/@Recycle"));
+        assert!(hits("/home/sub/@Recycle/x"));
+        // 正常路径不能被误伤
+        assert!(!hits("/home/qxync-test"));
+        assert!(!hits("/home/a.txt"));
+        assert!(!hits("/home/.recent"));
+        // 同名的普通文件（不是目录段）不该被当成回收站
+        assert!(!hits("/home/.Trash-1000.txt"));
+    }
 
     #[test]
     fn chunk_indices_covers_range() {

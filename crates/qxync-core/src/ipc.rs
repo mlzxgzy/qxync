@@ -520,6 +520,25 @@ pub struct UploadInfo {
     pub bytes: u64,
 }
 
+/// ★ M11：删除队列快照（`unlink`/`rmdir` 异步入队，后台同目录攒批推送）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeleteInfo {
+    /// 排队中（还没发出）的删除条目数。
+    pub pending: u64,
+    /// 是否正有一批在途（已取走、尚未拿到 NAS 回包）。
+    #[serde(default)]
+    pub active: bool,
+    /// 成功删除的条目数。
+    pub done: u64,
+    /// 重试超限、放弃的条目数（**非零就该看一眼**）。
+    pub failed: u64,
+    pub retries: u64,
+    /// 累计发出的批次数（每批一次 HTTP 请求）。
+    #[serde(default)]
+    pub batches: u64,
+    pub deleted: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MountInfo {
     pub mountpoint: PathBuf,
@@ -638,6 +657,9 @@ pub struct StatusData {
     pub hydro: HydroStats,
     #[serde(default)]
     pub uploads: Option<UploadInfo>,
+    /// ★ M11：删除队列（只读挂载为 `None`）。
+    #[serde(default)]
+    pub deletes: Option<DeleteInfo>,
     #[serde(default)]
     pub sync: Option<SyncInfo>,
     /// ★ M3：缓存/脱水状态。

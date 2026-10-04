@@ -71,6 +71,17 @@ CREATE TABLE IF NOT EXISTS uploads (
   attempts    INTEGER NOT NULL DEFAULT 0,
   ephemeral   INTEGER NOT NULL DEFAULT 0
 );
+-- ★ M11：删除队列。FUSE 的 unlink/rmdir 立刻入队就返回，真正打 NAS 由后台 worker 做。
+-- 语义与 uploads 一致：**表 = 未完成作业**，成功/放弃/取消都删行，重启重新入队。
+-- is_dir 只影响 NAS 侧接口选择与日志展示，删除本身对目录同样是 delete。
+CREATE TABLE IF NOT EXISTS deletes (
+  remote_path TEXT PRIMARY KEY,
+  remote_dir  TEXT NOT NULL,
+  remote_name TEXT NOT NULL,
+  is_dir      INTEGER NOT NULL DEFAULT 0,
+  attempts    INTEGER NOT NULL DEFAULT 0,
+  queued_unix INTEGER NOT NULL DEFAULT 0
+);
 -- ★ M8.3：同步活动日志。GUI 的「文件更新中心 / 错误列表」读的就是它。
 -- 写入侧**必须批量**（见 Store::journal_add_batch）：同步/上传热路径不许逐条事务。
 CREATE TABLE IF NOT EXISTS journal (
@@ -116,6 +127,31 @@ pub struct UploadRow {
 }
 
 impl UploadRow {
+    pub fn remote_path(&self) -> String {
+        format!(
+            "{}/{}",
+            self.remote_dir.trim_end_matches('/'),
+            self.remote_name
+        )
+    }
+}
+
+/// ★ M11：删除队列里的一行。
+///
+/// 和 `UploadRow` 同样的「表 = 未完成作业」语义：FUSE 侧入队即返回，
+/// 真正打 NAS 由后台 worker 批量做，失败退回重试，成功才删行。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteRow {
+    pub remote_dir: String,
+    pub remote_name: String,
+    /// 删除的是否是目录（NAS 侧对目录走同一条 delete，仅用于日志/统计）。
+    pub is_dir: bool,
+    pub attempts: u32,
+    /// 入队时的 unix 秒，用于稳定排序（同秒内按路径名兜底）。
+    pub queued_unix: i64,
+}
+
+impl DeleteRow {
     pub fn remote_path(&self) -> String {
         format!(
             "{}/{}",
@@ -825,6 +861,89 @@ impl Store {
         Ok(n)
     }
 
+    // ------------------------------------------------------------ 删除队列
+
+    /// 读取所有未完成的删除作业（按入队时间排序，保证删除顺序稳定）。
+    pub fn deletes(&self) -> Result<Vec<DeleteRow>> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT remote_dir, remote_name, is_dir, attempts, queued_unix
+                   FROM deletes ORDER BY queued_unix, remote_path",
+            )
+            .map_err(Error::from)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(DeleteRow {
+                    remote_dir: r.get(0)?,
+                    remote_name: r.get(1)?,
+                    is_dir: r.get::<_, i64>(2)? != 0,
+                    attempts: r.get::<_, i64>(3)? as u32,
+                    queued_unix: r.get(4)?,
+                })
+            })
+            .map_err(Error::from)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(Error::from)?);
+        }
+        Ok(out)
+    }
+
+    /// 入库一条删除作业；已存在则**只更新 attempts**（重试计数不倒退）。
+    pub fn put_delete(&self, r: &DeleteRow) -> Result<()> {
+        self.conn()
+            .execute(
+                "INSERT INTO deletes(remote_path, remote_dir, remote_name, is_dir, attempts, queued_unix)
+                 VALUES(?1,?2,?3,?4,?5,?6)
+                 ON CONFLICT(remote_path) DO UPDATE SET
+                   remote_dir = excluded.remote_dir,
+                   remote_name = excluded.remote_name,
+                   is_dir = excluded.is_dir,
+                   attempts = MAX(excluded.attempts, deletes.attempts),
+                   queued_unix = MIN(excluded.queued_unix, deletes.queued_unix)",
+                params![
+                    r.remote_path(),
+                    r.remote_dir,
+                    r.remote_name,
+                    r.is_dir as i64,
+                    r.attempts as i64,
+                    r.queued_unix,
+                ],
+            )
+            .map_err(Error::from)?;
+        Ok(())
+    }
+
+    pub fn bump_delete_attempts(&self, remote_path: &str, attempts: u32) -> Result<()> {
+        self.conn()
+            .execute(
+                "UPDATE deletes SET attempts = ?2 WHERE remote_path = ?1",
+                params![remote_path, attempts as i64],
+            )
+            .map_err(Error::from)?;
+        Ok(())
+    }
+
+    pub fn delete_row(&self, remote_path: &str) -> Result<bool> {
+        let n = self
+            .conn()
+            .execute(
+                "DELETE FROM deletes WHERE remote_path = ?1",
+                params![remote_path],
+            )
+            .map_err(Error::from)?;
+        Ok(n > 0)
+    }
+
+    pub fn clear_deletes(&self) -> Result<usize> {
+        let n = self
+            .conn()
+            .execute("DELETE FROM deletes", [])
+            .map_err(Error::from)?;
+        Ok(n)
+    }
+
     // ------------------------------------------------------------ 迁移 / 元数据
 
     /// 把 M2c 的 `cursors.json` / `baseline.json` 迁进库里（幂等）。
@@ -1306,6 +1425,101 @@ mod tests {
         assert!(s.uploads().unwrap().is_empty());
     }
 
+    /// ★ M11：删除队列的持久化语义 —— 入库 / 覆盖不丢重试计数 / 删行 / 清空。
+    #[test]
+    fn deletes_queue_roundtrip_and_upsert_keeps_attempts() {
+        let s = Store::open_in_memory().unwrap();
+        assert!(s.deletes().unwrap().is_empty());
+        let a = DeleteRow {
+            remote_dir: "/home/qxync-test".into(),
+            remote_name: "a.txt".into(),
+            is_dir: false,
+            attempts: 0,
+            queued_unix: 100,
+        };
+        let b = DeleteRow {
+            remote_dir: "/home/qxync-test".into(),
+            remote_name: "sub".into(),
+            is_dir: true,
+            attempts: 2,
+            queued_unix: 200,
+        };
+        s.put_delete(&a).unwrap();
+        s.put_delete(&b).unwrap();
+        assert_eq!(s.deletes().unwrap().len(), 2);
+
+        // 同路径再入队：仍是 1 行，且**重试计数只增不减**（崩溃恢复的关键）
+        let a2 = DeleteRow {
+            attempts: 5,
+            queued_unix: 50, // 更早的入队时间应被保留（稳定排序）
+            ..a.clone()
+        };
+        s.put_delete(&a2).unwrap();
+        let rows = s.deletes().unwrap();
+        assert_eq!(rows.len(), 2);
+        let got = rows.iter().find(|r| r.remote_name == "a.txt").unwrap();
+        assert_eq!(got.attempts, 5);
+        assert_eq!(got.queued_unix, 50, "入队时间取更早的那个，保持稳定排序");
+        let got_b = rows.iter().find(|r| r.remote_name == "sub").unwrap();
+        assert!(got_b.is_dir && got_b.attempts == 2);
+        // 远端路径拼接不含双斜杠
+        assert_eq!(got_b.remote_path(), "/home/qxync-test/sub");
+
+        s.bump_delete_attempts("/home/qxync-test/a.txt", 7).unwrap();
+        assert_eq!(
+            s.deletes()
+                .unwrap()
+                .iter()
+                .find(|r| r.remote_name == "a.txt")
+                .unwrap()
+                .attempts,
+            7
+        );
+        assert!(s.delete_row("/home/qxync-test/a.txt").unwrap());
+        assert!(!s.delete_row("/home/qxync-test/a.txt").unwrap());
+        assert_eq!(s.clear_deletes().unwrap(), 1);
+        assert!(s.deletes().unwrap().is_empty());
+    }
+
+    /// ★ M11：删除队列与上传队列**互不干扰**（同一 queue.db 里的两张表）。
+    #[test]
+    fn deletes_and_uploads_are_isolated() {
+        let s = Store::open_in_memory().unwrap();
+        s.put_upload(&UploadRow {
+            remote_dir: "/home".into(),
+            remote_name: "same.txt".into(),
+            local: PathBuf::from("/cache/same"),
+            mtime: 1,
+            attempts: 0,
+            ephemeral: false,
+        })
+        .unwrap();
+        s.put_delete(&DeleteRow {
+            remote_dir: "/home".into(),
+            remote_name: "same.txt".into(),
+            is_dir: false,
+            attempts: 0,
+            queued_unix: 1,
+        })
+        .unwrap();
+        // 删掉删除队列那行，不能影响上传队列
+        s.delete_row("/home/same.txt").unwrap();
+        assert!(s.deletes().unwrap().is_empty());
+        assert_eq!(s.uploads().unwrap().len(), 1);
+        // 反之亦然
+        s.clear_uploads().unwrap();
+        s.put_delete(&DeleteRow {
+            remote_dir: "/home".into(),
+            remote_name: "same.txt".into(),
+            is_dir: false,
+            attempts: 0,
+            queued_unix: 1,
+        })
+        .unwrap();
+        assert!(s.uploads().unwrap().is_empty());
+        assert_eq!(s.deletes().unwrap().len(), 1);
+    }
+
     #[test]
     fn sig_exists_is_dir_helpers_are_consistent() {
         // 保证 store 里用的 Sig 构造器与 sync.rs 的语义一致
@@ -1416,5 +1630,56 @@ mod tests {
         .unwrap();
         assert_eq!(s.decisions().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod m11_file_backed_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("qxync-m11-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// ★ M11：删除队列**跨重启**恢复（真实文件库，不是内存库）。
+    /// 这正是 `DeleteQueue::new` 崩溃恢复路径依赖的语义。
+    #[test]
+    fn deletes_survive_reopen() {
+        let dir = tmpdir("reopen");
+        let db = dir.join("queue.db");
+        {
+            let s = Store::open(&db).unwrap();
+            s.put_delete(&DeleteRow {
+                remote_dir: "/home/qxync-test".into(),
+                remote_name: "a.txt".into(),
+                is_dir: false,
+                attempts: 3,
+                queued_unix: 100,
+            })
+            .unwrap();
+            s.put_delete(&DeleteRow {
+                remote_dir: "/home/qxync-test".into(),
+                remote_name: "d".into(),
+                is_dir: true,
+                attempts: 0,
+                queued_unix: 50,
+            })
+            .unwrap();
+        }
+        // 模拟 daemon 重启
+        let s = Store::open(&db).unwrap();
+        let rows = s.deletes().unwrap();
+        assert_eq!(rows.len(), 2);
+        // 按 queued_unix 升序 → 稳定顺序（先入队的先删）
+        assert_eq!(rows[0].remote_name, "d");
+        assert_eq!(rows[1].remote_name, "a.txt");
+        assert_eq!(rows[1].attempts, 3, "重试计数必须跨重启保留");
+        // 新库的表结构齐全
+        assert_eq!(s.integrity_check().unwrap(), "ok");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
