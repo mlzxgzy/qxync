@@ -26,6 +26,9 @@
 | `qs_fixture.py` | 在 NAS 上造/删测试数据（`/home/qxync-test/`），并做下载 + Range + md5 校验 |
 | `nas_manifest.py` | **只读**清单：列出某个根的完整树，`--diff` 比对两次快照（验收时的「NAS 数据基线」） |
 | `p0_device_probe.py` | 设备注册相关端点的探针（Phase A/B/C），结论是**决策不实现设备注册** |
+| `paging_probe.py` | `get_list` 的 `start`/`limit` 分页与 `total` 语义（小目录速查版） |
+| `bigdir_probe.py` | **造 500 项目录**并验证翻页不重不漏（M15/T1 的前置，结论见下） |
+| `ls_probe.py` | 汇总 `probe-out/` 里所有 `get_list` 抓包的 `limit/start/total/datas` 关系 |
 
 连接目标一律走环境变量或 `--host`，**默认值是指不到任何真实设备的占位符**：
 
@@ -53,12 +56,32 @@ python3 qs_probe.py --host 192.168.1.10 raw 'func=qbox_get_qbox_info&sid=XXXX'
 # 5) 造测试夹具（含 >100 MiB 大文件）/ 只造 16 MiB
 python3 qs_fixture.py fixture
 python3 qs_fixture.py fixture --small
+
+# 6) 验证 get_list 分页（★ 会往 /home/bigdir-probe 写 500 个小文件，约 4~5 分钟）
+python3 bigdir_probe.py --host nas.example.com --port 9834 --user test1 --password 'xxx' --n 500
+
+# 7) 只看结论不重建数据（目录已存在时）
+python3 bigdir_probe.py --host nas.example.com --port 9834 --user test1 --password 'xxx' --skip-build
 ```
 
 输出：stdout 同时写入 `probe-out/<时间戳>/*.http`（含完整响应头与正文）。
 
 > ⚠️ `probe-out/` 里有**完整原始响应（含 sid、账号、主机名）**，已被 `.gitignore` 排除，
 > **永远不要提交**。
+
+## ★ `get_list` 分页的实测定论（2026-10-04，M15/T1）
+
+`bigdir_probe.py` 在真机上造了 501 项目录后测出来的，**改分页相关代码前先看这段**：
+
+| 验证项 | 结论 |
+|---|---|
+| `limit=200&start=0` | 只返回 **200** 条，`total=501` → 服务端**确实按页返回** |
+| 按 `start` 翻页 | 3 页拼回 **501** 条，**重复 0、漏 0** → 分页可用 |
+| `limit=5000` | 生效并一次返回 501 条 → 服务端**不**把 limit 夹在 `Max_File_List=200` |
+| `total` / `real_total` | **目录总项数**（`limit=1` 时 `total` 仍是 3，不是本页的 1） |
+
+推论：`Client::list` 的翻页循环本来就是对的，而下游 `qxync-fuse::filter_visible`
+曾经又 `.take(200)` 了一次 —— 那是「>200 项目录 `ls` 读不全」的真根因（M15/T1 已修）。
 
 ## 建议的验证顺序
 
