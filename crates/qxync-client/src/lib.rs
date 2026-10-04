@@ -723,8 +723,18 @@ impl Client {
     ///
     /// 注意：**不具备断点续传**。传到 90% 断网仍是从 0 重来
     /// （重试语义由 `UploadQueue` 的 `max_attempts` 兜着）。
-    /// 分片续传要看服务端 `upload.php` 是否认分片索引 —— 见 M15/T4，
-    /// 实测 `versioning_support=0`，在确认前不要自己造轮次协议。
+    ///
+    /// ★ M15/T4 已验证（2026-10-04）：**服务端确实实现了分片上传**
+    /// （`start_chunked_upload` / `get_chunked_upload_status` /
+    /// `delete_chunked_upload_file` + 5 个 `upload.c` 内部符号，
+    /// `op_chunked_upload` 读 `offset`/`filesize`/`upload_id`），
+    /// 但**那条通道只服务 Qbox 空间**（`upload_root_dir` 需 `/remote:` 前缀 +
+    /// `name@uid`），普通家目录路径过不去（handler status 12/46）。
+    /// 本函数用的 `dest_path` 是普通绝对路径 —— **两套路径空间不通，够不到**。
+    /// 探针与完整证据见 `xtask/probe/upload_chunk_probe.py` 与 M15 §2 T4。
+    ///
+    /// 所以「大文件断网从 0 重来」在当前架构下**没有协议层的解**，
+    /// 只能靠退避调参 + 进度上报（`UploadQueue` 侧，属 T8 范围）。
     pub async fn upload_file(&self, dest_path: &str, local: &Path, filename: &str) -> Result<u64> {
         // 长度必须**发之前**拿到：reqwest 据此决定发 Content-Length 还是 chunked。
         let len = tokio::fs::metadata(local)
