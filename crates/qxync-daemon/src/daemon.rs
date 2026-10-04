@@ -14,6 +14,7 @@ use qxync_core::ipc::{
     SettingsData, ShutdownData, SpaceData, StatusData, StoreData, SyncCursors, SyncInfo, TaskInfo,
     TasksData, IPC_VERSION,
 };
+use qxync_core::mounts::{MountRecord, MountsFile};
 use qxync_core::rules::Rules;
 use qxync_core::settings::{ProxySpec, Settings};
 use qxync_core::store::JournalEntry;
@@ -68,11 +69,20 @@ pub struct Options {
     pub link_id: String,
     pub socket: PathBuf,
     pub auto_login: bool,
-    /// ★ M8.2：启动时恢复 `enabled=true` 的任务（显式开启，见 `--restore-tasks` / `QXNYC_TASK_RESTORE`）。
+    /// ★ M8.2 / ★ M15/T5：启动时恢复挂载。
     ///
-    /// **默认关闭**是刻意的：任务恢复会「凭空挂载」，如果默认打开，
-    /// 上一次跑崩留下的挂载会在下一次 daemon 启动时复活，把验收矩阵的前提打乱
-    /// （`fuse-matrix.sh` 依赖「开跑前环境是干净的」）。GUI 自己拉起 daemon 时会显式打开。
+    /// 恢复做两件事（顺序固定）：先按 `mounts.json` 恢复**上一次实际挂了什么**
+    /// （含手工 `qxync mount` 挂的），再补 `tasks/` 里**还没挂上**的启用任务。
+    ///
+    /// ★ M15/T5 起**默认开启**。当初默认关是怕「凭空挂载」，那个顾虑现在被两件事
+    /// 消解了：
+    ///
+    /// * **幂等** —— 已挂载（`is_mounted` / 挂载表命中）就跳过，不会叠一层；
+    /// * **只恢复真的挂过的** —— 恢复源是 `mounts.json`（现场），不是「猜用户想要什么」。
+    ///   上次崩在半路的挂载因为没写进记录，不会复活。
+    ///
+    /// 仍可关掉：`--no-restore-mounts` 或 `QXNYC_TASK_RESTORE=0`
+    /// （验收矩阵要「开跑前环境干净」时用）。
     pub restore_tasks: bool,
 }
 
@@ -100,6 +110,12 @@ pub(crate) struct MountEntry {
     cache_mode: CacheMode,
     /// ★ M8.4：该挂载点的冲突策略（同步引擎按它分派冲突）。
     conflict: String,
+    /// ★ M15/T5：挂载时的**原始参数**（`mount()` 收到的那一份，canonicalize 之后）。
+    ///
+    /// 存它而不是卸载时现凑，是为了让 `mounts.json` 与「当时实际挂的是什么」逐字一致 ——
+    /// 线程数、水合超时、删除上限这些从 `MountEntry` 里已经取不回来了（`MountEntry`
+    /// 只留了同步引擎要用的 `cache_mode` / `conflict`）。
+    rec: MountRecord,
 }
 
 pub(crate) struct State {
@@ -545,7 +561,7 @@ pub async fn run(opts: Options) -> Result<()> {
     // ★ M8.3：journal 后台落库（批量 + 轮转）
     spawn_journal_flusher(state.clone());
 
-    // ★ M8.2：恢复启用的任务（**显式开启才跑**，见 Options::restore_tasks）
+    // ★ M8.2 / ★ M15/T5：恢复挂载（**默认开启**，见 Options::restore_tasks 的说明）
     if opts.restore_tasks {
         let st = state.clone();
         let lid = opts.link_id.clone();
@@ -557,7 +573,7 @@ pub async fn run(opts: Options) -> Result<()> {
                 }
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
-            restore_tasks_on_start(&st, &lid).await;
+            restore_mounts_on_start(&st, &lid).await;
         });
     }
 
@@ -1773,6 +1789,21 @@ async fn mount(
     let conflict = conflict
         .filter(|c| qxync_core::tasks::CONFLICTS.contains(&c.as_str()))
         .unwrap_or_else(|| CONFLICT_RENAME_LOCAL.to_string());
+    // ★ M15/T5：记下这次挂载的完整参数，供写 `mounts.json`（daemon 重启后按它恢复）。
+    // 取的是**归一化之后**的值（`mp` 是 canonicalize 过的、`remote` 过了
+    // `normalize_root`），所以恢复出来的挂载点和现在这个是同一个，不会出现
+    // 「记录里是软链路径、实际挂的是真实路径」这种对不上的情况。
+    let rec = MountRecord {
+        mountpoint: mp.clone(),
+        remote: remote.clone(),
+        read_write,
+        cache_mode: mode.as_str().to_string(),
+        conflict: conflict.clone(),
+        threads,
+        hydrate_timeout_secs: hydrate_timeout.as_secs(),
+        delete_limit,
+        auto_unmount,
+    };
     state.mounts.lock().unwrap().insert(
         mp.clone(),
         MountEntry {
@@ -1787,6 +1818,7 @@ async fn mount(
             handle,
             cache_mode: mode,
             conflict: conflict.clone(),
+            rec: rec.clone(),
         },
     );
     tracing::info!(
@@ -1798,10 +1830,70 @@ async fn mount(
         conflict_label(&conflict),
         if read_write { "读写" } else { "只读" }
     );
+    // ★ M15/T5：挂载成功才写盘。写失败只 WARN —— 记录文件是为了下次重启省一步，
+    // 不能因为它把「已经挂上了」这件事变成失败（用户会以为没挂成功去重试）。
+    mounts_persist(&state.mounts);
     to_value(info)
 }
 
+/// ★ M15/T5：把当前**挂载表**整体写进 `mounts.json`（daemon 重启后照它恢复）。
+///
+/// 刻意是「全量重建」而不是「读出来改一条再写回」：
+///
+/// * 挂载表本身就是唯一真相 —— 用它重建，内存与磁盘不可能对不上；
+/// * 避开读-改-写之间的窗口（并发挂载时后写的会覆盖先写的）；
+/// * 读不到旧文件也能写（比如用户手工删了 `mounts.json`，或格式升级后
+///   旧版本被降级丢弃）—— 那就从零建一份，不用先救活旧文件。
+///
+/// 失败只 WARN：这份文件的作用是「下次重启省一步」，写不进去最坏结果是
+/// 下次要手工重挂，**不该让 `mount` / `umount` 因此失败**。
+fn mounts_persist(mounts: &StdMutex<HashMap<PathBuf, MountEntry>>) {
+    let paths = match ConfigPaths::discover() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("挂载记录：读配置目录失败，本次的挂载改动不会被记下: {e}");
+            return;
+        }
+    };
+    // 按挂载点排序：挂载表是 HashMap（顺序不定），不排序的话每次写盘的字节序
+    // 都不一样，diff 一片噪音、也没法人工核对。
+    let mut recs: Vec<MountRecord> = mounts
+        .lock()
+        .unwrap()
+        .values()
+        .map(|e| e.rec.clone())
+        .collect();
+    recs.sort_by(|a, b| a.mountpoint.cmp(&b.mountpoint));
+    let f = MountsFile {
+        version: qxync_core::mounts::MOUNTS_VERSION,
+        mounts: recs,
+    };
+    if let Err(e) = f.save(&paths) {
+        tracing::warn!("挂载记录：写盘失败（本次挂载/卸载改动不会被记下）: {e}");
+    }
+}
+
 async fn umount(state: &Arc<State>, mountpoint: PathBuf) -> Result<serde_json::Value, IpcError> {
+    umount_inner(state, mountpoint, true).await
+}
+
+/// `umount` 的真正实现。
+///
+/// `persist_record` 区分两种「卸载」—— 这一层区分是 T5 能成立的前提：
+///
+/// * `true` = **用户主动卸载**（IPC `umount`）→ 意图是「我不要这个挂载点了」，
+///   必须从 `mounts.json` 去掉，否则下次启动又给它挂回来；
+/// * `false` = **daemon 退出时的强制清理**（`shutdown_all_mounts`）→ 进程马上就
+///   没了，这只是把手上的挂载收干净，**不是**用户不要它了。若这里也去改记录，
+///   `mounts.json` 会在每次 daemon 退出时被清空，T5 的自动重挂就永远失效。
+///
+/// （T6「SIGTERM 保留挂载」做完之后，退出路径会连 fusermount 都不调，
+/// 但这个区分仍然要留着 —— 它现在的语义是「谁该为这次卸载负责」。）
+async fn umount_inner(
+    state: &Arc<State>,
+    mountpoint: PathBuf,
+    persist_record: bool,
+) -> Result<serde_json::Value, IpcError> {
     let mp = std::fs::canonicalize(&mountpoint).unwrap_or(mountpoint);
     let mut entry = state.mounts.lock().unwrap().remove(&mp).ok_or_else(|| {
         IpcError::new(
@@ -1862,6 +1954,11 @@ async fn umount(state: &Arc<State>, mountpoint: PathBuf) -> Result<serde_json::V
         }
         None => tracing::info!("已卸载 {}", mp.display()),
     }
+    // ★ M15/T5：真正卸掉了才从 `mounts.json` 里去掉。放在这一步之后 ——
+    // 上面的失败分支会把挂载表条目放回去，那时就**不该**动记录文件。
+    if persist_record {
+        mounts_persist(&state.mounts);
+    }
     to_value(serde_json::json!({}))
 }
 
@@ -1915,8 +2012,10 @@ async fn shutdown_all_mounts(state: &Arc<State>) -> usize {
     let mps: Vec<PathBuf> = state.mounts.lock().unwrap().keys().cloned().collect();
     let mut n = 0;
     for mp in mps {
-        // 忽略错误：即使 fusermount 失败，进程退出时 auto_unmount 也会兜底
-        if let Ok(_) = umount(state, mp).await {
+        // 忽略错误：即使 fusermount 失败，进程退出时 auto_unmount 也会兜底。
+        // ★ M15/T5：`persist_record=false` —— 退出时的清理不是「用户不要这个挂载点」，
+        // 不能让它把 `mounts.json` 清空（否则 T5 的自动重挂每次都无记录可依）。
+        if let Ok(_) = umount_inner(state, mp, false).await {
             n += 1;
         }
     }
@@ -2776,11 +2875,114 @@ async fn tasks_cmd(
     }
 }
 
+/// ★ M15/T5：daemon 启动时按 `mounts.json` 恢复挂载（用户无感）。
+///
+/// 与 M8.2 的 [`restore_tasks_on_start`] 的分工：
+///
+/// * `mounts.json` 记的是**上一次实际挂了什么**（现场）—— 包括手工 `qxync mount`
+///   挂的、没登记进任务表的那些；
+/// * `tasks/` 记的是**用户登记了哪些共享文件夹**（意图）。
+///
+/// 两份都读、现场优先。`mounts.json` 里的挂载点先占位，任务表里同名的跳过
+/// （用户可能已经改过任务里的参数，让现场那份赢更贴近「重启前是什么样」）。
+///
+/// ## 三个不变量（M15/T5 改动点 3）
+///
+/// 1. **必须已登录** —— 调用方 [`run`] 那边已等过 `sid`，这里 `mount()` 自己
+///    还有 `ensure_session` + `require_sid` 兜底，登录不上只会这批失败；
+/// 2. **幂等** —— 已被别处挂上（或已经是挂载点）的跳过，不重复挂；
+/// 3. **失败不阻塞** —— 单个失败只 WARN，继续恢复下一个，绝不让 daemon 起不来。
+pub(crate) async fn restore_mounts_on_start(state: &Arc<State>, link_id: &str) {
+    let paths = match ConfigPaths::discover() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("恢复挂载：读配置目录失败 {e}");
+            return;
+        }
+    };
+    // 现场：上一次实际挂了什么
+    let (recorded, warns) = MountsFile::load(&paths);
+    for w in warns {
+        tracing::warn!("{w}");
+    }
+    let mut todo: Vec<MountRecord> = recorded.map(|f| f.mounts).unwrap_or_default();
+    // 排序：挂载恢复是「一个一个挂」，顺序影响谁先占用连接/线程；按挂载点排
+    // 让行为可复现（不然 HashMap 顺序会让日志每次都不一样）。
+    todo.sort_by(|a, b| a.mountpoint.cmp(&b.mountpoint));
+
+    if !todo.is_empty() {
+        tracing::info!("恢复挂载：{} 个挂载点待恢复（link={link_id}）", todo.len());
+    }
+    let want = todo.len();
+    let mut done = 0usize;
+    for rec in &todo {
+        let mp = &rec.mountpoint;
+        // 不变量 2：已挂载就跳过。**顺手把记录补齐**（上次记的 remote 与现在挂的
+        // 不一致，说明这期间用户改过 —— 此时不覆盖，只记一条 WARN）。
+        if let Some(info) = state.mounts.lock().unwrap().get(mp) {
+            if info.info.remote == rec.remote {
+                tracing::info!("恢复挂载：{} 已在挂载，跳过", mp.display());
+                done += 1;
+            } else {
+                tracing::warn!(
+                    "恢复挂载：{} 已挂载但 remote 不同（{} vs 记录 {}），跳过",
+                    mp.display(),
+                    info.info.remote,
+                    rec.remote
+                );
+            }
+            continue;
+        }
+        // 挂载点目录可能已经被删了（用户清了目录树）—— 建回来，否则 mount() 必失败
+        if let Err(e) = std::fs::create_dir_all(mp) {
+            tracing::warn!("恢复挂载：建挂载点 {} 失败（跳过，不影响其它）: {e}", mp.display());
+            continue;
+        }
+        match mount(
+            state,
+            mp.clone(),
+            Some(rec.remote.clone()),
+            // 记录里刻意不存 cache_dir（见 mounts.rs 模块文档）→ None = 默认目录
+            None,
+            rec.threads.max(1),
+            rec.auto_unmount,
+            Duration::from_secs(rec.hydrate_timeout_secs),
+            rec.read_write,
+            rec.delete_limit,
+            Some(rec.cache_mode.clone()),
+            Some(rec.conflict.clone()),
+        )
+        .await
+        {
+            Ok(_) => {
+                tracing::info!("恢复挂载成功: {} → {}", mp.display(), rec.remote);
+                done += 1;
+            }
+            // 不变量 3：只 WARN，继续下一个
+            Err(e) => tracing::warn!(
+                "恢复挂载失败（跳过，不影响其它挂载点）: {} → {}: {}",
+                mp.display(),
+                rec.remote,
+                e.message
+            ),
+        }
+    }
+    if done > 0 {
+        tracing::info!("恢复挂载：{done}/{want} 成功", want = want);
+    }
+
+    // 意图：用户登记了、但不在现场记录里的任务（第一次用、或上次没挂成功）
+    restore_tasks_on_start(state, link_id).await;
+}
+
 /// ★ M8.2：daemon 启动时恢复 `enabled=true` 的任务。
 ///
-/// **只有显式开启才跑**（`--restore-tasks` / `QXNYC_TASK_RESTORE=1`）：
-/// 任务恢复会「凭空挂载」，默认打开会让上一次跑崩留下的挂载在重启时复活，
-/// 把验收矩阵的前提（开跑前环境干净）打乱。
+/// **只有显式开启才跑**（`--restore-tasks` / `QXNYC_TASK_RESTORE=1`，
+/// 见 [`Options::restore_tasks`]）：任务恢复会「凭空挂载」，会把上一次跑崩
+/// 留下的挂载在重启时复活，打乱验收矩阵的前提。
+///
+/// ★ M15/T5 起只在 [`restore_mounts_on_start`] 的末尾被调用（现场恢复完再补意图），
+/// 所以现场已有的挂载点不会再被这里重复挂一遍。
 pub(crate) async fn restore_tasks_on_start(state: &Arc<State>, link_id: &str) {
     let paths = match ConfigPaths::discover() {
         Ok(p) => p,
@@ -2793,9 +2995,14 @@ pub(crate) async fn restore_tasks_on_start(state: &Arc<State>, link_id: &str) {
     for (p, e) in &bad {
         tracing::warn!("任务文件解析失败，已跳过 {}: {e}", p.display());
     }
-    let todo: Vec<Task> = list.into_iter().filter(|t| t.enabled).collect();
+    let todo: Vec<Task> = list
+        .into_iter()
+        .filter(|t| t.enabled)
+        // ★ M15/T5：现场已经挂上的不再重复挂（`restore_mounts_on_start` 刚挂过）
+        .filter(|t| !state.mounts.lock().unwrap().contains_key(&t.mountpoint))
+        .collect();
     if todo.is_empty() {
-        tracing::info!("恢复任务：没有启用的任务（link={link_id}）");
+        tracing::info!("恢复任务：没有启用的任务待恢复（link={link_id}）");
         return;
     }
     tracing::info!("恢复任务：{} 个启用的任务待恢复", todo.len());
