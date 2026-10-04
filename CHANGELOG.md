@@ -7,6 +7,85 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-04
+
+**同步引擎不再牵连挂载点 + 远端改名不再凭空多出冲突副本**：这一版把「同步」和「挂载」
+在生命周期上拆开，并给每个文件安了一个本地稳定身份。
+
+M15 清单的 T1–T9 到此收口（T4 验证后取消，理由见文末）。
+
+### 新增
+
+- **`systemctl --user reload qxyncd`（SIGHUP）：重载同步但挂载点一秒不中断**。
+  新增 `qxync daemon reload` 走同一条路径。实现是给同步引擎发一个「代次令牌」，
+  旧任务在下一个检查点自己退场 —— 不用 `abort()`，正在等网络 IO 的任务不会把退出拖住。
+  ★ **这是「重启不掉挂载」真正能用的路径**：systemd 的 `restart` 是
+  「stop → 等旧进程退出 → start」，一个不退出的守护进程会被 `TimeoutStopSec`
+  之后的 SIGKILL 杀掉，挂载照样断 —— 这是 systemd 的语义，不是 qxync 能绕开的。
+- **SIGTERM 保留挂载**：IPC `stop` / `SIGINT` 仍然真正卸载全部挂载（用户明确要「关掉」），
+  但 SIGTERM 现在只停同步任务、写盘、转入挂载守护模式。守护进程有 4 个退出条件
+  （IPC stop / SIGINT / 第二次 SIGTERM / 挂载表空）加一个可选的 `--mount-hold-secs`，
+  不会把 systemd 卡死。
+- **僵尸挂载自动清理**：真崩溃或 OOM 之后，挂载点会留在 `/proc/mounts` 里但 `ENOTCONN`，
+  `cd` 进去报「Transport endpoint is not connected」。现在 daemon 启动早期会
+  对**自己记录过的**挂载点写探针试活，确认已死才 `fusermount3 -uz` 懒卸载。
+  安全边界：只清 `mounts.json` 里记过的路径（不扫全盘）、校验 subtype 是 `qxync`
+  才动手、用 `-uz` 而非 `-u`、失败只 WARN 不阻塞启动。
+- **稳定文件身份 `file_id`（16 字节，本地自建）**：服务端 `DirEntry` 没有 id 字段，
+  所以身份由 `(mtime, size)` 推出（目录另算，**刻意不含文件名** —— 含了改名后身份就变了）。
+  新增 `nodes` 表（schema v3 → v4），删除即清理索引。
+  - **对账据此认出「远端改名」** → 本地节点跟着改名、baseline 迁移，
+    **不再生成冲突副本**。这是 0.4.x 里最烦人的 phantom copy 的根因。
+  - **上传队列排队期间远端改名**，作业落地到新名字，不再产生幽灵文件。
+  - **配对是保守的**：身份未知、类型不符、一个身份对应多个路径（有歧义）一律不配，
+    退回原有的增删判定。宁可多冲突，绝不错配或丢数据。
+- **`qxync file-states <dir>`**：逐文件看同步状态。`in_sync` 是**派生值**
+  （`dirty` / 待传作业 / 待裁决冲突三个信息源汇总），不新建状态表。
+- **传输进度**：下载每收完一个分片（128 KiB）回调一次，上传直接用 T2 那个
+  「真正发出的字节数」推进。进度上报**只读**且**绝不冒泡**到读/上传路径
+  （回调 panic 用 `catch_unwind` 隔离）。
+
+### 修复
+
+- **`rename_remote` 漏迁移身份索引**（本版内部抓到并修复）：对账认定的远端改名迁移了
+  本地节点，却没把 `nodes` 表那一行一起搬。于是同一个 `file_id` 出现两行 →
+  按身份反查恒定返回「有歧义」→ **上传队列的按身份重定向永久失效**，
+  且每次远端改名泄漏一行索引。已修，并补上能抓住它的回归测试
+  （用变异测试确认过：撤掉修复，该测试立刻报红）。
+- **`progress_percent` 整数溢出**：`done > total` 时 `saturating_mul(100)` 会输出
+  `18446744073709551615`。已改用 `u128` 中间量并夹到 100。
+- 为此把 `Store` 的 SQLite 连接改成 `Arc<Mutex<Connection>>`：FUSE 侧现在也要拿
+  一份 `Store`（做身份索引），必须是**同一个连接**而不是各开一个抢写锁。
+
+### 变更
+
+- **默认的「重启不掉挂载」路径从 `systemctl restart` 换成了 `systemctl reload`。
+  两者语义不同，别混用**：`restart` 仍会短暂断开挂载（由 T5 的自动重挂恢复，
+  通常 3 秒内）；要的是**一秒都不中断**就用 `reload`。systemd 单元的注释已同步更正
+  ——原先那句「qxyncd 收到 SIGTERM 会卸载全部 FUSE 挂载点」在 0.5.0 之后已不准确。
+- 停止守护进程请用 `qxync daemon stop`（走 IPC，真正卸载挂载）或
+  `qxync umount`（只卸挂载点）。
+
+### 不做
+
+- **T4 上传分片续传 —— 验证后取消**。原以为「服务端不支持分片」，实测是**错的**：
+  `qsyncsrv.cgi` 里分片上传实现得很完整（5 个 func、参数表齐全）。真正的障碍是
+  **分片通道只服务 Qbox 空间**（`upload_root_dir` 认 `/remote:` 前缀），
+  而 `upload.php` 的 `dest_path` 用的是普通家目录路径 —— **两套路径空间不通**，
+  我们够不到。探针留档在 `xtask/probe/upload_chunk_probe.py`。
+  顺带纠正一个隐蔽的坑：该 CGI 的响应是**两段 JSON**，第一段 `"status": 0` 是框架头，
+  只抓第一个会误判成「所有 func 都无反应」。
+
+### 验证状态
+
+- `cargo check --workspace --all-targets` 零 error 零 warning。
+- `cargo test --workspace --lib --bins --tests` **290 passed / 0 failed**
+  （基线 265 + 本批新增 25）。被 `#[ignore]` 的 19 条全部在 `qxync-proto-test/`，
+  需要真实 NAS —— 本批没有新增任何 ignore。
+- ⚠️ **本机没有 `/dev/fuse`**，所以凡是「真的挂上去再操作」的验收项
+  （reload 期间 `ls` 是否正常、`kill -9` 后能否自愈、SIGHUP 期间 FUSE 会话是否真没断）
+  **都只有逻辑层单测覆盖，没有真机验证**。T6/T7/T9 各节里逐条标了「未验」。
+
 ## [0.4.3] - 2026-10-04
 
 **挂载点不再有回收站 + 删除不再干等**：删文件时弹进回收站、删完要等半天，
@@ -559,6 +638,7 @@ NAS 设置名 `QSYNC_FOLDERPAIR_USE_SPACE_SAVING`、Windows 客户端注册表�
 - 验收结论从 README 抽出为 [`docs/验收记录.md`](docs/验收记录.md)。
 - 采用 **MIT OR Apache-2.0** 双许可（`LICENSE-MIT` / `LICENSE-APACHE`）。
 
+[0.5.0]: https://github.com/mlzxgzy/qxync/compare/v0.4.3...v0.5.0
 [0.4.3]: https://github.com/mlzxgzy/qxync/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/mlzxgzy/qxync/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/mlzxgzy/qxync/compare/v0.4.0...v0.4.1
