@@ -16,6 +16,7 @@
 //! * `qbox_write_log` 尽力而为（服务端不校验 action；未注册同步对时不会落盘，见 client 注释）。
 
 use qxync_client::{write_action, Client};
+use qxync_core::file_id::{FileId, ZERO_FILE_ID};
 use qxync_core::store::{Store, UploadRow};
 use qxync_core::Error as CoreError;
 use serde::{Deserialize, Serialize};
@@ -45,6 +46,31 @@ pub struct UploadJob {
     /// 临时内容（冲突副本的 stash）：上传成功后把本地文件删掉。
     #[serde(default)]
     pub ephemeral: bool,
+    /// ★ M15/T9：入队那一刻的稳定身份（[`ZERO_FILE_ID`] = 不知道）。
+    ///
+    /// 存在的唯一目的是**排队期间远端改名时不写到旧名字上**：worker 真正发之前
+    /// 按它反查当前路径（见 [`UploadQueue::set_name_resolver`]），查到新名字就落到
+    /// 新名字。没有它的话，排队这几十秒里对方设备把文件改名，NAS 上就会多出一个
+    /// 旧名字的**幽灵文件**（内容还是新的）。
+    #[serde(default)]
+    pub file_id: FileId,
+    /// ★ M15/T8：已经**真正发出**的字节数（不是文件大小）。
+    ///
+    /// 语义与 `client.upload_file` 的返回值严格一致：取自流式读取时的实际计数。
+    /// 绝不能拿 `metadata` 预读的大小来填 —— 上传期间用户可能还在改同一个文件，
+    /// 那是**下一版**的大小（`docs/M15` T2 验收第 4 条）。
+    ///
+    /// **纯运行时状态，不落库**（`uploads` 表没有这两列，`to_row`/`from_row` 都
+    /// 不带它们）：进程重启后进度从 0 重来才是对的 —— 队列里那些作业本来就
+    /// 一个字节都没传出去。
+    #[serde(default)]
+    pub bytes_sent: u64,
+    /// ★ M15/T8：这次传输的总字节数（发之前 `stat` 到的本地大小）。
+    ///
+    /// 只用来给界面算百分比。与 `bytes_sent` 一样可能被用户后续的改动「作废」，
+    /// 所以 `bytes_sent` 会被 `min` 夹住，绝不越界。
+    #[serde(default)]
+    pub bytes_total: u64,
 }
 
 impl UploadJob {
@@ -54,6 +80,19 @@ impl UploadJob {
             self.remote_dir.trim_end_matches('/'),
             self.remote_name
         )
+    }
+
+    /// 改写到新的远端位置（★ T9：排队期间被改名时用）。
+    fn retarget(&mut self, remote_path: &str) -> bool {
+        let Some((dir, name)) = remote_path.rsplit_once('/') else {
+            return false;
+        };
+        if self.remote_path() == remote_path {
+            return false;
+        }
+        self.remote_dir = dir.to_string();
+        self.remote_name = name.to_string();
+        true
     }
 
     /// 转成状态库的行（主键 `remote_path` 由 `UploadRow` 派生，和本类型一致）。
@@ -76,7 +115,27 @@ impl UploadJob {
             mtime: r.mtime,
             attempts: r.attempts,
             ephemeral: r.ephemeral,
+            // 崩溃恢复出来的作业没有身份（`uploads` 表没有这一列）。
+            // 那就退回「按排队时的路径发」—— 与 T9 之前完全一样，不会更糟。
+            file_id: ZERO_FILE_ID,
+            // ★ T8：崩溃恢复的作业一个字节都没传出去，进度必须从 0 起。
+            bytes_sent: 0,
+            bytes_total: 0,
         }
+    }
+
+    /// ★ M15/T8：把这个作业的传输进度记成 `(已发, 总量)` 并返回它。
+    ///
+    /// ## 为什么要 `min` 夹一下
+    /// `bytes_total` 是**发之前** `stat` 到的本地大小，而 `bytes_sent` 是
+    /// T2 流式上传里**真正读走**的字节数。上传期间用户可能又在改同一个文件：
+    /// 改小了 → `sent < total`（进度条走不到 100%，但作业马上就结束，会被清）；
+    /// 改大了 → `sent > total`，不夹的话界面会显示「120%」。
+    /// 两种都只是展示问题，绝不能让它反过来影响上传。
+    fn note_sent(&mut self, sent: u64, total: u64) -> (u64, u64) {
+        self.bytes_total = total;
+        self.bytes_sent = sent.min(total);
+        (self.bytes_sent, total)
     }
 }
 
@@ -116,6 +175,39 @@ pub struct UploadSnapshot {
 /// （默认 30s）才被 `AdoptBaseline` 补上 —— 那个窗口就是冲突的来源。
 pub type SuccessHook = Arc<dyn Fn(&str, (u64, i64)) + Send + Sync>;
 
+/// ★ M15/T8：上传进度上报回调（远端路径 + `Some((已发, 总量))`，`None` = 作业结束）。
+///
+/// ## 为什么用 `Option` 而不是两个函数
+/// 「传输结束」本身是一条必须上报的信息：完成/失败之后节点上不能留着
+/// 「停在 96%」的进度条（会被读成「还有一个作业在跑」）。参数带上 `None`
+/// 就让「置进度」与「清进度」共用一个回调，不会出现只实现了一半的注入点。
+///
+/// 与下载侧的 `ProgressHook` 分开定义：那边传的是「本次收到的增量」（8 路并发
+/// 要靠原子累加器合成累计值），这边传的是 T2 已经算好的**累计**字节数 ——
+/// 数据源不同，混用两种语义只会写出「进度乱跳」的 bug。
+pub type UploadProgressHook = Arc<dyn Fn(&str, Option<(u64, u64)>) + Send + Sync>;
+
+/// ★ M15/T8：调用上传进度回调 —— **panic 绝不能打死上传 worker**。
+///
+/// 与 [`invoke_success_hook`] 同一套理由：回调跑在上传 worker 的 OS 线程里，
+/// 它只能坏它自己。进度是纯展示，丢一次上报没有任何后果。
+pub(crate) fn invoke_progress_hook(
+    hook: Option<UploadProgressHook>,
+    remote: &str,
+    progress: Option<(u64, u64)>,
+) {
+    let Some(hook) = hook else {
+        return;
+    };
+    let shown = match progress {
+        Some((d, t)) => format!("{d}/{t}"),
+        None => "结束".to_string(),
+    };
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(remote, progress))).is_err() {
+        tracing::error!("上传进度回调 panic（已隔离，队列继续）: {remote} {shown}");
+    }
+}
+
 /// 调用成功回调 —— **回调 panic 绝不能打死上传 worker**。
 ///
 /// ★ M7 实测踩过：回调跑在**上传 worker 的 OS 线程**里（不是 tokio worker），
@@ -143,7 +235,23 @@ pub struct UploadQueue {
     shutdown: AtomicBool,
     stats: UploadStats,
     success_hook: Mutex<Option<SuccessHook>>,
+    /// ★ M15/T8：上传进度上报（`None` = 不上报）。FUSE 侧注入，写进节点的 `progress`。
+    progress_hook: Mutex<Option<UploadProgressHook>>,
+    /// ★ M15/T8：按远端路径的**在途**进度（`None` = 当前没有在传的作业）。
+    ///
+    /// 与节点的 `progress` 分开存：上传队列是**唯一**知道「我现在传的是哪个
+    /// 作业、传了多少」的地方，而它在 FUSE 节点表之外。`file_states` 汇总时
+    /// 两边取并集（节点侧管下载、这里管上传）。
+    inflight: Mutex<std::collections::HashMap<String, (u64, u64)>>,
+    /// ★ M15/T9：按 `file_id` 反查「这个东西现在叫什么」；`None` = 没注入。
+    name_resolver: Mutex<Option<NameResolver>>,
 }
+
+/// ★ M15/T9：身份 → 当前远端路径的解析器（由 FUSE 侧注入，内部查 `nodes` 表）。
+///
+/// **多条命中 = 有歧义 → 必须返回 `None`**：宁可发到排队时的旧路径（用户看得见
+/// 有个多余文件、可自行处理），也不能凭猜测把内容写到另一个文件的位置上。
+pub type NameResolver = Arc<dyn Fn(&FileId) -> Option<String> + Send + Sync>;
 
 struct State {
     pending: VecDeque<UploadJob>,
@@ -237,6 +345,10 @@ impl UploadQueue {
             cv: Condvar::new(),
             shutdown: AtomicBool::new(false),
             success_hook: Mutex::new(None),
+            // ★ T8
+            progress_hook: Mutex::new(None),
+            inflight: Mutex::new(std::collections::HashMap::new()),
+            name_resolver: Mutex::new(None),
             stats: UploadStats {
                 pending: AtomicU64::new(n),
                 ..Default::default()
@@ -247,6 +359,94 @@ impl UploadQueue {
     /// 注册「上传成功」回调（按远端路径调用）。daemon 用它把节点 `dirty` 清掉。
     pub fn set_success_hook(&self, hook: SuccessHook) {
         *self.success_hook.lock().unwrap() = Some(hook);
+    }
+
+    /// ★ M15/T8：注册「上传进度」回调（按远端路径 + 真正发出的字节数 + 总字节数）。
+    pub fn set_progress_hook(&self, hook: UploadProgressHook) {
+        *self.progress_hook.lock().unwrap() = Some(hook);
+    }
+
+    /// ★ M15/T8：某个远端路径当前的上传进度（`None` = 没有在传的作业）。
+    ///
+    /// `file_states` 汇总「传输中」时读它 —— 节点表里那条是下载侧写的，
+    /// 上传侧只有队列知道。
+    pub fn progress_of(&self, remote_path: &str) -> Option<(u64, u64)> {
+        self.inflight.lock().unwrap().get(remote_path).copied()
+    }
+
+    /// ★ M15/T8：上传侧在途汇总 —— `(在传作业数, 已发字节, 总字节)`。
+    ///
+    /// 与 [`crate::FsHandle::download_transfers`] 同一个口径，daemon 把两边加起来
+    /// 才是「现在一共有几个文件在传」。
+    pub fn upload_transfers(&self) -> (usize, u64, u64) {
+        let Ok(m) = self.inflight.lock() else {
+            return (0, 0, 0);
+        };
+        let mut done = 0u64;
+        let mut total = 0u64;
+        for (d, t) in m.values() {
+            done += d;
+            total += t;
+        }
+        (m.len(), done, total)
+    }
+
+    /// ★ M15/T8：记一次上传进度并上报。
+    ///
+    /// 同时做两件事：更新 [`Self::inflight`]（供 `file_states` 读）与调 hook
+    /// （让 FUSE 节点也看到）。**都不参与上传正确性** —— 拿不到锁就跳过。
+    ///
+    /// `None` = 作业结束，把在途记录撤掉并让节点清进度。
+    pub(crate) fn note_progress(&self, remote: &str, progress: Option<(u64, u64)>) {
+        match self.inflight.lock() {
+            Ok(mut m) => match progress {
+                Some(p) => {
+                    m.insert(remote.to_string(), p);
+                }
+                None => {
+                    m.remove(remote);
+                }
+            },
+            // 锁中毒 = 别的线程 panic 过。进度是纯展示，放弃这一次上报。
+            Err(_) => return,
+        }
+        invoke_progress_hook(
+            self.progress_hook.lock().ok().and_then(|h| h.clone()),
+            remote,
+            progress,
+        );
+    }
+
+    /// ★ M15/T9：注入「身份 → 当前远端路径」解析器。
+    ///
+    /// 注入之后，作业**真正发出去之前**会按 `file_id` 复查一次落地位置：
+    /// 排队期间对方设备改了名，就落到新名字（不产生旧名字的幽灵文件）。
+    /// 没注入 / 解析不出（歧义）→ 按排队时的路径发，与 T9 之前行为一致。
+    pub fn set_name_resolver(&self, resolver: NameResolver) {
+        *self.name_resolver.lock().unwrap() = Some(resolver);
+    }
+
+    /// ★ M15/T9：发之前把作业重定向到「身份现在所在的名字」。
+    /// 返回是否真的改了（改了的话调用方要重新落库，主键变了）。
+    fn retarget_by_identity(&self, job: &mut UploadJob) -> bool {
+        if job.file_id == ZERO_FILE_ID {
+            return false;
+        }
+        let resolver = self.name_resolver.lock().unwrap().clone();
+        let Some(resolve) = resolver else {
+            return false;
+        };
+        let Some(current) = resolve(&job.file_id) else {
+            return false;
+        };
+        if !job.retarget(&current) {
+            return false;
+        }
+        tracing::info!(
+            "排队期间远端改名，落地到新名字: {}（内容源仍是同一个文件）",
+            job.remote_path()
+        );
+        true
     }
 
     /// 入队：**先写状态库，再改内存队列**（崩溃安全）。
@@ -460,8 +660,28 @@ impl UploadQueue {
                 continue;
             }
 
+            // ★ M15/T9：**发出去之前**按身份复查落地位置。排队这几十秒里对方
+            // 设备改了名的话，写到旧名字会在 NAS 上留一个内容是新的「幽灵文件」。
+            // 主键（remote_path）变了 → 删旧行、落新行，保持「表 = 未完成作业」。
+            let mut job = job;
+            let job_pre_retarget_path = job.remote_path();
+            if self.retarget_by_identity(&mut job) {
+                self.persist_delete(&job_pre_retarget_path);
+                self.persist_put(&job);
+            }
+
+            // ★ T8：发之前把总量记下来（**只用于展示**）。baseline 推进仍然用
+            // T2 返回的「真正发出的字节数」，两者不是一回事：用户在上传期间改了
+            // 同一个文件的话，`metadata` 读到的是下一版的大小。
+            job.bytes_total = std::fs::metadata(&job.local).map(|m| m.len()).unwrap_or(0);
+            if job.bytes_total > 0 {
+                self.note_progress(&job.remote_path(), Some((0, job.bytes_total)));
+            }
             match self.rt.block_on(self.upload_one(&job)) {
                 Ok(n) => {
+                    // ★ T8：用 T2 的返回值（真正发出的字节数）结进度，`min` 夹住
+                    // 总量 → 越界（用户把文件改大了）也只会显示 100%。
+                    let shown = job.note_sent(n, job.bytes_total);
                     self.persist_delete(&job.remote_path());
                     if job.ephemeral {
                         // 冲突副本的 stash 是一次性的：传完就删
@@ -476,11 +696,21 @@ impl UploadQueue {
                         &job.remote_path(),
                         (n, job.mtime),
                     );
+                    // ★ T8：作业结束 → 撤掉在途进度（不留「停在 100%」的假象）。
+                    // 先报一次终值是为了让「刚好 100% → 结束」这个转折可被观测。
+                    if job.bytes_total > 0 {
+                        self.note_progress(&job.remote_path(), Some(shown));
+                    }
+                    self.note_progress(&job.remote_path(), None);
                     self.stats.done.fetch_add(1, Ordering::Relaxed);
                     self.stats.bytes.fetch_add(n, Ordering::Relaxed);
                     tracing::info!("已上传 {} ({} 字节)", job.remote_path(), n);
                 }
                 Err(e) => {
+                    // ★ T8：失败/放弃之后没有在传的作业了 → 清进度。
+                    // 「正在退避重试」由 `pending` 表达（作业已重新入队），
+                    // 不在这里假装还在传。
+                    self.note_progress(&job.remote_path(), None);
                     let attempts = job.attempts + 1;
                     if attempts >= self.max_attempts {
                         self.stats.failed.fetch_add(1, Ordering::Relaxed);
@@ -728,6 +958,11 @@ mod tests {
             mtime: 1234,
             attempts: 0,
             ephemeral: false,
+            // ★ T9：老构造路径（无身份）等价于 ZERO —— 队列按原路径发，退化行为一致。
+            file_id: ZERO_FILE_ID,
+            // ★ T8：还没开始传
+            bytes_sent: 0,
+            bytes_total: 0,
         }
     }
 
@@ -740,6 +975,9 @@ mod tests {
             mtime: 1,
             attempts: 0,
             ephemeral: false,
+            file_id: ZERO_FILE_ID,
+            bytes_sent: 0,
+            bytes_total: 0,
         };
         // remote_path 必须稳定（库里主键、write log、dirty 判定都靠它）
         assert_eq!(j.remote_path(), "/home/qxync-test/a b.txt");
@@ -884,6 +1122,234 @@ mod tests {
         );
         assert!(archived.exists(), "备份不能被删");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------------------ ★ T9 身份重定向
+
+    /// ★ T9：排队期间远端改了名 → 作业**落地到新名字**，不产生旧名字的幽灵文件。
+    ///
+    /// 断言要点：
+    /// 1. `retarget` 只改 `remote_dir`/`remote_name`，**本地内容源一字不动**（内容还是同一个文件）；
+    /// 2. 解析不出（`None`）→ **不重定向**（保守退化：宁可传到旧名字让用户看见，
+    ///    也不能凭猜测把内容写到别的文件位置上）；
+    /// 3. 无身份（崩溃恢复的作业）→ 完全不参与重定向。
+    #[test]
+    fn t9_job_retargets_to_the_current_name_of_the_same_identity() {
+        let mut j = job(Path::new("/tmp"), "old.txt");
+        let id =
+            qxync_core::file_id::compute_file_id(false, 100, 1_700_000_000, "old.txt", "/home");
+        assert_ne!(id, ZERO_FILE_ID);
+        j.file_id = id;
+
+        // 1. 解析出改名后的新路径 → 切过去，内容源不变
+        assert!(j.retarget("/home/qxync-test/new.txt"));
+        assert_eq!(j.remote_path(), "/home/qxync-test/new.txt");
+        assert_eq!(
+            j.remote_dir, "/home/qxync-test",
+            "目录按切分点写回，无尾斜杠"
+        );
+        assert_eq!(j.remote_name, "new.txt");
+        assert_eq!(j.local, Path::new("/tmp").join("cache").join("old.txt"));
+        assert_eq!(j.file_id, id, "重定向不改变身份");
+        assert_eq!(j.mtime, 1234, "重定向不改变内容特征");
+
+        // 2. 已经是当前名字 → 不动（幂等，不会把主键改来改去）
+        assert!(!j.retarget("/home/qxync-test/new.txt"));
+
+        // 3. `retarget` 本身只管切路径，**身份判定在 `retarget_by_identity` 里**（见下一个测试）
+        let mut anonymous = job(Path::new("/tmp"), "anon.txt");
+        assert_eq!(anonymous.file_id, ZERO_FILE_ID);
+        assert!(anonymous.retarget("/home/qxync-test/whatever.txt"));
+        assert_eq!(anonymous.remote_path(), "/home/qxync-test/whatever.txt");
+    }
+
+    /// ★ T9：`retarget_by_identity` 的四条退化路径 —— 身份为零 / 解析器缺席 /
+    /// 解析不出（歧义）/ 已是当前名字，都必须**原样保留排队时的路径**。
+    #[test]
+    fn t9_retarget_by_identity_falls_back_when_it_cannot_resolve() {
+        let dir = tmpdir("retarget");
+        let marker = dir.join("queue");
+        let (q, _rt) = test_queue(&marker);
+        let id = qxync_core::file_id::compute_file_id(false, 100, 1_700_000_000, "a.txt", "/home");
+
+        // 没注入解析器（daemon 还没接线 / 只读挂载）→ 不重定向
+        let mut j1 = job(&dir, "a.txt");
+        j1.file_id = id;
+        assert!(!q.retarget_by_identity(&mut j1));
+        assert_eq!(j1.remote_path(), "/home/qxync-test/a.txt");
+
+        // 注入解析器但解析不出（歧义 / 该身份已不存在）→ 不重定向
+        q.set_name_resolver(Arc::new(|_| None));
+        assert!(!q.retarget_by_identity(&mut j1));
+        assert_eq!(j1.remote_path(), "/home/qxync-test/a.txt");
+
+        // 身份为零（崩溃恢复的作业）→ 解析器给什么结果都不动
+        let mut anon = job(&dir, "anon.txt");
+        assert_eq!(anon.file_id, ZERO_FILE_ID);
+        assert!(!q.retarget_by_identity(&mut anon));
+        assert_eq!(anon.remote_path(), "/home/qxync-test/anon.txt");
+
+        // 解析器给出新名字 → 重定向
+        q.set_name_resolver(Arc::new(|_| {
+            Some("/home/qxync-test/改名了.txt".to_string())
+        }));
+        assert!(q.retarget_by_identity(&mut j1));
+        assert_eq!(j1.remote_path(), "/home/qxync-test/改名了.txt");
+        // 已经落到新名字后再解析一次 → 幂等，不再改主键
+        assert!(!q.retarget_by_identity(&mut j1));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ T9：重定向之后**队列状态库的主键要跟着换**（旧路径那行删掉、新路径那行写入）。
+    ///
+    /// 不换的后果：库里仍留着旧路径 → 崩溃恢复会复活一个已经不存在的路径的作业，
+    /// 也就是「幽灵文件」换个方向复发。
+    #[test]
+    fn t9_retarget_rekeys_the_persisted_row() {
+        let dir = tmpdir("rekey");
+        let marker = dir.join("queue");
+        let (q, _rt) = test_queue(&marker);
+        let id = qxync_core::file_id::compute_file_id(false, 7, 1_700_000_001, "x.bin", "/home");
+
+        let mut j = job(&dir, "x.bin");
+        j.file_id = id;
+        q.enqueue(j.clone()).unwrap();
+        assert!(Store::open(marker.join(QUEUE_DB_FILE))
+            .unwrap()
+            .uploads()
+            .unwrap()
+            .iter()
+            .any(|r| r.remote_path() == "/home/qxync-test/x.bin"));
+
+        // 模拟 worker：按身份查到新名字 → 改主键 → 旧行删掉、新行写入
+        q.set_name_resolver(Arc::new(|_| Some("/home/qxync-test/y.bin".to_string())));
+        let old_path = j.remote_path();
+        let mut job = j.clone();
+        assert!(q.retarget_by_identity(&mut job));
+        q.persist_delete(&old_path);
+        q.persist_put(&job);
+
+        let rows = Store::open(marker.join(QUEUE_DB_FILE))
+            .unwrap()
+            .uploads()
+            .unwrap();
+        assert_eq!(rows.len(), 1, "旧路径的行必须删掉，不能留幽灵");
+        assert_eq!(rows[0].remote_path(), "/home/qxync-test/y.bin");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ================================================================ ★ M15/T8
+
+    /// ★ T8：上传进度**从 T2 返回的「真正发出的字节数」推进，且不越界**。
+    #[test]
+    fn t8_upload_progress_uses_sent_bytes_and_never_exceeds_total() {
+        let dir = tmpdir("t8-sent");
+        let mut j = job(&dir, "a.bin");
+        // 正常：发出 400 / 总量 1000
+        assert_eq!(j.note_sent(400, 1000), (400, 1000));
+        assert_eq!(j.bytes_sent, 400);
+        assert_eq!(j.bytes_total, 1000);
+        // 上传期间用户把文件**改小**了 → 真正发出的比预读的小：如实报小值
+        assert_eq!(j.note_sent(120, 1000), (120, 1000));
+        // 上传期间用户把文件**改大**了 → 真正发出的超过预读：必须夹住，
+        // 绝不显示 120%
+        assert_eq!(j.note_sent(1200, 1000), (1000, 1000), "进度不能越界");
+        assert_eq!(j.bytes_sent, 1000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ T8：崩溃恢复出来的作业进度必须从 0 起（表里没有这两列）。
+    #[test]
+    fn t8_progress_is_not_persisted_across_restart() {
+        let dir = tmpdir("t8-nopersist");
+        let mut j = job(&dir, "a.bin");
+        j.note_sent(500, 1000);
+        // 往返一次 `uploads` 表（= 崩溃恢复走的路）
+        let row = j.to_row();
+        let back = UploadJob::from_row(&row);
+        assert_eq!(back.bytes_sent, 0, "库里没有进度列，恢复出来必须是 0");
+        assert_eq!(back.bytes_total, 0, "总量在发之前才 stat，不该被持久化");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ T8：在途表 + 回调一起推进，`None` 表示作业结束。
+    #[test]
+    fn t8_inflight_tracks_progress_and_clears() {
+        let dir = tmpdir("t8-inflight");
+        let (q, _rt) = test_queue(&dir.join("queue"));
+        let seen: Arc<std::sync::Mutex<Vec<(String, Option<(u64, u64)>)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s = seen.clone();
+        q.set_progress_hook(Arc::new(move |remote: &str, p: Option<(u64, u64)>| {
+            s.lock().unwrap().push((remote.to_string(), p));
+        }));
+
+        let p = "/home/qxync-test/a.bin";
+        assert_eq!(q.progress_of(p), None, "还没开始就没有在途进度");
+        assert_eq!(q.upload_transfers().0, 0);
+
+        q.note_progress(p, Some((0, 1000)));
+        assert_eq!(q.progress_of(p), Some((0, 1000)));
+        q.note_progress(p, Some((600, 1000)));
+        assert_eq!(q.progress_of(p), Some((600, 1000)));
+        assert_eq!(q.upload_transfers().0, 1);
+        assert_eq!(q.upload_transfers(), (1, 600, 1000));
+
+        // 作业结束 → 撤掉，不能停在 60%
+        q.note_progress(p, None);
+        assert_eq!(q.progress_of(p), None, "结束后不能留着在途进度");
+        assert_eq!(q.upload_transfers().0, 0);
+        assert_eq!(q.upload_transfers(), (0, 0, 0));
+
+        let v = seen.lock().unwrap();
+        assert_eq!(
+            *v,
+            vec![
+                (p.to_string(), Some((0, 1000))),
+                (p.to_string(), Some((600, 1000))),
+                (p.to_string(), None),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ T8：**回调 panic 不能打死上传 worker**（M7 同款坑，上传侧再堵一次）。
+    #[test]
+    fn t8_panicking_progress_hook_is_isolated() {
+        let called = Arc::new(AtomicU64::new(0));
+        let c = called.clone();
+        let hook: UploadProgressHook = Arc::new(move |_, _| {
+            c.fetch_add(1, Ordering::Relaxed);
+            panic!("进度回调里的 bug");
+        });
+        invoke_progress_hook(Some(hook.clone()), "/home/a.bin", Some((1, 10)));
+        // 隔离之后后续回调照常执行
+        let c2 = called.clone();
+        invoke_progress_hook(
+            Some(Arc::new(move |_, _| {
+                c2.fetch_add(1, Ordering::Relaxed);
+            })),
+            "/home/a.bin",
+            None,
+        );
+        assert_eq!(called.load(Ordering::Relaxed), 2, "回调 panic 不能中断调用点");
+        // 没回调也不能有事
+        invoke_progress_hook(None, "/home/a.bin", Some((1, 10)));
+    }
+
+    /// ★ T8：没注入回调时 `note_progress` 依然不能出错（`file_states` 还要读在途表）。
+    #[test]
+    fn t8_progress_without_hook_is_silent_and_harmless() {
+        let dir = tmpdir("t8-nohook");
+        let (q, _rt) = test_queue(&dir.join("queue"));
+        let p = "/home/qxync-test/a.bin";
+        q.note_progress(p, Some((10, 100)));
+        assert_eq!(q.progress_of(p), Some((10, 100)));
+        q.note_progress(p, None);
+        assert_eq!(q.progress_of(p), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

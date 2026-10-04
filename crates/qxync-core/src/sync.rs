@@ -18,9 +18,10 @@
 //! 5. 事件 `filepath` 是真实路径 `/share/homes/<user>/...`，必须映射回 `/home/...`。
 
 use crate::error::{Error, Result};
+use crate::file_id::{FileId, ZERO_FILE_ID};
 use crate::model::DirEntry;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------- 常量
@@ -392,6 +393,161 @@ pub fn decide(local: &LocalSig, base: &Sig, remote: &Sig) -> Decision {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------- ★ M15/T9 改名配对
+
+/// 一轮对账里的一个**改名候选**（带稳定身份）。
+///
+/// 两侧各是一个 `RenameCandidate`：远端消失的那个（`removed`）与
+/// 远端新出现的那个（`added`）。`file_id` 由
+/// [`crate::file_id::compute_file_id`] 算出。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenameCandidate {
+    pub path: String,
+    pub file_id: FileId,
+    pub is_dir: bool,
+}
+
+impl RenameCandidate {
+    pub fn new(path: impl Into<String>, file_id: FileId, is_dir: bool) -> Self {
+        Self {
+            path: path.into(),
+            file_id,
+            is_dir,
+        }
+    }
+
+    /// 父目录（`/home/a/b.txt` → `/home/a`；根下返回 `/`）。
+    pub fn parent(&self) -> &str {
+        match self.path.rfind('/') {
+            Some(0) | None => "/",
+            Some(i) => &self.path[..i],
+        }
+    }
+}
+
+/// 配成的一对改名：`old_path`（远端已消失）= `new_path`（远端新出现）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenamePair {
+    pub old_path: String,
+    pub new_path: String,
+    pub file_id: FileId,
+}
+
+/// ★ M15/T9：**按 `file_id` 把「远端删除 + 远端新增」配成改名**。
+///
+/// 这是 T9 的核心价值。原来的行为：远端把 `a.txt` 改名成 `b.txt`，对账看到的是
+/// 「`a.txt` 没了」（→ `DeleteLocal`）与「`b.txt` 来了」（→ `RefreshRemote`）两个
+/// 互不相干的事件 —— 后者与本地同名文件撞上就出冲突副本，凭空多占一份空间。
+/// 配成 rename 之后：`a.txt` 的本地节点改名成 `b.txt`、baseline 迁移过去，
+/// **不产生任何副本**。
+///
+/// ## 确定性保证（三条，缺一条就是错配风险）
+///
+/// 1. **同轮**：输入只来自本轮对账的候选集合。跨轮的历史身份由 `nodes` 表负责
+///    （见 `Store::node_by_file_id`），这里不引入时间维度。
+/// 2. **互斥**：一个 `file_id` 最多配成一对。同一 `file_id` 在任一侧出现多次
+///    → **整组放弃**（有歧义就不配），宁可多冲突也不能错配。
+/// 3. **保守退化**：任何拿不准的情况（身份未知、类型不符、歧义）都**不配**，
+///    调用方继续走原有的增删判定 —— 那条路径虽然会产生冲突副本，但**不丢数据**。
+///
+/// ## 父目录优先
+///
+/// 先在**同一父目录内**配（同名改名最常见的情形，误配概率最低）；
+/// 剩下的跨目录配对是「移动」场景，退化到全树范围。
+///
+/// ## 为什么 `ZERO_FILE_ID` 一律不配
+///
+/// 身份未知 ≠ 身份相同。把两个「不知道」当成「同一个」，就是在赌 ——
+/// 而赌错的代价是**把用户的另一个文件当成改名对象**，可能丢数据。
+pub fn pair_renames(removed: &[RenameCandidate], added: &[RenameCandidate]) -> Vec<RenamePair> {
+    // ① 索引：file_id → 候选（同 id 出现多次即歧义，整组作废用 None 表示）。
+    fn index(items: &[RenameCandidate]) -> BTreeMap<FileId, Option<RenameCandidate>> {
+        // 先数一遍出现次数。
+        let mut seen: BTreeMap<FileId, usize> = BTreeMap::new();
+        for it in items {
+            if it.file_id == ZERO_FILE_ID {
+                continue; // 身份未知 → 不参与配对。
+            }
+            *seen.entry(it.file_id).or_insert(0) += 1;
+        }
+        let mut m: BTreeMap<FileId, Option<RenameCandidate>> = BTreeMap::new();
+        for it in items {
+            if it.file_id == ZERO_FILE_ID {
+                continue;
+            }
+            if seen[&it.file_id] > 1 {
+                m.insert(it.file_id, None); // 歧义：整组作废。
+            } else {
+                m.insert(it.file_id, Some(it.clone()));
+            }
+        }
+        m
+    }
+    let gone = index(removed);
+    let fresh = index(added);
+
+    // ② 唯一可配的组合：两侧都唯一 + 类型一致。
+    let mut pairs: Vec<RenamePair> = Vec::new();
+    let mut used_new: BTreeSet<String> = BTreeSet::new();
+    for (id, old) in &gone {
+        let Some(old) = old else { continue };
+        let Some(Some(new)) = fresh.get(id) else {
+            continue;
+        };
+        if old.is_dir != new.is_dir {
+            continue; // 同身份但类型不同 —— 保守不配。
+        }
+        if used_new.contains(&new.path) {
+            continue;
+        }
+        used_new.insert(new.path.clone());
+        pairs.push(RenamePair {
+            old_path: old.path.clone(),
+            new_path: new.path.clone(),
+            file_id: *id,
+        });
+    }
+
+    // ③ 父目录优先：同父目录的排前面（调用方按序处理，冲突副本风险最低的先定）。
+    pairs.sort_by(|a, b| {
+        let pa = parent_of(&a.old_path);
+        let pb = parent_of(&b.old_path);
+        let same_a = (pa == parent_of(&a.new_path)) as u8;
+        let same_b = (pb == parent_of(&b.new_path)) as u8;
+        same_b
+            .cmp(&same_a)
+            .then_with(|| a.old_path.cmp(&b.old_path))
+    });
+    pairs
+}
+
+fn parent_of(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(0) | None => "/",
+        Some(i) => &path[..i],
+    }
+}
+
+/// ★ M15/T9：把配对结果应用到 baseline —— 身份搬过去，旧路径的条目删掉。
+///
+/// 返回真正迁移的条数（配对里 `from`/`to` 任一不在 baseline 里就不动）。
+pub fn apply_renames_to_baseline(baseline: &mut Baseline, pairs: &[RenamePair]) -> usize {
+    let mut n = 0;
+    for p in pairs {
+        if p.old_path == p.new_path {
+            continue;
+        }
+        if let Some(sig) = baseline.remove(&p.old_path) {
+            // 目标路径已有条目（不该发生）→ 保留既有的，只删旧键，不覆盖。
+            if baseline.get(&p.new_path) == Sig::MISSING {
+                baseline.put(p.new_path.clone(), sig);
+                n += 1;
+            }
+        }
+    }
+    n
 }
 
 // ---------------------------------------------------------------- 冲突副本
@@ -936,5 +1092,161 @@ mod tests {
     fn sync_state_dir_is_host_scoped_and_safe() {
         let p = sync_state_dir(Path::new("/data"), "nas.example:9834");
         assert_eq!(p, PathBuf::from("/data/sync/nas.example_9834"));
+    }
+
+    // ------------------------------------------------ ★ M15/T9 改名配对
+
+    /// 造一个候选（身份按 `(mtime, size)` 算，与真实算法一致）。
+    fn cand(path: &str, mtime: i64, size: u64, is_dir: bool) -> RenameCandidate {
+        let p = path.to_string();
+        let parent = parent_of(&p).to_string();
+        let name = p.rsplit('/').next().unwrap_or(&p).to_string();
+        RenameCandidate::new(
+            path,
+            crate::file_id::compute_file_id(is_dir, size, mtime, &name, &parent),
+            is_dir,
+        )
+    }
+
+    /// ★ T9 正例：远端把 `a.txt` 改名成 `b.txt`（内容与 mtime 不变）→ 配成一对 rename。
+    ///
+    /// 这条断言就是「不产生冲突副本」的全部依据：配上了，对账就会把
+    /// `a.txt` 的本地节点改名过去，而不是「删一个 + 建一个 + 撞出副本」。
+    #[test]
+    fn pairs_remote_rename_by_file_id() {
+        let gone = vec![cand("/home/a.txt", 1000, 10, false)];
+        let fresh = vec![cand("/home/b.txt", 1000, 10, false)];
+        let pairs = pair_renames(&gone, &fresh);
+        assert_eq!(pairs.len(), 1, "同身份必须配上");
+        assert_eq!(pairs[0].old_path, "/home/a.txt");
+        assert_eq!(pairs[0].new_path, "/home/b.txt");
+
+        // 配对上之后 baseline 迁过去：`a.txt` 不再被当成「远端删了」
+        let mut b = Baseline::default();
+        b.put("/home/a.txt", Sig::file(10, 1000));
+        b.put("/home/other.txt", Sig::file(3, 5));
+        assert_eq!(apply_renames_to_baseline(&mut b, &pairs), 1);
+        assert_eq!(b.get("/home/a.txt"), Sig::MISSING, "旧路径条目必须删掉");
+        assert_eq!(b.get("/home/b.txt"), Sig::file(10, 1000), "身份搬到新路径");
+        assert_eq!(b.get("/home/other.txt"), Sig::file(3, 5), "别的条目不动");
+        // 于是 decide 不会再走 DeleteLocal
+        assert_eq!(
+            decide(
+                &LocalSig {
+                    sig: Sig::MISSING,
+                    dirty: false
+                },
+                &Sig::MISSING,
+                &Sig::MISSING
+            ),
+            Decision::Noop
+        );
+    }
+
+    /// ★ T9 跨目录移动也配得上（退化到全树范围）。
+    #[test]
+    fn pairs_cross_directory_move() {
+        let gone = vec![cand("/home/a.txt", 1000, 10, false)];
+        let fresh = vec![cand("/home/sub/b.txt", 1000, 10, false)];
+        let pairs = pair_renames(&gone, &fresh);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].new_path, "/home/sub/b.txt");
+    }
+
+    /// ★ T9 保守退化：配不上（有别的差异）时**退回旧的增删判定**，不多配也不硬配。
+    #[test]
+    fn falls_back_when_no_shared_identity() {
+        // 内容变了（mtime/size 都不同）→ 是「删一个 + 加一个」，不是改名
+        let gone = vec![cand("/home/a.txt", 1000, 10, false)];
+        let fresh = vec![cand("/home/b.txt", 2000, 99, false)];
+        assert!(pair_renames(&gone, &fresh).is_empty());
+    }
+
+    /// ★ T9 保守退化：同一身份出现两次 = 歧义 → **整组不配**。
+    ///
+    /// 这是正确性红线：宁可多一个冲突副本，也不能把 A 认成 B（错配会丢数据）。
+    #[test]
+    fn ambiguous_identity_is_never_paired() {
+        let gone = vec![
+            cand("/home/a1.txt", 1000, 10, false),
+            cand("/home/a2.txt", 1000, 10, false), // 与 a1 撞 id
+        ];
+        let fresh = vec![
+            cand("/home/b1.txt", 1000, 10, false),
+            cand("/home/b2.txt", 1000, 10, false),
+        ];
+        assert!(
+            pair_renames(&gone, &fresh).is_empty(),
+            "两侧都有歧义时必须一个都不配"
+        );
+    }
+
+    /// ★ T9 保守退化：新增侧歧义也不能配（不能只对消一半）。
+    #[test]
+    fn ambiguous_new_side_is_never_paired() {
+        let gone = vec![cand("/home/a.txt", 1000, 10, false)];
+        let fresh = vec![
+            cand("/home/b1.txt", 1000, 10, false),
+            cand("/home/b2.txt", 1000, 10, false),
+        ];
+        assert!(pair_renames(&gone, &fresh).is_empty());
+    }
+
+    /// ★ T9：身份未知（`ZERO_FILE_ID`）一律不配 —— 「不知道」不等于「相同」。
+    #[test]
+    fn zero_file_id_is_never_paired() {
+        let gone = vec![RenameCandidate::new("/home/a.txt", ZERO_FILE_ID, false)];
+        let fresh = vec![RenameCandidate::new("/home/b.txt", ZERO_FILE_ID, false)];
+        assert!(pair_renames(&gone, &fresh).is_empty());
+    }
+
+    /// ★ T9：同身份但类型不符（目录 vs 文件）→ 不配。
+    #[test]
+    fn type_mismatch_is_never_paired() {
+        let dir = cand("/home/d", 1000, 0, true);
+        let file = RenameCandidate::new("/home/d", dir.file_id, false);
+        assert!(pair_renames(&[dir], &[file]).is_empty());
+    }
+
+    /// ★ T9：一个身份最多配一次（互斥），且同父目录的排前面（确定性）。
+    #[test]
+    fn pairing_is_mutually_exclusive_and_same_dir_first() {
+        let id_same = crate::file_id::compute_file_id(false, 10, 1000, "a", "/home/d");
+        let gone = vec![
+            // 跨目录的那一条应当排在同目录的后面
+            RenameCandidate::new("/home/x1.txt", id_same, false),
+            RenameCandidate::new("/home/d/y1.txt", id_same, false),
+        ];
+        let fresh = vec![
+            RenameCandidate::new("/home/d/y2.txt", id_same, false),
+            RenameCandidate::new("/home/x2.txt", id_same, false),
+        ];
+        // 两侧都歧义 → 一对都不配（互斥/歧义优先于排序）
+        assert!(pair_renames(&gone, &fresh).is_empty());
+
+        // 唯一配对时顺序确定：同父目录在前
+        let g = vec![RenameCandidate::new("/home/x1.txt", id_same, false)];
+        let f = vec![RenameCandidate::new("/home/d/y2.txt", id_same, false)];
+        let pairs = pair_renames(&g, &f);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].old_path, "/home/x1.txt");
+        assert_eq!(pairs[0].new_path, "/home/d/y2.txt");
+    }
+
+    /// ★ T9：同一身份不会配出两对（新增侧去重）。
+    #[test]
+    fn one_new_path_is_never_reused() {
+        let id = crate::file_id::compute_file_id(false, 10, 1000, "a", "/home");
+        // 两个不同的 gone 各自独立身份，但都指向同一个 fresh → 只能配一个
+        let id2 = crate::file_id::compute_file_id(false, 20, 1000, "a", "/home");
+        let gone = vec![
+            RenameCandidate::new("/home/g1.txt", id, false),
+            RenameCandidate::new("/home/g2.txt", id2, false),
+        ];
+        let fresh = vec![RenameCandidate::new("/home/f.txt", id, false)];
+        let pairs = pair_renames(&gone, &fresh);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].old_path, "/home/g1.txt");
+        assert_eq!(pairs[0].new_path, "/home/f.txt");
     }
 }

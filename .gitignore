@@ -45,5 +45,10 @@ crates/qxync-gui/gen/schemas/
 
 .local-run/
 
+# ===== 测试残留 =====
+# 单测里用相对路径建的临时目录（跑测试时 cwd 是 crate 根，不是 /tmp）。
+# 为什么会漏进来：某些测试自己 `env!("CARGO_MANIFEST_DIR")/../.tmpdir` 建目录。
+.tmpdir/
+
 # ===== 研究留档（QNAP 教程正文/截图，版权属 QNAP，仅供本地比对，不提交）=====
 .research/
