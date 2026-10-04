@@ -183,7 +183,7 @@ ls -l ~/qxync-mnt/qxync-test          # 真实大小，尚未下载
 cat ~/qxync-mnt/qxync-test/hello.txt  # 首次读触发按需水合（只取需要的区间）
 getfattr -n user.qxync.state ~/qxync-mnt/qxync-test/hello.txt   # placeholder / partial / hydrated
 
-qxync dehydrate --path /home/qxync-test/big.bin   # 脱水：丢本地内容、只留占位符
+qxync dehydrate --path /home/qxync-test/big.bin --force   # 脱水：丢本地内容、只留占位符（--force 跳过「刚访问过」保护窗口）
 qxync umount ~/qxync-mnt
 qxync daemon stop                                 # 干净退出：卸载全部挂载 + 删 socket/pid
 ```

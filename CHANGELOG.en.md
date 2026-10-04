@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Clicking "dehydrate" on a single row in the GUI file page always returned
+  "0 items, 0 B freed"** — not a single file was released. Two layers of root cause:
+  1. `doDehydratePath` only sent `{method:'dehydrate', path}`, without `force`. The
+     daemon's `let recent = if opts.force { 0 } else { 300 }` therefore applied the
+     300s "recently accessed" protection window to it — yet "I just downloaded / just
+     finished reading, now free the space" is precisely the case where releasing is
+     wanted most; you had to wait five minutes to dehydrate your own read. The CLI has
+     had `--force` all along (the M3 doc calls it "the existing switch for manual
+     dehydration", §5), but this GUI path had no equivalent, so the test matrices all
+     pass `--force` and the gap was never exercised. It now always sends `force: true`;
+     **only the "recently accessed" check is skipped** — pin / unuploaded changes /
+     open fds / mmap / in-flight / upload queue are all still enforced.
+  2. The log swallowed the reason: it printed only `dehydrated`/`freed_bytes`/
+     `used_bytes` and never the `blocked` list that the response already carried
+     (`DehydrateData.blocked`). There was no way to tell whether the file was blocked
+     by the protection window, blocked because it is pinned, or simply not under any
+     mount point's remote root (the latter also returns all zeros). It now appends
+     "｜blocked: <reason>" and picks one of three log levels: success → `logOk`,
+     0 items with reasons → `logErr`, 0 items without reasons → `logInfo`. The new
+     `dehydrateReasons()` handles both `blocked` shapes, de-duplicates reasons, and
+     folds anything past three into "and N more" (directory-level dehydration produces
+     hundreds of entries).
+- **The operation log's status colors were dead**: `.logline.ok/.err/.info` declared
+  their colors on `.res`, but the spans `logLine` appends are `.t` and `.c` — there
+  has never been a `.res` element in the DOM, so all three states rendered in the same
+  gray and "failed" / "blocked" were visually indistinguishable. Now matched against
+  `.c` (higher specificity, so it overrides the earlier `--fg-dim`), plus
+  `flex: 1 1 auto; min-width: 0` on `.c` so long text wraps properly.
+
+### Not done
+
+- **The "dehydrate all" button keeps `force: false`**: in a bulk operation the files
+  just accessed are exactly the ones worth keeping locally, which is a different
+  semantic from the single-file button. It already renders the full `blocked` list in
+  the panel, so observability is fine there.
+
 ## [0.5.0] - 2026-10-04
 
 **The sync engine no longer takes the mount point down with it, and remote renames no longer

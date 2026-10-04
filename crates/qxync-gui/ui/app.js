@@ -2708,23 +2708,61 @@
       });
   }
 
+  // 单文件/单目录的「脱水」= 用户明确点名要释放这个路径。
+  // ★ 必须带force：daemon.rs 的 `let recent = if opts.force { 0 } else { 300 }`
+  //   会给不带 force 的请求套上 300s「刚访问过」保护窗口 —— 而「刚下载 /
+  //   刚读完就点脱水」恰恰是最想释放空间的场景，不该被自己的保护窗口挡住
+  //   （等价于 CLI 的 `dehydrate --path X --force`）。
+  //   注意只跳「刚访问过」这一项，dirty / 待上传 / 打开的 fd / mmap /
+  //   在途 / pinned 这些安全检查一条都没松。
   function doDehydratePath(path, btn) {
     if (!requireDaemon()) { return; }
     withBusy({
       spinners: ['dehy-busy', 'files-busy'],
       buttons: btn ? [btn.id] : []
     }, function () {
-      return ipc({ method: 'dehydrate', path: path });
+      return ipc({ method: 'dehydrate', path: path, force: true });
     }).then(function (r) {
       if (r.ok) {
         var d = isObj(r.data) ? r.data : {};
-        logOk('脱水 ' + path + '：' + num(d.dehydrated, 0) + ' 项，释放 ' + humanSize(d.freed_bytes) +
-          '（当前已用 ' + humanSize(d.used_bytes) + '）');
+        var done = num(d.dehydrated, 0);
+        var reasons = dehydrateReasons(d.blocked);
+        var line = '脱水 ' + path + '：' + done + ' 项，释放 ' + humanSize(d.freed_bytes) +
+          '（当前已用 ' + humanSize(d.used_bytes) + '）';
+        if (reasons) { line += '｜被挡下：' + reasons; }
+        // ★ 0 项一定要说清为什么：只打「0 项，释放 0 B」等于静默失败
+        //   （用户无从判断是保护窗口、是 pinned，还是这个路径压根不在挂载范围内）。
+        if (done > 0) {
+          logOk(line);
+        } else if (reasons) {
+          logErr(line);
+        } else {
+          logInfo(line + '（没有可脱水的候选：该路径可能不在任何挂载点的远端根下）');
+        }
       } else {
         logErr('脱水失败：' + str(r.error));
       }
       return r;
     });
+  }
+
+  /** 把 `blocked: [(路径, 原因), …]` 压成一行人话（最多列 3 条，其余折成计数）。 */
+  function dehydrateReasons(blocked) {
+    if (!isObj(blocked) || !blocked.length) { return ''; }
+    var out = [];
+    for (var i = 0; i < blocked.length; i++) {
+      var pair = blocked[i];
+      var why = (isObj(pair) && pair.length !== undefined) ? str(pair[1]) : '';
+      if (!why && isObj(pair) && pair.reason !== undefined) { why = str(pair.reason); }
+      if (why) { out.push(why); }
+    }
+    if (!out.length) { return ''; }
+    var uniq = [];
+    for (var j = 0; j < out.length; j++) {
+      if (uniq.indexOf(out[j]) < 0) { uniq.push(out[j]); }
+    }
+    var head = uniq.slice(0, 3).join('、');
+    return uniq.length > 3 ? head+ ' 等 ' + uniq.length + ' 类' : head;
   }
 
   function doMkdir() {
