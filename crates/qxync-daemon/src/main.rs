@@ -48,11 +48,20 @@ struct Args {
     #[arg(long)]
     print_config: bool,
 
-    /// ★ M8.2：启动时恢复 enabled=true 的同步任务（默认关闭）。
-    /// 也可用环境变量 QXNYC_TASK_RESTORE=1 打开。
-    /// 默认关闭是刻意的：恢复会「凭空挂载」，可能让上一次跑崩留下的挂载复活。
+    /// ★ M8.2 / ★ M15/T5：启动时恢复挂载（**默认开启**）。
+    ///
+    /// 先按 `$XDG_STATE_HOME/qxync/mounts.json` 恢复上次实际挂载的挂载点
+    /// （含手工 `qxync mount` 挂的、没登记进任务表的），再补任务表里启用但还没挂上的。
+    /// 已挂载的幂等跳过，单个失败只 WARN，不影响其它挂载点、也不阻止 daemon 启动。
+    ///
+    /// ★ T5 起默认开（原先默认关是怕「凭空挂载」；幂等 + 只恢复真挂过的消解了这个顾虑）。
+    /// 要关用 `--no-restore-mounts` 或 `QXNYC_TASK_RESTORE=0`（验收矩阵要「开跑前环境干净」时）。
     #[arg(long)]
     restore_tasks: bool,
+
+    /// ★ M15/T5：显式关掉启动恢复。`--restore-tasks` 现在是默认行为，这个开关才是「关」。
+    #[arg(long)]
+    no_restore_mounts: bool,
 }
 
 fn main() -> Result<()> {
@@ -86,12 +95,20 @@ fn main() -> Result<()> {
         .enable_all()
         .build()
         .context("建 tokio 运行时失败")?;
-    // ★ M8.2：`--restore-tasks` 或 QXNYC_TASK_RESTORE=1 → 启动时恢复启用的任务
-    let restore = args.restore_tasks
-        || matches!(
-            std::env::var("QXNYC_TASK_RESTORE").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes")
-        );
+    // ★ M8.2 / ★ M15/T5：启动时恢复挂载。**默认开**（T5 起），三个开关从强到弱：
+    //   `--no-restore-mounts` > `QXNYC_TASK_RESTORE=0` > `--restore-tasks`
+    // 环境变量同时认开（1/true/yes）与关（0/false/no），这样 systemd unit 里
+    // 想显式关掉不必改命令行。
+    let env_restore = match std::env::var("QXNYC_TASK_RESTORE").ok().as_deref() {
+        Some(v) if matches!(v, "1" | "true" | "yes") => Some(true),
+        Some(v) if matches!(v, "0" | "false" | "no") => Some(false),
+        _ => None,
+    };
+    let restore = if args.no_restore_mounts {
+        false
+    } else {
+        env_restore.unwrap_or(true)
+    };
     let res = rt.block_on(daemon::run(daemon::Options {
         link_id: args.link,
         socket,
