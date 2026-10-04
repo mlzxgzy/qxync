@@ -453,10 +453,15 @@ enum PeerAction {
 enum DaemonAction {
     /// 拉起 qxyncd（已在运行则直接报成功）
     Start,
-    /// 请求 qxyncd 干净退出
+    /// 请求 qxyncd 干净退出（★ M15/T6：会**真正卸载**全部 FUSE 挂载点）
     Stop,
     /// ping + 状态快照
     Status,
+    /// ★ M15/T6：重载同步引擎（SIGHUP）—— **挂载点一秒都不中断**
+    ///
+    /// 等价于 `systemctl --user reload qxyncd`。这是「让同步重新跑起来」的
+    /// 推荐做法：restart 会短暂断开挂载点（systemd 语义限制，见 docs/M15 T6）。
+    Reload,
 }
 
 fn paths() -> Result<ConfigPaths> {
@@ -1886,26 +1891,45 @@ fn print_file_states(d: &FileStatesData) {
         "三态汇总  : 仅在线 {} · 本地可用 {} · 始终可用 {}",
         d.online, d.local, d.always
     );
+    // ★ M15/T8：同步维度汇总。**与上面那行正交** —— 「仅在线 + 已同步」是
+    // 完全正常的状态（没缓存但跟 NAS 一致），所以必须分开报，不能合成一个数。
+    println!(
+        "同步汇总  : 已同步 {} · 未同步 {} · 未知 {}{}",
+        d.in_sync,
+        d.out_of_sync,
+        d.unknown,
+        if d.transferring > 0 {
+            format!(" · 传输中 {}", d.transferring)
+        } else {
+            String::new()
+        }
+    );
     for e in &d.entries {
+        // ★ T8：两个维度组合成一句话 —— 空间三态 + 同步维度。
+        let space = if e.is_dir {
+            "目录".to_string()
+        } else {
+            match e.state.as_str() {
+                "always" => "始终可用".to_string(),
+                "local" => "本地可用".to_string(),
+                _ => "仅在线".to_string(),
+            }
+        };
+        // `in_sync = None` = 没查到节点（路径还没被 `lookup` 过）→ 说「未知」，
+        // 绝不谎报「已同步」。
+        let sync = match e.in_sync {
+            Some(v) => qxync_fuse::sync_state_label(v, e.progress, e.conflicts),
+            None => "同步状态未知".to_string(),
+        };
         println!(
-            "{:<8} {:>12}  {:<12} {}{}",
-            if e.is_dir {
-                "目录"
-            } else {
-                match e.state.as_str() {
-                    "always" => "始终可用",
-                    "local" => "本地可用",
-                    _ => "仅在线",
-                }
-            },
+            "{:<8} {:>12}  {:<12} {:<10} · {}  {}{}",
+            space,
             human_size(e.size),
             e.pin,
+            sync,
             e.name,
-            if e.dirty {
-                "（有未上传改动）"
-            } else {
-                ""
-            }
+            if e.dirty { "（有未上传改动）" } else { "" },
+            if e.pending_upload { "（队列中）" } else { "" },
         );
     }
     if let Some(n) = &d.note {
@@ -2263,6 +2287,14 @@ fn print_status(st: &StatusData) {
             c.max_log, c.global_notify, c.sync_signal
         );
     }
+    // ★ T8：传输汇总。`None` = 此刻没有在途作业（不是「查不到」——
+    // 老版本 daemon 也会给 `None`，那种情况下 GUI 另有版本号可判断）。
+    if let Some(t) = &st.transfers {
+        println!(
+            "传输中    : 共 {} 个文件（下载 {} · 上传 {}）｜{}/{} 字节",
+            t.active, t.downloading, t.uploading, t.done_bytes, t.total_bytes
+        );
+    }
     if let Some(c) = &st.cache {
         print_cache(c);
     }
@@ -2433,6 +2465,34 @@ async fn daemon_cmd(cli: &Cli, socket: &std::path::Path, action: &DaemonAction) 
                 p.pong, p.daemon_version, p.pid, p.uptime_secs
             );
             print_status(&st);
+        }
+        DaemonAction::Reload => {
+            // ★ M15/T6：SIGHUP = 重载同步引擎但**不碰 FUSE 会话**。
+            //   走信号而不是新增 IPC 方法，与 `systemctl reload` 完全同一条路径 ——
+            //   用户在两种部署下得到同样的行为。
+            let p: PingData = ipc_client::call(socket, Request::Ping)
+                .await
+                .map_err(|_| anyhow::anyhow!("qxyncd 未在运行（socket {}）", socket.display()))?;
+            // pid 走 IPC 传来是 u32，内核接口要 i32；pid 是内核分配的小整数，
+            // 实践中不会越界，但仍然显式挡一道，避免任何理论上的截断。
+            let pid = libc::pid_t::try_from(p.pid)
+                .map_err(|_| anyhow::anyhow!("qxyncd 返回了非法 pid={}", p.pid))?;
+            let rc = unsafe { libc::kill(pid, libc::SIGHUP) };
+            if rc != 0 {
+                bail!(
+                    "给 qxyncd(pid={}) 发 SIGHUP 失败: {}",
+                    p.pid,
+                    std::io::Error::last_os_error()
+                );
+            }
+            // SIGHUP 是异步的：这里只能确认「信号发到了」，重载是否完成看日志。
+            // 不 sleep 轮询 —— 同步引擎重载包含「等旧任务做完当前一轮」，
+            // 短则几秒长则几十秒，CLI 不该在这里卡住。
+            println!(
+                "✅ 已给 qxyncd(pid={}) 发 SIGHUP：同步引擎将重载（轮询 / 脱水 / 队列 / journal）",
+                p.pid
+            );
+            println!("   FUSE 挂载点**不中断** —— 这正是用 reload 而不是 restart 的原因");
         }
     }
     Ok(())

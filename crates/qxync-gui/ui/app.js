@@ -1543,7 +1543,7 @@
     if (!st || !st.running) {
       show('sync-missing', true);
       kvText(srv, '状态', 'qxyncd 未运行：请点顶部「启动 daemon」，或到「连接 / 登录」页保存配置后启动。');
-      ['sess-kv', 'cursors-kv', 'hydro-kv', 'uploads-kv', 'cache-kv', 'cache-blocked-kv', 'sync-summary-kv', 'sync-note']
+      ['sess-kv', 'cursors-kv', 'hydro-kv', 'transfers-kv', 'uploads-kv', 'cache-kv', 'cache-blocked-kv', 'sync-summary-kv', 'sync-note']
         .forEach(function (id) { clear($(id)); });
       show('uploads-active', false);
       show('sync-note', false);
@@ -1613,6 +1613,19 @@
     var h = isObj(s.hydro) ? s.hydro : { count: 0, bytes: 0 };
     kvText(hydro, '水合次数', num(h.count, 0));
     kvText(hydro, '水合字节', humanSize(h.bytes) + '（' + num(h.bytes, 0) + ' B）');
+
+    // --- ★ T8：传输中（下载 + 上传）。`undefined/null` = 此刻没有在途作业。
+    //   与上面的累计水合计数是**两个口径**：那个是历史总量，这个是此刻在传的。
+    var tr = $('transfers-kv');
+    clear(tr);
+    if (isObj(s.transfers)) {
+      var t = s.transfers;
+      kvText(tr, '在传文件', num(t.active, 0) + '（下载 ' + num(t.downloading, 0)
+        + ' · 上传 ' + num(t.uploading, 0) + '）');
+      kvText(tr, '在传字节', humanSize(num(t.done_bytes, 0)) + ' / ' + humanSize(num(t.total_bytes, 0)));
+    } else {
+      kvText(tr, '传输中', '无');
+    }
 
     // --- 上传队列
     var up = $('uploads-kv');
@@ -2290,6 +2303,11 @@
           online: num(r.data.online, 0),
           local: num(r.data.local, 0),
           always: num(r.data.always, 0),
+          // ★ T8：同步维度汇总（老 daemon 不给这几个字段 → num() 取默认 0）
+          in_sync: num(r.data.in_sync, 0),
+          out_of_sync: num(r.data.out_of_sync, 0),
+          unknown: num(r.data.unknown, 0),
+          transferring: num(r.data.transferring, 0),
           mountpoint: r.data.mountpoint,
           note: r.data.note
         };
@@ -2453,6 +2471,19 @@
         local: num(state.fsSummary.local, 0),
         always: num(state.fsSummary.always, 0)
       });
+      // ★ M15/T8：同步维度另起一句（与空间三态正交，不能合成一个数）
+      info += T('files.summary_sync', {
+        in_sync: num(state.fsSummary.in_sync, 0),
+        out_of_sync: num(state.fsSummary.out_of_sync, 0),
+        unknown: num(state.fsSummary.unknown, 0) > 0
+          ? T('state.syncUnknown') + ' ' + num(state.fsSummary.unknown, 0)
+          : ''
+      });
+      if (num(state.fsSummary.transferring, 0) > 0) {
+        info += T('files.summary_transferring', {
+          transferring: num(state.fsSummary.transferring, 0)
+        });
+      }
     } else if (state.files.dir) {
       info += T('files.summary_no_mount');
     }
@@ -2530,6 +2561,27 @@
     if (fs && !isDir && num(fs.hydrated_bytes, 0) > 0) {
       tdState.appendChild(document.createTextNode(' '));
       tdState.appendChild(el('span', 'task-meta', humanSize(num(fs.hydrated_bytes, 0))));
+    }
+    // ★ M15/T8：同步维度（与上面的空间三态**正交** ——「仅在线 + 已同步」很正常）。
+    //   progress 有值 → 正在传（百分比）；in_sync === false/null → 未同步/未知。
+    if (fs && !isDir) {
+      var prog = fs.progress;
+      if (isObj(prog) && num(prog[1], 0) > 0 && num(prog[0], 0) < num(prog[1], 0)) {
+        var pct = Math.floor(num(prog[0], 0) * 100 / num(prog[1], 0));
+        tdState.appendChild(document.createTextNode(' '));
+        tdState.appendChild(el('span', 'badge badge-syncing', T('state.progress', { pct: pct })));
+      } else if (fs.in_sync === false) {
+        tdState.appendChild(document.createTextNode(' '));
+        tdState.appendChild(el(
+          'span',
+          'badge badge-warn',
+          num(fs.conflicts, 0) > 0
+            ? T('state.conflicts', { n: num(fs.conflicts, 0) })
+            : T('state.outOfSync')));
+      } else if (fs.in_sync === null || fs.in_sync === undefined) {
+        tdState.appendChild(document.createTextNode(' '));
+        tdState.appendChild(el('span', 'badge', T('state.syncUnknown')));
+      }
     }
     if (fs && fs.dirty === true) {
       tdState.appendChild(document.createTextNode(' '));
