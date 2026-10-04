@@ -7,6 +7,11 @@
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-04
+
+**修两个 GUI 上「看着正常、其实功能不工作」的问题**：单文件脱水永远返回 0，
+文件表格最右一列看不见。
+
 ### 修复
 
 - **GUI 文件页点单行「脱水」永远返回「0 项，释放 0 B」**（一个文件都没清掉）。
@@ -685,6 +690,7 @@ NAS 设置名 `QSYNC_FOLDERPAIR_USE_SPACE_SAVING`、Windows 客户端注册表�
 - 验收结论从 README 抽出为 [`docs/验收记录.md`](docs/验收记录.md)。
 - 采用 **MIT OR Apache-2.0** 双许可（`LICENSE-MIT` / `LICENSE-APACHE`）。
 
+[0.5.1]: https://github.com/mlzxgzy/qxync/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/mlzxgzy/qxync/compare/v0.4.3...v0.5.0
 [0.4.3]: https://github.com/mlzxgzy/qxync/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/mlzxgzy/qxync/compare/v0.4.1...v0.4.2
