@@ -7,6 +7,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-04
+
+**The sync engine no longer takes the mount point down with it, and remote renames no longer
+sprout phantom conflict copies**: this release separates "sync" from "mount" in terms of
+lifecycle, and gives every file a locally-stable identity.
+
+That closes out T1–T9 of the M15 list (T4 was cancelled after verification — see below).
+
+### Added
+
+- **`systemctl --user reload qxyncd` (SIGHUP): reload sync without interrupting the mount
+  point for a single second.** New `qxync daemon reload` takes the same path. The
+  implementation hands the sync engine a *generation token*; old tasks retire at their next
+  checkpoint — no `abort()`, so a task parked on network I/O never holds up the shutdown.
+  ★ **This is the path that actually works for "restart without losing the mount"**:
+  systemd's `restart` is "stop → wait for the old process to exit → start", so a
+  never-exiting guardian gets SIGKILLed after `TimeoutStopSec` and the mount dies anyway.
+  That is systemd's semantics, not something qxync can work around.
+- **SIGTERM keeps mounts**: IPC `stop` / `SIGINT` still unmount everything (the user really
+  did say "shut it down"), but SIGTERM now only stops the sync tasks, writes state to disk,
+  and switches into mount-guardian mode. The guardian has four exit conditions (IPC stop /
+  SIGINT / a second SIGTERM / empty mount table) plus an optional `--mount-hold-secs`, so it
+  cannot wedge systemd.
+- **Automatic cleanup of zombie mounts**: after a real crash or an OOM kill, the mount point
+  stays in `/proc/mounts` but returns `ENOTCONN`, and `cd`ing in says "Transport endpoint is
+  not connected". The daemon now probes the mount points **it recorded** early at startup
+  and lazy-unmounts (`fusermount3 -uz`) only the ones confirmed dead. Safety boundaries: only
+  paths from `mounts.json` (never a full-disk scan), subtype must be `qxync`, `-uz` rather
+  than `-u`, and a failure only warns — it never blocks startup.
+- **Stable file identity `file_id` (16 bytes, built locally)**: the server's `DirEntry` has no
+  id field, so identity is derived from `(mtime, size)` (directories get their own scheme,
+  and it **deliberately excludes the filename** — including it would change identity on
+  rename). New `nodes` table (schema v3 → v4); deletions clear the index.
+  - **Reconciliation uses it to recognise remote renames** → the local node is renamed and
+    the baseline moves with it, so **no conflict copy is generated**. This was the root
+    cause of the most annoying phantom copy in 0.4.x.
+  - **A queued upload whose file is renamed remotely** now lands under the new name instead
+    of creating a ghost file.
+  - **Pairing is conservative**: unknown identity, mismatched type, or one identity mapping
+    to several paths (ambiguous) are all refused, falling back to the original add/delete
+    decision. Better one conflict too many than a mis-pairing or lost data.
+- **`qxync file-states <dir>`**: per-file sync status. `in_sync` is a **derived value**
+  (aggregating `dirty` / queued uploads / pending conflict decisions) — no new state table.
+- **Transfer progress**: download reports after every received chunk (128 KiB); upload
+  advances using the "bytes actually sent" counter introduced back in T2. Progress reporting
+  is **read-only** and **never propagates** into the read or upload path (callback panics are
+  isolated with `catch_unwind`).
+
+### Fixed
+
+- **`rename_remote` failed to migrate the identity index** (caught and fixed during this
+  release's own review): the remote-rename path migrated the local node but left the row in
+  the `nodes` table behind. The same `file_id` then appeared twice → lookups by identity
+  permanently reported "ambiguous" → **the upload queue's identity-based retargeting was dead
+  for good**, and every remote rename leaked one index row. Fixed, with a regression test
+  that actually catches it (verified by mutation testing: remove the fix and the test fails).
+- **`progress_percent` integer overflow**: with `done > total`, `saturating_mul(100)` produced
+  `18446744073709551615`. Now uses a `u128` intermediate and clamps to 100.
+- `Store`'s SQLite connection is now an `Arc<Mutex<Connection>>`: the FUSE side also needs a
+  `Store` (for the identity index), and it must be the **same connection** rather than two
+  connections fighting over the write lock.
+
+### Changed
+
+- **The default "restart without losing the mount" path moves from `systemctl restart` to
+  `systemctl reload`. The two are not interchangeable — don't mix them up**: `restart` still
+  interrupts the mount briefly (recovered by T5's automatic remount, typically within 3
+  seconds); use `reload` when you need *zero* interruption. The systemd unit's comment was
+  corrected accordingly — the old line "qxyncd unmounts all FUSE mount points on SIGTERM" is
+  no longer accurate as of 0.5.0.
+- To stop the guardian process use `qxync daemon stop` (goes through IPC, really unmounts) or
+  `qxync umount` (unmounts the mount point only).
+
+### Not doing
+
+- **T4 chunked/resumable upload — cancelled after verification.** The original premise was
+  wrong: `qsyncsrv.cgi` implements chunked upload thoroughly (5 funcs, complete parameter
+  tables). The real obstacle is that **the chunked channel only serves Qbox space**
+  (`upload_root_dir` recognises the `/remote:` prefix), while `upload.php`'s `dest_path` uses
+  ordinary home-directory paths — **the two path spaces are disjoint**, so we cannot reach it.
+  The probe is kept at `xtask/probe/upload_chunk_probe.py`. It also corrects a subtle trap:
+  that CGI returns **two JSON documents**, and the leading `"status": 0` is a framework
+  header — scraping only the first one makes every func look like it did nothing.
+
+### Verification status
+
+- `cargo check --workspace --all-targets`: zero errors, zero warnings.
+- `cargo test --workspace --lib --bins --tests`: **290 passed / 0 failed** (baseline 265 +
+  25 new in this batch). All 19 `#[ignore]`d tests live in `qxync-proto-test/` and need a real
+  NAS; this batch added no new ignores.
+- ⚠️ **This machine has no `/dev/fuse`**, so every acceptance item that requires actually
+  mounting something (`ls` during reload, self-healing after `kill -9`, whether the FUSE
+  session truly survives SIGHUP) is covered **by logic-level unit tests only — no real-machine
+  verification**. The T6/T7/T9 sections mark each such item "unverified".
+
 ## [0.4.3] - 2026-10-04
 
 **No trash bin on the mount point, and deletes no longer block**: files landing in a trash
@@ -674,6 +769,7 @@ Verified on **QNAP TS-464C / QTS 5.2.9 / Qsync QPKG 5.0.0.7 (build 20260723)**.
 - Acceptance results were split out of the README into [`docs/验收记录.md`](docs/验收记录.md).
 - Dual-licensed under **MIT OR Apache-2.0** (`LICENSE-MIT` / `LICENSE-APACHE`).
 
+[0.5.0]: https://github.com/mlzxgzy/qxync/compare/v0.4.3...v0.5.0
 [0.4.3]: https://github.com/mlzxgzy/qxync/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/mlzxgzy/qxync/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/mlzxgzy/qxync/compare/v0.4.0...v0.4.1
