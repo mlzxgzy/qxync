@@ -195,7 +195,7 @@ ls -l ~/qxync-mnt/qxync-test          # real size, nothing downloaded yet
 cat ~/qxync-mnt/qxync-test/hello.txt  # the first read triggers on-demand hydration (only the ranges needed)
 getfattr -n user.qxync.state ~/qxync-mnt/qxync-test/hello.txt   # placeholder / partial / hydrated
 
-qxync dehydrate --path /home/qxync-test/big.bin   # dehydrate: drop the local content, keep only a placeholder
+qxync dehydrate --path /home/qxync-test/big.bin --force   # dehydrate: drop the local content, keep only a placeholder (--force skips the "recently accessed" window)
 qxync umount ~/qxync-mnt
 qxync daemon stop                                 # clean exit: unmount everything + delete socket/pid
 ```

@@ -949,11 +949,14 @@ button.link-btn {
 
 .logline { display: flex; gap: 8px; white-space: pre-wrap; word-break: break-word; }
 .logline .t { color: var(--fg-faint); flex: 0 0 auto; }
-.logline .c { color: var(--fg-dim); flex: 0 0 auto; }
-.logline .res { flex: 1 1 auto; }
-.logline.ok .res { color: var(--ok); }
-.logline.err .res { color: var(--err); font-weight: 600; }
-.logline.info .res { color: var(--fg-dim); }
+/* ★ 正文是 `.c`（见 app.js logLine），不是 `.res` —— 原来三条状态色都挂在
+   `.res` 上，而 DOM 里从来没有 `.res` 元素，等于ok/err/info 全是同一个灰，
+   「失败 / 被挡下」在视觉上完全看不出来。改成匹配 `.c`（specificity 更高，
+   会覆盖上面那条 `--fg-dim`）。 */
+.logline .c { color: var(--fg-dim); flex: 1 1 auto; min-width: 0; }
+.logline.ok .c { color: var(--ok); }
+.logline.err .c { color: var(--err); font-weight: 600; }
+.logline.info .c { color: var(--fg-dim); }
 
 /* --------------------------------------------------------------- 弹窗 */
 .modal {

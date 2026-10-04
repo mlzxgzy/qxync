@@ -150,8 +150,15 @@ Tauri 2 的 `withGlobalTauri: true` 会把 `window.__TAURI__.core.invoke` 直接
 | **状态 / 进度**（诊断 → 状态 / 进度） | 服务端信息（Qsync 版本/QPKG/build/busy_reason）、会话、三游标、水合统计、上传队列（pending/active/done/failed/retries/bytes）、缓存限额进度条、`blocked_*` 分类、挂载列表、**NAS 同步文件夹**面板、最近一轮同步摘要 |
 | **连接 / 登录**（设置） | host/port/https/insecure/user/password/ipv4_only 表单（打开时预填）；保存配置 / **保存并登录** / 启停 daemon；三个 XDG 目录与 socket 路径 |
 | **挂载**（诊断 → 挂载） | 当前挂载表（可卸载）+ 新建挂载（挂载点默认 `$HOME/qxync-mnt`、**一个** NAS 目录、读写开关、`cache_mode`、线程数、水合超时、删除熔断阈值、auto_unmount） |
-| **文件 / pin**（文件） | 远端目录浏览（真机 `ls`，目录优先）、每行 pin 查询/设置（`unspecified/pinned/unpinned/excluded`）、下载（`get`）、脱水（`dehydrate`）、新建目录、删除 |
-| **同步 / 缓存**（诊断 → 同步 / 缓存） | `SyncInfo` 全量（含 `devices`、`last_error`、`delete_block_reason`）+ 立即同步 / 强制放行删除 / 暂停轮询 / 设间隔；`CacheInfo` 全量 + 脱水预演 / 全部脱水 / 按限额 / 释放闲置 |
+| **文件 / pin**（文件） | 远端目录浏览（真机 `ls`，目录优先）、每行 pin 查询/设置（`unspecified/pinned/unpinned/excluded`）、下载（`get`）、脱水（`dehydrate`，**恒带 `force: true`**）、新建目录、删除 |
+| **同步 / 缓存**（诊断 → 同步 / 缓存） | `SyncInfo` 全量（含 `devices`、`last_error`、`delete_block_reason`）+ 立即同步 / 强制放行删除 / 暂停轮询 / 设间隔；`CacheInfo` 全量 + 脱水预演 / 全部脱水（`force: false`）/ 按限额 / 释放闲置 |
+
+> ★ **两个脱水入口的 `force` 与呈现不同，是有意为之**：
+> 单行「脱水」= 用户点名释放这一个路径，恒带 `force: true`（跳过 300s「刚访问过」，
+> 否则「刚读完就点释放」永远脱不掉）；「全部脱水」是批量操作，`force: false` 保留保护
+> 窗口（刚读过的文件正是最该留在本地的）。两者都**必须**把返回体的 `blocked` 原因
+> 显示出来 —— 只打「0 项，释放 0 B」等于静默失败，详见 [`M3-脱水.md`](M3-脱水.md) §4/§6。
+
 
 ## 5. 自检与验收
 
