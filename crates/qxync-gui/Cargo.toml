@@ -25,6 +25,10 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 qxync-core = { path = "../qxync-core" }
+# ★ T3：「一键校验缓存」要的就是 `qxync_fuse::verify_cache_dir` —— `.qxstate` /
+# `.qxsum` 的格式定义在 fuse 侧，挪到 core 等于搬一整套私有状态机过去。
+# 代价是 GUI 链接了 fuser，但 fuser 默认走纯 Rust 实现，不需要系统 libfuse。
+qxync-fuse = { path = "../qxync-fuse" }
 # ★ M8.4：托盘是本轮的硬需求，所以把 `tray-icon` 打开（Tauri 默认不带，省体积）。
 # `image-png` 是 `Image::from_bytes` 解码 PNG 的前提——没有它 `include_bytes!` 进来的
 # 图标字节没法变成 `tauri::image::Image`。两者都是编译期 feature，运行时不增加依赖。

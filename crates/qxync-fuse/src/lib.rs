@@ -72,23 +72,67 @@ const REFRESH_MAX_ATTEMPTS: u32 = 3;
 // 有内容**，`cat` 还是会重新去 NAS 逐个区间拉一遍（「缓存过的文件 cat 还要等几秒」
 // 就是这么来的）。位图落在缓存文件旁边（`<cache>.qxstate`），并带上「远端签名」
 // （size + mtime）：签名对不上（NAS 上那份变了）就整份作废，绝不拿旧内容冒充新内容。
+//
+// ★ M15/T3 再加一层「内容校验和」。原来下载只校验**长度**（`ensure_chunk` 里
+// `data.len() != want`），长度对、内容错（网络截断改写、稀疏空洞被当真数据、
+// 位图与内容写序颠倒）要几个月后用户才发现。现在每个区间落一份 `xxhash64`。
+//
+// ★ **为什么不把 per-chunk 校验和直接塞进 `.qxstate`**（M15 原文的写法）：
+// 10 GB 文件 / 128 KiB = 81920 个区间，`8 × nchunks` = 640 KB；而
+// `persist_chunk_state` 是**每个区间就绪就全量重写一次**，水合一遍就是
+// 640 KB × 81920 ≈ 52 GB 写入 —— 比数据本身大 5 倍。所以拆成两个文件：
+// * `.qxstate` —— 头 + 位图，**小到可以随便全量重写**（10 GB 文件也只 10 KB）；
+// * `.qxsum`   —— 定长 `8 × nchunks` 的 per-chunk xxhash64，**只做定点 pwrite**
+//   （写一个区间就改 8 字节，不重写整张表）。
+// 语义等价，但写放大从 O(n²) 降到 O(n)。
 
-const STATE_MAGIC: [u8; 8] = *b"QXSTATE1";
-const STATE_VERSION: u32 = 1;
-/// 位图头：magic(8) + version(4) + chunk_size(8) + size(8) + mtime(8) + nchunks(8)。
-const STATE_HEAD: usize = 8 + 4 + 8 + 8 + 8 + 8;
+const STATE_MAGIC: [u8; 8] = *b"QXSTATE2";
+const STATE_VERSION: u32 = 2;
+/// v1 的 magic —— 只用于**识别并安全作废**（M15 验收：不能 panic）。
+const STATE_MAGIC_V1: [u8; 8] = *b"QXSTATE1";
+const STATE_VERSION_V1: u32 = 1;
+/// 位图头：magic(8) + version(4) + chunk_size(8) + size(8) + mtime(8) + nchunks(8)
+/// \+ file_id(16) + whole_xxhash(8)。
+const STATE_HEAD: usize = 8 + 4 + 8 + 8 + 8 + 8 + 16 + 8;
+/// v1 的头长（少 file_id + whole_xxhash）。
+const STATE_HEAD_V1: usize = 8 + 4 + 8 + 8 + 8 + 8;
+/// 「还没算出整文件校验和」的哨兵 —— 0 不用，因为 xxhash64 可能真是 0。
+const NO_HASH: u64 = u64::MAX;
+
+/// ★ T3：全零的 `file_id`（还没接 T9 的稳定身份，先占位）。
+const ZERO_FILE_ID: [u8; 16] = [0u8; 16];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ChunkState {
     chunk_size: u64,
     size: u64,
     mtime: i64,
+    /// ★ T9 用：跨改名/移动稳定的文件身份；当前恒为全零。
+    file_id: [u8; 16],
+    /// ★ T3：整文件校验和（全量就绪时算一次，用于「一个数判全文件」）。
+    /// 未算出时是 [`NO_HASH`]。
+    whole_xxhash: u64,
     done: Vec<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StateVerdict {
+    /// v2，能用。
+    Ok,
+    /// v1 老格式 —— 没有校验和，认领不了（作废重水合是唯一安全选择）。
+    LegacyV1,
+    /// 损坏 / 截断 / 不认识。
+    Corrupt,
 }
 
 /// 缓存文件 → 位图文件（`<cache>.qxstate`；脱水/失效时和内容一起删）。
 fn state_path(cache: &Path) -> PathBuf {
     sibling_path(cache, ".qxstate")
+}
+
+/// 缓存文件 → 校验和文件（`<cache>.qxsum`；与 `.qxstate` 同生共死）。
+fn sum_path(cache: &Path) -> PathBuf {
+    sibling_path(cache, ".qxsum")
 }
 
 fn sibling_path(base: &Path, suffix: &str) -> PathBuf {
@@ -97,7 +141,7 @@ fn sibling_path(base: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// 删掉某个缓存文件的「内容 + 位图」两件套（幂等）。
+/// 删掉某个缓存文件的「内容 + 位图 + 校验和」三件套（幂等）。
 fn remove_cache_files(cache: &Path) {
     if let Err(e) = std::fs::remove_file(cache) {
         if e.kind() != io::ErrorKind::NotFound {
@@ -105,11 +149,12 @@ fn remove_cache_files(cache: &Path) {
         }
     }
     let _ = std::fs::remove_file(state_path(cache));
+    let _ = std::fs::remove_file(sum_path(cache));
 }
 
 /// 位图落盘（先写 `.tmp` 再 `rename`，原子替换）。
 ///
-/// 顺序很关键：**先 pwrite 内容、后写位图**。崩在中间只会「位图比内容旧」
+/// 顺序很关键：**先 pwrite 内容与 `.qxsum`、后写位图**。崩在中间只会「位图比内容旧」
 /// （至多重下一次区间）；反过来就会把稀疏空洞里的 0 当成真数据。
 fn state_save(cache: &Path, st: &ChunkState) -> io::Result<()> {
     let path = state_path(cache);
@@ -121,6 +166,8 @@ fn state_save(cache: &Path, st: &ChunkState) -> io::Result<()> {
     buf.extend_from_slice(&st.size.to_le_bytes());
     buf.extend_from_slice(&st.mtime.to_le_bytes());
     buf.extend_from_slice(&(st.done.len() as u64).to_le_bytes());
+    buf.extend_from_slice(&st.file_id);
+    buf.extend_from_slice(&st.whole_xxhash.to_le_bytes());
     let mut bitmap = vec![0u8; st.done.len().div_ceil(8)];
     for (i, d) in st.done.iter().enumerate() {
         if *d {
@@ -132,12 +179,32 @@ fn state_save(cache: &Path, st: &ChunkState) -> io::Result<()> {
     std::fs::rename(&tmp, &path)
 }
 
-fn state_decode(buf: &[u8]) -> Option<ChunkState> {
-    if buf.len() < STATE_HEAD || buf[..8] != STATE_MAGIC {
-        return None;
+/// 判断一个 `.qxstate` 缓冲区的版本（不解析内容）。
+///
+/// v1 单独认出来是为了**安全作废**（M15 验收：不能 panic、也不能静默当损坏）。
+/// 只看 magic+version 是不够的：一个 8 字节的 `QXSTATE1` 截断文件也会落到
+/// LegacyV1，所以额外要求头长度至少 `STATE_HEAD_V1`。
+fn state_verdict(buf: &[u8]) -> StateVerdict {
+    if buf.len() < 12 {
+        return StateVerdict::Corrupt;
     }
-    let version = u32::from_le_bytes(buf[8..12].try_into().ok()?);
-    if version != STATE_VERSION {
+    let magic: [u8; 8] = buf[..8].try_into().unwrap();
+    let version = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+    if magic == STATE_MAGIC {
+        return if version == STATE_VERSION && buf.len() >= STATE_HEAD {
+            StateVerdict::Ok
+        } else {
+            StateVerdict::Corrupt
+        };
+    }
+    if magic == STATE_MAGIC_V1 && version == STATE_VERSION_V1 && buf.len() >= STATE_HEAD_V1 {
+        return StateVerdict::LegacyV1;
+    }
+    StateVerdict::Corrupt
+}
+
+fn state_decode(buf: &[u8]) -> Option<ChunkState> {
+    if state_verdict(buf) != StateVerdict::Ok {
         return None;
     }
     let chunk_size = u64::from_le_bytes(buf[12..20].try_into().ok()?);
@@ -160,6 +227,8 @@ fn state_decode(buf: &[u8]) -> Option<ChunkState> {
     if buf.len() < STATE_HEAD + bits {
         return None;
     }
+    let file_id: [u8; 16] = buf[44..60].try_into().ok()?;
+    let whole_xxhash = u64::from_le_bytes(buf[60..68].try_into().ok()?);
     let bitmap = &buf[STATE_HEAD..STATE_HEAD + bits];
     let mut done = Vec::with_capacity(nchunks as usize);
     for i in 0..nchunks as usize {
@@ -169,13 +238,109 @@ fn state_decode(buf: &[u8]) -> Option<ChunkState> {
         chunk_size,
         size,
         mtime,
+        file_id,
+        whole_xxhash,
         done,
     })
 }
 
 fn state_load(cache: &Path) -> Option<ChunkState> {
-    let buf = std::fs::read(state_path(cache)).ok()?;
-    state_decode(&buf)
+    let buf = match std::fs::read(state_path(cache)) {
+        Ok(b) => b,
+        Err(e) => {
+            if e.kind() != io::ErrorKind::NotFound {
+                tracing::warn!("读取水合位图失败 {}: {e}", state_path(cache).display());
+            }
+            return None;
+        }
+    };
+    match state_verdict(&buf) {
+        StateVerdict::Ok => state_decode(&buf),
+        StateVerdict::LegacyV1 => {
+            // ★ M15 验收：v1 必须能被识别并**安全作废**，不能 panic、也不能静默。
+            // v1 里没有校验和，「哪些区间内容是对的」这个问题无法回答 —— 位图说就绪
+            // 但没哈希可比，所以只能当没缓存过（重下一次，用户无感：读操作而已）。
+            tracing::info!(
+                "旧版水合位图（v1，无校验和）已作废，将按需重新水合: {}",
+                state_path(cache).display()
+            );
+            let _ = std::fs::remove_file(state_path(cache));
+            let _ = std::fs::remove_file(sum_path(cache));
+            None
+        }
+        StateVerdict::Corrupt => {
+            tracing::warn!("水合位图损坏，按未缓存处理: {}", state_path(cache).display());
+            None
+        }
+    }
+}
+
+/// 读回整张 per-chunk 校验和表（长度必须正好是 `8 × nchunks`，否则全 [`NO_HASH`]）。
+fn sum_load(cache: &Path, nchunks: usize) -> Vec<u64> {
+    let want = nchunks * 8;
+    match std::fs::read(sum_path(cache)) {
+        Ok(b) if b.len() == want => b
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .collect(),
+        Ok(b) => {
+            tracing::warn!(
+                "校验和表长度不符（{} != {want}），本轮不做内容校验: {}",
+                b.len(),
+                sum_path(cache).display()
+            );
+            vec![NO_HASH; nchunks]
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => vec![NO_HASH; nchunks],
+        Err(e) => {
+            tracing::warn!("读取校验和表失败 {}: {e}", sum_path(cache).display());
+            vec![NO_HASH; nchunks]
+        }
+    }
+}
+
+/// **定点**写若干个区间的校验和（每个区间 `pwrite` 8 字节，不重写整张表）。
+///
+/// **一次 open 写多个**：水合/本地写路径常常一口气要记好几个区间（水合是 1 个，
+/// 但 `mark_written_chunks` 一次 write 可能覆盖几十个），每区间各开一次文件
+/// 在 8192 个区间的大文件上是 8192 次 open + 8192 次 `stat`，纯属自找的开销。
+///
+/// 表文件按需创建并 `set_len` 到定长；调用方保证「先写内容与校验和、后置位图上的位」。
+fn sum_store_many(cache: &Path, nchunks: usize, items: &[(u64, u64)]) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    if items.is_empty() {
+        return Ok(());
+    }
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(sum_path(cache))?;
+    let want = (nchunks * 8) as u64;
+    if f.metadata()?.len() != want {
+        f.set_len(want)?;
+    }
+    for (idx, h) in items {
+        f.write_all_at(&h.to_le_bytes(), idx * 8)?;
+    }
+    Ok(())
+}
+
+/// 单区间版本（便利包装）。
+fn sum_store_one(cache: &Path, nchunks: usize, idx: u64, hash: u64) -> io::Result<()> {
+    sum_store_many(cache, nchunks, &[(idx, hash)])
+}
+
+/// 整表重写（认领时按需修补、verify --repair 用）。
+fn sum_store_all(cache: &Path, hashes: &[u64]) -> io::Result<()> {
+    let mut buf = Vec::with_capacity(hashes.len() * 8);
+    for h in hashes {
+        buf.extend_from_slice(&h.to_le_bytes());
+    }
+    let tmp = sibling_path(cache, ".qxsum.tmp");
+    std::fs::write(&tmp, &buf)?;
+    std::fs::rename(&tmp, sum_path(cache))
 }
 
 /// 把节点的水合位图落盘（内容已写过之后调用）。
@@ -194,12 +359,112 @@ fn persist_chunk_state(inner: &Arc<Mutex<Inner>>, chunk_size: u64, ino: INodeNo)
                 chunk_size,
                 size: n.attr.size,
                 mtime: epoch_secs(n.attr.mtime),
+                file_id: n.file_id,
+                whole_xxhash: n.whole_xxhash,
                 done: n.chunks_done.clone(),
             },
         )
     };
     if let Err(e) = state_save(&cache, &st) {
         tracing::warn!("水合位图落盘失败 {}: {e}", cache.display());
+    }
+}
+
+// ---------------------------------------------------------------- T3：内容校验和
+
+/// 为什么是 xxhash64 而不是 sha256：快一个数量级，而这里要挡的是**意外损坏**
+/// （掉电、位翻转、写序颠倒、网络截断改写），不是恶意篡改 —— 攻击者能同时改内容
+/// 和校验和的话，本来就能改 `sync.db`。真要防篡改得靠服务端签名，那是另一件事。
+fn xxh64(bytes: &[u8]) -> u64 {
+    use xxhash_rust::xxh64::xxh64;
+    xxh64(bytes, 0)
+}
+
+/// 读缓存文件里某个区间的字节（用于算校验和）。
+fn read_chunk_bytes(cache: &Path, chunk_size: u64, size: u64, idx: u64) -> io::Result<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+    let start = idx * chunk_size;
+    if start >= size {
+        return Ok(Vec::new());
+    }
+    let end = (start + chunk_size).min(size);
+    let f = std::fs::File::open(cache)?;
+    let mut buf = vec![0u8; (end - start) as usize];
+    f.read_exact_at(&mut buf, start)?;
+    Ok(buf)
+}
+
+/// 算一个区间在缓存文件里的校验和（**只读那一段**，不把整个文件读进内存）。
+fn chunk_hash(cache: &Path, chunk_size: u64, size: u64, idx: u64) -> io::Result<u64> {
+    let data = read_chunk_bytes(cache, chunk_size, size, idx)?;
+    Ok(xxh64(&data))
+}
+
+/// 算整文件的校验和（流式，不把整个文件读进内存）。
+fn whole_hash(cache: &Path, size: u64) -> io::Result<u64> {
+    use std::io::Read;
+    use xxhash_rust::xxh64::Xxh64;
+    let mut f = std::fs::File::open(cache)?;
+    let mut hasher = Xxh64::new(0);
+    let mut buf = vec![0u8; 512 * 1024];
+    let mut left = size;
+    while left > 0 {
+        let want = buf.len().min(left as usize);
+        let n = f.read(&mut buf[..want])?;
+        if n == 0 {
+            // 文件比记录的 size 短：按实际读到的算（调用方会因长度不符另行处理）
+            break;
+        }
+        hasher.update(&buf[..n]);
+        left -= n as u64;
+    }
+    Ok(hasher.digest())
+}
+
+/// 核一遍所有「已就绪」区间，返回**校验和不符的区间下标**。
+///
+/// * 只有位图里标了就绪的区间才核（未就绪的本来就是稀疏空洞，不该有校验和）。
+/// * 某个区间的校验和是 [`NO_HASH`]（表缺失/损坏）→ 保守当**不符**：
+///   没有基准可比，就不能声称「内容是对的」。这正是「校验失败退回按需水合」。
+/// * 读不出来（IO 错）也当不符。
+fn verify_done_chunks(cache: &Path, done: &[bool], size: u64, chunk_size: u64) -> Vec<u64> {
+    let nchunks = done.len();
+    if nchunks == 0 || !done.iter().any(|d| *d) {
+        return Vec::new();
+    }
+    let sums = sum_load(cache, nchunks);
+    let mut bad = Vec::new();
+    for (idx, d) in done.iter().enumerate() {
+        if !*d {
+            continue;
+        }
+        let want = sums[idx];
+        let got = match chunk_hash(cache, chunk_size, size, idx as u64) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!("读区间 {idx} 算校验和失败 {}: {e}", cache.display());
+                0
+            }
+        };
+        if want == NO_HASH || got != want {
+            bad.push(idx as u64);
+        }
+    }
+    bad
+}
+
+/// 日志里别把上千个坏区间全列出来 —— 只报头几个 + 总数。
+fn summarize_bad(bad: &[u64], chunk_size: u64) -> String {
+    const MAX: usize = 5;
+    let head: Vec<String> = bad
+        .iter()
+        .take(MAX)
+        .map(|i| format!("#{i}(@{})", i * chunk_size))
+        .collect();
+    if bad.len() > MAX {
+        format!("{} …共 {} 个", head.join(" "), bad.len())
+    } else {
+        head.join(" ")
     }
 }
 
@@ -216,6 +481,13 @@ struct Node {
     cache: Option<PathBuf>,
     /// 每个 128 KiB 区间的完成标记；长度 = 区间数，在创建缓存文件时初始化。
     chunks_done: Vec<bool>,
+    /// ★ T3：跨改名/移动稳定的文件身份（`.qxstate` v2 头里的一栏）。
+    /// T9 落地前恒为 [`ZERO_FILE_ID`]；先占住位置，避免格式再升一次版。
+    file_id: [u8; 16],
+    /// ★ T3：整文件校验和。全量就绪（`chunks_done` 全 true）时算一次，
+    /// 之后 `qxync verify` 就能「一个数」判整个文件而不必逐区间。
+    /// 未算出时是 [`NO_HASH`]。
+    whole_xxhash: u64,
     /// 本地有未上传的改动。
     dirty: bool,
     /// ★ M3：打开的 fd 数（>0 时禁止脱水，报告 12 §8.1）。
@@ -284,6 +556,16 @@ impl Node {
             self.attr.mtime = t;
             self.attr.ctime = t;
         }
+    }
+
+    /// ★ T3：把区间表重置成「全未就绪 / 全就绪」。
+    ///
+    /// 内容一变，旧区间就都不作数了，`whole_xxhash` 同步作废（否则会拿旧版本的
+    /// 整文件哈希去比新内容，verify 会报假损坏）。per-chunk 的 `.qxsum` 由调用方
+    /// 单独重写 —— 位图（内存态）和校验和（落盘态）在这里必须一起想。
+    fn reset_chunks(&mut self, chunk_size: u64, done: bool) {
+        self.chunks_done = vec![done; self.chunk_count(chunk_size)];
+        self.whole_xxhash = NO_HASH;
     }
 
     /// 给 xattr 用的状态串。
@@ -581,11 +863,40 @@ fn install_refreshed(
         let t = UNIX_EPOCH + Duration::from_secs(mtime.max(0) as u64);
         n.attr.mtime = t;
         n.attr.ctime = t;
-        n.chunks_done = vec![true; n.chunk_count(chunk_size)];
+        n.reset_chunks(chunk_size, true);
         n.pending = None;
         n.refresh_attempts = 0;
         n.ino
     };
+    // ★ T3：整份刷新出来的内容是**一次下载**得到的，可以顺手把 per-chunk 校验和
+    // 一次算齐（逐段读本地 tmp，不额外走网络）。不写的话下次认领会因「有位图
+    // 但无校验和」把整份判成不可信，用户会看到刚刷新的文件又被退回重水合。
+    let nchunks = {
+        let g = inner.lock().unwrap();
+        g.nodes.get(&ino).map(|n| n.chunk_count(chunk_size))
+    };
+    if let Some(nc) = nchunks {
+        let mut sums = vec![NO_HASH; nc];
+        for idx in 0..nc {
+            match chunk_hash(cache, chunk_size, size, idx as u64) {
+                Ok(h) => sums[idx as usize] = h,
+                Err(e) => {
+                    tracing::warn!("刷新后算区间校验和失败 {remote} #{idx}: {e}");
+                    break;
+                }
+            }
+        }
+        if let Err(e) = sum_store_all(cache, &sums) {
+            tracing::warn!("刷新后写校验和表失败 {}: {e}", cache.display());
+        }
+    }
+    // 整文件校验和也顺手更新（本地顺序读一遍）
+    if let Ok(h) = whole_hash(cache, size) {
+        let mut g = inner.lock().unwrap();
+        if let Some(n) = g.nodes.get_mut(&ino) {
+            n.whole_xxhash = h;
+        }
+    }
     // 内容、元数据、区间表、位图必须一起切到新签名，否则下次挂载会认领到旧的那份
     persist_chunk_state(inner, chunk_size, ino);
     Some(ino)
@@ -983,7 +1294,7 @@ impl FsHandle {
             if let Some(n) = g.nodes.get_mut(&ino) {
                 // 脱水之后没有内容 → 待刷新的新签名直接落到 attr 上
                 n.apply_pending_sig();
-                n.chunks_done = vec![false; n.chunk_count(chunk_size)];
+                n.reset_chunks(chunk_size, false);
                 n.dirty = false;
             }
         }
@@ -1155,7 +1466,7 @@ impl LocalView for FsHandle {
             if let Some(p) = n.cache.take() {
                 remove_cache_files(&p);
             }
-            n.chunks_done = vec![false; n.chunk_count(chunk_size)];
+            n.reset_chunks(chunk_size, false);
             n.pending = None;
         }
         true
@@ -1175,7 +1486,7 @@ impl LocalView for FsHandle {
         if let Some(p) = n.cache.take() {
             remove_cache_files(&p);
         }
-        n.chunks_done = vec![false; n.chunk_count(chunk_size)];
+        n.reset_chunks(chunk_size, false);
         n.dirty = false;
         true
     }
@@ -1369,7 +1680,7 @@ impl LocalView for FsHandle {
                             if let Some(p) = n.cache.take() {
                                 remove_cache_files(&p);
                             }
-                            n.chunks_done = vec![false; n.chunk_count(chunk_size)];
+                            n.reset_chunks(chunk_size, false);
                             n.pending = None;
                             n.refresh_attempts = 0;
                         }
@@ -1730,6 +2041,8 @@ impl QxyncFs {
             attr: root_attr,
             cache: None,
             chunks_done: Vec::new(),
+            file_id: ZERO_FILE_ID,
+            whole_xxhash: NO_HASH,
             dirty: false,
             open_count: 0,
             last_access: UNIX_EPOCH,
@@ -2154,6 +2467,8 @@ impl QxyncFs {
             attr,
             cache: None,
             chunks_done: Vec::new(),
+            file_id: ZERO_FILE_ID,
+            whole_xxhash: NO_HASH,
             dirty: false,
             open_count: 0,
             last_access: SystemTime::now(),
@@ -2543,33 +2858,58 @@ impl QxyncFs {
             return;
         }
         let chunk_size = self.chunk_size;
-        let mut flipped = false;
-        {
+        let mut flipped: Vec<u64> = Vec::new();
+        let mut newly: Vec<u64> = Vec::new();
+        let (cache, size, want) = {
             let mut g = self.inner.lock().unwrap();
-            if let Some(n) = g.nodes.get_mut(&ino) {
-                let want = n.chunk_count(chunk_size);
-                if n.chunks_done.len() < want {
-                    n.chunks_done.resize(want, false);
-                }
-                let end = offset + len;
-                let (first, last) = chunk_indices(offset, len, chunk_size);
-                for idx in first..=last {
-                    let c_start = idx * chunk_size;
-                    let c_end = ((idx + 1) * chunk_size).min(n.attr.size);
-                    if c_start >= offset && c_end <= end {
-                        if let Some(slot) = n.chunks_done.get_mut(idx as usize) {
-                            if !*slot {
-                                *slot = true;
-                                flipped = true;
-                            }
+            let Some(n) = g.nodes.get_mut(&ino) else {
+                return;
+            };
+            let want = n.chunk_count(chunk_size);
+            if n.chunks_done.len() < want {
+                n.chunks_done.resize(want, false);
+            }
+            let end = offset + len;
+            let (first, last) = chunk_indices(offset, len, chunk_size);
+            for idx in first..=last {
+                let c_start = idx * chunk_size;
+                let c_end = ((idx + 1) * chunk_size).min(n.attr.size);
+                if c_start >= offset && c_end <= end {
+                    if let Some(slot) = n.chunks_done.get_mut(idx as usize) {
+                        if !*slot {
+                            *slot = true;
+                            flipped.push(idx);
                         }
+                        newly.push(idx);
                     }
                 }
+            }
+            (n.cache.clone(), n.attr.size, want)
+        };
+        // ★ T3：本地写过的区间同样要有校验和 —— 否则 verify 会把「用户自己写的文件」
+        // 全判成损坏。内容刚由 write 落盘，这里读回来算很便宜；一次 write 覆盖多个
+        // 区间时合成一次 `pwrite` 批次，别一个区间开一次文件。
+        if let Some(cache) = &cache {
+            let mut items: Vec<(u64, u64)> = Vec::with_capacity(newly.len());
+            for idx in &newly {
+                match chunk_hash(cache, chunk_size, size, *idx) {
+                    Ok(h) => items.push((*idx, h)),
+                    Err(e) => tracing::warn!("算区间校验和失败 {} #{idx}: {e}", cache.display()),
+                }
+            }
+            if let Err(e) = sum_store_many(cache, want, &items) {
+                tracing::warn!("写校验和失败 {}: {e}", cache.display());
             }
         }
         // ★ M9：本地写入同样是「已有内容」。只在**真的有区间翻成就绪**时落盘：
         //   4 KB 一块的小写不该每写一次就重写一遍位图（`release` 时还有一次兜底落盘）。
-        if flipped {
+        if !flipped.is_empty() {
+            // 内容变了 → 旧的整文件哈希作废
+            let mut g = self.inner.lock().unwrap();
+            if let Some(n) = g.nodes.get_mut(&ino) {
+                n.whole_xxhash = NO_HASH;
+            }
+            drop(g);
             persist_chunk_state(&self.inner, chunk_size, ino);
         }
     }
@@ -2585,6 +2925,11 @@ impl QxyncFs {
     /// ★ M9：**先认领磁盘上已有的缓存**。节点表是内存态，重建节点后 `chunks_done`
     /// 本来是空的；如果缓存文件 + 位图（`.qxstate`）都还在、且远端签名（size/mtime）
     /// 与本节点一致，就直接把区间表恢复出来 —— `read()` 于是完全不用问 NAS。
+    ///
+    /// ★ T3：认领时**逐区间核一遍 `xxhash64`**。位图只说「这个区间下过」，不保证
+    /// 「现在磁盘上的内容还是那份」—— 位图/内容写序颠倒、掉电、静默位翻转都会留下
+    /// 「长度对、内容错」的区间。核不过的区间直接清成未就绪，让 `read` 退回按需水合，
+    /// **绝不返回错误内容**。这是 `qxync verify` 之外的一道兜底。
     fn cache_file_for(&self, ino: INodeNo) -> Result<PathBuf, fuser::Errno> {
         let (remote, name, size, mtime, existing) = {
             let g = self.inner.lock().unwrap();
@@ -2609,11 +2954,23 @@ impl QxyncFs {
                 let len_ok = std::fs::metadata(&path)
                     .map(|m| m.len() == size)
                     .unwrap_or(false);
-                if st.chunk_size == chunk_size && st.size == size && st.mtime == mtime && len_ok {
-                    Some(st.done)
-                } else {
-                    None
+                if st.chunk_size != chunk_size || st.size != size || st.mtime != mtime || !len_ok {
+                    return None;
                 }
+                // ★ T3：签名过了，再逐区间核内容。核不过的清成未就绪。
+                let mut done = st.done;
+                let bad = verify_done_chunks(&path, &done, size, chunk_size);
+                if !bad.is_empty() {
+                    tracing::warn!(
+                        "认领时发现 {} 个区间内容与校验和不符，已退回按需水合: {remote} {:?}",
+                        bad.len(),
+                        summarize_bad(&bad, chunk_size)
+                    );
+                    for idx in &bad {
+                        done[*idx as usize] = false;
+                    }
+                }
+                Some((done, st.whole_xxhash))
             })
         } else {
             None
@@ -2626,7 +2983,7 @@ impl QxyncFs {
             return Ok(p.clone());
         }
         let want = n.chunk_count(chunk_size);
-        if let Some(mut done) = adopted {
+        if let Some((mut done, whole)) = adopted {
             // size 在拿锁期间变了 → 认领作废
             if n.attr.size == size {
                 done.resize(want, false);
@@ -2636,6 +2993,7 @@ impl QxyncFs {
                     want
                 );
                 n.chunks_done = done;
+                n.whole_xxhash = whole;
                 n.cache = Some(path.clone());
                 return Ok(path);
             }
@@ -2656,6 +3014,7 @@ impl QxyncFs {
             fuser::Errno::EIO
         })?;
         n.chunks_done = vec![false; want];
+        n.whole_xxhash = NO_HASH;
         n.cache = Some(path.clone());
         Ok(path)
     }
@@ -2777,19 +3136,65 @@ impl QxyncFs {
             })?;
         }
 
-        {
+        // ★ T3：**先落校验和，再置位图上的位**。顺序反了的话，崩在中间会留下
+        // 「位图说就绪、但没有校验和可比」的区间 —— 那只能当损坏处理，白重下一次。
+        let nchunks = {
+            let g = self.inner.lock().unwrap();
+            g.nodes.get(&ino).map(|n| n.chunk_count(self.chunk_size))
+        };
+        if let Some(nc) = nchunks {
+            if let Err(e) = sum_store_one(&dest, nc, idx, xxh64(&data)) {
+                // 校验和写不进去 → 这一区间不能声称「内容是对的」，别置位。
+                tracing::warn!("写校验和失败 {} #{idx}: {e}", dest.display());
+                self.inner.lock().unwrap().inflight_chunks.remove(&key);
+                return Err(fuser::Errno::EIO);
+            }
+        }
+
+        let all_done = {
             let mut g = self.inner.lock().unwrap();
+            let mut all = false;
             if let Some(n) = g.nodes.get_mut(&ino) {
                 if let Some(slot) = n.chunks_done.get_mut(idx as usize) {
                     *slot = true;
                 }
+                all = n.is_fully_hydrated();
             }
             g.inflight_chunks.remove(&key);
-        }
+            all
+        };
         // ★ M9：位图落盘 —— 下次挂载/节点重建时这份内容才算「已经缓存过」。
+        // ★ T3：全量就绪时顺手算一次整文件校验和（读一遍本地缓存，不问 NAS）。
+        // 之后 `qxync verify` 可以「一个数」判整个文件，不用逐区间。
+        if all_done {
+            self.refresh_whole_hash(ino, &dest);
+        }
         persist_chunk_state(&self.inner, self.chunk_size, ino);
         tracing::debug!("区间就绪: {remote} [{start}..={end}] ({want} 字节)");
         Ok(())
+    }
+
+    /// 重算整文件校验和并挂到节点上（**只读本地缓存文件**，不碰 NAS）。
+    ///
+    /// 失败就保持 [`NO_HASH`] —— 「没有整文件哈希」只影响 verify 的快路径，
+    /// 不影响正确性（per-chunk 校验和仍然在）。
+    fn refresh_whole_hash(&self, ino: INodeNo, cache: &Path) {
+        let size = {
+            let g = self.inner.lock().unwrap();
+            match g.nodes.get(&ino) {
+                Some(n) if n.is_fully_hydrated() => n.attr.size,
+                _ => return,
+            }
+        };
+        match whole_hash(cache, size) {
+            Ok(h) => {
+                let mut g = self.inner.lock().unwrap();
+                if let Some(n) = g.nodes.get_mut(&ino) {
+                    n.whole_xxhash = h;
+                }
+            }
+            Err(e) => tracing::warn!("算整文件校验和失败 {}: {e}", cache.display()),
+        }
     }
 }
 
@@ -3742,6 +4147,230 @@ pub fn mount(
     )
 }
 
+// ---------------------------------------------------------------- T3：`qxync verify`
+
+/// 一个缓存文件的校验结果。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct VerifyFileReport {
+    /// 缓存文件名（`<hash>_<name>`）。
+    pub cache: String,
+    /// 已就绪区间数 / 总区间数。
+    pub chunks_done: usize,
+    pub chunks_total: usize,
+    /// 文件大小（字节）。
+    pub size: u64,
+    /// 内容与校验和不符的区间下标（升序）。
+    pub bad_chunks: Vec<u64>,
+    /// 位图缺失/损坏/是旧版 v1 —— 这类文件「不可信」，应按需重水合。
+    pub stale_state: Option<String>,
+    /// 整文件校验和（只在全量就绪且 `.qxstate` 里已记录时有值）。
+    pub whole_xxhash: Option<u64>,
+    /// 校验和表缺失（`.qxsum` 不在或长度不对）→ 无法做内容校验。
+    pub missing_sums: bool,
+}
+
+impl VerifyFileReport {
+    /// 这个文件是不是有实质问题。
+    pub fn is_bad(&self) -> bool {
+        !self.bad_chunks.is_empty() || self.stale_state.is_some() || self.missing_sums
+    }
+}
+
+/// 整个缓存目录的校验汇总。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct VerifyReport {
+    pub files: Vec<VerifyFileReport>,
+    /// 扫过的缓存文件总数（含完全没水合的）。
+    pub files_scanned: usize,
+    /// 校验过的字节数（只算已就绪区间的）。
+    pub bytes_verified: u64,
+    /// 干掉的坏区间数（`--repair`）。
+    pub repaired_chunks: usize,
+    /// 因位图不可信被重置的区间数（`--repair`）。
+    pub reset_chunks: usize,
+    /// 整文件校验和重算并写回的数量（`--repair`）。
+    pub whole_hashes_written: usize,
+    /// 扫描耗时（毫秒）。
+    pub elapsed_ms: u128,
+}
+
+impl VerifyReport {
+    /// 全部文件都干净（可作为退出码依据）。
+    pub fn is_clean(&self) -> bool {
+        self.files.iter().all(|f| !f.is_bad())
+    }
+
+    /// 有问题的文件数。
+    pub fn bad_files(&self) -> usize {
+        self.files.iter().filter(|f| f.is_bad()).count()
+    }
+}
+
+/// 校验一个缓存目录下的所有缓存文件（`qxync verify` 的实现）。
+///
+/// **不碰 NAS**：只读缓存文件与 `.qxstate` / `.qxsum`，所以断网也能跑。
+/// * `repair = false`（默认）—— 只报告，不改任何文件。
+/// * `repair = true` —— 把坏区间从位图里清掉（下次读按需水合）并删掉对应校验和；
+///   位图本身不可信的（缺失/损坏/v1）则整份重置成「全未就绪」。
+///
+/// 注意这里**不做「重新下载」**：repair 只让缓存回到「诚实的未水合」状态，
+/// 真正的数据修复由后续的 `read` 按需水合完成 —— 校验和修复不该偷偷产生 NAS 流量。
+///
+/// **递归扫**（限 [`VERIFY_MAX_DEPTH`] 层）：daemon 的实际缓存目录是
+/// `<配置的 cache_dir>/<nas host>`，多了一层；GUI 又是从数据目录根上扫过来的。
+/// 只看一层会「什么都没扫到」还报「一切正常」—— 那是最坏的失败方式。
+pub fn verify_cache_dir(cache_dir: &Path, repair: bool) -> VerifyReport {
+    let t0 = std::time::Instant::now();
+    let mut rep = VerifyReport::default();
+    let mut seen = 0usize;
+    scan_cache_dir(cache_dir, cache_dir, 0, repair, &mut rep, &mut seen);
+    rep.files.sort_by(|a, b| a.cache.cmp(&b.cache));
+    rep.files_scanned = seen;
+    rep.elapsed_ms = t0.elapsed().as_millis();
+    rep
+}
+
+/// 递归深度上限：daemon 只拼一层主机名，4 层足够宽松又不至于在异常目录树上空转。
+const VERIFY_MAX_DEPTH: usize = 4;
+
+fn scan_cache_dir(
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    repair: bool,
+    rep: &mut VerifyReport,
+    seen: &mut usize,
+) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for ent in rd.flatten() {
+        let path = ent.path();
+        let name = ent.file_name().to_string_lossy().to_string();
+        if path.is_dir() {
+            if depth < VERIFY_MAX_DEPTH && name != "conflicts" && name != "upload-queue" {
+                scan_cache_dir(root, &path, depth + 1, repair, rep, seen);
+            }
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+        // 缓存文件名形如 `<16位hash>_<safe name>`；`.qxstate` / `.qxsum` 等跳过。
+        if name.ends_with(".qxstate") || name.ends_with(".qxsum") || name.starts_with('.') {
+            continue;
+        }
+        *seen += 1;
+        // 报告里给**相对路径**，否则多 NAS / 多任务时用户看到一堆同名文件定位不了
+        let label = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .to_string();
+        verify_one(&path, &label, repair, rep);
+    }
+}
+
+/// 校验单个缓存文件。
+///
+/// 「一个区间都没就绪」的文件不进报告 —— 那是正常的占位符状态（几百个文件里
+/// 大部分都没读过），报出来只是噪音。
+fn verify_one(cache: &Path, name: &str, repair: bool, rep: &mut VerifyReport) {
+    let Some(st) = state_load(cache) else {
+        // state_load 对 v1 已经打过日志并删了；这里再判一次「文件在但状态不可信」。
+        let content_len = std::fs::metadata(cache).map(|m| m.len()).unwrap_or(0);
+        if content_len == 0 {
+            return;
+        }
+        let r = VerifyFileReport {
+            cache: name.to_string(),
+            chunks_done: 0,
+            chunks_total: 0,
+            size: content_len,
+            bad_chunks: Vec::new(),
+            stale_state: Some("missing-or-legacy".into()),
+            whole_xxhash: None,
+            missing_sums: false,
+        };
+        if repair {
+            // 位图不可信 → 整份删掉（内容留着当稀疏文件，下次读会重水合相应区间）。
+            let _ = std::fs::remove_file(state_path(cache));
+            let _ = std::fs::remove_file(sum_path(cache));
+        }
+        rep.files.push(r);
+        return;
+    };
+
+    let nchunks = st.done.len();
+    let done_n = st.done.iter().filter(|d| **d).count();
+    if done_n == 0 {
+        // 一块都没水合：位图没什么可校验的（`.qxsum` 也可能压根没建）。
+        return;
+    }
+    let chunk_size = st.chunk_size;
+    // 校验和表缺失或长度对不上 → 这一文件「无法做内容校验」，和损坏一样要报出来。
+    let sum_len = std::fs::metadata(sum_path(cache)).map(|m| m.len()).unwrap_or(0);
+    let missing_sums = sum_len != (nchunks * 8) as u64;
+    let bad_chunks = verify_done_chunks(cache, &st.done, st.size, chunk_size);
+
+    let mut whole = if st.whole_xxhash != NO_HASH && bad_chunks.is_empty() {
+        Some(st.whole_xxhash)
+    } else {
+        None
+    };
+
+    if repair && !bad_chunks.is_empty() {
+        // 坏区间：位图清位 + 校验和清 NO_HASH（下次 ensure_chunk 会重新下载并重算）。
+        let mut done = st.done.clone();
+        let mut sums = sum_load(cache, nchunks);
+        for idx in &bad_chunks {
+            done[*idx as usize] = false;
+            sums[*idx as usize] = NO_HASH;
+        }
+        let fixed = ChunkState {
+            done,
+            whole_xxhash: NO_HASH, // 内容变了，整文件哈希作废
+            ..st.clone()
+        };
+        if let Err(e) = state_save(cache, &fixed) {
+            tracing::warn!("verify 修复位图失败 {}: {e}", cache.display());
+        } else if let Err(e) = sum_store_all(cache, &sums) {
+            tracing::warn!("verify 修复校验和表失败 {}: {e}", cache.display());
+        }
+        rep.repaired_chunks += bad_chunks.len();
+    }
+
+    // 全部就绪且内容无损 → 顺手（重）算一次整文件校验和，让下次 verify 能走快路径。
+    if repair && bad_chunks.is_empty() && done_n == nchunks {
+        match whole_hash(cache, st.size) {
+            Ok(h) if h != st.whole_xxhash => {
+                let updated = ChunkState {
+                    whole_xxhash: h,
+                    ..st.clone()
+                };
+                if state_save(cache, &updated).is_ok() {
+                    rep.whole_hashes_written += 1;
+                }
+                whole = Some(h);
+            }
+            Ok(h) => whole = Some(h),
+            Err(e) => tracing::warn!("verify 算整文件校验和失败 {}: {e}", cache.display()),
+        }
+    }
+
+    rep.bytes_verified += done_n as u64 * chunk_size;
+    rep.files.push(VerifyFileReport {
+        cache: name.to_string(),
+        chunks_done: done_n,
+        chunks_total: nchunks,
+        size: st.size,
+        bad_chunks,
+        stale_state: None,
+        whole_xxhash: whole,
+        missing_sums,
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3877,6 +4506,8 @@ mod tests {
             attr,
             cache: None,
             chunks_done: vec![false; 3],
+            file_id: ZERO_FILE_ID,
+            whole_xxhash: NO_HASH,
             dirty: false,
             open_count: 0,
             last_access: UNIX_EPOCH,
@@ -4775,13 +5406,15 @@ mod tests {
 
     // ------------------------------------------------ ★ M9：缓存优先 / 映射本地化
 
-    /// 位图编解码往返 + 损坏防护。
+    /// 位图编解码往返 + 损坏防护 + ★ T3 的 v1 兼容。
     #[test]
     fn chunk_state_roundtrip_and_rejects_corruption() {
         let st = ChunkState {
             chunk_size: 128 * 1024,
             size: 300 * 1024,
             mtime: 12345,
+            file_id: ZERO_FILE_ID,
+            whole_xxhash: 0xDEAD_BEEF_CAFE_1234,
             done: vec![true, false, true],
         };
         let buf = {
@@ -4802,6 +5435,321 @@ mod tests {
         assert!(state_decode(&bad).is_none(), "自洽性校验必须挡住损坏位图");
         assert!(state_decode(b"not a qxstate file").is_none());
         assert!(state_decode(&buf[..STATE_HEAD]).is_none());
+    }
+
+    /// ★ T3 验收：**旧版 v1 位图要被识别并安全作废，不能 panic、也不能被当 v2 用**。
+    ///
+    /// v1 里没有校验和，「这个区间的内容还对不对」无法回答，所以只能当没缓存过。
+    /// 这里同时验证「识别」（`state_verdict` 认得出 v1）和「作废」（文件被删、
+    /// `state_load` 返回 `None`，而不是解出一个缺字段的 v2 结构）。
+    #[test]
+    fn legacy_v1_state_is_detected_and_safely_discarded() {
+        // 手工拼一个合法的 v1 位图：QXSTATE1 + v1 + chunk_size/size/mtime/nchunks + 位图
+        let mut v1 = Vec::new();
+        v1.extend_from_slice(&STATE_MAGIC_V1);
+        v1.extend_from_slice(&STATE_VERSION_V1.to_le_bytes());
+        v1.extend_from_slice(&(128u64 * 1024).to_le_bytes());
+        v1.extend_from_slice(&(300u64 * 1024).to_le_bytes());
+        v1.extend_from_slice(&777i64.to_le_bytes());
+        v1.extend_from_slice(&3u64.to_le_bytes());
+        v1.extend_from_slice(&[0b101]); // 第 0、2 区间就绪
+        assert_eq!(v1.len(), STATE_HEAD_V1 + 1);
+        assert_eq!(state_verdict(&v1), StateVerdict::LegacyV1);
+        assert!(state_decode(&v1).is_none(), "v1 绝不能被当成 v2 解出来");
+
+        let dir = m7_tmpdir("state-v1");
+        let cache = dir.join("legacy.bin");
+        std::fs::write(&cache, b"x").unwrap();
+        std::fs::write(state_path(&cache), &v1).unwrap();
+        assert!(state_load(&cache).is_none(), "v1 不该被认领");
+        assert!(
+            !state_path(&cache).exists(),
+            "v1 位图必须被删掉（安全作废，不是静默留着反复试）"
+        );
+
+        // 截断到只剩 magic+version 的 v1 残骸 → 判损坏而不是 LegacyV1
+        let mut stub = STATE_MAGIC_V1.to_vec();
+        stub.extend_from_slice(&STATE_VERSION_V1.to_le_bytes());
+        assert_eq!(state_verdict(&stub), StateVerdict::Corrupt);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ T3 核心：手工破坏某个区间后，校验能**定位到具体文件和区间**，
+    /// 且坏区间退回按需水合（不返回错误内容）。
+    #[test]
+    fn verify_locates_the_corrupted_chunk() {
+        let dir = m7_tmpdir("t3-verify");
+        let cache = dir.join("broken.bin");
+        let cs = 128 * 1024u64;
+        let size = 300 * 1024u64;
+        let nchunks = 3usize;
+        let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&cache, &payload).unwrap();
+
+        // 三段都就绪，各自带校验和
+        for i in 0..nchunks {
+            let h = chunk_hash(&cache, cs, size, i as u64).unwrap();
+            sum_store_one(&cache, nchunks, i as u64, h).unwrap();
+        }
+        let st = ChunkState {
+            chunk_size: cs,
+            size,
+            mtime: 42,
+            file_id: ZERO_FILE_ID,
+            whole_xxhash: whole_hash(&cache, size).unwrap(),
+            done: vec![true; nchunks],
+        };
+        state_save(&cache, &st).unwrap();
+
+        // 干净时：没有坏区间
+        assert!(verify_done_chunks(&cache, &st.done, size, cs).is_empty());
+
+        // ★ 破坏第 1 区间中间（长度不变 —— 这正是只查长度查不出来的场景）
+        {
+            use std::os::unix::fs::FileExt;
+            let f = std::fs::OpenOptions::new().write(true).open(&cache).unwrap();
+            f.write_all_at(&[0xFFu8; 64], cs + 4096).unwrap();
+        }
+        let bad = verify_done_chunks(&cache, &st.done, size, cs);
+        assert_eq!(bad, vec![1], "必须精确定位到第 1 区间，而不是「文件坏了」");
+
+        // 整文件校验和也必须跟着发现不一致
+        assert_ne!(whole_hash(&cache, size).unwrap(), st.whole_xxhash);
+
+        // `.qxsum` 缺失 → 全部已就绪区间都视为「不可信」（保守：没有基准可比）
+        let _ = std::fs::remove_file(sum_path(&cache));
+        assert_eq!(
+            verify_done_chunks(&cache, &st.done, size, cs),
+            vec![0, 1, 2],
+            "没有校验和就不许声称内容正确"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ T3 验收：`verify_cache_dir` 的报告 + `--repair` 语义。
+    #[test]
+    fn verify_cache_dir_reports_and_repairs() {
+        let dir = m7_tmpdir("t3-report");
+        let cs = 128 * 1024u64;
+        let size = 256 * 1024u64;
+        let nchunks = 2usize;
+
+        // 文件 A：完好
+        let good = dir.join("aaaaaaaa_good.bin");
+        let p: Vec<u8> = (0..size).map(|i| (i % 97) as u8).collect();
+        std::fs::write(&good, &p).unwrap();
+        for i in 0..nchunks {
+            let h = chunk_hash(&good, cs, size, i as u64).unwrap();
+            sum_store_one(&good, nchunks, i as u64, h).unwrap();
+        }
+        state_save(
+            &good,
+            &ChunkState {
+                chunk_size: cs,
+                size,
+                mtime: 1,
+                file_id: ZERO_FILE_ID,
+                whole_xxhash: whole_hash(&good, size).unwrap(),
+                done: vec![true; nchunks],
+            },
+        )
+        .unwrap();
+
+        // 文件 B：第 1 区间坏了
+        let bad = dir.join("bbbbbbbb_bad.bin");
+        let q: Vec<u8> = (0..size).map(|i| (i % 89) as u8).collect();
+        std::fs::write(&bad, &q).unwrap();
+        for i in 0..nchunks {
+            let h = chunk_hash(&bad, cs, size, i as u64).unwrap();
+            sum_store_one(&bad, nchunks, i as u64, h).unwrap();
+        }
+        state_save(
+            &bad,
+            &ChunkState {
+                chunk_size: cs,
+                size,
+                mtime: 2,
+                file_id: ZERO_FILE_ID,
+                whole_xxhash: NO_HASH,
+                done: vec![true; nchunks],
+            },
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::FileExt;
+            let f = std::fs::OpenOptions::new().write(true).open(&bad).unwrap();
+            f.write_all_at(&[0u8; 10], cs + 7).unwrap();
+        }
+
+        // 只报告，不改文件
+        let rep = verify_cache_dir(&dir, false);
+        assert_eq!(rep.files.len(), 2, "两个已水合文件都要报");
+        assert!(!rep.is_clean());
+        assert_eq!(rep.bad_files(), 1);
+        let bf = rep.files.iter().find(|f| f.cache.contains("bad")).unwrap();
+        assert_eq!(bf.bad_chunks, vec![1]);
+        assert_eq!(rep.repaired_chunks, 0, "默认不改");
+        assert_eq!(
+            state_load(&bad).unwrap().done,
+            vec![true; nchunks],
+            "只报告模式不许动位图"
+        );
+
+        // --repair：坏区间退回未就绪，下次读按需水合
+        let rep2 = verify_cache_dir(&dir, true);
+        assert_eq!(rep2.repaired_chunks, 1);
+        let fixed = state_load(&bad).unwrap();
+        assert_eq!(fixed.done, vec![true, false], "第 1 区间应退回未就绪");
+        assert_eq!(
+            fixed.whole_xxhash, NO_HASH,
+            "内容变了，整文件校验和必须作废"
+        );
+        // 校验和表里那一格也要清掉（否则下次认领还会误判）
+        let sums = sum_load(&bad, nchunks);
+        assert_eq!(sums[1], NO_HASH);
+        // 修完之后这一轮就干净了（好文件不受影响）
+        let rep3 = verify_cache_dir(&dir, true);
+        assert!(rep3.is_clean(), "repair 后再校验应全清");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ T3 验收：**认领时核不过的区间必须退回按需水合，绝不返回错误内容**。
+    ///
+    /// 用 `nas.invalid` 当 NAS：只要还去问 NAS 就一定失败，所以
+    /// 「坏区间读不出来」== 「没把坏内容当好的返回」。
+    #[test]
+    fn adopt_rejects_tampered_chunk_instead_of_serving_it() {
+        let dir = m7_tmpdir("t3-adopt");
+        let cs = 128 * 1024u64;
+        let size = 300 * 1024u64;
+        let entry = DirEntry::local("tampered.bin", false, size, 555);
+
+        let cache = {
+            let fs = test_fs(&dir, false);
+            let node = fs.insert_node(INodeNo::ROOT, "tampered.bin", "/home/tampered.bin", &entry);
+            let cache = fs.cache_file_for(node.ino).unwrap();
+            let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            std::fs::write(&cache, &payload).unwrap();
+            fs.mark_written_chunks(node.ino, 0, size);
+            assert!(
+                state_path(&cache).is_file() && sum_path(&cache).is_file(),
+                "位图与校验和表都要落盘"
+            );
+            cache
+        };
+
+        // 破坏第 2 区间（长度不变）
+        {
+            use std::os::unix::fs::FileExt;
+            let f = std::fs::OpenOptions::new().write(true).open(&cache).unwrap();
+            f.write_all_at(&[0xEEu8; 128], 2 * cs + 11).unwrap();
+        }
+
+        // 新会话认领：应只认领 2/3 个区间
+        let fs = test_fs(&dir, false);
+        let node = fs.insert_node(INodeNo::ROOT, "tampered.bin", "/home/tampered.bin", &entry);
+        let path = fs.cache_file_for(node.ino).unwrap();
+        assert_eq!(path, cache);
+        let (done, state_str) = {
+            let g = fs.inner.lock().unwrap();
+            let n = g.nodes.get(&node.ino).unwrap();
+            (n.chunks_done.clone(), n.state_str())
+        };
+        assert_eq!(
+            done,
+            vec![true, true, false],
+            "被破坏的区间必须退回未就绪"
+        );
+        assert_eq!(state_str, "partial");
+        // 读那个坏区间必然失败（要去 NAS，nas.invalid 不通）—— 而不是返回垃圾
+        assert!(fs.ensure_range(node.ino, 2 * cs, cs).is_err());
+        // 好的两个区间仍然本地可读
+        let p = fs.ensure_range(node.ino, 0, 2 * cs).unwrap();
+        let bytes = std::fs::read(&p).unwrap();
+        let expect: Vec<u8> = (0..2 * cs).map(|i| (i % 251) as u8).collect();
+        assert_eq!(bytes[..2 * cs as usize], expect[..]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ T3：daemon 的实际缓存目录是 `<配置的 cache_dir>/<nas host>`，
+    /// 比 CLI 默认的那一层深 —— 扫不到就会「什么都没扫到还报一切正常」，
+    /// 那是最坏的失败方式。
+    #[test]
+    fn verify_recurses_into_nas_host_subdir() {
+        let dir = m7_tmpdir("t3-nested");
+        // 模拟 <cache>/<nas host>/
+        let host_dir = dir.join("nas.example.com");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        let cs = 128 * 1024u64;
+        let size = 256 * 1024u64;
+        let nchunks = 2usize;
+        let cache = host_dir.join("cccccccc_nested.bin");
+        std::fs::write(&cache, vec![3u8; size as usize]).unwrap();
+        for i in 0..nchunks {
+            let h = chunk_hash(&cache, cs, size, i as u64).unwrap();
+            sum_store_one(&cache, nchunks, i as u64, h).unwrap();
+        }
+        state_save(
+            &cache,
+            &ChunkState {
+                chunk_size: cs,
+                size,
+                mtime: 1,
+                file_id: ZERO_FILE_ID,
+                whole_xxhash: NO_HASH,
+                done: vec![true; nchunks],
+            },
+        )
+        .unwrap();
+
+        let rep = verify_cache_dir(&dir, false);
+        assert_eq!(rep.files_scanned, 1, "必须递归到 <nas host>/ 里");
+        assert_eq!(rep.files.len(), 1);
+        assert!(
+            rep.files[0].cache.contains("nas.example.com"),
+            "报告里要带相对路径便于定位，实际 {}",
+            rep.files[0].cache
+        );
+        assert!(rep.is_clean());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ T3 验收：10 GB 级别全量校验的**开销**（单测跑不了 10 GB，
+    /// 这里按 1/40 缩比跑 256 MiB，看换算到 10 GB 是否仍在 30 s 预算内）。
+    #[test]
+    fn verify_throughput_is_far_above_the_30s_budget() {
+        let dir = m7_tmpdir("t3-speed");
+        let cs = 128 * 1024u64;
+        let size = 256 * 1024 * 1024u64;
+        let nchunks = (size / cs) as usize;
+        let cache = dir.join("speed.bin");
+        std::fs::write(&cache, vec![7u8; size as usize]).unwrap();
+        for i in 0..nchunks {
+            let h = chunk_hash(&cache, cs, size, i as u64).unwrap();
+            sum_store_one(&cache, nchunks, i as u64, h).unwrap();
+        }
+        // 只测「校验」这一段：算每区间校验和 + 与表里比
+        let t0 = std::time::Instant::now();
+        let bad = verify_done_chunks(&cache, &vec![true; nchunks], size, cs);
+        let elapsed = t0.elapsed();
+        assert!(bad.is_empty(), "刚写完的校验和表必须能一遍过: {bad:?}");
+        let mib = size as f64 / 1048576.0;
+        let mibs = mib / elapsed.as_secs_f64().max(1e-9);
+        // 换算到 10 GB 需要多久
+        let projected_10g = 10240.0 / mibs;
+        println!(
+            "[T3] 校验吞吐 {mibs:.0} MiB/s → 10 GB 全量校验预计 {projected_10g:.1}s"
+        );
+        assert!(
+            projected_10g < 30.0,
+            "10 GB 全量校验预计 {projected_10g:.1}s，超过 30s 预算（实测 {mibs:.0} MiB/s）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// ★ M9 的核心回归：**磁盘上已经缓存好的内容，重建节点后仍然算数**。

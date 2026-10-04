@@ -49,6 +49,8 @@ pub fn run() {
             commands::login_flow,
             // ★ M8.4：托盘 / 通知 / 选择器 / opener / 窗口控制
             commands::m84_info,
+            // ★ T3：缓存内容一键校验（纯本地，不经 daemon）
+            commands::cache_verify,
             commands::notify_show,
             commands::pick_folder,
             commands::pick_file,

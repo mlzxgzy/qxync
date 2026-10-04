@@ -57,6 +57,11 @@
     'diag.sync': '同步 / 缓存',
     'diag.tabs_aria': '诊断子页',
 
+    // ---- ★ T3：缓存内容校验
+    'cache.integrity': '内容校验（xxhash64）',
+    'cache.verify': '校验缓存内容',
+    'cache.verify_repair': '校验并修复',
+
     // ---- 设置分区
     'sec.connect': '连接',
     'sec.proxy': '代理',
