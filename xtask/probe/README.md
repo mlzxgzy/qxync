@@ -29,6 +29,9 @@
 | `paging_probe.py` | `get_list` 的 `start`/`limit` 分页与 `total` 语义（小目录速查版） |
 | `bigdir_probe.py` | **造 500 项目录**并验证翻页不重不漏（M15/T1 的前置，结论见下） |
 | `ls_probe.py` | 汇总 `probe-out/` 里所有 `get_list` 抓包的 `limit/start/total/datas` 关系 |
+| `qxstate_fixture.py` | **离线**造 v2 缓存（`.qxstate` + `.qxsum`），含「手工破坏某区间」，用来端到端验 `qxync verify`（M15/T3） |
+| `upload_stream_diag.py` | 诊断 `upload.php` 对「整块 body vs chunked body」的真实反应 —— 结论：**服务端不接受 chunked，必须带 Content-Length**（M15/T2 的关键前置） |
+| `upload_mem_probe.py` | 量「流式上传」与「整文件读内存」的**峰值 RSS 对照**（读 `/proc/<pid>/status` 的 `VmHWM`），M15/T2 验收依据 |
 
 连接目标一律走环境变量或 `--host`，**默认值是指不到任何真实设备的占位符**：
 
@@ -82,6 +85,39 @@ python3 bigdir_probe.py --host nas.example.com --port 9834 --user test1 --passwo
 
 推论：`Client::list` 的翻页循环本来就是对的，而下游 `qxync-fuse::filter_visible`
 曾经又 `.take(200)` 了一次 —— 那是「>200 项目录 `ls` 读不全」的真根因（M15/T1 已修）。
+
+## ★ `.qxstate` v2 与内容校验和（2026-10-04，M15/T3）
+
+`qxstate_fixture.py` 用**独立的 Python xxh64 实现**造出符合 v2 格式的缓存，
+然后用 `qxync verify` 验 —— 两边算法一致才说明格式真的对得上，不是同一份代码自证。
+
+```bash
+python3 qxstate_fixture.py /tmp/qx-cache-demo      # 造 4 个文件（3 个有损坏，含嵌套子目录）
+qxync verify --path /tmp/qx-cache-demo              # 报告：定位到文件 + 区间，退出码 1
+qxync verify --path /tmp/qx-cache-demo --repair     # 坏区间退回「按需水合」
+qxync verify --path /tmp/qx-cache-demo              # 全部通过，退出码 0
+```
+
+实测输出（离线，不需要 NAS）：
+
+| 文件 | 报告 |
+|---|---|
+| `aaaaaaaaaa_good.bin` | 通过（不误报） |
+| `bbbbbbbbbb_bad1.bin` | `1/3 区间内容损坏: #1` |
+| `cccccccc_bad02.bin` | `2/3 区间内容损坏: #0 #2` |
+| `nas.example.com/dddddddddd_nested.bin` | `1/2 区间内容损坏: #1`（**递归扫到了**） |
+
+两个值得记的坑：
+
+1. **`mergeRound` 没有 avalanche**。Python 版 xxh64 我第一版给 `mergeRound` 加了
+   `h ^= h>>33` 之类，于是**短输入（<32 字节）的官方测试向量能过、长输入全错** ——
+   而我们的区间是 128 KiB。如果 fixture 改用 Rust 侧代码生成，这个 bug 会被完全掩盖。
+2. **v1 位图要能认出来**。`qxync verify` 遇到 `QXSTATE1` 会打一行 INFO（说明是
+   哪种情况）、删掉位图、按「未水合」处理并在报告里标 `stale_state` —— 不 panic、
+   不静默当损坏。
+
+校验吞吐（256 MiB 实测，dev profile、缓存热）：**1212 MiB/s** → 10 GB 全量校验
+约 **8.4 s**，远低于 30 s 预算。
 
 ## 建议的验证顺序
 
