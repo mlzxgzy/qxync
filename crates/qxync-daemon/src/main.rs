@@ -62,6 +62,22 @@ struct Args {
     /// ★ M15/T5：显式关掉启动恢复。`--restore-tasks` 现在是默认行为，这个开关才是「关」。
     #[arg(long)]
     no_restore_mounts: bool,
+
+    /// ★ M15/T6：收到 SIGTERM 后「挂载守护」的最长秒数（**0 = 无限，默认**）。
+    ///
+    /// SIGTERM 时 daemon 会停同步、**保留 FUSE 挂载点**继续应答内核
+    /// （`ls` / 已下载文件的读都还正常），这个秒数是「最多守护多久」。
+    ///
+    /// ★ **默认无限是刻意的，但要知道代价**：systemd 的 restart 是
+    /// 「stop 旧进程 → 等它退出 → start 新进程」，守护进程不退会把 stop 阶段
+    /// 卡死，最终被 `TimeoutStopSec` 后的 SIGKILL 杀掉 —— 挂载一样断。
+    /// **所以这条参数不是给 `systemctl restart` 用的**，那条路请用
+    /// `systemctl reload qxyncd`（SIGHUP，挂载点一秒都不中断）。
+    ///
+    /// 无论设不设时长，守护都能被立刻收干净：`qxync daemon stop`（IPC）、
+    /// 再发一次 SIGTERM、或挂载表被卸空。设一个有限值只是防「忘了它还活着」。
+    #[arg(long, default_value_t = 0)]
+    mount_hold_secs: u64,
 }
 
 fn main() -> Result<()> {
@@ -114,6 +130,8 @@ fn main() -> Result<()> {
         socket,
         auto_login: args.auto_login,
         restore_tasks: restore,
+        // ★ M15/T6：SIGTERM 后进「挂载守护」模式的上限（0 = 无限）
+        mount_hold_secs: args.mount_hold_secs,
     }));
     // ★ daemon 化之后 fd 0/1/2 全都指向 `/dev/null`（见 [`daemonize`]），所以启动期的
     //   致命错误如果不写进日志文件就**彻底不可见** —— 用户只会看到 `qxync daemon start`
