@@ -1335,7 +1335,11 @@ mod tests {
             "/home/a.bin",
             None,
         );
-        assert_eq!(called.load(Ordering::Relaxed), 2, "回调 panic 不能中断调用点");
+        assert_eq!(
+            called.load(Ordering::Relaxed),
+            2,
+            "回调 panic 不能中断调用点"
+        );
         // 没回调也不能有事
         invoke_progress_hook(None, "/home/a.bin", Some((1, 10)));
     }

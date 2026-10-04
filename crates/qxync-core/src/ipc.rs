@@ -1022,7 +1022,6 @@ pub struct FileStateInfo {
     // 上面那些是**空间维度**（内容在不在本地），下面是**同步维度**（本地与远端
     // 一不一致）。两个维度**正交**：「仅在线 + 已同步」是完全正常的状态
     //（文件没 hydrated，但跟远端一模一样）。所以不能把它们压成一个枚举。
-
     /// ★ M15/T8：本地与远端是否一致（`baseline` 一致 且 无待传作业 且 无待裁决冲突）。
     ///
     /// 这是**派生值**，不是独立状态：`dirty` / `pending_upload` / `conflicts`
@@ -1574,7 +1573,13 @@ mod tests {
         })
         .unwrap();
         let tv = v.get("transfers").unwrap();
-        for k in ["active", "downloading", "uploading", "done_bytes", "total_bytes"] {
+        for k in [
+            "active",
+            "downloading",
+            "uploading",
+            "done_bytes",
+            "total_bytes",
+        ] {
             assert!(tv.get(k).is_some(), "transfers 缺字段 {k}");
         }
     }

@@ -1275,14 +1275,10 @@ async fn run_verify(cli: &Cli) -> Result<()> {
 /// 人读格式的 verify 报告。
 fn print_verify(cache: &std::path::Path, rep: &qxync_fuse::VerifyReport, repair: bool) {
     if rep.files.is_empty() {
-        println!(
-            "✅ 缓存里没有已水合的文件可校验: {}",
-            cache.display()
-        );
+        println!("✅ 缓存里没有已水合的文件可校验: {}", cache.display());
         return;
     }
-    let bad: Vec<&qxync_fuse::VerifyFileReport> =
-        rep.files.iter().filter(|f| f.is_bad()).collect();
+    let bad: Vec<&qxync_fuse::VerifyFileReport> = rep.files.iter().filter(|f| f.is_bad()).collect();
     for f in &bad {
         let head = format!("❌ {}", f.cache);
         if let Some(why) = &f.stale_state {
@@ -1638,7 +1634,8 @@ async fn route_via_daemon(
                 );
             }
         }
-        Cmd::State { .. } | Cmd::Daemon { .. } => unreachable!(),    }
+        Cmd::State { .. } | Cmd::Daemon { .. } => unreachable!(),
+    }
     Ok(())
 }
 
@@ -1928,8 +1925,16 @@ fn print_file_states(d: &FileStatesData) {
             e.pin,
             sync,
             e.name,
-            if e.dirty { "（有未上传改动）" } else { "" },
-            if e.pending_upload { "（队列中）" } else { "" },
+            if e.dirty {
+                "（有未上传改动）"
+            } else {
+                ""
+            },
+            if e.pending_upload {
+                "（队列中）"
+            } else {
+                ""
+            },
         );
     }
     if let Some(n) = &d.note {
