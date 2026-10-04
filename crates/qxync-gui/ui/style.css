@@ -1051,6 +1051,9 @@ button.link-btn {
 .badge-local { background: var(--warn-soft); color: var(--warn); border-color: currentColor; }
 .badge-always { background: var(--ok-soft); color: var(--ok); border-color: currentColor; }
 
+/* ★ M15/T8 同步维度：正在传（主色，不与三态的绿/黄/灰混淆） */
+.badge-syncing { background: var(--accent-soft); color: var(--accent); border-color: currentColor; }
+
 /* 幽灵按钮（明确不做的功能：可点，点了给原因） */
 button.ghost {
   background: transparent;

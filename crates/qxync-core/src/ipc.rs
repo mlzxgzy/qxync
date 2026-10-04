@@ -665,7 +665,32 @@ pub struct StatusData {
     /// ★ M3：缓存/脱水状态。
     #[serde(default)]
     pub cache: Option<CacheInfo>,
+    /// ★ M15/T8：**全部挂载点**的传输汇总（下载 + 上传）。
+    ///
+    /// 单机同时可能有好几个挂载点都在水合，逐个去看 `file_states` 太贵，
+    /// 而「现在一共有几个文件在传」是首页最想知道的一句话。
+    #[serde(default)]
+    pub transfers: Option<TransferInfo>,
     pub mounts: Vec<MountInfo>,
+}
+
+/// ★ M15/T8：传输进度汇总（`status` 的增量字段）。
+///
+/// 只报**计数与字节**，不报百分比 —— 各文件大小差几个数量级，算一个「平均
+/// 百分比」出来既不均值也没有意义。真正要看某个文件传到哪，去 `file_states`。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TransferInfo {
+    /// 当前有在传作业的文件数。
+    pub active: usize,
+    /// 下载在途的文件数。
+    pub downloading: usize,
+    /// 上传在途的文件数。
+    pub uploading: usize,
+    /// 本次查询时各在途文件已传字节之和。
+    pub done_bytes: u64,
+    /// 本次查询时各在途文件总字节之和。
+    pub total_bytes: u64,
 }
 
 /// ★ `qbox_get_syncing_folder_list` 的一项（NAS 侧登记的 Qsync 同步文件夹）。
@@ -991,6 +1016,35 @@ pub struct FileStateInfo {
     pub dirty: bool,
     /// 该条目是否被规则隐藏（隐藏的不该出现在三态列里，这里只是兜底信息）。
     pub hidden: bool,
+
+    // ------------------------------------------------ ★ M15/T8 同步维度
+    //
+    // 上面那些是**空间维度**（内容在不在本地），下面是**同步维度**（本地与远端
+    // 一不一致）。两个维度**正交**：「仅在线 + 已同步」是完全正常的状态
+    //（文件没 hydrated，但跟远端一模一样）。所以不能把它们压成一个枚举。
+
+    /// ★ M15/T8：本地与远端是否一致（`baseline` 一致 且 无待传作业 且 无待裁决冲突）。
+    ///
+    /// 这是**派生值**，不是独立状态：`dirty` / `pending_upload` / `conflicts`
+    /// 三个源任意一个变false 它就得跟着变。`None` = 拿不到节点（路径还没被
+    /// `lookup` 过）→ 显示「未知」，不谎报「已同步」。
+    #[serde(default)]
+    pub in_sync: Option<bool>,
+    /// ★ M15/T8：队列里还有这个路径的待传作业。
+    #[serde(default)]
+    pub pending_upload: bool,
+    /// ★ M15/T8：传输进度 `(已传, 总量)`；`None` = 当前没有在传的作业。
+    #[serde(default)]
+    pub progress: Option<(u64, u64)>,
+    /// ★ M15/T8：待裁决冲突数（`decisions` 表里 `resolution IS NULL` 的条数）。
+    #[serde(default)]
+    pub conflicts: usize,
+    /// ★ M15/T8：调用方是否真的查到了冲突信息。
+    ///
+    /// `false` 时 `conflicts = 0` 的含义是「**没查到**」而不是「没有」——
+    /// 必须能区分，否则界面会把「查不到」显示成「已同步」。
+    #[serde(default)]
+    pub conflicts_known: bool,
 }
 
 /// ★ M8.4：`file_states` 的返回。
@@ -1008,6 +1062,20 @@ pub struct FileStatesData {
     pub local: usize,
     pub always: usize,
     pub note: Option<String>,
+
+    // ------------------------------------------------ ★ M15/T8 同步维度汇总
+    /// 已同步的条目数（`in_sync == Some(true)`）。
+    #[serde(default)]
+    pub in_sync: usize,
+    /// 未同步的条目数（`in_sync == Some(false)`）。
+    #[serde(default)]
+    pub out_of_sync: usize,
+    /// 状态未知的条目数（`in_sync == None`，路径没被 `lookup` 过）。
+    #[serde(default)]
+    pub unknown: usize,
+    /// 当前有在传作业的条目数。
+    #[serde(default)]
+    pub transferring: usize,
 }
 
 /// ★ M8.4：`space` 的返回（设置 →「释放空间」页 + `qxync space`）。
@@ -1353,5 +1421,161 @@ mod tests {
     fn unknown_method_is_a_parse_error_not_a_panic() {
         let bad = br#"{"v":1,"method":"nope"}"#;
         assert!(decode_line::<RequestEnvelope>(bad).is_err());
+    }
+
+    // ================================================================ ★ M15/T8
+
+    /// ★ T8：`file_states` 的 JSON 字段名**固定**（验收脚本按名字断言）。
+    ///
+    /// 为什么要专门钉住：这些字段是 CLI `--json` 与 GUI 的契约，改名/漏字段
+    /// 不会让任何编译失败，只会让脚本静默读到 `null`。
+    #[test]
+    fn t8_file_states_json_field_names_are_stable() {
+        let d = FileStatesData {
+            path: "/home".into(),
+            mountpoint: Some("/mnt/q".into()),
+            root: Some("/home".into()),
+            entries: vec![FileStateInfo {
+                name: "a.bin".into(),
+                remote: "/home/a.bin".into(),
+                is_dir: false,
+                size: 1000,
+                hydrated_bytes: 400,
+                state: "local".into(),
+                pin: "unspecified".into(),
+                dirty: true,
+                hidden: false,
+                in_sync: Some(false),
+                pending_upload: true,
+                progress: Some((400, 1000)),
+                conflicts: 2,
+                conflicts_known: true,
+            }],
+            online: 1,
+            local: 2,
+            always: 3,
+            note: None,
+            in_sync: 4,
+            out_of_sync: 5,
+            unknown: 6,
+            transferring: 7,
+        };
+        let v = serde_json::to_value(&d).unwrap();
+        // 汇总字段（空间维度 + 同步维度）
+        for k in [
+            "path",
+            "mountpoint",
+            "root",
+            "entries",
+            "online",
+            "local",
+            "always",
+            "note",
+            "in_sync",
+            "out_of_sync",
+            "unknown",
+            "transferring",
+        ] {
+            assert!(v.get(k).is_some(), "汇总缺字段 {k}");
+        }
+        // 单条字段
+        let e = v.get("entries").unwrap().as_array().unwrap()[0].clone();
+        for k in [
+            "name",
+            "remote",
+            "is_dir",
+            "size",
+            "hydrated_bytes",
+            "state",
+            "pin",
+            "dirty",
+            "hidden",
+            "in_sync",
+            "pending_upload",
+            "progress",
+            "conflicts",
+            "conflicts_known",
+        ] {
+            assert!(e.get(k).is_some(), "条目缺字段 {k}");
+        }
+        // progress 必须是 `[done, total]` 两个数（GUI 直接按下标读）
+        let p = e.get("progress").unwrap().as_array().unwrap();
+        assert_eq!(p.len(), 2);
+        assert_eq!(p[0].as_u64(), Some(400));
+        assert_eq!(p[1].as_u64(), Some(1000));
+    }
+
+    /// ★ T8：老 daemon / 老 GUI 的 JSON 缺 T8 字段时必须还能解析（`serde(default)`）。
+    #[test]
+    fn t8_file_states_json_is_backward_compatible() {
+        // 这是 T8 之前的形状（只有空间维度）
+        let old = r#"{
+            "path": "/home",
+            "mountpoint": "/mnt/q",
+            "root": "/home",
+            "entries": [{"name":"a.bin","remote":"/home/a.bin","is_dir":false,
+                         "size":10,"hydrated_bytes":0,"state":"online",
+                         "pin":"unspecified","dirty":false,"hidden":false}],
+            "online": 1, "local": 0, "always": 0
+        }"#;
+        let d: FileStatesData = serde_json::from_str(old).expect("老 payload 必须能解析");
+        assert_eq!(d.entries.len(), 1);
+        let e = &d.entries[0];
+        // 缺失的 T8 字段取默认值，且 `in_sync = None`（= 未知，不是「已同步」）
+        assert_eq!(e.in_sync, None);
+        assert!(!e.pending_upload);
+        assert_eq!(e.progress, None);
+        assert_eq!(e.conflicts, 0);
+        assert!(!e.conflicts_known, "查不到就不能冒充「没有冲突」");
+        assert_eq!(d.in_sync, 0);
+        assert_eq!(d.out_of_sync, 0);
+        assert_eq!(d.unknown, 0);
+        assert_eq!(d.transferring, 0);
+    }
+
+    /// ★ T8：`status.transfers` 缺字段时为 `None`（老 daemon），不报错。
+    #[test]
+    fn t8_status_transfers_is_optional() {
+        let old = r#"{
+            "daemon":{"version":"0.4.3","pid":1,"uptime_secs":1,"socket":"/tmp/s"},
+            "logged_in": false,
+            "hydro":{"count":0,"bytes":0},
+            "mounts": []
+        }"#;
+        let st: StatusData = serde_json::from_str(old).expect("老 status 必须能解析");
+        assert!(st.transfers.is_none(), "没有在途作业时是 None");
+        // 新形状：字段齐全
+        let t = TransferInfo {
+            active: 2,
+            downloading: 1,
+            uploading: 1,
+            done_bytes: 300,
+            total_bytes: 1000,
+        };
+        let v = serde_json::to_value(StatusData {
+            daemon: DaemonInfo {
+                version: "0.4.3".into(),
+                pid: 1,
+                uptime_secs: 1,
+                socket: "/tmp/s".into(),
+            },
+            link: None,
+            logged_in: false,
+            session: None,
+            server: None,
+            cursors: None,
+            hydro: HydroStats::default(),
+            uploads: None,
+            deletes: None,
+            sync: None,
+            cache: None,
+            transfers: Some(t),
+            mounts: vec![],
+        })
+        .unwrap();
+        let tv = v.get("transfers").unwrap();
+        for k in ["active", "downloading", "uploading", "done_bytes", "total_bytes"] {
+            assert!(tv.get(k).is_some(), "transfers 缺字段 {k}");
+        }
     }
 }
