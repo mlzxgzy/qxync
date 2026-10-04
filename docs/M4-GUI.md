@@ -151,7 +151,13 @@ Tauri 2 的 `withGlobalTauri: true` 会把 `window.__TAURI__.core.invoke` 直接
 | **连接 / 登录**（设置） | host/port/https/insecure/user/password/ipv4_only 表单（打开时预填）；保存配置 / **保存并登录** / 启停 daemon；三个 XDG 目录与 socket 路径 |
 | **挂载**（诊断 → 挂载） | 当前挂载表（可卸载）+ 新建挂载（挂载点默认 `$HOME/qxync-mnt`、**一个** NAS 目录、读写开关、`cache_mode`、线程数、水合超时、删除熔断阈值、auto_unmount） |
 | **文件 / pin**（文件） | 远端目录浏览（真机 `ls`，目录优先）、每行 pin 查询/设置（`unspecified/pinned/unpinned/excluded`）、下载（`get`）、脱水（`dehydrate`，**恒带 `force: true`**）、新建目录、删除 |
-| **同步 / 缓存**（诊断 → 同步 / 缓存） | `SyncInfo` 全量（含 `devices`、`last_error`、`delete_block_reason`）+ 立即同步 / 强制放行删除 / 暂停轮询 / 设间隔；`CacheInfo` 全量 + 脱水预演 / 全部脱水（`force: false`）/ 按限额 / 释放闲置 |
+| **同步 / 缓存**（诊断 → 同步 / 缓存） | `SyncInfo` 全量（含 `devices`、`last_error`、`delete_block_reason`）+ 立即同步 / 暂停轮询 / 设间隔；`CacheInfo` 全量 + 脱水预演 / 全部脱水（`force: false`）/ 按限额 / 释放闲置 |
+
+> ★ **「放行删除」不只住在诊断页**：删除熔断一旦发生，主页「最近一次同步」、
+> 诊断 → 状态、诊断 → 同步 / 缓存、任务卡操作区**四处**同时出现「放行删除」，
+> 都收敛到 `doForceDeletes()`（二次确认 + 展示 daemon 给的原始原因）。
+> 理由与决策表见 [`M2c-变更发现.md`](M2c-变更发现.md) §5.1 —— 一句话版本：
+> **凡是「看到了还得做点什么」的状态，出口就挂在提示自己身上**，别让用户自己找。
 
 > ★ **两个脱水入口的 `force` 与呈现不同，是有意为之**：
 > 单行「脱水」= 用户点名释放这一个路径，恒带 `force: true`（跳过 300s「刚访问过」，

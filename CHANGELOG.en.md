@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The GUI said "some deletes are blocked by the circuit breaker" but gave you no way to
+  act on it** (user report). This was a state with a pointer but no destination: the task
+  card read "有删除被熔断挡住（待确认）" and the home page added "到「诊断 → 同步 / 缓存」
+  可强制放行一轮" — but the only button over there is called "**强制放行删除**", which
+  corresponds to nothing in the message. Readers had no way to know which one to click and
+  ended up searching the whole UI.
+  1. `addAlert()` takes an optional `action` argument, so an alert row can carry its own
+     button. **Any state you must still act on after seeing it now carries its own exit**,
+     instead of sending you hunting.
+  2. All three alerts (home "last sync", diagnostics → status, diagnostics → sync/cache)
+     embed a "放行删除" button.
+  3. The task card's action row grows a "放行删除" button while the breaker is tripped —
+     and only while the state line is actually talking about the breaker. When the card's
+     own "paused / not mounted" state overrides the global one, the button steps aside too,
+     so you never see "state says paused" next to a release-deletes button (a button that
+     really does delete things).
+  4. The vague "待确认" is gone, replaced by the plain fact "**这轮没有真的删除任何文件**".
+     What the breaker holds back is a deletion that was *about to run*; the thing users
+     actually fear — files already gone — never happens, and the UI never said so.
+  5. All three entry points now funnel into one `doForceDeletes()`: it asks for
+     confirmation and **shows the daemon's original reason in the prompt** ("一次对账要
+     删除 812 项，超过上限 50" carries far more information than "确认放行？"), plus a
+     warning not to release if the remote was emptied by accident. Deletion is
+     irreversible; this step cannot be skipped.
+
 ## [0.5.1] - 2026-10-04
 
 **Fixes two GUI problems that looked fine but were not actually working**: single-file

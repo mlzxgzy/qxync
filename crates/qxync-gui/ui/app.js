@@ -645,7 +645,7 @@
         return { mark: '⚠️', tone: 'err', text: T('task.state_sync_error', { msg: String(sy.last_error) }) };
       }
       if (sy.delete_block_reason) {
-        return { mark: '⚠️', tone: 'warn', text: T('task.state_delete_blocked') };
+        return { mark: '⚠️', tone: 'warn', text: T('task.state_delete_blocked'), blocked: true };
       }
       if (!sy.enabled) {
         return { mark: '⏸', tone: 'warn', text: T('task.state_paused') };
@@ -750,9 +750,13 @@
 
     var body = el('div', 'task-body');
     var stateText = ts.text;
+    // 卡片自己的登记状态会盖掉全局同步状态（暂停 / 未挂载更"紧急"）——
+    // 覆盖生效时下面的「放行删除」也要一起让位，否则会出现「状态说已暂停、
+    // 却挂着个放行删除按钮」的矛盾画面。
+    var blocked = ts.blocked === true;
     if (t) {
-      if (!t.enabled) { stateText = T('task.state_paused_task'); }
-      else if (!v.mounted) { stateText = T('task.state_not_mounted'); }
+      if (!t.enabled) { stateText = T('task.state_paused_task'); blocked = false; }
+      else if (!v.mounted) { stateText = T('task.state_not_mounted'); blocked = false; }
     }
     body.appendChild(el('div', 'task-state', stateText));
 
@@ -856,6 +860,15 @@
         doTaskAction('delete', t.id, '删除登记', bDel);
       });
       act.appendChild(bDel);
+    }
+
+    // ★ 只有状态行真的在讲「删除被熔断」时才给这个按钮：它是这条提示的**出口**，
+    //   放在别的状态下就是个语义错位的危险按钮（而它确实会真删东西）。
+    if (blocked) {
+      var bForce = el('button', 'mini danger', T('sync.force_deletes'));
+      bForce.type = 'button';
+      bForce.addEventListener('click', function () { doForceDeletes(bForce); });
+      act.appendChild(bForce);
     }
 
     card.appendChild(act);
@@ -1523,8 +1536,8 @@
 
     if (sy.last_error) { addAlert('home-alerts', '同步错误：' + String(sy.last_error)); }
     if (sy.delete_block_reason) {
-      addAlert('home-alerts', '删除被熔断挡住：' + String(sy.delete_block_reason) +
-        '（到「诊断 → 同步 / 缓存」可强制放行一轮）');
+      addAlert('home-alerts', T('sync.blocked_alert', { reason: String(sy.delete_block_reason) }),
+        null, { label: T('sync.force_deletes'), onClick: doForceDeletes });
     }
     if (sy.note) { addAlert('home-alerts', '说明：' + String(sy.note), 'warn'); }
   }
@@ -1702,7 +1715,8 @@
         addAlert('sync-alerts', '同步错误：' + String(sy.last_error));
       }
       if (sy.delete_block_reason) {
-        addAlert('sync-alerts', '删除被熔断挡住：' + String(sy.delete_block_reason) + '（可用「强制放行删除」放行一轮）');
+        addAlert('sync-alerts', T('sync.blocked_alert', { reason: String(sy.delete_block_reason) }),
+          null, { label: T('sync.force_deletes'), onClick: doForceDeletes });
       }
       var note = $('sync-note');
       if (note) {
@@ -1746,11 +1760,58 @@
   // severity: 'error'（默认，红，真失败）| 'warn'（黄，需注意但不致命）。
   // ★ 只有真失败才配红色；引擎的 note（如 qbox_get_sync_log 的 -17「区间内没有事件」）
   //   是提示性诊断信息，归 'warn'，否则主页会常驻一个红框。
-  function addAlert(containerId, text, severity) {
+  //
+  // ★ action（可选 {label, onClick}）：告警行右侧挂一个按钮。
+  //   用户反馈（2026-10-04）：「有删除被熔断挡住（待确认）」这条提示**没地方处理**——
+  //   它只说「到诊断→同步/缓存可放行」，而那里的按钮叫「强制放行删除」，两边对不上，
+  //   看到的人根本不知道该点哪个。**凡是「看到了还得做点什么」的状态，就把按钮挂在
+  //   这条提示自己身上**，别让用户自己去找。
+  function addAlert(containerId, text, severity, action) {
     var box = $(containerId);
     if (!box) { return; }
     var cls = (severity === 'warn') ? 'alert alert-warn' : 'alert';
-    box.appendChild(el('div', cls, text));
+    var row = el('div', cls);
+    row.appendChild(el('span', 'alert-text', text));
+    if (isObj(action) && action.label && typeof action.onClick === 'function') {
+      row.className += ' alert-act';
+      var b = el('button', 'mini danger', action.label);
+      b.type = 'button';
+      b.addEventListener('click', function () { action.onClick(b); });
+      row.appendChild(b);
+    }
+    box.appendChild(row);
+  }
+
+  /**
+   * 「放行删除」的唯一实现 —— 告警行内按钮、任务卡按钮、诊断页按钮都走这里。
+   *
+   * 删除不可逆，所以：① 把 daemon 给的**原始原因**摆出来让人自己判断
+   * （「一次对账要删除 812 项，超过上限 50」比「确认放行？」有信息量得多）；
+   * ② 一定要二次确认；③ 按钮在飞行中禁用，防连点。
+   * 只放行**这一轮**（daemon 侧 `force_deletes` 用完即置回 false）。
+   */
+  function doForceDeletes(btn) {
+    if (!requireDaemon()) { return Promise.resolve(null); }
+    var st = state.lastStatus;
+    var sy = (st && st.status && isObj(st.status.sync)) ? st.status.sync : null;
+    var reason = (sy && sy.delete_block_reason) ? String(sy.delete_block_reason) : '';
+    var n = num(sy && sy.deletes_blocked, 0);
+    if (!window.confirm(T('sync.force_deletes_confirm', {
+      reason: reason || T('sync.force_deletes_noreason'),
+      n: n
+    }))) {
+      return Promise.resolve(null);
+    }
+    if (btn) { btn.disabled = true; }
+    return doSync({ once: true, force_deletes: true }, [], T('sync.force_deletes')).then(function (r) {
+      // 放行成功后这一轮就没有 delete_block_reason 了，刷新会把按钮一起收掉；
+      // 这里只保证「万一没消失，按钮不会卡在禁用态」。
+      if (btn) { btn.disabled = false; }
+      return r;
+    }, function (e) {
+      if (btn) { btn.disabled = false; }
+      throw e;
+    });
   }
 
   function clearAlerts(containerId) {
@@ -2861,7 +2922,8 @@
     clearAlerts('sync2-alerts');
     if (sy.last_error) { addAlert('sync2-alerts', '同步错误：' + String(sy.last_error)); }
     if (sy.delete_block_reason) {
-      addAlert('sync2-alerts', '删除熔断：' + String(sy.delete_block_reason));
+      addAlert('sync2-alerts', T('sync.blocked_alert', { reason: String(sy.delete_block_reason) }),
+        null, { label: T('sync.force_deletes'), onClick: doForceDeletes });
     }
 
     var cdl = $('cache-full-kv');
@@ -4167,9 +4229,7 @@
 
     // 同步页
     on('btn-sync-once', 'click', function () { doSync({ once: true }, ['btn-sync-once'], '立即同步'); });
-    on('btn-sync-force', 'click', function () {
-      doSync({ once: true, force_deletes: true }, ['btn-sync-force'], '强制放行删除');
-    });
+    on('btn-sync-force', 'click', function () { doForceDeletes($('btn-sync-force')); });
     on('btn-sync-pause', 'click', function () { doSync({ interval_secs: 0 }, ['btn-sync-pause'], '暂停轮询'); });
     on('btn-sync-interval', 'click', function () {
       var v = num($('sy-interval') ? $('sy-interval').value : 60, 60);

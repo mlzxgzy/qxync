@@ -537,6 +537,19 @@ code {
   color: var(--warn);
 }
 
+/* ★ 带操作出口的 alert（删除熔断）：文案 + 按钮同一行。
+   按钮要能换行 —— 熔断原因可能很长（「一次对账要删除 812/2400 项（34%），超过阈值 25%」），
+   窄窗口下不能让按钮被挤出可视区。 */
+.alert-act {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.alert-act .alert-text { flex: 1 1 240px; min-width: 0; }
+.alert-act .mini { margin-left: auto; flex: 0 0 auto; }
+
 .alert-stack:empty { display: none; }
 
 /* ★ M8.3：错误列表的一行（要能换行显示长路径） */
