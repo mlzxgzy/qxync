@@ -261,28 +261,33 @@
             <span class="toolbar-info" id="files-info">—</span>
             <span class="busy" id="files-busy" hidden data-i18n="busy.text">进行中…</span>
           </div>
-          <table class="tbl tbl-files">
-            <thead>
-              <tr>
-                <th class="col-sel">选</th>
-                <th class="col-type">类型</th>
-                <th>文件名</th>
-                <th class="col-size">大小</th>
-                <th class="col-time">修改时间</th>
-                <th class="col-child">have_child</th>
-                <th class="col-state">状态（节省空间模式）</th>
-                <th class="col-pin">pin 状态 / 操作</th>
-              </tr>
-            </thead>
-            <tbody id="files-tbody"></tbody>
-          </table>
+          <!-- ★ 横向滚动兜底：列多时宁可出滚动条，也不要把最右列静默裁掉 -->
+          <div class="tbl-scroll">
+            <table class="tbl tbl-files">
+              <thead>
+                <tr>
+                  <th class="col-sel">选</th>
+                  <!-- have_child 并进「类型」列（目录名后的 ▾）：单独一列在 NAS 上
+                       几乎恒为空，白占 ~80px 还把文件名列挤窄。 -->
+                  <th class="col-type">类型</th>
+                  <th class="col-name">文件名</th>
+                  <th class="col-size">大小</th>
+                  <th class="col-time">修改时间</th>
+                  <th class="col-state">状态（节省空间模式）</th>
+                  <th class="col-pin">pin / 操作</th>
+                </tr>
+              </thead>
+              <tbody id="files-tbody"></tbody>
+            </table>
+          </div>
           <p class="empty-hint" id="files-empty" hidden data-state="ready" data-i18n="files.empty">目录为空，或尚未加载。</p>
           <p class="note">
             <strong>状态</strong>列就是 Qsync 的「节省空间模式」三态：
             <span class="badge badge-online">仅在线</span>（占位符，没有本地内容）·
             <span class="badge badge-local">本地可用</span>（已缓存）·
             <span class="badge badge-always">始终可用</span>（<code>pin=pinned</code>，永不自动释放）。
-            右键任意一行可以「始终保留在此设备 / 释放空间 / 下载 / 删除 / 复制路径」。
+            行尾<strong>⋯</strong>或<strong>右键</strong>任意一行都能打开操作菜单
+            （查询 / 设置 pin、释放空间、下载、删除、复制路径）。
           </p>
         </div>
       </section>
@@ -848,8 +853,12 @@
      系统菜单：前端零依赖、验收矩阵能直接断言条目；所有字符串来自 daemon，绝不拼 innerHTML。 -->
 <div id="row-menu" class="ctx-menu" role="menu" aria-label="文件操作" hidden>
   <div class="ctx-title" id="row-menu-title">—</div>
+  <button type="button" class="ctx-item" role="menuitem" data-act="pinquery" data-i18n="menu.pinquery">🔍 查询 pin 状态</button>
+  <div class="ctx-sep" role="separator"></div>
   <button type="button" class="ctx-item" role="menuitem" data-act="pin" data-i18n="menu.pin">☑ 始终保留在此设备（Always keep on this device）</button>
   <button type="button" class="ctx-item" role="menuitem" data-act="unpin" data-i18n="menu.unpin">☐ 取消固定</button>
+  <button type="button" class="ctx-item" role="menuitem" data-act="unpinned" data-i18n="menu.unpinned">⊘ 不保留在此设备</button>
+  <button type="button" class="ctx-item" role="menuitem" data-act="excluded" data-i18n="menu.excluded">🚫 排除（不同步）</button>
   <button type="button" class="ctx-item" role="menuitem" data-act="free" data-i18n="menu.free">⤓ 释放空间（Free up space）</button>
   <div class="ctx-sep" role="separator"></div>
   <button type="button" class="ctx-item" role="menuitem" data-act="get" data-i18n="menu.get">下载到本地…</button>

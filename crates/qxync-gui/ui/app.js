@@ -2327,10 +2327,12 @@
     }, 500);
   }
 
-  function openRowMenu(ev, e, full) {
+  function openRowMenu(ev, e, full, selectEl) {
     var menu = $('row-menu');
     if (!menu) { return; }
-    state.rowMenu = { entry: e, path: full };
+    // selectEl 是该行的 pin 下拉：菜单里改完 pin 把它回填上，
+    // 否则用户「设了 pinned」却还看着下拉显示「（未知）」。
+    state.rowMenu = { entry: e, path: full, selectEl: selectEl || null };
     // ★ M8.6：键盘（Shift+F10 / 菜单键）也能开；关闭时把焦点还给来处
     state.rowMenuTrigger = document.activeElement;
     setText('row-menu-title', full);
@@ -2405,11 +2407,23 @@
     var e = cur.entry;
     var full = cur.path;
     closeRowMenu(false);
-    if (act === 'pin') {
-      setPinState(full, 'pinned', null, null);
+    if (act === 'pinquery') {
+      // ★ 查询（不设置）：结果回填到该行的 pin 下拉上，不传 state 就是查询
+      var sel = cur.selectEl || null;
+      if (sel) { sel.value = ''; }
+      setPinState(full, null, sel, null);
+      refreshFileStatesSoon();
+    } else if (act === 'pin') {
+      setPinState(full, 'pinned', cur.selectEl || null, null);
       refreshFileStatesSoon();
     } else if (act === 'unpin') {
-      setPinState(full, 'unspecified', null, null);
+      setPinState(full, 'unspecified', cur.selectEl || null, null);
+      refreshFileStatesSoon();
+    } else if (act === 'unpinned') {
+      setPinState(full, 'unpinned', cur.selectEl || null, null);
+      refreshFileStatesSoon();
+    } else if (act === 'excluded') {
+      setPinState(full, 'excluded', cur.selectEl || null, null);
       refreshFileStatesSoon();
     } else if (act === 'free') {
       doDehydratePath(full, null).then(refreshFileStatesSoon);
@@ -2508,14 +2522,23 @@
     tdSel.appendChild(cb);
     tr.appendChild(tdSel);
 
-    // 类型
+    // 类型（have_child 合并在这里：目录名后加 ▾ 表示有子目录）
     var isDir = e.isfolder === true;
-    tr.appendChild(el('td', 'col-type', isDir ? '📁' : '📄'));
+    var tdType = el('td', 'col-type');
+    tdType.appendChild(document.createTextNode(isDir ? '📁' : '📄'));
+    if (isDir && e.have_child === true) {
+      var sub = el('span', 'has-child', '▾');
+      sub.title = '有子目录';
+      tdType.appendChild(sub);
+    }
+    tr.appendChild(tdType);
 
     // 文件名
     var tdName = el('td', 'name');
+    var dispName = str(e.filename);
+    tdName.title = dispName;          // ★ 省略号显示时靠title 给全名
     if (isDir) {
-      var btn = el('button', 'name-link', str(e.filename));
+      var btn = el('button', 'name-link', dispName);
       btn.type = 'button';
       btn.addEventListener('click', function () {
         state.files.selected = null;
@@ -2523,7 +2546,7 @@
       });
       tdName.appendChild(btn);
     } else {
-      tdName.appendChild(el('span', 'name-file', str(e.filename)));
+      tdName.appendChild(el('span', 'name-file', dispName));
     }
     if (e.exist === false) {
       tdName.appendChild(document.createTextNode(' '));
@@ -2540,9 +2563,6 @@
 
     // 时间
     tr.appendChild(el('td', 'col-time mono', entryTime(e)));
-
-    // have_child
-    tr.appendChild(el('td', 'col-child', e.have_child === true ? '✔' : ''));
 
     // ★ M8.4：状态列（节省空间模式三态）
     var fs = state.fileStates[str(e.filename)];
@@ -2589,73 +2609,52 @@
     }
     tr.appendChild(tdState);
 
+    // ★ pin 下拉先建出来：右键菜单 / 键盘菜单 /⋯ 按钮都要用它回填 pin 状态
+    var sel = el('select', PIN_SELECT_CLASS);
+
     // 右键菜单（对齐 Qsync 的「节省空间模式 ▸ …」）
     tr.addEventListener('contextmenu', function (ev) {
       ev.preventDefault();
-      openRowMenu(ev, e, full);
+      openRowMenu(ev, e, full, sel);
     });
     // ★ M8.6：键盘打开同一份菜单（Shift+F10 或菜单键）—— 事件从行内的 checkbox/按钮冒泡上来
     tr.addEventListener('keydown', function (ev) {
       if (ev.key === 'ContextMenu' || (ev.shiftKey && ev.key === 'F10')) {
         ev.preventDefault();
-        openRowMenu(ev, e, full);
+        openRowMenu(ev, e, full, sel);
       }
     });
 
-    // pin 操作
+    // ★ pin 操作列 —— 从「下拉 + 4 个按钮」收成「下拉 + ⋯ 菜单」。
+    //   原因：那 4 个按钮（查 pin / 设 pin / 下载 / 脱水）每一个都在行右键菜单里有
+    //   等价项（查 pin 原本缺，已补），而它们把这一列撑到 ~370px —— 整张表因此
+    //   溢出容器，最右列被**静默裁掉**，用户得横向拖才能看到。查询/设置/下载/
+    //   脱水的文案与说明在菜单里反而更完整，所以收编过去不丢功能。
     var tdPin = el('td', 'col-pin');
-    var sel = el('select', PIN_SELECT_CLASS);
     var opt0 = el('option', null, '（未知）');
     opt0.value = '';
     sel.appendChild(opt0);
     for (var i = 0; i < PIN_STATES.length; i++) {
-      var o = el('option', null, PIN_STATES[i] + ' · ' + PIN_LABEL[PIN_STATES[i]]);
+      // 选项文字只留英文 key —— 中文说明挪到菜单项里，下拉框窄一点才放得下
+      var o = el('option', null, PIN_STATES[i]);
       o.value = PIN_STATES[i];
+      o.title = PIN_LABEL[PIN_STATES[i]];
       sel.appendChild(o);
     }
     sel.value = '';
+    sel.title = '选中后从⋯ 菜单里设 pin';
     tdPin.appendChild(sel);
-    tdPin.appendChild(document.createTextNode(' '));
 
-    var btnQuery = el('button', 'mini', '查 pin');
-    btnQuery.type = 'button';
-    btnQuery.addEventListener('click', function () {
-      setPinState(full, null, sel, btnQuery);
+    var btnMore = el('button', 'mini row-more', '⋯');
+    btnMore.type = 'button';
+    btnMore.title = '这一行的操作（也可用右键 / Shift+F10）';
+    btnMore.addEventListener('click', function (ev) {
+      ev.preventDefault();
+      ev.stopPropagation();          // 别让行自己再开一次
+      openRowMenu(ev, e, full, sel);
     });
-    tdPin.appendChild(btnQuery);
     tdPin.appendChild(document.createTextNode(' '));
-
-    var btnSet = el('button', 'mini', '设 pin');
-    btnSet.type = 'button';
-    btnSet.addEventListener('click', function () {
-      if (!sel.value) {
-        logInfo('请先选择 pin 状态（unspecified / pinned / unpinned / excluded）');
-        return;
-      }
-      setPinState(full, sel.value, sel, btnSet);
-    });
-    tdPin.appendChild(btnSet);
-
-    // 文件额外操作：下载 / 脱水
-    if (!isDir) {
-      tdPin.appendChild(document.createTextNode(' '));
-      var btnGet = el('button', 'mini', '下载');
-      btnGet.type = 'button';
-      btnGet.addEventListener('click', function () { doDownload(e, btnGet); });
-      tdPin.appendChild(btnGet);
-
-      tdPin.appendChild(document.createTextNode(' '));
-      var btnDehy = el('button', 'mini', '脱水');
-      btnDehy.type = 'button';
-      btnDehy.addEventListener('click', function () { doDehydratePath(full, btnDehy); });
-      tdPin.appendChild(btnDehy);
-    } else {
-      tdPin.appendChild(document.createTextNode(' '));
-      var btnDehyDir = el('button', 'mini', '脱水');
-      btnDehyDir.type = 'button';
-      btnDehyDir.addEventListener('click', function () { doDehydratePath(full, btnDehyDir); });
-      tdPin.appendChild(btnDehyDir);
-    }
+    tdPin.appendChild(btnMore);
 
     tr.appendChild(tdPin);
     return tr;

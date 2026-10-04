@@ -221,8 +221,11 @@
     'busy.text': '进行中…',
 
     // ---- 行右键菜单（节省空间模式）
+    'menu.pinquery': '🔍 查询 pin 状态',
     'menu.pin': '☑ 始终保留在此设备（Always keep on this device）',
     'menu.unpin': '☐ 取消固定',
+    'menu.unpinned': '⊘ 不保留在此设备',
+    'menu.excluded': '🚫 排除（不同步）',
     'menu.free': '⤓ 释放空间（Free up space）',
     'menu.get': '下载到本地…',
     'menu.copy': '复制 NAS 路径',
