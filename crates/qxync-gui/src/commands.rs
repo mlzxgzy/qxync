@@ -515,6 +515,50 @@ pub async fn m84_info() -> Result<Value, String> {
     }))
 }
 
+/// ★ T3：一键校验本地水合缓存的内容完整性（GUI 侧入口，逻辑全在 `qxync_fuse`）。
+///
+/// **纯本地**：只读缓存文件 + `.qxstate` / `.qxsum`，不连 NAS、不要 daemon。
+/// 「数据出问题的时候往往正是网络不方便的时候」—— 校验按钮不该依赖挂载还在跑。
+///
+/// `repair = true` 时把坏区间退回「按需水合」（**不下载**，下次读到那个区间时
+/// 自然从 NAS 重取）。这是刻意的：点一下「修复」就产生流量会很吓人，而且 NAS
+/// 可能正连不上。
+#[tauri::command]
+pub async fn cache_verify(repair: Option<bool>) -> Result<Value, String> {
+    let repair = repair.unwrap_or(false);
+    let p = paths()?;
+    // 从数据目录的 `cache/` 往下扫：`verify_cache_dir` 自己会递归（daemon 的实际
+    // 缓存目录是 `<cache>/<nas host>/`，多一层）。
+    let cache_root = p.data_dir.join("cache");
+    if !cache_root.is_dir() {
+        return Ok(json!({
+            "ok": true,
+            "skipped": true,
+            "reason": format!("缓存目录还不存在: {}", cache_root.display()),
+        }));
+    }
+    // 校验是纯 CPU/IO 的同步活儿；放阻塞线程池，别占住 Tauri 的 async 运行时。
+    let dir = cache_root.clone();
+    let rep = tauri::async_runtime::spawn_blocking(move || {
+        qxync_fuse::verify_cache_dir(&dir, repair)
+    })
+    .await
+    .map_err(|e| format!("校验任务失败: {e}"))?;
+    Ok(json!({
+        "ok": true,
+        "skipped": false,
+        "clean": rep.is_clean(),
+        "bad_files": rep.bad_files(),
+        "files_scanned": rep.files_scanned,
+        "files_reported": rep.files.len(),
+        "bytes_verified": rep.bytes_verified,
+        "repaired_chunks": rep.repaired_chunks,
+        "whole_hashes_written": rep.whole_hashes_written,
+        "elapsed_ms": rep.elapsed_ms,
+        "files": rep.files,
+    }))
+}
+
 /// ★ M8.4：发一条桌面通知（前端在同步出错/完成时调用）。
 ///
 /// 设置 `desktop_notifications=false` 时**诚实地什么都不发**并说明原因 —— 返回

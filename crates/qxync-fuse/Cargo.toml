@@ -19,3 +19,4 @@ serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true }
 tracing.workspace = true
+xxhash-rust = { version = "0.8.19", features = ["xxh64"] }

@@ -809,6 +809,16 @@
               <div class="bar-label mono" id="cache2-bar-label">—</div>
             </div>
             <div id="dehy-result" class="result" hidden></div>
+
+            <!-- ★ T3：内容校验和。放这里而不是「设置」页 —— 脱水/校验是同一件事的
+                 两面（一个省空间、一个保正确），用户在同一张卡片里对照着看。 -->
+            <h3 class="sub" data-i18n="cache.integrity">内容校验（xxhash64）</h3>
+            <div class="btn-row">
+              <button type="button" id="btn-verify" data-i18n="cache.verify">校验缓存内容</button>
+              <button type="button" id="btn-verify-repair" data-i18n="cache.verify_repair">校验并修复</button>
+              <span class="busy" id="verify-busy" hidden data-i18n="busy.text">进行中…</span>
+            </div>
+            <div id="verify-result" class="result" hidden></div>
           </div>
         </section>
       </section>

@@ -611,3 +611,84 @@ async fn list_paginates_past_200() {
         assert!(all.iter().any(|e| e.filename == *n), "缺项 {n}");
     }
 }
+
+// ---------------------------------------------------------------- ★ T3：区间内容可复现性
+//
+// qxync 的内容校验和（\`qxsync verify\`）建立在一条前提上：**同一区间两次下载
+// 拿到的字节必须完全一样**。这条测试就是验这个前提 —— 它在真机上跑，因为如果
+// Qsync 服务端对同一个 Range 请求返回的内容不稳定（比如负载均衡到不同后端、
+// 或者做了某种内容变换），那所有校验和都会误报损坏。
+//
+// 顺带确认「Range 响应长度 == 请求长度」，这是 \`ensure_chunk\` 唯一已有的把关，
+// 校验和是它的加强而不是替代。
+
+/// ★ T3：同一区间重复下载必须逐字节一致（校验和方案的前提）。
+#[tokio::test]
+#[ignore = "需要真机 NAS（只读，不写入）"]
+async fn ranged_download_is_byte_stable() {
+    let Some(client) = logged_in().await else {
+        return;
+    };
+    let dir = fixture_root();
+    let entries = match client.list(&dir).await {
+        Ok(v) if !v.is_empty() => v,
+        _ => {
+            println!("跳过（{dir} 为空，先跑 xtask/probe/qs_fixture.py）");
+            return;
+        }
+    };
+    // 挑一个大一点的普通文件，区间才够有意思
+    let Some(e) = entries
+        .iter()
+        .filter(|e| !e.isfolder && e.filesize > 400 * 1024)
+        .max_by_key(|e| e.filesize)
+    else {
+        println!("跳过（{dir} 里没有 > 400 KiB 的文件）");
+        return;
+    };
+    println!("验证 {}/{}（{} 字节）", dir, e.filename, e.filesize);
+
+    // 取头、中、尾三个 128 KiB 区间（与 qxync 的区间大小一致）
+    let cs = 128 * 1024u64;
+    for (label, start) in [
+        ("首区间", 0u64),
+        ("中间", (e.filesize / 2) / cs * cs),
+        ("末区间", e.filesize.saturating_sub(cs) / cs * cs),
+    ] {
+        let end = (start + cs - 1).min(e.filesize.saturating_sub(1));
+        let a = client
+            .download_range(&dir, &e.filename, start, end)
+            .await
+            .expect("第一次区间下载");
+        let b = client
+            .download_range(&dir, &e.filename, start, end)
+            .await
+            .expect("第二次区间下载");
+
+        // 长度必须与请求一致（ensure_chunk 的既有把关）
+        assert_eq!(
+            a.len() as u64,
+            end - start + 1,
+            "{label} [{start}..={end}] 返回长度与请求不符"
+        );
+        // ★ 核心：两次必须逐字节一致，否则校验和会一直误报
+        assert_eq!(
+            a, b,
+            "{label} [{start}..={end}] 两次下载内容不同 —— 校验和方案的前提不成立"
+        );
+
+        // 相邻区间不能重叠（错位会让 per-chunk 校验和互相矛盾）
+        if start > 0 {
+            let prev_end = start - 1;
+            let prev = client
+                .download_range(&dir, &e.filename, start - cs, prev_end)
+                .await
+                .expect("前一区间");
+            assert_eq!(
+                prev.len() as u64, cs,
+                "前一区间长度异常（末区间不完整时应为 start..=end）"
+            );
+        }
+        println!("  {label} [{start}..={end}] {} 字节，两次一致 ✓", a.len());
+    }
+}

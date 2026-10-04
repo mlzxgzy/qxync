@@ -2869,6 +2869,76 @@
     });
   }
 
+  // ★ T3：缓存内容校验（**纯本地** —— 不查 daemon 是否在跑，也不经 IPC）。
+  //
+  // 走 Tauri 命令 `cache_verify` 而不是 IPC：校验只读本地缓存文件与
+  // `.qxstate`/`.qxsum`，「数据出问题的时候往往正是网络不方便的时候」，
+  // 不该要求挂载还活着。
+  function doVerify(repair) {
+    return withBusy({
+      spinners: ['verify-busy'],
+      buttons: ['btn-verify', 'btn-verify-repair']
+    }, function () {
+      return call('cache_verify', { repair: !!repair });
+    }).then(function (r) {
+      if (!r || r.ok === false) {
+        renderError('verify-result', '校验失败', (r && str(r.error)) || '未知错误');
+        return r;
+      }
+      var d = (r.data && isObj(r.data)) ? r.data : r;
+      if (d.skipped) {
+        renderResult('verify-result', true, '校验', [
+          ['状态', str(d.reason || '缓存目录不存在')]
+        ]);
+        return r;
+      }
+      var clean = d.clean === true;
+      var label = repair ? '校验并修复' : '校验';
+      var rows = [
+        ['结论', clean ? '全部通过' : (num(d.bad_files, 0) + ' 个文件有问题')],
+        ['扫过文件', num(d.files_scanned, 0)],
+        ['校验字节', humanSize(d.bytes_verified)],
+        ['耗时', num(d.elapsed_ms, 0) + ' ms']
+      ];
+      if (repair) {
+        rows.push(['修复区间', num(d.repaired_chunks, 0)]);
+        rows.push(['整文件哈希更新', num(d.whole_hashes_written, 0)]);
+      }
+      // 修完之后不算「失败」：坏区间已经退回按需水合，缓存回到了诚实的状态。
+      // 显示红色只会让用户以为修复没生效，反而再去点一次。
+      var title = clean ? label + '（通过）'
+        : (repair ? label + '（已把坏区间退回按需水合）' : label + '（发现损坏）');
+      renderResult('verify-result', clean || repair, title, rows);
+
+      // 有问题的文件逐个列出，精确到**文件 + 区间** —— 这是用户能自己处理的粒度
+      var list = (d.files || []).filter(function (f) {
+        return isObj(f) && ((f.bad_chunks && f.bad_chunks.length) || f.stale_state || f.missing_sums);
+      });
+      var box = $('verify-result');
+      if (box && list.length) {
+        var ul = el('ul', 'plain-list mono');
+        for (var i = 0; i < list.length && i < 30; i++) {
+          var f = list[i];
+          var why = [];
+          if (f.stale_state) { why.push('位图不可信(' + str(f.stale_state) + ')'); }
+          if (f.missing_sums) { why.push('缺校验和表'); }
+          if (f.bad_chunks && f.bad_chunks.length) {
+            var ids = f.bad_chunks.slice(0, 8).map(function (n) { return '#' + n; }).join(' ');
+            why.push(f.bad_chunks.length + ' 个区间损坏: ' + ids +
+              (f.bad_chunks.length > 8 ? ' …' : ''));
+          }
+          var li = el('li', null, str(f.cache) + ' —— ' + why.join('；'));
+          ul.appendChild(li);
+        }
+        if (list.length > 30) {
+          ul.appendChild(el('li', null, '…还有 ' + (list.length - 30) + ' 个（用 qxync verify --json 看全部）'));
+        }
+        box.appendChild(ul);
+      }
+      return r;
+    });
+  }
+
   // ============================================================ 状态轮询
   var inflight = null;   // 进行中的 daemon_status Promise（避免重叠请求）
 
@@ -4033,6 +4103,8 @@
       var idle = num($('dehy-idle') ? $('dehy-idle').value : 0, 0);
       doDehydrate({ idle_secs: idle }, '释放闲置 ≥ ' + idle + 's');
     });
+    on('btn-verify', 'click', function () { doVerify(false); });
+    on('btn-verify-repair', 'click', function () { doVerify(true); });
 
     // ★ M8.4：设置中心
     var stabs = document.querySelectorAll('#settings-tabs .tab');

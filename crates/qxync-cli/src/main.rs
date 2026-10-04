@@ -312,6 +312,23 @@ enum Cmd {
     /// 查看某路径的占位符状态（pin + 远端元数据）
     State { path: String },
 
+    /// ★ T3：校验本地水合缓存的内容完整性（**不碰 NAS**，断网也能跑）
+    ///
+    /// 逐区间比 `.qxsum` 里的 `xxhash64`，能定位到**具体文件和具体区间**。
+    /// 发现损坏时：报告模式只报；`--repair` 把坏区间退回「按需水合」并清掉校验和。
+    /// 退出码：有损坏 = 1，全清 = 0（可直接进 CI / 定时任务）。
+    Verify {
+        /// 缓存目录（默认 ~/.local/share/qxync/cache）
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// 把坏区间退回「按需水合」（不下载，下次读时自然修复）
+        #[arg(long)]
+        repair: bool,
+        /// 直接输出 JSON（脚本/验收用）
+        #[arg(long)]
+        json: bool,
+    },
+
     /// 守护进程生命周期
     Daemon {
         #[command(subcommand)]
@@ -568,6 +585,12 @@ async fn main() -> Result<()> {
     }
 
     // ---- 路由：显式指定 > 自动探测（socket 可连就走 daemon）----
+    // ★ T3：`verify` 是**纯本地**的（只读缓存文件，不问 NAS、不用 daemon），
+    // 所以在路由之前就短路 —— 否则 `--via-daemon` 会把它塞进 IPC，而 IPC 里
+    // 并没有这个方法。
+    if matches!(cli.cmd, Cmd::Verify { .. }) {
+        return run_verify(&cli).await;
+    }
     let use_ipc = if cli.direct {
         false
     } else if cli.via_daemon {
@@ -754,6 +777,7 @@ async fn main() -> Result<()> {
             }
             print_settings(&st, &paths, *json, saved)?;
         }
+        Cmd::Verify { .. } => unreachable!("verify 在路由前已短路"),
         Cmd::Pin { .. }
         | Cmd::State { .. }
         | Cmd::Sync { .. }
@@ -1198,7 +1222,8 @@ fn to_request(cli: &Cli) -> Option<Request> {
             dry_run: Some(*dry_run),
             mountpoint: mount.clone(),
         },
-        Cmd::State { .. } | Cmd::Daemon { .. } => return None,
+        // verify / state / daemon 都不走 IPC
+        Cmd::Verify { .. } | Cmd::State { .. } | Cmd::Daemon { .. } => return None,
     })
 }
 
@@ -1206,6 +1231,108 @@ fn split_remote(path: &str) -> (String, String) {
     match path.rfind('/') {
         Some(i) if i > 0 => (path[..i].to_string(), path[i + 1..].to_string()),
         _ => ("/".to_string(), path.trim_start_matches('/').to_string()),
+    }
+}
+
+/// ★ T3：`qxync verify` —— 纯本地校验缓存内容完整性。
+///
+/// 之所以不走 daemon：它只读本地缓存文件（`<cache>` + `.qxstate` + `.qxsum`），
+/// 不问 NAS、不要凭据，断网/未挂载时也能跑 —— 「数据出问题的时候往往正是网络
+/// 不方便的时候」。
+async fn run_verify(cli: &Cli) -> Result<()> {
+    let Cmd::Verify { path, repair, json } = &cli.cmd else {
+        bail!("内部错误：run_verify 只能处理 verify");
+    };
+    let cache = path.clone().unwrap_or_else(|| {
+        paths()
+            .map(|p| p.data_dir.join("cache"))
+            .unwrap_or_else(|_| PathBuf::from("/tmp/qxync-cache"))
+    });
+    if !cache.is_dir() {
+        bail!("缓存目录不存在: {}", cache.display());
+    }
+    let rep = qxync_fuse::verify_cache_dir(&cache, *repair);
+    if *json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&rep).map_err(|e| anyhow::anyhow!("序列化失败: {e}"))?
+        );
+    } else {
+        print_verify(&cache, &rep, *repair);
+    }
+    // 有损坏 = 退出码 1，方便 `qxync verify && echo ok` / 定时任务报警。
+    if !rep.is_clean() {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// 人读格式的 verify 报告。
+fn print_verify(cache: &std::path::Path, rep: &qxync_fuse::VerifyReport, repair: bool) {
+    if rep.files.is_empty() {
+        println!(
+            "✅ 缓存里没有已水合的文件可校验: {}",
+            cache.display()
+        );
+        return;
+    }
+    let bad: Vec<&qxync_fuse::VerifyFileReport> =
+        rep.files.iter().filter(|f| f.is_bad()).collect();
+    for f in &bad {
+        let head = format!("❌ {}", f.cache);
+        if let Some(why) = &f.stale_state {
+            println!("{head}  位图不可信（{why}）");
+        }
+        if f.missing_sums && f.stale_state.is_none() {
+            println!("{head}  缺校验和表，无法校验内容");
+        }
+        if !f.bad_chunks.is_empty() {
+            // 区间号 + 字节偏移都给出来，便于手工核对/定点重取
+            let shown: Vec<String> = f
+                .bad_chunks
+                .iter()
+                .take(10)
+                .map(|i| format!("#{i}"))
+                .collect();
+            let more = if f.bad_chunks.len() > 10 {
+                format!(" …共 {} 个", f.bad_chunks.len())
+            } else {
+                String::new()
+            };
+            println!(
+                "{head}  {}/{} 区间内容损坏: {}{more}",
+                f.bad_chunks.len(),
+                f.chunks_total,
+                shown.join(" ")
+            );
+        }
+    }
+    let total: u64 = rep.files.iter().map(|f| f.size).sum();
+    println!(
+        "── 校验 {} 个文件 / {:.2} MiB（已就绪 {:.2} MiB），耗时 {} ms",
+        rep.files.len(),
+        total as f64 / 1048576.0,
+        rep.bytes_verified as f64 / 1048576.0,
+        rep.elapsed_ms
+    );
+    if rep.is_clean() {
+        println!("✅ 全部通过：缓存内容与校验和一致");
+    } else if repair {
+        println!(
+            "✅ 已修复：{} 个坏区间退回按需水合{}",
+            rep.repaired_chunks,
+            if rep.whole_hashes_written > 0 {
+                format!("，{} 个整文件校验和已更新", rep.whole_hashes_written)
+            } else {
+                String::new()
+            }
+        );
+        println!("   （坏区间下次被读到时会自动从 NAS 重新取）");
+    } else {
+        println!(
+            "⚠️  {} 个文件有问题。加 --repair 可把坏区间退回按需水合（本次不下载）",
+            bad.len()
+        );
     }
 }
 
@@ -1250,6 +1377,8 @@ async fn route_via_daemon(
     };
     let socket = socket.to_path_buf();
     match &cli.cmd {
+        // verify 走不到这里（路由前已短路）
+        Cmd::Verify { .. } => unreachable!(),
         Cmd::Login => {
             let d: qxync_core::ipc::LoginData = ipc_client::call(&socket, req).await?;
             println!(
@@ -1504,8 +1633,7 @@ async fn route_via_daemon(
                 );
             }
         }
-        Cmd::State { .. } | Cmd::Daemon { .. } => unreachable!(),
-    }
+        Cmd::State { .. } | Cmd::Daemon { .. } => unreachable!(),    }
     Ok(())
 }
 
