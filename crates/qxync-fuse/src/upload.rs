@@ -518,12 +518,18 @@ impl UploadQueue {
 
     /// 单个作业：上传内容 → 对齐 mtime → 记 write log（尽力而为）。
     ///
+    /// ★ M15/T2：走 [`Client::upload_file`] **流式**上传，不再 `fs::read` 整个文件
+    /// 进内存（传 4 GB 文件原来就是 4 GB 内存，并发几个直接 OOM）。现在内存是
+    /// O(8 MB)，与文件大小无关。
+    ///
     /// 返回**真正发出去的字节数**（success hook 要用它把 baseline 推到准确签名）。
+    /// 注意它取自流式读取时的实际计数，**不是** `metadata` 预先读到的大小 ——
+    /// 上传期间用户可能还在改同一个文件（这正是「用刚发出的字节数推进 baseline」
+    /// 这条正确性关键要防的事，见 M15/T2 验收第 4 条）。
     async fn upload_one(&self, job: &UploadJob) -> Result<u64, CoreError> {
-        let bytes = std::fs::read(&job.local)?;
-        let n = bytes.len() as u64;
-        self.client
-            .upload_bytes(&job.remote_dir, &job.remote_name, bytes)
+        let n = self
+            .client
+            .upload_file(&job.remote_dir, &job.local, &job.remote_name)
             .await?;
         if job.mtime > 0 {
             self.client

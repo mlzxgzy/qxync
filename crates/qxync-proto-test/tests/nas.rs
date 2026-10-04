@@ -174,6 +174,171 @@ async fn upload_roundtrip() {
     let _ = client.delete_entry(&fixture_root(), "rust-proto").await;
 }
 
+/// ★ M15/T2 核心验收：流式上传大文件时**进程内存不随文件大小增长**。
+///
+/// 旧实现 `fs::read` 整个文件 → 传 N 字节就吃 N 字节内存（4 GB 文件 = 4 GB RSS，
+/// 并发几个直接 OOM）。这里量的是「传 64 MiB 时 RSS 峰值增量」：
+/// 流式实现应该在几十 MiB 以内（一个 8 MiB 块 + 协议缓冲），
+/// 而非 +64 MiB。
+///
+/// 判据故意留了余量：不做精确断言（reqwest/分配器行为随平台变），
+/// 只在「内存增量远超文件大小」时失败 —— 那才是回归。
+#[tokio::test]
+#[ignore = "需要真机 NAS，且会写入 NAS"]
+async fn stream_upload_memory_stays_flat() {
+    let Some(client) = logged_in().await else {
+        return;
+    };
+    let dir = format!("{}/rust-mem", fixture_root());
+    let _ = client.mkdir(&fixture_root(), "rust-mem").await;
+
+    let size = 64 * 1024 * 1024u64;
+    let tmpdir = std::env::var("QXYNC_TEST_TMPDIR").map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let local = tmpdir.join("qxync-mem-probe.bin");
+    // 分块写磁盘，不在测试进程里造 64 MiB 的 Vec
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&local).expect("建临时文件");
+        let chunk = vec![7u8; 1024 * 1024];
+        for _ in 0..(size / chunk.len() as u64) {
+            f.write_all(&chunk).expect("写临时文件");
+        }
+    }
+
+    // 采样 RSS：/proc/self/status 的 VmHWM 是**峰值**，VmRSS 是当前值
+    let read_status = |key: &str| -> Option<u64> {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()?
+            .lines()
+            .find(|l| l.starts_with(key))?
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()
+    };
+    let rss_before = read_status("VmRSS:").unwrap_or(0);
+    let hwm_before = read_status("VmHWM:").unwrap_or(0);
+
+    let sent = client
+        .upload_file(&dir, &local, "mem-probe.bin")
+        .await
+        .expect("流式上传 64 MiB");
+    assert_eq!(sent, size, "应发出全部 {size} 字节");
+
+    let rss_after = read_status("VmRSS:").unwrap_or(0);
+    let hwm_after = read_status("VmHWM:").unwrap_or(0);
+    let grew = hwm_after.saturating_sub(hwm_before);
+    let mib = |kb: u64| kb / 1024;
+    println!(
+        "64 MiB 流式上传：VmHWM {hwm_before}→{hwm_after} kB（峰值增量 {} MiB）、\
+         VmRSS {rss_before}→{rss_after} kB",
+        mib(grew)
+    );
+
+    // 峰值增量不应接近文件大小（64 MiB）。留 2 倍余量仍判失败，说明是回归。
+    assert!(
+        grew < size / 2,
+        "峰值 RSS 增量 {} MiB 逼近文件大小（{} MiB）——流式没生效？",
+        mib(grew),
+        mib(size)
+    );
+
+    let e = client.stat(&dir, "mem-probe.bin").await.unwrap();
+    assert_eq!(e.map(|e| e.filesize), Some(size), "服务端落盘大小不对");
+
+    let _ = std::fs::remove_file(&local);
+    let _ = client.delete_entry(&dir, "mem-probe.bin").await;
+    let _ = client.delete_entry(&fixture_root(), "rust-mem").await;
+}
+
+///
+/// 改动的性质决定了验证方式：流式与非流式的**唯一**区别是 body 怎么来的，
+/// 服务端不该关心 —— 所以这条测试比的是「流式传的东西与原字节逐字节相同」，
+/// 而不只是「传上去了」。
+///
+/// 覆盖三种尺寸（跨块边界是重点）+ 中文/空格文件名（multipart 边界最容易出问题的地方）。
+/// 会写入真机，跑完自己清理。
+#[tokio::test]
+#[ignore = "需要真机 NAS，且会写入 NAS"]
+async fn stream_upload_matches_bytes_upload() {
+    let Some(client) = logged_in().await else {
+        return;
+    };
+    let dir = format!("{}/rust-stream", fixture_root());
+    let _ = client.mkdir(&fixture_root(), "rust-stream").await;
+
+    // 8 MB 恰好等于 UPLOAD_CHUNK；再加 1 字节迫使服务端跨块收
+    let sizes = [1u64, 4096, 8 * 1024 * 1024 + 1, 20 * 1024 * 1024];
+    for size in sizes {
+        // 内容用可复现的伪随机：全 0 / 全 0xFF 会让某些边角问题测不出来
+        let payload: Vec<u8> = (0..size).map(|i| ((i * 31 + 7) % 251) as u8).collect();
+        let name = if size == sizes[0] {
+            "空 格 流式.bin".to_string()
+        } else {
+            format!("stream-{size}.bin")
+        };
+
+        // 临时目录可能是个只有几 MB 的 tmpfs（写大文件会 ENOSPC），
+        // 所以优先用环境变量指定的目录，其次退到当前目录。
+        let tmpdir = std::env::var("QXYNC_TEST_TMPDIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let local = tmpdir.join(format!("qxync-stream-{size}.bin"));
+        std::fs::write(&local, &payload).unwrap_or_else(|e| {
+            panic!(
+                "写本地临时文件 {}（{size} 字节）失败: {e}；\
+                 可用 QXYNC_TEST_TMPDIR 指定空间充足的目录",
+                local.display()
+            )
+        });
+
+        let sent = client
+            .upload_file(&dir, &local, &name)
+            .await
+            .unwrap_or_else(|e| panic!("流式上传 {name}（{size} 字节）失败: {e}"));
+        assert_eq!(
+            sent, size,
+            "{name}: upload_file 应返回真正发出的字节数 {size}"
+        );
+
+        let e = client
+            .stat(&dir, &name)
+            .await
+            .expect("stat")
+            .expect("存在");
+        assert_eq!(e.filesize, size, "{name}: 服务端落盘大小不对");
+
+        // 逐字节回读（小文件全量；大文件抽头尾 + 中段，避免测试本身跑很久）
+        let back = if size <= 4096 {
+            client.download_range(&dir, &name, 0, size - 1).await.expect("回读")
+        } else {
+            let head = client.download_range(&dir, &name, 0, 4095).await.expect("回读头");
+            let mid = client
+                .download_range(&dir, &name, size / 2, size / 2 + 4095)
+                .await
+                .expect("回读中段");
+            let tail = client
+                .download_range(&dir, &name, size - 4096, size - 1)
+                .await
+                .expect("回读尾");
+            assert_eq!(head, payload[..4096], "{name}: 头部不一致");
+            assert_eq!(tail, payload[size as usize - 4096..], "{name}: 尾部不一致");
+            let m = (size / 2) as usize;
+            assert_eq!(mid, payload[m..m + 4096], "{name}: 中段不一致");
+            Vec::new()
+        };
+        if size <= 4096 {
+            assert_eq!(back, payload, "{name}: 小文件必须逐字节一致");
+        }
+
+        let _ = std::fs::remove_file(&local);
+        let _ = client.delete_entry(&dir, &name).await;
+        println!("  ✓ {name}: {size} 字节流式上传并校验通过");
+    }
+    let _ = client.delete_entry(&fixture_root(), "rust-stream").await;
+}
+
 /// M2b 写接口契约：rename/move/delete + `stat` 的 `exist` 语义。
 ///
 /// 会写入真机（在 `<fixture>/rust-write-api/` 下），跑完自己清理。
