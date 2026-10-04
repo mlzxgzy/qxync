@@ -3119,7 +3119,7 @@ dependencies = [
 
 [[package]]
 name = "qxync-cli"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -3136,7 +3136,7 @@ dependencies = [
 
 [[package]]
 name = "qxync-client"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "base64 0.22.1",
  "futures-util",
@@ -3151,7 +3151,7 @@ dependencies = [
 
 [[package]]
 name = "qxync-core"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "libc",
  "percent-encoding",
@@ -3164,7 +3164,7 @@ dependencies = [
 
 [[package]]
 name = "qxync-daemon"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -3182,7 +3182,7 @@ dependencies = [
 
 [[package]]
 name = "qxync-fuse"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "fuser",
  "libc",
@@ -3197,7 +3197,7 @@ dependencies = [
 
 [[package]]
 name = "qxync-gui"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "libc",
@@ -3220,7 +3220,7 @@ dependencies = [
 
 [[package]]
 name = "qxync-proto-test"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "qxync-client",
  "qxync-core",
