@@ -710,16 +710,67 @@ table.tbl tr.selected { background: var(--accent-soft); }
 table.tbl tbody tr:focus-within { background: var(--accent-soft); }
 table.tbl tbody tr:focus-within td { box-shadow: inset 0 -1px 0 var(--focus); }
 
+/* ★ 表格的横向滚动兜底：列多的时候给出滚动条，
+ *   而不是让最右列被容器**静默裁掉**（那正是文件页表格此前的毛病）。 */
+.tbl-scroll {
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
+
+/* ------------------------------------------------------------- 文件表格
+ * 固定布局 + 显式列宽：文件名列拿走全部剩余宽度，长文件名单行省略（title 给全名），
+ * 其余列按内容给固定 px。这样在 1200px 默认窗口（内容区约 1090px）内总宽 < 容器宽，
+ * 不再需要横向拖；窗口再窄才出滚动条。 */
+.tbl-files {
+  table-layout: fixed;
+  min-width: 720px;              /* 比容器窄才不滚动；比它宽就横向滚，不裁 */
+}
+.tbl-files .col-sel   { width: 34px; }
+.tbl-files .col-type  { width: 46px; }
+.tbl-files .col-name  { width: auto; }   /* 唯一弹性列 */
+.tbl-files .col-size  { width: 84px; }
+.tbl-files .col-time  { width: 128px; }
+.tbl-files .col-state { width: 156px; }
+.tbl-files .col-pin   { width: 150px; }
+
+.tbl-files td.name {
+  max-width: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 「有子目录」的 ▾ 标记（have_child 已并进类型列） */
+.has-child {
+  margin-left: 1px;
+  color: var(--fg-faint);
+  font-size: 10px;
+  cursor: default;
+}
+
+/* pin 下拉：选项文字已缩成英文 key，这里再限一下宽，固定布局下不会被长选项顶开 */
+.tbl-files .pin-select {
+  width: 108px;
+  min-width: 0;
+  padding: 2px 4px;
+  font-size: 11.5px;
+}
+
+/* 行尾的⋯ 菜单按钮 */
+.row-more {
+  margin-left: 0;
+  padding: 1px 6px;
+  font-size: 13px;
+  line-height: 1.2;
+}
+
 .col-act { width: 1%; white-space: nowrap; }
 .col-num { text-align: right; font-family: var(--mono); }
 .col-sel { width: 1%; }
 .col-type { width: 1%; text-align: center; }
 .col-size { width: 1%; text-align: right; white-space: nowrap; }
 .col-time { width: 1%; white-space: nowrap; }
-.col-child { width: 1%; text-align: center; }
 .col-pin { width: 1%; white-space: nowrap; }
-
-.tbl-files td.name { max-width: 420px; }
 
 .name-link {
   background: none;
@@ -1111,8 +1162,12 @@ button.ghost:hover { color: var(--fg-dim); }
 .ctx-item.danger { color: var(--err); }
 .ctx-sep { height: 1px; background: var(--border-soft); margin: 4px 2px; }
 
-/* 文件行的三态列 */
-.tbl-files .col-state { width: 130px; }
+/* 文件行状态列：一行放不下三态时换行，别把行撑得很高 */
+.tbl-files td.col-state .badge {
+  margin-bottom: 2px;
+  white-space: nowrap;
+}
+.tbl-files td.col-state .task-meta { white-space: nowrap; }
 
 /* ============================================================================
  * ★ M8.6：`prefers-reduced-motion: reduce` —— 关掉脉冲/过渡（无障碍基线）

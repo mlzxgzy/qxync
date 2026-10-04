@@ -37,6 +37,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gray and "failed" / "blocked" were visually indistinguishable. Now matched against
   `.c` (higher specificity, so it overrides the earlier `--fg-dim`), plus
   `flex: 1 1 auto; min-width: 0` on `.c` so long text wraps properly.
+- **The GUI file page table did not fit — the whole rightmost "pin / 操作" column was
+  cut off**: at the default 1200px window you had to drag horizontally to reach the end
+  of a row, and the overflow **produced no scrollbar at all** (the card clipped it, so
+  content vanished silently). Three causes stacked up, none of them "the window is too
+  small":
+  1. The pin column rendered, **on every row**, a `<select>` plus four buttons
+     (query pin / set pin / download / dehydrate) — roughly 370px for that one column —
+     while **every one of those four already had an equivalent in the row context menu**.
+     Pure redundancy.
+  2. The table had no horizontal scroll container: `#main` does have `overflow:auto`, but
+     the table is constrained to the card width, so the excess simply disappeared.
+  3. `have_child` had its own column, yet QNAP returns 0 for directories almost always —
+     so the column was permanently empty, wasting ~80px and squeezing the name column.
+
+  Fix: the pin column becomes "narrow select + ⋯ button", with all four operations moved
+  into the row context menu (plus three that were missing: query pin state / set unpinned
+  / exclude); the table is wrapped in a `.tbl-scroll{overflow-x:auto}` safety net;
+  `.tbl-files` switches to `table-layout: fixed` with explicit column widths, the filename
+  column is the only flexible one, and long names ellipsize with the full name in `title`;
+  `have_child` folded into the type column (a ▾ after directories) so no information is
+  lost and a whole column is saved. Measured horizontal overflow while narrowing the
+  content area: 1136→0 / 1000→0 / 900→0 / 800→0, 700→66, 600→166 (only then does it
+  degrade to a scrollbar) — **zero overflow at the 960px minimum window**.
+  `openRowMenu` gained a 4th parameter carrying that row's select into the menu state, so
+  changing pin now writes back to it instead of leaving "unknown" on screen.
 
 ### Not done
 
