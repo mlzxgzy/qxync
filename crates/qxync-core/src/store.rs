@@ -21,19 +21,21 @@
 //! 只是持久层从 JSON 换成 SQLite（调用方代码几乎不动，风险最低）。
 
 use crate::error::{Error, Result};
+use crate::file_id::FileId;
 use crate::sync::{Baseline, Cursors, Sig, BASELINE_FILE, CURSORS_FILE};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// 状态库文件名（每个 NAS 一个：`<data>/sync/<host>/sync.db`）。
 pub const DB_FILE: &str = "sync.db";
 
 /// schema 版本（写进 `PRAGMA user_version`；将来加表要迁移时用它判断）。
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 // ★ M8.3：v1 → v2 只是**新增 journal 表与索引**。
 // ★ M8.4：v2 → v3 只是**新增 decisions 表（冲突待裁决队列）**。
+// ★ M15/T9：v3 → v4 只是**新增 nodes 表（稳定文件身份 file_id → path 的索引）**。
 // 因为整份 SCHEMA_SQL 都是
 // `CREATE TABLE/INDEX IF NOT EXISTS`，老库在下次 `Store::open()` 时会被自动补齐，
 // **不需要写迁移代码、也不会碰已有表里的数据**（迁移幂等由 m5-matrix 断言覆盖）。
@@ -113,7 +115,53 @@ CREATE TABLE IF NOT EXISTS decisions (
 );
 CREATE INDEX IF NOT EXISTS decisions_created ON decisions(created_unix DESC);
 CREATE INDEX IF NOT EXISTS decisions_path    ON decisions(path);
+-- ★ M15/T9：`nodes` —— 稳定文件身份 `file_id` → 路径的双向索引。
+--
+-- 为什么需要：M2c 之后所有状态都以 **path 为主键**（baseline / uploads / deletes /
+-- pins / decisions 五张表，外加内存里的 `Inner.by_remote`）。服务端 `get_list`
+-- 又**不提供任何 id**（见 model.rs 的 DirEntry）→ 远端把 `a.txt` 改名成 `b.txt`，
+-- 本地看到的就是「a.txt 没了 + b.txt 来了」，两者毫无关系，decide 只能判成
+-- 「删除 + 新增」→ 平白生成冲突副本。这张表把「同一个东西的两个名字」接起来。
+--
+-- file_id 是**本地自建**的（`qxync_core::file_id::compute_file_id`），纯函数可复算。
+-- 表是**缓存/派生**出来的索引，不是权威状态：任何一行丢了都只是退化成
+-- 「配不上 rename」（保守退回旧的增删判定），不会丢数据 —— 这是它能被
+-- 「随时重建」的原因，也是清理策略可以激进的原因（见 `Store::node_forget`）。
+--
+-- ★ 主键是 **(file_id, path) 复合键，不是 file_id 单列** —— 这是与「file_id 作主键」
+--   的刻意分歧。file_id 由 `(mtime, size)` 算出（见 file_id 模块），所以**两个不同的
+--   文件完全可能算出同一个 id**（批量 rsync 的小文件 mtime 相同、大小也相同是常事）。
+--   单列主键会让后写的那一行把前一行「顶掉」（`path` 被改写），另一个文件的身份
+--   就此从表里消失 —— 索引静默丢数据。复合键下「同 id 多行」是合法状态：
+--   调用方看到多行就知道**有歧义**，于是保守地不配对（见 `sync::pair_renames`）。
+--   「一个路径只挂一个身份」由 path 的唯一索引保证。
+CREATE TABLE IF NOT EXISTS nodes (
+  file_id    BLOB    NOT NULL CHECK (length(file_id) = 16),
+  path       TEXT    NOT NULL,
+  remote_path TEXT   NOT NULL DEFAULT '',
+  size       INTEGER NOT NULL DEFAULT 0,
+  mtime      INTEGER NOT NULL DEFAULT 0,
+  isfolder   INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (file_id, path)
+);
+-- path 侧查询（上传队列落地时按 file_id 反查最新名字、对账时按 path 取身份）
+CREATE UNIQUE INDEX IF NOT EXISTS nodes_path ON nodes(path);
 "#;
+
+/// ★ M15/T9：`nodes` 表的一行 —— 一个稳定文件身份当前对应的路径。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeRow {
+    pub file_id: FileId,
+    /// 该身份当前对应的路径（**会随改名变**，file_id 不变）。
+    pub path: String,
+    /// 远端路径（与 `path` 通常相同；分开留是为了将来本地视图与远端视图分家）。
+    pub remote_path: String,
+    pub size: u64,
+    pub mtime: i64,
+    pub is_folder: bool,
+    pub updated_at: i64,
+}
 
 /// 上传队列里的一行（M5 起队列也进状态库）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -277,6 +325,22 @@ pub fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+/// 把字面量前缀转成 `LIKE ... ESCAPE '\'` 的模式（转义 `%` / `_` / `\`）。
+///
+/// ★ M15/T9 的目录子树清理要用它：目录名里出现 `%`（`100%`）或 `_`（`a_b`）
+/// 是合法的，不转义就会被当成通配符 → **删掉不在范围内的行**。
+fn like_prefix(prefix: &str) -> String {
+    let mut out = String::with_capacity(prefix.len() + 8);
+    for c in prefix.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('%');
+    out
+}
+
 /// 从 JSON 迁移的结果（验收脚本会读它）。
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct MigrateReport {
@@ -295,8 +359,19 @@ impl MigrateReport {
 }
 
 /// 一个 NAS 的状态库。
+///
+/// ★ M15/T9：连接放在 `Arc` 里，于是 `Store` 可以廉价克隆。
+/// 克隆出来的句柄**共用同一个 SQLite 连接**（不是各开一个）—— 这正是要的：
+/// FUSE 侧要拿一份 `Store` 做 `nodes` 身份索引（`with_nodes_store`），
+/// 它必须和同步引擎那份看到同一份数据、并且共用同一把连接锁。
+/// 万一有人误以为克隆 = 独立副本，那也是「共享」比「各开一个连接写同一个文件」安全得多的方向
+/// （后者会撞 SQLite 的写锁）。
+///
+/// ⚠️ 想在多个组件间共享**同一个** `Store`，请用 `Arc<Store>`（`SyncState` 就是这么放的），
+/// 不要靠克隆 `Store` —— 克隆虽然共享连接，但 `path()` 之类的语义会让人以为它是独立实例。
+#[derive(Clone)]
 pub struct Store {
-    conn: Mutex<Connection>,
+    conn: Arc<Mutex<Connection>>,
     path: PathBuf,
 }
 
@@ -329,7 +404,7 @@ impl Store {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(Error::from)?;
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: Arc::new(Mutex::new(conn)),
             path,
         })
     }
@@ -773,6 +848,211 @@ impl Store {
         let n = self
             .conn()
             .execute("DELETE FROM decisions", [])
+            .map_err(Error::from)?;
+        Ok(n)
+    }
+
+    // ------------------------------------------------------------ ★ M15/T9 nodes（稳定身份）
+
+    /// 记/更新一个身份的当前位置。
+    ///
+    /// 语义（复合主键 `(file_id, path)`）：
+    ///
+    /// * **同 path 换了 file_id** → 先删掉该 path 的旧行再插新的。必须这么做：
+    ///   `nodes_path` 是唯一索引，不删就会直接报错，而报错等于「改名功能整个挂掉」。
+    ///   语义上也对：内容变了（改了 size/mtime）就是新身份，同一个路径不能同时
+    ///   挂两个身份。
+    /// * **同 file_id 换了 path** → 插一行新的（这就是「改名」在表里的样子：
+    ///   身份不变、地址变了；旧行由 `node_rename` 负责删/改）。
+    /// * **同 file_id 出现在不同 path 上** → 允许并存。file_id 只由 `(mtime,size)`
+    ///   算出，不同文件撞 id 是常事；并存才是诚实的，「哪一条才是那个文件」交给
+    ///   调用方按歧义处理（保守不配对）。
+    pub fn node_upsert(&self, row: &NodeRow) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(Error::from)?;
+        tx.execute(
+            "DELETE FROM nodes WHERE path = ?1 AND file_id <> ?2",
+            params![row.path, row.file_id.as_slice()],
+        )
+        .map_err(Error::from)?;
+        tx.execute(
+            "INSERT INTO nodes (file_id, path, remote_path, size, mtime, isfolder, updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)
+             ON CONFLICT(file_id, path) DO UPDATE SET
+               remote_path = excluded.remote_path,
+               size        = excluded.size,
+               mtime       = excluded.mtime,
+               isfolder    = excluded.isfolder,
+               updated_at  = excluded.updated_at",
+            params![
+                row.file_id.as_slice(),
+                row.path,
+                row.remote_path,
+                row.size as i64,
+                row.mtime,
+                row.is_folder as i64,
+                row.updated_at,
+            ],
+        )
+        .map_err(Error::from)?;
+        tx.commit().map_err(Error::from)?;
+        Ok(())
+    }
+
+    fn node_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NodeRow> {
+        let blob: Vec<u8> = r.get(0)?;
+        let mut file_id = crate::file_id::ZERO_FILE_ID;
+        // 长度不足 16 的畸形行：补零（CHECK 约束已挡，这里只是防御旧库/手工改库）
+        let n = blob.len().min(16);
+        file_id[..n].copy_from_slice(&blob[..n]);
+        Ok(NodeRow {
+            file_id,
+            path: r.get(1)?,
+            remote_path: r.get(2)?,
+            size: r.get::<_, i64>(3)? as u64,
+            mtime: r.get(4)?,
+            is_folder: r.get::<_, i64>(5)? != 0,
+            updated_at: r.get(6)?,
+        })
+    }
+
+    const NODE_COLS: &'static str = "file_id, path, remote_path, size, mtime, isfolder, updated_at";
+
+    /// 按身份取**全部**行（对账/上传队列落地时的主力查询）。
+    ///
+    /// 返回 `Vec` 而不是 `Option`：file_id 只由 `(mtime,size)` 算出，
+    /// 不同文件撞 id 是常事（见 `SCHEMA_SQL` 里的说明）。调用方拿到多行就应当
+    /// **当作歧义**处理（保守退回），而不是随便挑一条。
+    pub fn nodes_by_file_id(&self, file_id: &FileId) -> Result<Vec<NodeRow>> {
+        let sql = format!(
+            "SELECT {} FROM nodes WHERE file_id = ?1 ORDER BY updated_at DESC, path",
+            Self::NODE_COLS
+        );
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&sql).map_err(Error::from)?;
+        let rows = stmt
+            .query_map(params![file_id.as_slice()], |r| Self::node_from_row(r))
+            .map_err(Error::from)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(Error::from)?);
+        }
+        Ok(out)
+    }
+
+    /// 按路径取（改名迁移的落点检查、配对前的自查；路径唯一，所以至多一行）。
+    pub fn node_by_path(&self, path: &str) -> Result<Option<NodeRow>> {
+        let sql = format!("SELECT {} FROM nodes WHERE path = ?1", Self::NODE_COLS);
+        Ok(self
+            .conn()
+            .query_row(&sql, params![path], |r| Self::node_from_row(r))
+            .optional()
+            .map_err(Error::from)?)
+    }
+
+    /// 全量（对账配对用；按 path 排序保证遍历顺序确定）。
+    pub fn nodes(&self) -> Result<Vec<NodeRow>> {
+        let sql = format!("SELECT {} FROM nodes ORDER BY path", Self::NODE_COLS);
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&sql).map_err(Error::from)?;
+        let rows = stmt
+            .query_map([], |r| Self::node_from_row(r))
+            .map_err(Error::from)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(Error::from)?);
+        }
+        Ok(out)
+    }
+
+    /// ★ 改名：**只改 path，`file_id` 一个字节都不动**。
+    ///
+    /// 这是 T9 的语义核心 —— 身份跟着文件走，名字是它当下的地址。
+    /// 返回是否命中（没命中不算错：可能这个身份还没被记进表里）。
+    ///
+    /// 目标路径上已有别的身份时**先删那一行**：`nodes_path` 是唯一索引，
+    /// 不删就会撞约束报错，而报错等于「改名直接失败」—— 比删掉更糟。
+    /// 被删的那一行只能是「同名位置上另一个身份」，它下次对账会重新记进来。
+    pub fn node_rename(&self, old_path: &str, new_path: &str) -> Result<bool> {
+        if old_path == new_path {
+            return Ok(false);
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(Error::from)?;
+        // 先查旧位置上那个身份（path 唯一，至多一行）。
+        let moved: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT file_id FROM nodes WHERE path = ?1",
+                params![old_path],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(Error::from)?;
+        let Some(id) = moved else {
+            tx.commit().map_err(Error::from)?;
+            return Ok(false);
+        };
+        // 目标路径上已有别的身份 → 先删那一行。它下次对账会按新内容重新记进来，
+        // 现在留着只会让 `nodes_path` 唯一约束把整个改名打挂（报错 = 改名失败）。
+        tx.execute(
+            "DELETE FROM nodes WHERE path = ?1 AND file_id <> ?2",
+            params![new_path, id],
+        )
+        .map_err(Error::from)?;
+        let n = tx
+            .execute(
+                "UPDATE nodes SET path = ?2, updated_at = ?3 WHERE path = ?1",
+                params![old_path, new_path, now_unix()],
+            )
+            .map_err(Error::from)?;
+        tx.commit().map_err(Error::from)?;
+        Ok(n > 0)
+    }
+
+    /// ★ 清理：本地/远端真的删掉了 → 把这个身份的行删掉。
+    ///
+    /// **为什么必须删**（正确性红线）：留着行，下次对账时那个 `file_id` 还在，
+    /// 而新出现的文件**可能算出同一个 `file_id`**（`(mtime, size)` 相同就会撞，
+    /// 见 `file_id` 模块头「代价要写清楚」）。老身份没清 → 新文件被认成
+    /// 「老文件改名过来的」→ 配错对 → **丢数据**。
+    /// 所以策略是**删除点即清理**，而不是靠事后对账扫描（扫描会有窗口期）。
+    pub fn node_forget(&self, path: &str) -> Result<bool> {
+        let n = self
+            .conn()
+            .execute("DELETE FROM nodes WHERE path = ?1", params![path])
+            .map_err(Error::from)?;
+        Ok(n > 0)
+    }
+
+    /// ★ 清理：删一个目录节点时把它下面的所有身份一起清掉（路径前缀匹配）。
+    ///
+    /// `prefix` 传目录自身的远端路径（不带尾斜杠），内部补斜杠，
+    /// 免得 `/home/a` 误删 `/home/ab`。
+    pub fn node_forget_subtree(&self, dir: &str) -> Result<usize> {
+        let prefix = format!("{}/", dir.trim_end_matches('/'));
+        let n = self
+            .conn()
+            .execute(
+                "DELETE FROM nodes WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'",
+                params![dir, like_prefix(&prefix)],
+            )
+            .map_err(Error::from)?;
+        Ok(n)
+    }
+
+    pub fn nodes_len(&self) -> Result<u64> {
+        let n: i64 = self
+            .conn()
+            .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+            .map_err(Error::from)?;
+        Ok(n as u64)
+    }
+
+    /// 清空整张表（**只清索引，不动任何文件**；用于重建）。
+    pub fn nodes_clear(&self) -> Result<usize> {
+        let n = self
+            .conn()
+            .execute("DELETE FROM nodes", [])
             .map_err(Error::from)?;
         Ok(n)
     }
@@ -1630,6 +1910,223 @@ mod tests {
         .unwrap();
         assert_eq!(s.decisions().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn tmpdir_t9(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "qxync-store-t9-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// ★ M15/T9：v3 老库打开后自动补 `nodes` 表（不写迁移代码），**五张老表数据一条不丢**。
+    #[test]
+    fn nodes_table_added_to_v3_db_without_losing_old_tables() {
+        let dir = tmpdir_t9("v3");
+        let db = dir.join(DB_FILE);
+        {
+            // 按 v3 的真实 schema 建库并塞数据（baseline/pins/uploads/deletes/decisions 五张）
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE baseline (path TEXT PRIMARY KEY, present INTEGER NOT NULL,
+                   is_dir INTEGER NOT NULL, size INTEGER NOT NULL, mtime INTEGER NOT NULL);
+                 CREATE TABLE pins (path TEXT PRIMARY KEY, state TEXT NOT NULL);
+                 CREATE TABLE uploads (remote_path TEXT PRIMARY KEY, remote_dir TEXT NOT NULL,
+                   remote_name TEXT NOT NULL, local TEXT NOT NULL,
+                   mtime INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0,
+                   ephemeral INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE deletes (remote_path TEXT PRIMARY KEY, remote_dir TEXT NOT NULL,
+                   remote_name TEXT NOT NULL, is_dir INTEGER NOT NULL DEFAULT 0,
+                   attempts INTEGER NOT NULL DEFAULT 0, queued_unix INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE decisions (id TEXT PRIMARY KEY, path TEXT NOT NULL UNIQUE,
+                   task_id TEXT NOT NULL DEFAULT '', is_dir INTEGER NOT NULL DEFAULT 0,
+                   local_size INTEGER NOT NULL DEFAULT 0, local_mtime INTEGER NOT NULL DEFAULT 0,
+                   remote_size INTEGER NOT NULL DEFAULT 0, remote_mtime INTEGER NOT NULL DEFAULT 0,
+                   created_unix INTEGER NOT NULL DEFAULT 0, resolution TEXT);
+                 INSERT INTO baseline VALUES ('/home/a.txt',1,0,10,100);
+                 INSERT INTO baseline VALUES ('/home/dir',1,1,0,0);
+                 INSERT INTO pins VALUES ('/home/a.txt','pinned');
+                 INSERT INTO uploads VALUES ('/home/a.txt','/home','a.txt','/tmp/a',100,0,0);
+                 INSERT INTO deletes VALUES ('/home/gone.txt','/home','gone.txt',0,2,55);
+                 INSERT INTO decisions VALUES ('x','/home/c.txt','',0,0,0,0,0,7,NULL);",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 3i64).unwrap();
+        }
+        let s = Store::open(&db).unwrap();
+        assert_eq!(s.schema_version().unwrap(), 4, "打开时应升到 v4");
+        assert_eq!(s.integrity_check().unwrap(), "ok");
+
+        // 五张老表的数据一条不丢
+        let b = s.baseline().unwrap();
+        assert_eq!(b.len(), 2);
+        assert_eq!(b.get("/home/a.txt").size, 10);
+        assert!(b.get("/home/dir").is_dir);
+        assert_eq!(s.pin("/home/a.txt").unwrap().as_deref(), Some("pinned"));
+        assert_eq!(s.uploads().unwrap().len(), 1);
+        assert_eq!(s.uploads().unwrap()[0].attempts, 0);
+        let d = s.deletes().unwrap();
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].attempts, 2, "重试计数必须原样保留");
+        let dec = s.decisions().unwrap();
+        assert_eq!(dec.len(), 1);
+        assert_eq!(dec[0].path, "/home/c.txt");
+
+        // 新表是空的，且可用
+        assert_eq!(s.nodes_len().unwrap(), 0);
+        let id = crate::file_id::compute_file_id(false, 10, 100, "a.txt", "/home");
+        s.node_upsert(&NodeRow {
+            file_id: id,
+            path: "/home/a.txt".into(),
+            remote_path: "/home/a.txt".into(),
+            size: 10,
+            mtime: 100,
+            is_folder: false,
+            updated_at: 1,
+        })
+        .unwrap();
+        assert_eq!(s.nodes_by_file_id(&id).unwrap()[0].path, "/home/a.txt");
+        assert_eq!(s.node_by_path("/home/a.txt").unwrap().unwrap().file_id, id);
+        assert_eq!(s.integrity_check().unwrap(), "ok");
+
+        // 再打开一次仍幂等（v4 → v4 不重复建表、不报错）
+        drop(s);
+        let s2 = Store::open(&db).unwrap();
+        assert_eq!(s2.schema_version().unwrap(), 4);
+        assert_eq!(s2.nodes_len().unwrap(), 1);
+        assert_eq!(s2.baseline().unwrap().len(), 2, "二次打开数据仍在");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M15/T9：upsert / 改名 / 清理的完整语义。
+    #[test]
+    fn nodes_upsert_rename_and_forget_semantics() {
+        let s = Store::open_in_memory().unwrap();
+        let id_a = crate::file_id::compute_file_id(false, 10, 100, "a.txt", "/home");
+        let mk = |id: FileId, path: &str, size: u64| NodeRow {
+            file_id: id,
+            path: path.into(),
+            remote_path: path.into(),
+            size,
+            mtime: 100,
+            is_folder: false,
+            updated_at: 0,
+        };
+
+        s.node_upsert(&mk(id_a, "/home/a.txt", 10)).unwrap();
+        s.node_upsert(&mk(id_a, "/home/a.txt", 10)).unwrap();
+        assert_eq!(s.nodes_len().unwrap(), 1, "同身份同路径重复写只留一行");
+
+        // 改名：path 变、file_id 不变
+        assert!(s.node_rename("/home/a.txt", "/home/b.txt").unwrap());
+        let rows = s.nodes_by_file_id(&id_a).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "/home/b.txt");
+        assert_eq!(rows[0].file_id, id_a, "★ 改名必须保住身份");
+        assert!(s.node_by_path("/home/a.txt").unwrap().is_none());
+        assert!(
+            !s.node_rename("/home/nope", "/home/x").unwrap(),
+            "没命中不算错"
+        );
+
+        // 同一路径换身份（内容变了）→ 旧行必须被顶掉，不能撞唯一索引
+        let id_b = crate::file_id::compute_file_id(false, 11, 100, "b.txt", "/home");
+        s.node_upsert(&mk(id_b, "/home/b.txt", 11)).unwrap();
+        assert_eq!(s.nodes_len().unwrap(), 1, "同路径的新身份顶掉旧的");
+        assert!(s.nodes_by_file_id(&id_a).unwrap().is_empty());
+
+        // 清理：删本地文件 → 身份必须消失（否则下次会误配到新文件上）
+        assert!(s.node_forget("/home/b.txt").unwrap());
+        assert_eq!(s.nodes_len().unwrap(), 0);
+        assert!(!s.node_forget("/home/b.txt").unwrap());
+    }
+
+    /// ★ M15/T9：不同文件算出同一个 `file_id` 时**必须并存**，不能互相顶掉。
+    ///
+    /// 这是复合主键 `(file_id, path)` 存在的理由：file_id 只由 `(mtime,size)` 算出，
+    /// 批量同步的小文件撞 id 是常事。单列主键会让「后写的顶掉先写的」，
+    /// 另一个文件的身份静默消失 → 索引丢数据。
+    #[test]
+    fn nodes_keeps_distinct_paths_that_share_a_file_id() {
+        let s = Store::open_in_memory().unwrap();
+        // 同样的 (mtime, size) → 必然同一个 id
+        let id = crate::file_id::compute_file_id(false, 4, 100, "x", "/home/a");
+        let same = crate::file_id::compute_file_id(false, 4, 100, "y", "/home/b");
+        assert_eq!(id, same, "本测试的前提：两个文件撞同一个 id");
+
+        for p in ["/home/a/1.txt", "/home/a/2.txt", "/home/b/1.txt"] {
+            s.node_upsert(&NodeRow {
+                file_id: id,
+                path: p.into(),
+                remote_path: p.into(),
+                size: 4,
+                mtime: 100,
+                is_folder: false,
+                updated_at: 0,
+            })
+            .unwrap();
+        }
+        assert_eq!(s.nodes_len().unwrap(), 3, "三条都得在");
+        assert_eq!(
+            s.nodes_by_file_id(&id).unwrap().len(),
+            3,
+            "查身份时看到 3 行 = 歧义"
+        );
+        // 路径唯一仍然成立
+        s.node_upsert(&NodeRow {
+            file_id: crate::file_id::compute_file_id(false, 5, 100, "z", "/home/a"),
+            path: "/home/a/1.txt".into(),
+            remote_path: "/home/a/1.txt".into(),
+            size: 5,
+            mtime: 100,
+            is_folder: false,
+            updated_at: 0,
+        })
+        .unwrap();
+        assert_eq!(s.nodes_len().unwrap(), 3, "换身份顶掉旧行，总数不变");
+    }
+
+    /// ★ M15/T9：目录子树清理 —— 前缀匹配，且**不该误删同前缀的兄弟**。
+    #[test]
+    fn nodes_forget_subtree_does_not_touch_sibling_prefix() {
+        let s = Store::open_in_memory().unwrap();
+        // 每条用不同的 mtime，避免撞 file_id 造成「同 id 并存」干扰这个断言
+        let mut seq = 1i64;
+        let mut put = |name: &str, parent: &str| {
+            seq += 1;
+            s.node_upsert(&NodeRow {
+                file_id: crate::file_id::compute_file_id(false, 1, seq, name, parent),
+                path: format!("{parent}/{name}"),
+                remote_path: format!("{parent}/{name}"),
+                size: 1,
+                mtime: seq,
+                is_folder: false,
+                updated_at: 0,
+            })
+            .unwrap();
+        };
+        put("in_dir.txt", "/home/a");
+        put("deep.txt", "/home/a/sub");
+        put("sibling.txt", "/home/ab");
+
+        assert_eq!(s.node_forget_subtree("/home/a").unwrap(), 2);
+        assert_eq!(
+            s.nodes_len().unwrap(),
+            1,
+            "/home/ab 不能被 /home/a 的清理带走"
+        );
+        assert_eq!(s.nodes().unwrap()[0].path, "/home/ab/sibling.txt");
+
+        // 含 LIKE 通配符的目录名不能被当成通配符
+        put("x.txt", "/home/100%_d");
+        assert_eq!(s.node_forget_subtree("/home/100%_d").unwrap(), 1);
+        assert_eq!(s.nodes_len().unwrap(), 1);
     }
 }
 

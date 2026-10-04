@@ -17,8 +17,9 @@ use qxync_client::{write_action, Client};
 use qxync_core::rules::{HideReason, Rules};
 use qxync_core::store::{Store, DB_FILE};
 use qxync_core::sync::{
-    conflict_name, conflict_name_with_seq, decide, is_log_missing, map_event_path, Baseline,
-    Cursors, Decision, DeleteProtection, LocalSig, Sig, DEFAULT_LOG_BATCH,
+    apply_renames_to_baseline, conflict_name, conflict_name_with_seq, decide, is_log_missing,
+    map_event_path, pair_renames, Baseline, Cursors, Decision, DeleteProtection, LocalSig,
+    RenameCandidate, Sig, DEFAULT_LOG_BATCH,
 };
 use qxync_core::tasks::{
     CONFLICT_ASK, CONFLICT_RENAME_REMOTE, CONFLICT_REPLACE_LOCAL, CONFLICT_REPLACE_REMOTE,
@@ -101,6 +102,8 @@ pub struct SyncReport {
     pub conflicts: u64,
     pub deleted: u64,
     pub deletes_blocked: u64,
+    /// ★ M15/T9：按 `file_id` 认出并迁移成功的远端改名次数。
+    pub renamed: u64,
     pub baseline_entries: usize,
     pub dirs_scanned: usize,
     pub devices: Vec<String>,
@@ -699,8 +702,47 @@ async fn reconcile_view(
         remote_map.len()
     );
 
+    // ★ M15/T9：**先把「远端删除 + 远端新增」按 `file_id` 配成改名**，
+    // 配上的走 `rename_remote` 迁移本地节点 —— 不生成冲突副本。
+    //
+    // 必须在删除/决策**之前**做完：配上的路径要同时从「删除清单」和「决策循环」里摘掉，
+    // 否则会被后面的删除分支当成「远端没了」把本地节点连缓存一起删掉。
+    //
+    // 保守性由 `pair_renames` 保证（唯一+ 互斥 + 类型一致才配），这里再做一层：
+    // `rename_remote` 返回 false（视图不支持 / 目标已被占）就**不配**，
+    // 退回原有的增删判定。
+    let renames = collect_renames(view, baseline, &candidates, &remote_map, report);
+    let mut renamed_set: BTreeSet<String> = BTreeSet::new();
+    for pair in &renames {
+        if !view.view.rename_remote(&pair.old_path, &pair.new_path) {
+            // 迁移失败 → 这一对不成立，保守退回增删判定。
+            tracing::debug!(
+                "改名配对迁移失败 {} → {}（退回增删判定）",
+                pair.old_path,
+                pair.new_path
+            );
+            continue;
+        }
+        renamed_set.insert(pair.old_path.clone());
+        renamed_set.insert(pair.new_path.clone());
+        // baseline 跟着搬：旧路径的签名迁到新路径，下一轮不再当成「本地新增」。
+        apply_renames_to_baseline(baseline, std::slice::from_ref(pair));
+        if report.renamed < u64::MAX {
+            report.renamed += 1;
+        }
+    }
+    if !renamed_set.is_empty() {
+        report.note(format!(
+            "按文件身份认出 {} 处远端改名（不生成冲突副本）",
+            report.renamed
+        ));
+    }
+
     let mut deletes: Vec<String> = Vec::new();
     for path in &candidates {
+        if renamed_set.contains(path) {
+            continue;
+        }
         let remote = remote_map.get(path).copied().unwrap_or(Sig::MISSING);
         let local = local_sig(view, path);
         let base = baseline.get(path);
@@ -748,6 +790,89 @@ async fn reconcile_view(
         }
         report.note(format!("删除 {} 项", deletes.len()));
     }
+}
+
+/// ★ M15/T9：收集本轮可能的改名对 —— 「远端已删」×「远端新增」，按 `file_id` 配。
+///
+/// 两侧的取法（都是**本轮已观测到的事实**，不猜）：
+///
+/// * **已删侧** = 在 `candidates` 里、但不在 `remote_map` 里的路径 —— 对账已经认定
+///   「本地/基线里有、远端这轮没列出来」。
+/// * **新增侧** = 在 `remote_map` 里、但既不在 `candidates` 也不在 `baseline` 里的路径 ——
+///   即「远端有了、本地还没见过」。
+///
+/// 配对本身交给 `pair_renames`（唯一 / 互斥 / 类型一致才配，歧义整组作废）。
+/// 这里只负责**把两侧的 `file_id` 算出来并组装好候选**，外加两条本层特有的过滤：
+///
+/// 1. 身份为 `ZERO_FILE_ID` 的一律不参与 —— 「不知道」不能当成「同一个」；
+/// 2. 两侧都必须在同一个挂载视图的远端根之下 —— 别把两个视图的路径凑成一对。
+///
+/// 返回的候选对**只是候选** —— 调用方还要看 `rename_remote` 是否真的迁移成功，
+/// 失败就整对作废（退回增删判定）。
+fn collect_renames(
+    view: &MountView,
+    baseline: &Baseline,
+    candidates: &BTreeSet<String>,
+    remote_map: &BTreeMap<String, Sig>,
+    _report: &mut SyncReport,
+) -> Vec<qxync_core::sync::RenamePair> {
+    let root = view.remote_root.trim_end_matches('/').to_string();
+    let under_root =
+        |p: &str| p == root || p.starts_with(&format!("{root}/"));
+
+    // 新增侧：远端有、本地没见过。
+    let mut added: Vec<RenameCandidate> = Vec::new();
+    for (path, sig) in remote_map {
+        if candidates.contains(path) || baseline.get(path).exists {
+            continue;
+        }
+        let Some(fid) = candidate_file_id(view, path, sig) else {
+            continue;
+        };
+        added.push(RenameCandidate::new(path.clone(), fid, sig.is_dir));
+    }
+    if added.is_empty() {
+        return Vec::new();
+    }
+
+    // 已删侧：候选里有、远端这轮没列出来。
+    let mut removed: Vec<RenameCandidate> = Vec::new();
+    for path in candidates {
+        if remote_map.contains_key(path) || !under_root(path) {
+            continue;
+        }
+        let Some(node) = view.view.node(path) else {
+            continue;
+        };
+        // 用**节点自己的身份**（FUSE 侧按内容算好存着）。取不到就不参与 ——
+        // 宁可少配一对（退回增删，多个副本），也不要拿一个猜出来的身份去配。
+        if node.file_id == qxync_core::file_id::ZERO_FILE_ID {
+            continue;
+        }
+        removed.push(RenameCandidate::new(path.clone(), node.file_id, node.is_dir));
+    }
+    if removed.is_empty() {
+        return Vec::new();
+    }
+    pair_renames(&removed, &added)
+}
+
+/// 算出「远端新增项」的身份。新增侧本地还没有节点，只能按远端签名算 ——
+/// 与本地节点用的是同一个算法（`compute_file_id`），所以两边算出来的 id 可比。
+fn candidate_file_id(view: &MountView, path: &str, sig: &Sig) -> Option<qxync_core::file_id::FileId> {
+    use qxync_core::file_id::{compute_file_id, ZERO_FILE_ID};
+    let name = path.rsplit_once('/').map(|(_, n)| n).unwrap_or(path);
+    let parent = path.rsplit_once('/').map(|(d, _)| d).unwrap_or("/");
+    let fid = compute_file_id(sig.is_dir, sig.size, sig.mtime, name, parent);
+    if fid == ZERO_FILE_ID {
+        return None;
+    }
+    // 挂载根之外的路径不参与（防止跨视图配对）
+    let root = view.remote_root.trim_end_matches('/');
+    if !(path == root || path.starts_with(&format!("{root}/"))) {
+        return None;
+    }
+    Some(fid)
 }
 
 /// 执行非删除类决策。
@@ -1290,6 +1415,9 @@ mod tests {
                     mtime,
                     dirty,
                     cache,
+                    // ★ M15/T9：测试替身没有真实身份计算 → 留全零 = 「身份未知」。
+                    // 全零在 `pair_renames` 里一律不配，行为退回 T9 之前的增删判定。
+                    file_id: qxync_core::file_id::ZERO_FILE_ID,
                 },
             );
         }
@@ -1409,6 +1537,13 @@ mod tests {
                 mtime,
                 attempts: 0,
                 ephemeral: false,
+                // ★ M15/T9：这里的作业是同步引擎入队的，身份由 FUSE 侧按内容算。
+                // 传全零 = 「无身份」→ 上传时不做按身份重定向，退化成写死 remote_name
+                // （与 T9 之前的行为一致）。
+                file_id: qxync_core::file_id::ZERO_FILE_ID,
+                // ★ T8：入队时还没开始传
+                bytes_sent: 0,
+                bytes_total: 0,
             })
         }
     }

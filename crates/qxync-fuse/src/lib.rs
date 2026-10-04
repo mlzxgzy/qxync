@@ -30,7 +30,9 @@ use crate::delete::DeleteJob;
 use qxync_client::peer::{self, ContentSource, PeerConfig, PeerHead};
 use qxync_client::Client;
 use qxync_core::dehydrate::{Block, Candidate, Policy};
+use qxync_core::file_id::{compute_file_id, FileId, ZERO_FILE_ID};
 use qxync_core::rules::{HideReason, Rules};
+use qxync_core::store::{NodeRow, Store};
 use qxync_core::DirEntry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
@@ -99,16 +101,16 @@ const STATE_HEAD_V1: usize = 8 + 4 + 8 + 8 + 8 + 8;
 /// 「还没算出整文件校验和」的哨兵 —— 0 不用，因为 xxhash64 可能真是 0。
 const NO_HASH: u64 = u64::MAX;
 
-/// ★ T3：全零的 `file_id`（还没接 T9 的稳定身份，先占位）。
-const ZERO_FILE_ID: [u8; 16] = [0u8; 16];
+/// ★ T3：全零的 `file_id` —— 「没有身份」的哨兵，**只在测试与降级路径出现**。
+/// 真实值一律由 [`qxync_core::file_id::compute_file_id`] 算（★ M15/T9）。
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ChunkState {
     chunk_size: u64,
     size: u64,
     mtime: i64,
-    /// ★ T9 用：跨改名/移动稳定的文件身份；当前恒为全零。
-    file_id: [u8; 16],
+    /// ★ T9：跨改名/移动稳定的文件身份（由 `compute_file_id` 算出，随签名变化更新）。
+    file_id: FileId,
     /// ★ T3：整文件校验和（全量就绪时算一次，用于「一个数判全文件」）。
     /// 未算出时是 [`NO_HASH`]。
     whole_xxhash: u64,
@@ -269,7 +271,10 @@ fn state_load(cache: &Path) -> Option<ChunkState> {
             None
         }
         StateVerdict::Corrupt => {
-            tracing::warn!("水合位图损坏，按未缓存处理: {}", state_path(cache).display());
+            tracing::warn!(
+                "水合位图损坏，按未缓存处理: {}",
+                state_path(cache).display()
+            );
             None
         }
     }
@@ -343,16 +348,78 @@ fn sum_store_all(cache: &Path, hashes: &[u64]) -> io::Result<()> {
     std::fs::rename(&tmp, sum_path(cache))
 }
 
+/// ★ T9：按节点的**当前签名**现算 `file_id`（不读节点里存的那份）。
+///
+/// 为什么每次现算而不是信任 `Node.file_id`：`file_id` 是
+/// `(is_dir, size, mtime)` 的纯函数，任何改了签名的路径（`write` / `setattr` /
+/// 后台刷新换上）都会让它变 —— 现算就永远不会「用旧身份去签新内容」。
+/// 父目录远端路径从节点表里取（改名时 `parent` 已更新，取到的是新父目录）。
+fn compute_node_file_id(inner: &Arc<Mutex<Inner>>, ino: INodeNo) -> Option<FileId> {
+    let g = inner.lock().unwrap();
+    let n = g.nodes.get(&ino)?;
+    let parent_remote = g
+        .nodes
+        .get(&n.parent)
+        .map(|p| p.remote.clone())
+        .unwrap_or_default();
+    Some(compute_file_id(
+        n.attr.kind == FileType::Directory,
+        n.attr.size,
+        epoch_secs(n.attr.mtime),
+        &n.name,
+        &parent_remote,
+    ))
+}
+
+/// ★ T9：把一个身份的当前位置记进 `nodes` 表（未注入 store 时**静默跳过**）。
+///
+/// 只记「当前这一条」，不记历史：`nodes` 是**当下位置**的索引，
+/// 历史关联由「改名时改 path、删除时删行」维护。
+fn nodes_remember(
+    nodes: Option<&Arc<Store>>,
+    remote: &str,
+    file_id: FileId,
+    size: u64,
+    mtime: i64,
+    is_dir: bool,
+) {
+    let Some(store) = nodes else { return };
+    if let Err(e) = store.node_upsert(&NodeRow {
+        file_id,
+        path: remote.to_string(),
+        remote_path: remote.to_string(),
+        size,
+        mtime,
+        is_folder: is_dir,
+        updated_at: qxync_core::store::now_unix(),
+    }) {
+        // 索引写失败只影响 rename 配对的收益，**绝不影响数据操作本身**。
+        tracing::warn!("记 nodes 身份失败 {remote}: {e}");
+    }
+}
+
 /// 把节点的水合位图落盘（内容已写过之后调用）。
+///
+/// ★ T9：落盘前按当前签名**现算** `file_id` 写进 `.qxstate` 头 ——
+/// 认领时（`cache_file_for`）会用同一个函数重算并比对，两边算法天生一致。
 fn persist_chunk_state(inner: &Arc<Mutex<Inner>>, chunk_size: u64, ino: INodeNo) {
     let (cache, st) = {
-        let g = inner.lock().unwrap();
-        let Some(n) = g.nodes.get(&ino) else {
+        let mut g = inner.lock().unwrap();
+        let Some(parent_remote) = g
+            .nodes
+            .get(&ino)
+            .and_then(|n| g.nodes.get(&n.parent))
+            .map(|p| p.remote.clone())
+        else {
+            return;
+        };
+        let Some(n) = g.nodes.get_mut(&ino) else {
             return;
         };
         let Some(cache) = n.cache.clone() else {
             return;
         };
+        n.refresh_file_id(&parent_remote);
         (
             cache,
             ChunkState {
@@ -375,9 +442,11 @@ fn persist_chunk_state(inner: &Arc<Mutex<Inner>>, chunk_size: u64, ino: INodeNo)
 /// 为什么是 xxhash64 而不是 sha256：快一个数量级，而这里要挡的是**意外损坏**
 /// （掉电、位翻转、写序颠倒、网络截断改写），不是恶意篡改 —— 攻击者能同时改内容
 /// 和校验和的话，本来就能改 `sync.db`。真要防篡改得靠服务端签名，那是另一件事。
+///
+/// ★ M15/T9：实现下沉到 `qxync_core::file_id::xxh64`（seed 仍是 0，已写进 `.qxsum`
+/// 的校验和不能变）。下沉是为了让 chunk 校验和与 `file_id` 共用同一份散列实现。
 fn xxh64(bytes: &[u8]) -> u64 {
-    use xxhash_rust::xxh64::xxh64;
-    xxh64(bytes, 0)
+    qxync_core::file_id::xxh64(bytes)
 }
 
 /// 读缓存文件里某个区间的字节（用于算校验和）。
@@ -481,15 +550,43 @@ struct Node {
     cache: Option<PathBuf>,
     /// 每个 128 KiB 区间的完成标记；长度 = 区间数，在创建缓存文件时初始化。
     chunks_done: Vec<bool>,
-    /// ★ T3：跨改名/移动稳定的文件身份（`.qxstate` v2 头里的一栏）。
-    /// T9 落地前恒为 [`ZERO_FILE_ID`]；先占住位置，避免格式再升一次版。
-    file_id: [u8; 16],
+    /// ★ T3/T9：跨改名/移动稳定的文件身份（`.qxstate` v2 头里的一栏）。
+    ///
+    /// ★ M15/T9 起是**真值**：`compute_file_id(is_dir, size, mtime, name, parent)`。
+    /// 它随 `(size, mtime)` 变化（内容变了就是新身份），但**改名/移动不变** ——
+    /// 这一点正是 T9 能把「远端删除 + 远端新增」认成一次改名的前提。
+    file_id: FileId,
     /// ★ T3：整文件校验和。全量就绪（`chunks_done` 全 true）时算一次，
     /// 之后 `qxync verify` 就能「一个数」判整个文件而不必逐区间。
     /// 未算出时是 [`NO_HASH`]。
     whole_xxhash: u64,
     /// 本地有未上传的改动。
     dirty: bool,
+    /// ★ M15/T8 **同步维度**：本地与远端是否一致。
+    ///
+    /// ## 为什么它与 [`Node::dirty`] 不是一回事
+    /// `dirty` 只答「本地有没有还没上传的改动」，答不了「有没有作业正排在队列里」
+    /// 或「有没有冲突等我裁决」。用户问的却是后者 —— 「我上周改的文件上传成功了吗」。
+    ///
+    /// ## 它是**派生**字段，不是新的状态机
+    /// 三个信息源本来就现成（见 [`combine_in_sync`]）：`dirty`、上传队列里有没有该路径的
+    /// 作业、daemon 侧 `decisions` 的待裁决数。**刻意不加新表、不加状态枚举** ——
+    /// 那三个源已经是真相，再存一份只会带来「两份状态不一致」这种最难查的故障。
+    ///
+    /// ## 更新时机
+    /// 只在**已经知道答案**的地方同步（本地写/标脏、清脏、脱水、丢弃内容、远端元数据
+    /// 变更）。读的时候（`FsHandle::file_states`）会再算一遍并顺手刷新本字段，
+    /// 所以哪怕某个写入点漏了也不会一直错下去 —— 详见 `LocalView` 的说明。
+    in_sync: bool,
+    /// ★ M15/T8 传输进度 `(done_bytes, total_bytes)`；`None` = 当前没有在传的作业。
+    ///
+    /// **下载与上传共用这一个槽位**：同一个文件不会同时被这两边传（上传的前提是
+    /// 本地已是权威内容，见 `hydrate_all` 的 `local_authoritative`），所以不必分开。
+    /// 完成/失败/取消一律清成 `None` —— 留着旧进度比没有进度更糟（用户会以为还在传）。
+    ///
+    /// 由 `Mutex<Inner>` 保护（与节点表同一把锁）。**不用 `Cell`**：进度回调来自
+    /// 多个线程（`ensure_chunk` 在读线程、`upload_one` 在上传 worker 线程）。
+    progress: Option<(u64, u64)>,
     /// ★ M3：打开的 fd 数（>0 时禁止脱水，报告 12 §8.1）。
     open_count: u32,
     /// ★ M3：最后一次读/写时间（LRU 脱水排序、闲置判定）。
@@ -517,6 +614,48 @@ impl Node {
         } else {
             self.attr.size.div_ceil(chunk_size) as usize
         }
+    }
+
+    /// ★ M15/T8：标脏/清脏的**唯一**入口 —— `dirty` 与 `in_sync` 必须同时变。
+    ///
+    /// 刻意做成方法而不是让人在各处直接写 `n.dirty = ...`：这两个字段是同一个事实的
+    /// 两种说法，只改一个就出现「`dirty=false` 但 `in_sync=false`」这种自相矛盾。
+    fn set_dirty(&mut self, dirty: bool) {
+        self.dirty = dirty;
+        // 有本地改动 → 必然未同步。清脏**不**直接置 true：还要看队列里有没有作业、
+        // 有没有待裁决冲突，那两个源在别处（见 `FsHandle::file_states`）。
+        if dirty {
+            self.in_sync = false;
+        }
+    }
+
+    /// ★ M15/T8：记一次传输进度（**单调不减**，且完成即清空）。
+    ///
+    /// 返回是否真的改动了状态（没改 = 调用方不必打日志）。
+    ///
+    /// ## 为什么要单调不减而不是直接赋值
+    /// 下载是 8 路并发（`DEFAULT_HYDRATE_FANOUT`），各分片回调到达顺序与完成顺序
+    /// 无关。直接赋值会让进度条来回跳 —— 那比不显示更让人怀疑「是不是坏了」。
+    /// 取 `max` 之后进度只会向前走。
+    ///
+    /// ## 为什么完成就清空而不是置 `(total, total)`
+    /// 100% 停在那里会被读成「还有一个作业在跑」。传输结束（无论成败）就没有在传的
+    /// 作业了，`None` 是唯一诚实的表达。
+    fn note_progress(&mut self, done: u64, total: u64) -> bool {
+        if total == 0 || done >= total {
+            let changed = self.progress.take().is_some();
+            self.progress = None;
+            return changed;
+        }
+        let done = done.max(self.progress.map_or(0, |(d, _)| d));
+        let changed = self.progress != Some((done, total));
+        self.progress = Some((done, total));
+        changed
+    }
+
+    /// ★ M15/T8：传输结束（成功/失败/取消）—— 清进度。
+    fn clear_progress(&mut self) -> bool {
+        self.progress.take().is_some()
     }
 
     fn is_fully_hydrated(&self) -> bool {
@@ -568,6 +707,20 @@ impl Node {
         self.whole_xxhash = NO_HASH;
     }
 
+    /// ★ M15/T9：按当前签名重算 `file_id`。
+    ///
+    /// 调用点是**签名刚变的地方**（远端元数据刷新、后台刷新换上、本地写/截断、
+    /// 新建节点）。改名/移动**不**调用 —— 那时 `name`/`remote` 变了但身份必须不变。
+    fn refresh_file_id(&mut self, parent_remote: &str) {
+        self.file_id = compute_file_id(
+            self.attr.kind == FileType::Directory,
+            self.attr.size,
+            epoch_secs(self.attr.mtime),
+            &self.name,
+            parent_remote,
+        );
+    }
+
     /// 给 xattr 用的状态串。
     fn state_str(&self) -> &'static str {
         if !self.is_partially_hydrated() {
@@ -577,6 +730,73 @@ impl Node {
         } else {
             "partial"
         }
+    }
+}
+
+/// ★ M15/T8：把三个信息源汇总成 per-file 的「是否已同步」。
+///
+/// ## 三个源（**都不是新造的**）
+/// | 源 | 含义 | 位置 |
+/// |---|---|---|
+/// | `dirty` | 本地有还没上传的改动 | `Node.dirty`（FUSE 写路径置位） |
+/// | `pending_upload` | 上传队列里排着这个路径的作业 | `UploadQueue::has_pending` |
+/// | `conflicts` | 这个路径有冲突等我裁决 | `Store::decision_by_path`（daemon 侧 `decisions` 表） |
+///
+/// ## 规则
+/// **任一不为零/为真 → 未同步。** 三者都清空才是「已同步」。
+///
+/// ## 为什么是「与」而不是「或」
+/// `dirty=false` 只说明「没有本地改动」，**不代表 NAS 上就有这份内容**：
+/// 作业还排在队列里没发出去时（`pending_upload=true`）用户看到的就是「我明明改完了，
+/// 为什么 NAS 上还是没有」。冲突同理 —— 内容两边都在，但**谁都没生效**，
+/// 只有用户裁决之后才算定局。
+///
+/// ## 为什么抽成纯函数
+/// 这条规则要有单测，就必须能脱离 FUSE 会话跑（三个源都是入参）。
+/// 同时它也是**唯一**的判定处 —— daemon 与 FUSE 两侧都调它，不会出现两套口径。
+pub fn combine_in_sync(dirty: bool, pending_upload: bool, conflicts: usize) -> bool {
+    !dirty && !pending_upload && conflicts == 0
+}
+
+/// ★ M15/T8：同步维度（`in_sync` / `progress`）的展示文案。
+///
+/// 与空间维度（`SpaceState`）**刻意分开算、组合展示**：前者答「NAS 上有没有
+/// 我这份内容」，后者答「本地有没有内容可读」。两者独立 —— 一个
+/// `pin=pinned` 但上传队列排着的文件就是「始终可用 · 未同步」。
+///
+/// 百分比向下取整（`0%` 而不是 `0.4%` —— 展示层不引入假精度），
+/// 算法与 [`progress_percent`] 共用同一个函数。
+pub fn sync_state_label(in_sync: bool, progress: Option<(u64, u64)>, conflicts: usize) -> String {
+    if let Some((done, total)) = progress {
+        // 进度优先：正在传的时候「已同步」是错的（还没传完）。
+        return format!("同步中 {}%", progress_percent(done, total));
+    }
+    if !in_sync && conflicts > 0 {
+        return format!("未同步（{conflicts} 个冲突待处理）");
+    }
+    if !in_sync {
+        // 分不清是「有本地改动」还是「作业在排队」时，如实说「未同步」——
+        // 界面另有 `dirty` / `pending_upload` 两个布尔可以细看，这里不猜。
+        return "未同步".to_string();
+    }
+    "已同步".to_string()
+}
+
+/// 进度百分比（0..=100）—— GUI/CLI 共用同一套算法。
+///
+/// `total == 0` → 0；**`done > total` → 100**。
+/// 夹 100 不是洁癖：用户可能在传输期间把文件改大，这时 `done` 会超过入队时
+/// `stat` 到的 `total`，不夹的话界面会显示「120%」，而更糟的是
+/// `saturating_mul(100)` 之后除法会把超大值原样吐出来。
+pub fn progress_percent(done: u64, total: u64) -> u64 {
+    if total == 0 {
+        0
+    } else if done >= total {
+        100
+    } else {
+        // 这里 `done < total`，`done * 100` 仍可能溢出（total 接近 u64::MAX），
+        // 所以先除后算：`(done / total) * 100` 会损失精度，改用 u128。
+        ((done as u128 * 100) / total as u128) as u64
     }
 }
 
@@ -697,6 +917,122 @@ struct FetchCtx {
     timeout: Duration,
     /// 水合计数（前台水合与后台刷新都记在这儿）。
     hydro: Arc<HydroCounters>,
+    /// ★ M15/T8：**每收完一个分片**调一次的上报回调（`None` = 不上报）。
+    ///
+    /// ## 为什么是回调而不是轮询
+    /// 轮询要么得在 daemon 里另开一个定时器去猜「现在传到哪了」（那只能问 NAS，
+    /// 一次 `list` 换不到字节级进度），要么得在 FUSE 侧留一个共享计数器 +
+    /// 定时读 —— 而 FUSE 会话在挂载线程里，daemon 拿不到它。回调是唯一能把
+    /// 「刚收好一个分片」这件事**在发生的当场**送到状态表去的办法。
+    ///
+    /// ## 参数是「本次收到的字节数」而不是累计值
+    /// 累计由回调自己那份闭包里的 [`transfer_meter`] 算。分片下载本来就是并发的
+    /// （8 路扇出），谁先谁后不确定 —— **只有把累加收在一个原子的计数器里**
+    /// 才能保证单调不减；让每个回调各自去累加就必然算错。
+    ///
+    /// ## ⚠️ 它跑在 FUSE 读路径上
+    /// 一次 `read` 可能触发多个分片下载，回调每个分片被调一次。**必须廉价**：
+    /// 现有实现只做「一次原子加 + 拿一次 `Mutex<Inner>` + 改两个字段」。
+    /// 回调 panic 由 [`invoke_progress_hook`] 隔离 —— 进度上报出问题绝不能
+    /// 让用户的 `read` 失败。
+    progress: Option<ProgressHook>,
+}
+
+/// ★ M15/T8：分片进度上报回调（参数 = 本次收到的字节数、该文件的总字节数）。
+pub type ProgressHook = Arc<dyn Fn(u64, u64) + Send + Sync>;
+
+/// ★ M15/T8：把「分片回调」变成「累计字节 + 上报」的组合（返回回调与那个计数器）。
+///
+/// 用 [`AtomicU64`] 而不是 `Mutex<u64>`：8 路并发取块会**同时**进这个函数，
+/// 累加必须原子。它也是**唯一**持有「已传输字节」的地方 —— 节点的 `progress`
+/// 字段只由 `note_progress` 单向写，不参与累加，这样「读进度」不会把进度往前推。
+///
+/// `start_done` 让一次传输可以从**已有进度**接着算（重试、后台刷新接着传）。
+pub fn transfer_meter<F>(sink: F, start_done: u64) -> (ProgressHook, Arc<AtomicU64>)
+where
+    F: Fn(u64, u64) + Send + Sync + 'static,
+{
+    let seen = Arc::new(AtomicU64::new(start_done));
+    let seen2 = seen.clone();
+    let hook: ProgressHook = Arc::new(move |delta, total| {
+        // 饱和加 + 夹住 total：溢出或超量都只会停在 100%，不会绕回 0%
+        let done = seen2
+            .fetch_add(delta, Ordering::Relaxed)
+            .saturating_add(delta)
+            .min(total);
+        sink(done, total);
+    });
+    (hook, seen)
+}
+
+/// ★ M15/T8：调用进度回调，**panic 与错误一律吞掉**。
+///
+/// ## 为什么必须隔离
+/// 这个回调跑在 `read` 的关键路径上（`ensure_chunk` → `fetch_chunk_bytes`）。
+/// 回调里 panic 会把整个读路径炸掉，用户看到的是「文件读不出来」—— 为了一段
+/// **纯展示**的进度条把数据读取搞挂，是最坏的交易。
+///
+/// 复用 `invoke_success_hook` 那套 `catch_unwind` 写法（本项目 M7 实测踩过
+/// 「回调 panic 打死上传 worker」的坑）。
+pub(crate) fn invoke_progress_hook(hook: &Option<ProgressHook>, delta: u64, total: u64) {
+    let Some(hook) = hook else {
+        return;
+    };
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(delta, total))).is_err() {
+        tracing::error!("进度回调 panic（已隔离，传输继续）: +{delta}/{total}");
+    }
+}
+
+/// ★ M15/T8：给一份 [`FetchCtx`] 装上分片进度上报。
+///
+/// 抽成自由函数是因为 [`QxyncFs`]（读路径水合）与 [`FsHandle`]（后台整份刷新）
+/// 要用同一份逻辑 —— 抄两遍的话，改一处忘一处就会让两个入口的进度语义分叉。
+///
+/// `start_done` = 这次传输开始时**已经**有的字节数（重试/接着传时非 0），
+/// 这样进度是从头单调走完的，不会中途归零。
+fn fetch_ctx_progressing(
+    mut ctx: FetchCtx,
+    inner: Arc<Mutex<Inner>>,
+    remote: &str,
+    start_done: u64,
+) -> FetchCtx {
+    let remote = remote.to_string();
+    let (hook, _seen) = transfer_meter(
+        move |done, total| note_node_progress(&inner, &remote, Some((done, total))),
+        start_done,
+    );
+    ctx.progress = Some(hook);
+    ctx
+}
+
+/// ★ M15/T8：把一次传输进度写进对应节点（`by_remote` 反查 ino）。
+///
+/// 下载侧（分片回调）、上传侧（队列回调）、`FsHandle::note_progress` 三处共用
+/// 这一份实现 —— 进度语义（单调、不越界、完成即清）必须只有一处定义。
+///
+/// **纯展示，绝不影响传输正确性**：锁中毒 / 路径已不在表里 → 静默放弃这一次
+/// 上报（丢一次没有任何后果）。
+fn note_node_progress(inner: &Arc<Mutex<Inner>>, remote: &str, p: Option<(u64, u64)>) {
+    let Ok(mut g) = inner.lock() else {
+        return;
+    };
+    let Some(ino) = g.by_remote.get(remote).copied() else {
+        return;
+    };
+    let Some(n) = g.nodes.get_mut(&ino) else {
+        return;
+    };
+    match p {
+        Some((done, total)) => {
+            if n.note_progress(done, total) {
+                tracing::debug!("传输进度 {remote}: {done}/{total}");
+            }
+        }
+        // 作业结束 → 撤进度，别让界面停在「上传中 96%」
+        None => {
+            n.clear_progress();
+        }
+    }
 }
 
 /// 区间下载失败的形态（日志要分得清「超时」「会话失效」还是「NAS 报错」）。
@@ -753,6 +1089,8 @@ async fn fetch_chunk_bytes(
                 h.took
             );
             ctx.hydro.record(h.data.len() as u64);
+            // ★ T8：LAN 直传也是「收完一个分片」，同样要上报
+            invoke_progress_hook(&ctx.progress, h.data.len() as u64, total);
             return Ok(h.data);
         }
         ctx.stats.mismatches.fetch_add(1, Ordering::Relaxed);
@@ -772,6 +1110,12 @@ async fn fetch_chunk_bytes(
         Ok(Err(e)) => Err(ChunkFetchError::Nas(e.to_string())),
         Ok(Ok(d)) => {
             ctx.hydro.record(d.len() as u64);
+            // ★ T8：**每收完一个分片**上报一次。分片 = 128 KiB，粒度合适 ——
+            //   比它细就把回调变成热路径上的噪声，比它粗进度条会一跳一跳。
+            //   注意上报的是**实收字节**而不是 `want`：长度不符时 `ensure_chunk`
+            //   会拒收（铁则 1），那时候进度不该算进去 —— 但这里已经报过了，
+            //   所以 `ensure_chunk` 在拒收那条路径上会清掉进度（不留脏进度）。
+            invoke_progress_hook(&ctx.progress, d.len() as u64, total);
             Ok(d)
         }
     }
@@ -866,6 +1210,8 @@ fn install_refreshed(
         n.reset_chunks(chunk_size, true);
         n.pending = None;
         n.refresh_attempts = 0;
+        // ★ T8：新内容整个换上去了 → 传输结束，清进度（不留「停在 99%」的假象）
+        n.clear_progress();
         n.ino
     };
     // ★ T3：整份刷新出来的内容是**一次下载**得到的，可以顺手把 per-chunk 校验和
@@ -942,6 +1288,8 @@ pub struct LocalNode {
     pub dirty: bool,
     /// 稀疏缓存文件（未水合时为 `None`）。
     pub cache: Option<PathBuf>,
+    /// ★ M15/T9：稳定身份（16 字节）。改名/移动**不变**，这是对账认出远端改名的依据。
+    pub file_id: FileId,
 }
 
 /// ★ M2c 的关键抽象：同步引擎只依赖这个 trait，因此**可以不挂载 FUSE 就测**。
@@ -971,6 +1319,24 @@ pub trait LocalView: Send + Sync {
     fn invalidate_content(&self, remote: &str) -> bool;
     /// 远端已删除：移除节点 + 缓存（目录连后代一起）。
     fn remove_remote(&self, remote: &str) -> bool;
+    /// ★ M15/T9：**远端把文件改了名/移了目录**，把本地节点从 `old_remote` 迁到 `new_remote`。
+    ///
+    /// 对账靠它把「远端删除 + 远端新增」认成一次改名，从而**不产生冲突副本**。
+    /// 返回 true 表示迁移成功（调用方据此跳过删除与刷新两条路径）。
+    ///
+    /// ## 为什么要单独一个方法
+    /// `remove_remote` + `apply_remote_meta` 两条拼起来做不到这件事：前者会把节点
+    /// 连同**已水合的缓存内容**一起删掉（`remove_cache_files`），本地就只剩个空壳；
+    /// 而改名后本地内容仍是那份内容，只是「它现在叫另一个名字」。
+    ///
+    /// ## 默认实现 = 不支持（保守退化）
+    /// 拿不到这个能力的实现方（测试替身 `FakeLocalView`、将来可能的 RPC 实现）
+    /// 会对账时退回「删除 + 新增」—— 也就是 T9 之前的行为：可能多出冲突副本，
+    /// 但**不会错配、不会丢数据**。退化方向必须是保守的。
+    fn rename_remote(&self, old_remote: &str, new_remote: &str) -> bool {
+        let _ = (old_remote, new_remote);
+        false
+    }
     /// 把本地节点标脏并入队上传（`remote` 必须已有缓存内容）。
     fn mark_dirty(&self, remote: &str) -> std::io::Result<()>;
     /// 冲突副本：把本地缓存内容复制到一个稳定的 stash 文件，返回该路径。
@@ -1029,6 +1395,8 @@ pub struct FsHandle {
     hydro: Arc<HydroCounters>,
     /// ★ M9/M10：daemon 挂载后注入的运行时回调（内核失效 + 会话热更新）。
     hooks: Hooks,
+    /// ★ T9：稳定身份索引（`nodes` 表）；`None` = 未注入（见 [`QxyncFs::with_nodes_store`]）。
+    nodes: Option<Arc<Store>>,
 }
 
 /// 「把某个 inode 的内核缓存作废」的回调（daemon 挂载后注入 `fuser::Notifier`）。
@@ -1074,9 +1442,67 @@ pub enum DehydrateOutcome {
     Failed(String),
 }
 
+/// ★ M15/T8：一个文件的**同步维度**状态（与 `SpaceState` 那个空间维度正交）。
+///
+/// ## 为什么单独一个类型而不是往 `Candidate` 上加字段
+/// `Candidate` 是脱水的安全判据（「现在能不能动这个文件的内容」），往那里加
+/// 「同步状态」会把一个**展示用**的概念混进**安全判定**里 —— 脱水逻辑会开始
+/// 关心用户看不看得到状态，那是错的耦合。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileSyncState {
+    /// 三个源汇总后的结论：baseline 一致 且 无待传作业 且 无待裁决冲突。
+    pub in_sync: bool,
+    /// 本地有未上传的改动（三个源之一，单独暴露给界面做差异化文案）。
+    pub dirty: bool,
+    /// 上传队列里排着这个路径的作业。
+    pub pending_upload: bool,
+    /// 传输进度 `(done_bytes, total_bytes)`；`None` = 当前没有在传的作业。
+    pub progress: Option<(u64, u64)>,
+    /// 待裁决冲突数。
+    pub conflicts: usize,
+    /// 调用方**是否真的查到**了冲突数。`false` 时 `conflicts` 是被当作 0 用的
+    /// （见 [`FsHandle::file_states`]）—— 界面据此可以标「冲突未知」而不是
+    /// 让用户以为「没有冲突」。
+    pub conflicts_known: bool,
+}
+
+impl FileSyncState {
+    /// 进度百分比（0..=100）。
+    pub fn percent(&self) -> Option<u64> {
+        self.progress
+            .map(|(done, total)| progress_percent(done, total))
+    }
+
+    /// 同步维度的一句话（不含空间维度；组合展示见 CLI/GUI）。
+    pub fn label(&self) -> String {
+        sync_state_label(self.in_sync, self.progress, self.conflicts)
+    }
+}
+
 impl FsHandle {
     pub fn cache_dir(&self) -> &Path {
         &self.cache_dir
+    }
+
+    // ------------------------------------------------ ★ T9 稳定身份索引（`nodes` 表）
+
+    /// ★ T9：某个路径的身份（对账/上传队列查「这个东西现在叫什么」）。
+    pub fn node_file_id(&self, remote: &str) -> Option<FileId> {
+        let row = self.nodes.as_ref()?.node_by_path(remote).ok()??;
+        Some(row.file_id)
+    }
+
+    /// ★ T9：按身份反查当前路径（上传队列落地时用）。
+    ///
+    /// **多条命中 = 歧义 → 返回 `None`**（保守：宁可传到旧名字让用户看见，
+    /// 也不能凭猜测把内容写到另一个文件的位置上）。
+    pub fn path_for_file_id(&self, file_id: &FileId) -> Option<String> {
+        let rows = self.nodes.as_ref()?.nodes_by_file_id(file_id).ok()?;
+        if rows.len() == 1 {
+            Some(rows[0].path.clone())
+        } else {
+            None
+        }
     }
 
     /// ★ M9：注入「内核缓存失效」回调。挂载成功后 daemon 把 `fuser::Notifier` 塞进来，
@@ -1209,7 +1635,96 @@ impl FsHandle {
         out
     }
 
+    /// ★ M15/T8：下载侧在途汇总 —— `(在传文件数, 已传字节, 总字节)`。
+    ///
+    /// 给 daemon 的 `status` 用（首页那句「现在有几个文件在传」）。
+    /// **只统计 `progress` 非空的节点**，也就是当前真有下载作业的那些 ——
+    /// 「已缓存 4 GB」不是「在传」，两者不能混在一个数里。
+    pub fn download_transfers(&self) -> (usize, u64, u64) {
+        let g = self.inner.lock().unwrap();
+        let (mut n, mut done, mut total) = (0usize, 0u64, 0u64);
+        for node in g.nodes.values() {
+            if let Some((d, t)) = node.progress {
+                n += 1;
+                done += d;
+                total += t;
+            }
+        }
+        (n, done, total)
+    }
+
+    /// ★ M15/T8：某个远端路径的**同步维度**状态（`file_states` 与 xattr 的数据源）。
+    ///
+    /// ## 这里为什么是「读时算」而不是「只读节点上的字段」
+    /// `Node.in_sync` 只在**已经知道答案**的地方被同步更新，而三个源里有两个
+    /// （上传队列、daemon 的 `decisions`）住在节点表之外。读的时候三个源都在手上，
+    /// 算一遍既准确又顺手把结果写回节点 —— **任何一处更新点漏了都不会一直错下去**。
+    /// 写时更新只是为了「不等别人来问」也能看个大概，不承担正确性责任。
+    ///
+    /// ## `conflicts` 从哪来
+    /// FUSE 侧**不知道**待裁决冲突（那是 daemon 的 `decisions` 表）。所以这里把它
+    /// 做成入参：daemon 侧 `Store` 有库，能查；`None` 表示「调用方拿不到冲突信息」，
+    /// 此时按 **0** 处理并在 [`FileSyncState::conflicts_known`] 里如实标注 ——
+    /// 不拿「查不到」冒充「没有」。
+    ///
+    /// 拿不到节点时返回 `None`（例如目录还没被 `lookup` 过）—— 那时**不猜**，
+    /// 让调用方显示「未知」而不是谎报「已同步」。
+    pub fn file_states(&self, remote: &str, conflicts: Option<usize>) -> Option<FileSyncState> {
+        let pending_upload = self.has_pending(remote);
+        let conflicts_known = conflicts.is_some();
+        let conflicts = conflicts.unwrap_or(0);
+        // ★ T8：上传侧的在途进度以**队列**为准。节点上那份是 hook 写过去的，
+        // 万一那次写撞上锁中毒就丢了；队列自己那份一定是真的（有就必有）。
+        // 队列没有在途作业时才回退到节点（那多半是下载侧写的）。
+        let inflight = self
+            .upload
+            .as_ref()
+            .and_then(|q| q.progress_of(remote))
+            .filter(|(d, t)| *t > 0 && *d < *t);
+        let (dirty, progress) = {
+            let g = self.inner.lock().unwrap();
+            let ino = *g.by_remote.get(remote)?;
+            let n = g.nodes.get(&ino)?;
+            (n.dirty, inflight.or(n.progress))
+        };
+        let in_sync = combine_in_sync(dirty, pending_upload, conflicts);
+        // 顺手把判定结果写回节点（读时校准，见方法注释）
+        {
+            let mut g = self.inner.lock().unwrap();
+            if let Some(ino) = g.by_remote.get(remote).copied() {
+                if let Some(n) = g.nodes.get_mut(&ino) {
+                    n.in_sync = in_sync;
+                }
+            }
+        }
+        Some(FileSyncState {
+            in_sync,
+            dirty,
+            pending_upload,
+            progress,
+            conflicts,
+            conflicts_known,
+        })
+    }
+
+    /// ★ M15/T8：上报一次传输进度（下载侧与上传侧回调都走这里）。
+    ///
+    /// **必须廉价、绝不能影响传输正确性**：锁拿不到就静默跳过（进度是只读上报，
+    /// 丢一次没有任何后果）。回调本身的 panic 由调用方隔离。
+    pub fn note_progress(&self, remote: &str, done: u64, total: u64) {
+        note_node_progress(&self.inner, remote, Some((done, total)));
+    }
+
+    /// ★ M15/T8：清掉某个路径的传输进度（完成/失败/取消）。
+    pub fn clear_progress(&self, remote: &str) {
+        note_node_progress(&self.inner, remote, None);
+    }
+
     /// 上传成功后清掉 `dirty`（有 hook 时由上传队列回调）。
+    ///
+    /// ★ T8：清脏**不**顺手把 `in_sync` 置 true —— 队列里可能还排着别的作业，
+    /// 也可能有待裁决冲突。真正的判定在 [`FsHandle::file_states`]（调
+    /// [`combine_in_sync`]），那里会顺手把结果写回节点。宁可这里保守一点。
     pub fn clear_dirty(&self, remote: &str) {
         if self.has_pending(remote) {
             return;
@@ -1217,7 +1732,7 @@ impl FsHandle {
         let mut g = self.inner.lock().unwrap();
         if let Some(ino) = g.by_remote.get(remote).copied() {
             if let Some(n) = g.nodes.get_mut(&ino) {
-                n.dirty = false;
+                n.set_dirty(false);
             }
         }
     }
@@ -1295,7 +1810,10 @@ impl FsHandle {
                 // 脱水之后没有内容 → 待刷新的新签名直接落到 attr 上
                 n.apply_pending_sig();
                 n.reset_chunks(chunk_size, false);
-                n.dirty = false;
+                // ★ T8：内容整个丢了、也没有在传 → 进度槽必须跟着清，
+                //   否则脱水之后界面还显示着一个永远走不完的进度条。
+                n.set_dirty(false);
+                n.clear_progress();
             }
         }
         tracing::info!("已脱水 {remote}（释放 {freed} 字节，先 inval_inode 再清内容）");
@@ -1487,7 +2005,10 @@ impl LocalView for FsHandle {
             remove_cache_files(&p);
         }
         n.reset_chunks(chunk_size, false);
-        n.dirty = false;
+        // ★ T8：内容作废 → 传输一定已经结束（要么没在传，要么被这次作废打断），
+        //   清进度；同时 `dirty` 归零后是否真「已同步」由 file_states 重算。
+        n.set_dirty(false);
+        n.clear_progress();
         true
     }
 
@@ -1511,6 +2032,110 @@ impl LocalView for FsHandle {
                 }
             }
         }
+        drop(g);
+        // ★ T9：远端删掉了 → 身份索引当场清掉（与本地删除同一条规则，见 `remove_entry`
+        //   里的说明：留着会让新文件被误认成「老文件改名过来的」→ 可能丢数据）。
+        //   注意这里**不因为清理失败而拒绝删除**：远端已经是那个状态了，
+        //   索引写失败只让 rename 配对少一次机会，保守退化即可。
+        if let Some(store) = &self.nodes {
+            if let Err(e) = store.node_forget_subtree(remote) {
+                tracing::warn!("清理 nodes 身份失败 {remote}: {e}");
+            }
+        }
+        true
+    }
+
+    fn rename_remote(&self, old_remote: &str, new_remote: &str) -> bool {
+        if old_remote == new_remote {
+            return true;
+        }
+        // ★ M15/T9：对账认定的改名。**只改「远端路径」这一个维度** ——
+        // 名字、缓存内容、`.qxstate` 位图、`file_id` 全部原样保留。
+        //
+        // 刻意**不重算 `file_id`**：改名的前提就是「还是同一个文件」，重算等于
+        // 自己把自己的身份否认了（下一轮配对就再也配不上）。
+        //
+        // 与 FUSE `rename` 回调的差别：那边是**用户在本机改名**（本地文件真的动了，
+        // 要迁缓存文件）；这边是**远端改了名**（本地文件没动，只是不再叫旧名字）。
+        // 所以这里不碰 `n.cache` 的物理路径，只更新索引。
+        {
+            let mut g = self.inner.lock().unwrap();
+            let Some(ino) = g.by_remote.get(old_remote).copied() else {
+                return false;
+            };
+            let new_name = new_remote
+                .rsplit_once('/')
+                .map(|(_, n)| n.to_string())
+                .unwrap_or_else(|| new_remote.to_string());
+            let new_parent_remote = new_remote
+                .rsplit_once('/')
+                .map(|(d, _)| d.to_string())
+                .unwrap_or_else(|| self.remote_root.clone());
+            // 目标已被别的节点占用 → 拒绝迁移（宁可退回增删判定，也不能覆盖）
+            if let Some(existing) = g.by_remote.get(new_remote).copied() {
+                if existing != ino {
+                    return false;
+                }
+            }
+            // 新父目录还没在节点表里（远端刚建的那一层）→ 先按现有父节点顶着。
+            // `readdir`/`lookup` 走的是 `by_remote`，父节点缺失不影响按路径找到本节点；
+            // 等那一层被列出来（`apply_listing`）时父子关系自然补上。
+            let new_parent = g
+                .by_remote
+                .get(&new_parent_remote)
+                .copied()
+                .or_else(|| g.nodes.get(&ino).map(|n| n.parent))
+                .unwrap_or(ino);
+            g.by_remote.remove(old_remote);
+            g.by_remote.insert(new_remote.to_string(), ino);
+            if let Some(n) = g.nodes.get_mut(&ino) {
+                n.name = new_name;
+                n.remote = new_remote.to_string();
+                n.parent = new_parent;
+            }
+        }
+        // 「映射」快照同步换名，否则 readdir 还会露出旧名字
+        if let Some((od, on)) = old_remote.rsplit_once('/') {
+            listing_remove(&self.inner, od, on);
+        }
+        if let Some((nd, nn)) = new_remote.rsplit_once('/') {
+            let entry = {
+                let g = self.inner.lock().unwrap();
+                g.by_remote.get(new_remote).and_then(|ino| {
+                    g.nodes.get(ino).map(|n| {
+                        let mut e = DirEntry::local(
+                            nn,
+                            n.attr.kind == FileType::Directory,
+                            n.attr.size,
+                            epoch_secs(n.attr.mtime),
+                        );
+                        // ★ 沿用节点身份，不重算
+                        e.file_id = n.file_id;
+                        e
+                    })
+                })
+            };
+            if let Some(e) = entry {
+                listing_upsert(&self.inner, nd, &e);
+            }
+        }
+        // ★ T9：`nodes` 索引行的 path 也要跟着搬（`file_id` 不动）。
+        //
+        // 漏了这一句的后果（不是「少一次配对」，是**索引永久失效**）：
+        // 老 path 的行还在那儿，而下一次对账给新 path 记身份时会**再插一行** ——
+        // 同一 file_id 变成两行 → `nodes_by_file_id` 返回 2 行 → 调用方按「歧义」
+        // 保守地返回 `None` → `path_for_file_id` 从此恒为 None（上传队列再也没法
+        // 按身份重定向），对账侧也永远配不上。行还会随每次远端改名多留一份。
+        //
+        // 与 FUSE `rename` 回调走的是 `QxyncFs::migrate_nodes_row` 同一套语义
+        // （`store.node_rename`，失败只 warn）。这里在 `FsHandle` 上，故直接调
+        // `Store`，不走那个包装函数。
+        if let Some(store) = &self.nodes {
+            if let Err(e) = store.node_rename(old_remote, new_remote) {
+                tracing::warn!("迁移 nodes 身份路径失败 {old_remote} -> {new_remote}: {e}");
+            }
+        }
+        tracing::info!("远端改名 {old_remote} → {new_remote}（本地节点迁移，不生成冲突副本）");
         true
     }
 
@@ -1519,7 +2144,7 @@ impl LocalView for FsHandle {
             .upload
             .as_ref()
             .ok_or_else(|| std::io::Error::other("只读挂载，没有上传队列"))?;
-        let (name, mtime, cache) = {
+        let (name, mtime, cache, file_id) = {
             let mut g = self.inner.lock().unwrap();
             let Some(ino) = g.by_remote.get(remote).copied() else {
                 return Err(std::io::Error::new(
@@ -1527,15 +2152,27 @@ impl LocalView for FsHandle {
                     format!("{remote} 不在节点表里"),
                 ));
             };
+            let parent_remote = g
+                .nodes
+                .get(&ino)
+                .and_then(|n| g.nodes.get(&n.parent))
+                .map(|p| p.remote.clone())
+                .unwrap_or_default();
             let n = g.nodes.get_mut(&ino).unwrap();
-            n.dirty = true;
+            // ★ T8：标脏 → 立刻未同步（`set_dirty` 内部同时置 `in_sync=false`）。
+            //   这次入队之后队列里就有作业了，`file_states` 重算时 pending 也会为真。
+            n.set_dirty(true);
             // 本地改动是权威：远端新内容的后台刷新意图作废
             n.pending = None;
+            // 后台刷新不会发生了 → 它的进度也没意义了
+            n.clear_progress();
             let cache = n
                 .cache
                 .clone()
                 .ok_or_else(|| std::io::Error::other(format!("{remote} 没有本地缓存，无法上传")))?;
-            (n.name.clone(), epoch_secs(n.attr.mtime), cache)
+            // ★ T9：随作业带上身份 → worker 发之前能复查「现在该落到哪个名字」。
+            n.refresh_file_id(&parent_remote);
+            (n.name.clone(), epoch_secs(n.attr.mtime), cache, n.file_id)
         };
         let dir = remote
             .rsplit_once('/')
@@ -1548,6 +2185,10 @@ impl LocalView for FsHandle {
             mtime,
             attempts: 0,
             ephemeral: false,
+            file_id,
+            // ★ T8：入队时还没开始传
+            bytes_sent: 0,
+            bytes_total: 0,
         })
     }
 
@@ -1594,6 +2235,12 @@ impl LocalView for FsHandle {
             .upload
             .as_ref()
             .ok_or_else(|| std::io::Error::other("只读挂载，没有上传队列"))?;
+        // ★ T9：冲突副本的 stash 同样带上身份（它也是「某个文件的当前内容」）。
+        let file_id = self.node_file_id(&format!(
+            "{}/{}",
+            remote_dir.trim_end_matches('/'),
+            remote_name
+        ));
         q.enqueue(UploadJob {
             remote_dir: remote_dir.to_string(),
             remote_name: remote_name.to_string(),
@@ -1601,6 +2248,10 @@ impl LocalView for FsHandle {
             mtime,
             attempts: 0,
             ephemeral: true,
+            file_id: file_id.unwrap_or(ZERO_FILE_ID),
+            // ★ T8：入队时还没开始传
+            bytes_sent: 0,
+            bytes_total: 0,
         })
     }
 
@@ -1655,13 +2306,21 @@ impl LocalView for FsHandle {
         };
         let (size, mtime) = sig;
         let tmp = sibling_path(&cache, ".refresh");
-        let ctx = FetchCtx {
-            client: self.client.clone(),
-            peers: self.lan_peers.clone(),
-            stats: self.lan_stats.clone(),
-            timeout: self.hydrate_timeout,
-            hydro: self.hydro.clone(),
-        };
+        // ★ T8：后台整份刷新也从 0 开始报进度（它是「把远端新版本整份拉下来」，
+        //   与前台按需水合是两次独立传输，进度不该接着前一次的走）。
+        let ctx = fetch_ctx_progressing(
+            FetchCtx {
+                client: self.client.clone(),
+                peers: self.lan_peers.clone(),
+                stats: self.lan_stats.clone(),
+                timeout: self.hydrate_timeout,
+                hydro: self.hydro.clone(),
+                progress: None,
+            },
+            self.inner.clone(),
+            remote,
+            0,
+        );
         let inner = self.inner.clone();
         let invalidator = self.hooks.invalidator.clone();
         let remote = remote.to_string();
@@ -1674,6 +2333,8 @@ impl LocalView for FsHandle {
                     let found = g.by_remote.get(&remote).copied();
                     if let Some(n) = found.and_then(|i| g.nodes.get_mut(&i)) {
                         n.refreshing = false;
+                        // ★ T8：刷新失败 → 没有在传的作业了，清进度
+                        n.clear_progress();
                         n.refresh_attempts = n.refresh_attempts.saturating_add(1);
                         if n.refresh_attempts >= REFRESH_MAX_ATTEMPTS {
                             tracing::warn!("后台刷新连续失败，退回按需水合: {remote}");
@@ -1731,6 +2392,7 @@ fn node_snapshot(n: &Node) -> LocalNode {
             .unwrap_or(0),
         dirty: n.dirty,
         cache: n.cache.clone(),
+        file_id: n.file_id,
     }
 }
 
@@ -1975,6 +2637,13 @@ pub struct QxyncFs {
     trash_uid: u32,
     /// ★ M11：删除队列（写模式必须提供）。`None` 时 `unlink` 退回同步删除。
     delete_queue: Option<Arc<crate::delete::DeleteQueue>>,
+    /// ★ T9：稳定身份索引（`nodes` 表）。`None` = 未注入 → **不写表**。
+    ///
+    /// 为什么是可选的：这个库由 daemon 打开（`<data>/sync/<host>/sync.db`），
+    /// FUSE 自己不该再开第二个连接去写同一块状态。没注入时 T9 退化成
+    /// 「`file_id` 只在内存与 `.qxstate` 里用」——改名配对退化成旧的增删判定
+    /// （保守，仍然不丢数据）。用 [`Self::with_nodes_store`] 注入。
+    nodes: Option<Arc<Store>>,
 }
 
 /// ★ M7：LAN 快路径计数（`status` 里能看到省了多少次 NAS 请求）。
@@ -2041,9 +2710,14 @@ impl QxyncFs {
             attr: root_attr,
             cache: None,
             chunks_done: Vec::new(),
-            file_id: ZERO_FILE_ID,
+            // ★ T9：挂载根本身也是一个目录节点，给它真身份（父目录为空串）。
+            //   之前是全零 —— 那会让「根目录参与 rename 配对」永远配不上。
+            file_id: compute_file_id(true, 0, 0, "", ""),
             whole_xxhash: NO_HASH,
             dirty: false,
+            // ★ T8：目录没有「本地改动 / 待上传」这回事，一律视为已同步。
+            in_sync: true,
+            progress: None,
             open_count: 0,
             last_access: UNIX_EPOCH,
             op_lock: Arc::new(Mutex::new(())),
@@ -2086,6 +2760,7 @@ impl QxyncFs {
             hooks: Hooks::default(),
             trash_uid: unsafe { libc::getuid() },
             delete_queue: None,
+            nodes: None,
         })
     }
 
@@ -2128,7 +2803,29 @@ impl QxyncFs {
     }
 
     /// 注入上传队列（写模式下必须）。
+    ///
+    /// ★ T9：顺带把「身份 → 当前远端路径」的解析器装到队列上 —— 排队期间远端
+    /// 改名时，作业会落到新名字而不是留一个旧名字的幽灵文件。没注入
+    /// [`Self::with_nodes_store`] 时解析器查不到东西，队列按原路径发（退化）。
+    ///
+    /// ★ T8：顺带把「上传进度」也装到队列上 —— 上传侧的进度只有队列知道
+    /// （节点表那边只管下载），不注入就只有一个「排队中」，看不到传了多少。
     pub fn with_upload_queue(mut self, queue: Arc<UploadQueue>) -> Self {
+        let store = self.nodes.clone();
+        queue.set_name_resolver(Arc::new(move |id: &FileId| {
+            let store = store.as_ref()?;
+            // 多条命中 = 歧义 → `None`（宁可发到旧路径，也不能猜错位置）
+            let rows = store.nodes_by_file_id(id).ok()?;
+            if rows.len() == 1 {
+                Some(rows[0].path.clone())
+            } else {
+                None
+            }
+        }));
+        let inner = self.inner.clone();
+        queue.set_progress_hook(Arc::new(move |remote: &str, p: Option<(u64, u64)>| {
+            note_node_progress(&inner, remote, p);
+        }));
         self.upload = Some(queue);
         self
     }
@@ -2148,6 +2845,18 @@ impl QxyncFs {
     /// 共享 pin 状态（daemon 场景：IPC 的 `pin` 与 xattr 要看到同一份）。
     pub fn with_pins(mut self, pins: PinMap) -> Self {
         self.pins = pins;
+        self
+    }
+
+    /// ★ T9：注入稳定身份索引所在的 `Store`（daemon 已打开的 `sync.db`）。
+    ///
+    /// 注入之后：`rename` 会同步迁移 `nodes` 行的 path（身份不变），
+    /// 删除会清掉对应行，上传队列能按身份反查最新名字。
+    /// 不注入时这三件事都跳过 —— T9 退化成「身份只在内存/`.qxstate` 里」，
+    /// 对账按身份配对 rename 的收益拿不到，但**行为退化方向是保守的**
+    /// （退回旧的增删判定，只是可能多出冲突副本，不会错配或丢数据）。
+    pub fn with_nodes_store(mut self, store: Arc<Store>) -> Self {
+        self.nodes = Some(store);
         self
     }
 
@@ -2172,6 +2881,7 @@ impl QxyncFs {
             lan_peers: self.lan_peers.clone(),
             hydro: self.hydro.clone(),
             hooks: self.hooks.clone(),
+            nodes: self.nodes.clone(),
         }
     }
 
@@ -2244,6 +2954,10 @@ impl QxyncFs {
     }
 
     /// ★ M9：构造一次区间下载的上下文（前台水合与后台内容刷新共用同一套路径）。
+    ///
+    /// ★ T8：**默认不上报进度** —— 要上报的调用点用自由函数
+    /// [`fetch_ctx_progressing`] 包一层。保持默认「无回调」是为了让不关心进度的
+    /// 调用点（测试、单测路径）一行不改。
     fn fetch_ctx(&self) -> FetchCtx {
         FetchCtx {
             client: self.client.clone(),
@@ -2251,6 +2965,7 @@ impl QxyncFs {
             stats: self.lan_stats.clone(),
             timeout: self.hydrate_timeout,
             hydro: self.hydro.clone(),
+            progress: None,
         }
     }
 
@@ -2459,7 +3174,12 @@ impl QxyncFs {
         let ino = INodeNo(g.next_ino);
         g.next_ino += 1;
         let attr = self.attr_from(ino, entry);
-        let node = Node {
+        let parent_remote = g
+            .nodes
+            .get(&parent)
+            .map(|p| p.remote.clone())
+            .unwrap_or_default();
+        let mut node = Node {
             ino,
             parent,
             name: name.to_string(),
@@ -2467,9 +3187,16 @@ impl QxyncFs {
             attr,
             cache: None,
             chunks_done: Vec::new(),
+            // ★ T9：真身份，紧接着由 `refresh_file_id` 按 (kind, size, mtime,
+            // name, parent) 现算填上 —— 节点表是本地权威，签名的唯一来源是 `attr`。
             file_id: ZERO_FILE_ID,
             whole_xxhash: NO_HASH,
             dirty: false,
+            // ★ T8：刚从远端清单物化出来的节点 —— 本地无改动、无待传作业、无冲突。
+            //   即便判断错了，`FsHandle::file_states` 读的时候还会用
+            //   `combine_in_sync` 重算一遍并刷新本字段。
+            in_sync: true,
+            progress: None,
             open_count: 0,
             last_access: SystemTime::now(),
             op_lock: Arc::new(Mutex::new(())),
@@ -2477,9 +3204,34 @@ impl QxyncFs {
             refreshing: false,
             refresh_attempts: 0,
         };
+        node.refresh_file_id(&parent_remote);
+        let (file_id, size, mtime, is_dir) = (
+            node.file_id,
+            node.attr.size,
+            epoch_secs(node.attr.mtime),
+            node.attr.kind == FileType::Directory,
+        );
         g.nodes.insert(ino, node.clone());
         g.by_remote.insert(remote.to_string(), ino);
+        drop(g);
+        // ★ T9：节点一建出来就把身份记进索引（对账要靠它把「删除 + 新增」配成改名）。
+        //   锁外写库：SQLite 有自己的锁，不能在持有节点表锁时做慢 IO。
+        nodes_remember(self.nodes.as_ref(), remote, file_id, size, mtime, is_dir);
         node
+    }
+
+    /// ★ T9：把 `nodes` 行的 path 从 `old` 搬到 `new`（`file_id` 一个字节都不动）。
+    ///
+    /// 不搬的后果：索引里留着旧名字 → 下一轮对账按身份反查时找不到当前路径 →
+    /// 改名配对失效（退化成旧的增删判定，用户看到冲突副本）。
+    ///
+    /// 失败**刻意不上报**：远端已经改成功、本地节点也搬完了，因为索引写失败
+    /// 就让用户看到 ENOENT 是本末倒置（索引只影响配对收益，保守退化即可）。
+    fn migrate_nodes_row(&self, old_remote: &str, new_remote: &str) {
+        let Some(store) = &self.nodes else { return };
+        if let Err(e) = store.node_rename(old_remote, new_remote) {
+            tracing::warn!("迁移 nodes 身份路径失败 {old_remote} -> {new_remote}: {e}");
+        }
     }
 
     /// 列一个目录（不水合），并把子节点的元数据灌进表里。
@@ -2787,6 +3539,23 @@ impl QxyncFs {
                 }
             }
         }
+        // ★ T9：**删除点即清理**身份索引（正确性红线）。
+        //
+        // 留着行不清理的后果：新文件**可能算出同一个 `file_id`**（`(mtime,size)`
+        // 相同就会撞），下次对账就会把新文件认成「老文件改名过来的」→ 配错对 →
+        // 可能丢数据。所以必须在删除的**当场**清，而不是靠事后扫描（那有窗口期）。
+        // 目录连同子树一起清（`node_forget_subtree` 内部转义了 LIKE 通配符，
+        // 目录名里有 `%`/`_` 也不会误删兄弟目录）。
+        if let Some(store) = &self.nodes {
+            let res = if is_dir {
+                store.node_forget_subtree(&remote)
+            } else {
+                store.node_forget(&remote).map(|_| 1)
+            };
+            if let Err(e) = res {
+                tracing::warn!("清理 nodes 身份失败 {remote}: {e}");
+            }
+        }
         // ★ M9：本地删除立刻从「映射」里摘掉，否则旧快照会把删掉的名字复活成幽灵节点
         listing_remove(&self.inner, &parent_remote, name);
         tracing::debug!("{} {}", if is_dir { "rmdir" } else { "unlink" }, remote);
@@ -2802,7 +3571,8 @@ impl QxyncFs {
         let (remote, name, mtime, cache) = {
             let mut g = self.inner.lock().unwrap();
             let n = g.nodes.get_mut(&ino).ok_or(fuser::Errno::ENOENT)?;
-            n.dirty = true;
+            // ★ T8：标脏 → 未同步（`set_dirty` 同时置 `in_sync=false`）
+            n.set_dirty(true);
             // 本地改动是权威：远端新内容的后台刷新意图作废
             n.pending = None;
             let cache = n.cache.clone().ok_or(fuser::Errno::EIO)?;
@@ -2813,6 +3583,8 @@ impl QxyncFs {
                 cache,
             )
         };
+        // ★ T9：随作业带上身份 → worker 发之前能复查「现在该落到哪个名字」。
+        let file_id = compute_node_file_id(&self.inner, ino).unwrap_or(ZERO_FILE_ID);
         let job = UploadJob {
             remote_dir: self.remote_dir_of(&remote),
             remote_name: name,
@@ -2820,6 +3592,10 @@ impl QxyncFs {
             mtime,
             attempts: 0,
             ephemeral: false,
+            file_id,
+            // ★ T8：入队时还没开始传
+            bytes_sent: 0,
+            bytes_total: 0,
         };
         queue.enqueue(job).map_err(|e| {
             tracing::error!("入队上传失败: {e}");
@@ -2948,6 +3724,12 @@ impl QxyncFs {
         let chunk_size = self.chunk_size;
         let path = self.cache_path(&remote, &name);
 
+        // ★ T9：认领前按当前签名现算身份（与 `persist_chunk_state` 落盘时同一个函数）。
+        // 拿不到节点（极少见：并发删掉）就退回「不认领」。
+        let Some(want_id) = compute_node_file_id(&self.inner, ino) else {
+            return Err(fuser::Errno::ENOENT);
+        };
+
         // ① 认领：位图签名与节点一致 + 内容文件长度对得上，才敢信。
         let adopted = if path.is_file() {
             state_load(&path).and_then(|st| {
@@ -2955,6 +3737,21 @@ impl QxyncFs {
                     .map(|m| m.len() == size)
                     .unwrap_or(false);
                 if st.chunk_size != chunk_size || st.size != size || st.mtime != mtime || !len_ok {
+                    return None;
+                }
+                // ★ T9：签名过了，再比**身份**。这一栏挡的是「另一个文件认领了这份缓存」——
+                // 典型场景：同一路径删了重建、或改名后旧缓存文件被留在盘上。
+                // 身份不符就整份不认领（退回按需水合），**绝不返回错误内容**。
+                //
+                // 这一栏是 T3 序列上的**新增一道**，不是替代：T3 的「先比签名、
+                // 签名过了再逐区间核 xxhash、坏区间清未就绪」顺序原样保留，
+                // file_id 只是把签名比对的判据补全。
+                if st.file_id != want_id {
+                    tracing::debug!(
+                        "认领作废 {remote}：位图身份 {} 与当前身份 {} 不符",
+                        qxync_core::file_id::file_id_hex(&st.file_id),
+                        qxync_core::file_id::file_id_hex(&want_id),
+                    );
                     return None;
                 }
                 // ★ T3：签名过了，再逐区间核内容。核不过的清成未就绪。
@@ -3063,7 +3860,7 @@ impl QxyncFs {
             return Ok(());
         }
 
-        let (remote, total, dest, mtime) = {
+        let (remote, total, dest, mtime, start_done) = {
             let g = self.inner.lock().unwrap();
             let n = g.nodes.get(&ino).ok_or(fuser::Errno::ENOENT)?;
             (
@@ -3071,6 +3868,10 @@ impl QxyncFs {
                 n.attr.size,
                 n.cache.clone().ok_or(fuser::Errno::EIO)?,
                 Self::epoch_of(n.attr.mtime),
+                // ★ T8：本次传输的起点 = 已经就绪的区间字节数。一次 `read` 往往要
+                //   连着取多个分片（`hydrate_all` 还会 8 路并发），每次都从 0 起算
+                //   会让进度条反复归零。
+                n.hydrated_bytes(self.chunk_size),
             )
         };
         // ★ M7：规则兜底（lookup 已经挡住了，这里是纵深防御）
@@ -3083,7 +3884,8 @@ impl QxyncFs {
         let want = end - start + 1;
 
         // ★ M7/M9：LAN 快路径 → NAS 回落，走同一套区间下载原语（后台内容刷新也用它）。
-        let ctx = self.fetch_ctx();
+        // ★ T8：带上报，每收完一个分片推一次进度。
+        let ctx = fetch_ctx_progressing(self.fetch_ctx(), self.inner.clone(), &remote, start_done);
         let timeout = self.hydrate_timeout;
         let mut auth_retried = false;
         let data = loop {
@@ -3098,17 +3900,21 @@ impl QxyncFs {
                     tracing::warn!("区间水合鉴权失败（{msg}），重登后重试: {remote}");
                     if !self.refresh_sid() {
                         self.inner.lock().unwrap().inflight_chunks.remove(&key);
+                        // ★ T8：失败 → 清进度（别让界面停在一个永远走不完的数上）
+                        self.clear_node_progress(ino);
                         return Err(fuser::Errno::EACCES);
                     }
                 }
                 Err(ChunkFetchError::Timeout) => {
                     tracing::warn!("区间水合超时({timeout:?}): {remote} [{start}..={end}]");
                     self.inner.lock().unwrap().inflight_chunks.remove(&key);
+                    self.clear_node_progress(ino);
                     return Err(fuser::Errno::EIO);
                 }
                 Err(e) => {
                     tracing::warn!("区间水合失败: {remote} [{start}..={end}]: {e}");
                     self.inner.lock().unwrap().inflight_chunks.remove(&key);
+                    self.clear_node_progress(ino);
                     return Err(fuser::Errno::EIO);
                 }
             }
@@ -3121,6 +3927,9 @@ impl QxyncFs {
                 data.len()
             );
             self.inner.lock().unwrap().inflight_chunks.remove(&key);
+            // ★ T8：进度回调已经报过这个分片的字节数，但它**不会被采用** ——
+            //   长度不符的区间不写进缓存（上一行刚 return），留着就是脏进度。
+            self.clear_node_progress(ino);
             return Err(fuser::Errno::EIO);
         }
 
@@ -3147,6 +3956,7 @@ impl QxyncFs {
                 // 校验和写不进去 → 这一区间不能声称「内容是对的」，别置位。
                 tracing::warn!("写校验和失败 {} #{idx}: {e}", dest.display());
                 self.inner.lock().unwrap().inflight_chunks.remove(&key);
+                self.clear_node_progress(ino);
                 return Err(fuser::Errno::EIO);
             }
         }
@@ -3169,9 +3979,24 @@ impl QxyncFs {
         if all_done {
             self.refresh_whole_hash(ino, &dest);
         }
+        // ★ T8：全量就绪 = 没有在传的作业了 → 清进度（`note_progress` 到 100% 时
+        //   也会清，这里再兜一次底：并发取块时最后一个分片可能不是本线程收的）。
+        if all_done {
+            self.clear_node_progress(ino);
+        }
         persist_chunk_state(&self.inner, self.chunk_size, ino);
         tracing::debug!("区间就绪: {remote} [{start}..={end}] ({want} 字节)");
         Ok(())
+    }
+
+    /// ★ T8：清掉某个节点的传输进度（按 ino，节点可能已被移出 `by_remote`）。
+    fn clear_node_progress(&self, ino: INodeNo) {
+        let Ok(mut g) = self.inner.lock() else {
+            return;
+        };
+        if let Some(n) = g.nodes.get_mut(&ino) {
+            n.clear_progress();
+        }
     }
 
     /// 重算整文件校验和并挂到节点上（**只读本地缓存文件**，不碰 NAS）。
@@ -3849,17 +4674,25 @@ impl Filesystem for QxyncFs {
                 n.name = newname.to_string();
                 n.remote = new_remote.clone();
                 n.parent = newparent;
+                // ★ T9：**刻意不重算 `file_id`** —— 改名/移动之后身份必须不变，
+                // 这正是下一轮对账能把「远端删除 + 远端新增」认成一次改名的前提。
+                // 重算发生在**签名变了**的地方（`persist_chunk_state` 现算）。
             }
         }
+        // ★ T9：把 `nodes` 行的 path 一起搬过去（`file_id` 一个字节都不动）。
+        self.migrate_nodes_row(&old_remote, &new_remote);
         // ★ M9：改名同步到「映射」：旧名字摘掉、新名字补上
         listing_remove(&self.inner, &parent_remote, name);
         if let Some(node) = self.node_by_remote(&new_remote) {
-            let e = DirEntry::local(
+            let mut e = DirEntry::local(
                 newname,
                 node.attr.kind == FileType::Directory,
                 node.attr.size,
                 Self::epoch_of(node.attr.mtime),
             );
+            // ★ T9：直接沿用节点的身份，**不重算** —— 改名之后身份必须还是它自己
+            // （重算在 mtime<=0 的退化路径下会算出新 id，那就等于「改名变了身份」）。
+            e.file_id = node.file_id;
             listing_upsert(&self.inner, &newparent_remote, &e);
         }
         tracing::debug!("rename {old_remote} -> {new_remote}");
@@ -4309,7 +5142,9 @@ fn verify_one(cache: &Path, name: &str, repair: bool, rep: &mut VerifyReport) {
     }
     let chunk_size = st.chunk_size;
     // 校验和表缺失或长度对不上 → 这一文件「无法做内容校验」，和损坏一样要报出来。
-    let sum_len = std::fs::metadata(sum_path(cache)).map(|m| m.len()).unwrap_or(0);
+    let sum_len = std::fs::metadata(sum_path(cache))
+        .map(|m| m.len())
+        .unwrap_or(0);
     let missing_sums = sum_len != (nchunks * 8) as u64;
     let bad_chunks = verify_done_chunks(cache, &st.done, st.size, chunk_size);
 
@@ -4509,6 +5344,8 @@ mod tests {
             file_id: ZERO_FILE_ID,
             whole_xxhash: NO_HASH,
             dirty: false,
+            in_sync: true,
+            progress: None,
             open_count: 0,
             last_access: UNIX_EPOCH,
             op_lock: Arc::new(Mutex::new(())),
@@ -5141,7 +5978,7 @@ mod tests {
         // dirty → 拒绝
         {
             let mut g = fs.inner.lock().unwrap();
-            g.nodes.get_mut(&node.ino).unwrap().dirty = true;
+            g.nodes.get_mut(&node.ino).unwrap().set_dirty(true);
         }
         assert_eq!(
             h.dehydrate_now("/home/a.bin", &manual, false, |_| Ok(())),
@@ -5150,7 +5987,7 @@ mod tests {
         // dirty 清了但上传队列里还有作业 → 拒绝
         {
             let mut g = fs.inner.lock().unwrap();
-            g.nodes.get_mut(&node.ino).unwrap().dirty = false;
+            g.nodes.get_mut(&node.ino).unwrap().set_dirty(false);
         }
         // 直接入队（不置 dirty）→ 只触发「队列里还有作业」这条
         q.enqueue(UploadJob {
@@ -5160,6 +5997,9 @@ mod tests {
             mtime: 111,
             attempts: 0,
             ephemeral: false,
+            file_id: ZERO_FILE_ID,
+            bytes_sent: 0,
+            bytes_total: 0,
         })
         .unwrap();
         assert_eq!(
@@ -5171,7 +6011,7 @@ mod tests {
         q.cancel("/home/a.bin");
         {
             let mut g = fs.inner.lock().unwrap();
-            g.nodes.get_mut(&node.ino).unwrap().dirty = false;
+            g.nodes.get_mut(&node.ino).unwrap().set_dirty(false);
         }
         assert!(matches!(
             h.dehydrate_now("/home/a.bin", &manual, false, |_| Ok(())),
@@ -5508,7 +6348,10 @@ mod tests {
         // ★ 破坏第 1 区间中间（长度不变 —— 这正是只查长度查不出来的场景）
         {
             use std::os::unix::fs::FileExt;
-            let f = std::fs::OpenOptions::new().write(true).open(&cache).unwrap();
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&cache)
+                .unwrap();
             f.write_all_at(&[0xFFu8; 64], cs + 4096).unwrap();
         }
         let bad = verify_done_chunks(&cache, &st.done, size, cs);
@@ -5644,7 +6487,10 @@ mod tests {
         // 破坏第 2 区间（长度不变）
         {
             use std::os::unix::fs::FileExt;
-            let f = std::fs::OpenOptions::new().write(true).open(&cache).unwrap();
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&cache)
+                .unwrap();
             f.write_all_at(&[0xEEu8; 128], 2 * cs + 11).unwrap();
         }
 
@@ -5658,11 +6504,7 @@ mod tests {
             let n = g.nodes.get(&node.ino).unwrap();
             (n.chunks_done.clone(), n.state_str())
         };
-        assert_eq!(
-            done,
-            vec![true, true, false],
-            "被破坏的区间必须退回未就绪"
-        );
+        assert_eq!(done, vec![true, true, false], "被破坏的区间必须退回未就绪");
         assert_eq!(state_str, "partial");
         // 读那个坏区间必然失败（要去 NAS，nas.invalid 不通）—— 而不是返回垃圾
         assert!(fs.ensure_range(node.ino, 2 * cs, cs).is_err());
@@ -5742,9 +6584,7 @@ mod tests {
         let mibs = mib / elapsed.as_secs_f64().max(1e-9);
         // 换算到 10 GB 需要多久
         let projected_10g = 10240.0 / mibs;
-        println!(
-            "[T3] 校验吞吐 {mibs:.0} MiB/s → 10 GB 全量校验预计 {projected_10g:.1}s"
-        );
+        println!("[T3] 校验吞吐 {mibs:.0} MiB/s → 10 GB 全量校验预计 {projected_10g:.1}s");
         assert!(
             projected_10g < 30.0,
             "10 GB 全量校验预计 {projected_10g:.1}s，超过 30s 预算（实测 {mibs:.0} MiB/s）"
@@ -6044,7 +6884,7 @@ mod tests {
         // 期间用户改了内容（dirty）→ 作废
         {
             let mut g = fs.inner.lock().unwrap();
-            g.nodes.get_mut(&ino).unwrap().dirty = true;
+            g.nodes.get_mut(&ino).unwrap().set_dirty(true);
         }
         assert_eq!(
             install_refreshed(
@@ -6099,6 +6939,585 @@ mod tests {
         );
         assert!(!cache.exists());
         assert!(!h.pending_refresh("/home/a.bin"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------------------ ★ T9 稳定身份
+
+    /// T9 测试用的状态库（独立文件，跟节点表一样是「重启后还在」的那份索引）。
+    /// 返回 `Arc` 是因为 `QxyncFs` 拿的是共享句柄，测试要能从外面查同一份库。
+    fn t9_store(tag: &str) -> (Arc<Store>, PathBuf) {
+        let dir = m7_tmpdir(tag);
+        let store = Store::open(dir.join("state.db")).unwrap();
+        (Arc::new(store), dir)
+    }
+
+    /// ★ T9：节点一建出来就把**真身份**记进 `nodes` 表，且与节点自身的 `file_id` 一致。
+    ///
+    /// 这是整条链的起点：`Inner.by_remote` 只索引「路径 → 节点」，对账要判 rename
+    /// 必须有一个**跨改名稳定**的身份从节点表落到可查询的索引里。
+    #[test]
+    fn t9_insert_node_records_the_real_identity() {
+        let (store, dir) = t9_store("t9-insert");
+        let fs = test_fs(&dir, false).with_nodes_store(store.clone());
+
+        let entry = DirEntry::local("a.txt", false, 1234, 1_700_000_000);
+        let node = fs.insert_node(INodeNo::ROOT, "a.txt", "/home/a.txt", &entry);
+        assert_ne!(node.file_id, ZERO_FILE_ID, "节点不能是零身份");
+
+        let row = store.node_by_path("/home/a.txt").unwrap().unwrap();
+        assert_eq!(row.file_id, node.file_id, "索引里的身份必须就是节点的身份");
+        assert_eq!(row.path, "/home/a.txt");
+        assert_eq!(row.remote_path, "/home/a.txt");
+        assert_eq!(row.size, 1234);
+        assert_eq!(row.mtime, 1_700_000_000);
+        assert!(!row.is_folder);
+
+        // 目录也必须有身份，且与同名文件不撞（否则目录改名会被当成文件改名配对）
+        let d = DirEntry::local("a.txt", true, 0, 1_700_000_000);
+        let dir_node = fs.insert_node(INodeNo::ROOT, "a.txt", "/home/dir_a.txt", &d);
+        assert_ne!(dir_node.file_id, node.file_id);
+        assert!(
+            store
+                .node_by_path("/home/dir_a.txt")
+                .unwrap()
+                .unwrap()
+                .is_folder
+        );
+
+        // 每次落盘都可复算：同一份元数据重算一遍必须得到同一个身份
+        assert_eq!(
+            dir_node.file_id,
+            compute_file_id(true, 0, 1_700_000_000, "a.txt", "/home")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ T9：改名/移动之后 `nodes` 行的 path 更新到新位置，**`file_id` 一个字节都不变**。
+    ///
+    /// 覆盖三层：
+    /// 1. 节点表：改名后 `Node.remote`/`name`/`parent` 更新，`file_id` 保持；
+    /// 2. 索引表：`nodes.path` 跟着搬（`migrate_nodes_row` 就是 `rename` 回调调的那一句）；
+    /// 3. 反查：`path_for_file_id` 能从身份查到**新**路径（旧路径查不到了）。
+    #[test]
+    fn t9_rename_moves_the_nodes_row_and_keeps_the_identity() {
+        let (store, dir) = t9_store("t9-rename");
+        let fs = test_fs(&dir, false).with_nodes_store(store.clone());
+        let h = fs.handle();
+
+        let entry = DirEntry::local("old.txt", false, 4096, 1_700_000_000);
+        let node = fs.insert_node(INodeNo::ROOT, "old.txt", "/home/old.txt", &entry);
+        let id_before = node.file_id;
+        assert_eq!(store.nodes_len().unwrap(), 1);
+        assert_eq!(h.node_file_id("/home/old.txt"), Some(id_before));
+
+        // 复刻 `rename` 回调里那段「本地节点搬家」的逻辑（远端调用需要真 NAS，
+        // 单元测试跑不到，所以这里只驱动它之后的那两句索引同步）
+        {
+            let mut g = fs.inner.lock().unwrap();
+            g.by_remote.remove("/home/old.txt");
+            g.by_remote.insert("/home/new.txt".to_string(), node.ino);
+            if let Some(n) = g.nodes.get_mut(&node.ino) {
+                // ★ 刻意不重算 file_id
+                n.name = "new.txt".to_string();
+                n.remote = "/home/new.txt".to_string();
+            }
+        }
+        fs.migrate_nodes_row("/home/old.txt", "/home/new.txt");
+
+        // 1. 节点身份没变
+        let after = fs.node_by_remote("/home/new.txt").unwrap();
+        assert_eq!(after.file_id, id_before, "改名绝不能改身份");
+        assert_eq!(after.name, "new.txt");
+        // 2. 索引行搬到新路径，身份不变
+        assert_eq!(store.nodes_len().unwrap(), 1, "搬家不是新增一行");
+        assert_eq!(
+            store.node_by_path("/home/old.txt").unwrap(),
+            None,
+            "旧路径必须查不到，否则按身份反查会拿到过期名字"
+        );
+        let row = store.node_by_path("/home/new.txt").unwrap().unwrap();
+        assert_eq!(row.file_id, id_before);
+        assert_eq!(row.path, "/home/new.txt");
+        // 3. 身份反查给出新名字（上传队列就靠这个落地）
+        assert_eq!(
+            h.path_for_file_id(&id_before).as_deref(),
+            Some("/home/new.txt")
+        );
+        assert_eq!(h.node_file_id("/home/old.txt"), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M15/T9 + 独立校验补测：**`rename_remote` 本身**（对账认定的远端改名路径）。
+    ///
+    /// 之前只测了 FUSE `rename` 回调那条路径，导致一个真 bug 溜过去：
+    /// `rename_remote` 忘了把 `nodes` 索引行一起搬，于是同一个 `file_id` 出现两行 →
+    /// `nodes_by_file_id` 恒返回 2 行 → `path_for_file_id` 从此恒 `None`，
+    /// **上传队列的按身份重定向永久失效**、对账也永远配不上（且每次远端改名泄漏一行）。
+    /// 这个测试就是守住那条「索引必须同步搬」的。
+    #[test]
+    fn t9_rename_remote_migrates_node_and_index_together() {
+        let (store, dir) = t9_store("t9-rename-remote");
+        let fs = test_fs(&dir, false).with_nodes_store(store.clone());
+        let h = fs.handle();
+
+        let entry = DirEntry::local("old.txt", false, 4096, 1_700_000_000);
+        let node = fs.insert_node(INodeNo::ROOT, "old.txt", "/home/old.txt", &entry);
+        let id = node.file_id;
+        assert_eq!(store.nodes_len().unwrap(), 1);
+
+        // 目标路径先被别的节点占着 → 必须拒绝迁移（宁可退回增删判定也不能覆盖）
+        let other = DirEntry::local("taken.txt", false, 10, 1_700_000_001);
+        fs.insert_node(INodeNo::ROOT, "taken.txt", "/home/taken.txt", &other);
+        assert!(
+            !h.rename_remote("/home/old.txt", "/home/taken.txt"),
+            "目标已被占用时必须拒绝迁移"
+        );
+        assert!(fs.node_by_remote("/home/old.txt").is_some(), "拒绝时不该动原节点");
+
+        // 正常改名
+        assert!(h.rename_remote("/home/old.txt", "/home/new.txt"));
+        assert!(fs.node_by_remote("/home/old.txt").is_none(), "旧路径不该还在");
+        let moved = fs.node_by_remote("/home/new.txt").expect("新路径要有节点");
+        assert_eq!(moved.file_id, id, "改名绝不能改身份");
+        assert_eq!(moved.name, "new.txt");
+
+        // ★ 这条是本测试的核心：索引行必须**搬**而不是**新增**。
+        // 漏了它 → 同一 file_id 两行 → 按身份反查恒失效（P1 bug）。
+        assert_eq!(store.nodes_len().unwrap(), 2, "搬家不应新增行（1 行原样搬过去）");
+        assert!(store.node_by_path("/home/old.txt").unwrap().is_none());
+        assert_eq!(
+            store.node_by_path("/home/new.txt").unwrap().unwrap().file_id,
+            id
+        );
+        // 身份反查必须仍能给出**唯一**答案（上传队列就靠这个落地）
+        assert_eq!(
+            store.nodes_by_file_id(&id).unwrap().len(),
+            1,
+            "同一身份只能对应一个路径，否则重定向会拿到过期名字"
+        );
+        assert_eq!(h.path_for_file_id(&id).as_deref(), Some("/home/new.txt"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ T9：删除时必须把身份索引**清掉**（否则下次对账会把老 file_id 配到新文件上）。
+    ///
+    /// 覆盖远端删除（`remove_remote`）与本地删除（`remove_entry` 的 `node_forget`）
+    /// 两条路径；目录删除还要连子树一起清。
+    #[test]
+    fn t9_local_and_remote_deletion_forget_the_identity() {
+        let (store, dir) = t9_store("t9-forget");
+        let fs = test_fs(&dir, false).with_nodes_store(store.clone());
+        let h = fs.handle();
+
+        let e1 = DirEntry::local("gone.txt", false, 10, 1_700_000_000);
+        fs.insert_node(INodeNo::ROOT, "gone.txt", "/home/gone.txt", &e1);
+        let sub = DirEntry::local("sub", true, 0, 1_700_000_001);
+        fs.insert_node(INodeNo::ROOT, "sub", "/home/sub", &sub);
+        let e2 = DirEntry::local("kid.txt", false, 20, 1_700_000_002);
+        fs.insert_node(INodeNo::ROOT, "kid.txt", "/home/sub/kid.txt", &e2);
+        // 兄弟目录不能被误伤
+        let sib = DirEntry::local("sub2", true, 0, 1_700_000_003);
+        fs.insert_node(INodeNo::ROOT, "sub2", "/home/sub2", &sib);
+        assert_eq!(store.nodes_len().unwrap(), 4);
+
+        // 远端删掉一个文件 → 只掉它自己
+        assert!(h.remove_remote("/home/gone.txt"));
+        assert_eq!(store.nodes_len().unwrap(), 3);
+        assert!(store.node_by_path("/home/gone.txt").unwrap().is_none());
+
+        // 远端删掉一个目录 → 连子树一起掉，兄弟目录留着
+        assert!(h.remove_remote("/home/sub"));
+        assert_eq!(store.nodes_len().unwrap(), 1);
+        assert!(store.node_by_path("/home/sub").unwrap().is_none());
+        assert!(store.node_by_path("/home/sub/kid.txt").unwrap().is_none());
+        assert!(store.node_by_path("/home/sub2").unwrap().is_some());
+
+        // 删完之后身份反查必须说「没有」→ 上传队列退回按排队路径发（保守）
+        let kid_id = compute_file_id(false, 20, 1_700_000_002, "kid.txt", "/home/sub");
+        assert_eq!(h.path_for_file_id(&kid_id), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ T9：**没注入 store 时一切 nodes 操作静默跳过**，挂载与数据操作完全不受影响。
+    ///
+    /// 这是 T9 的降级方向（老 daemon / 只读挂载）：身份只在节点表和 `.qxstate` 里，
+    /// 对账拿不到索引 → 退回旧的增删判定（多报冲突，不丢数据）。
+    #[test]
+    fn t9_without_a_nodes_store_everything_still_works() {
+        let dir = m7_tmpdir("t9-nostore");
+        let fs = test_fs(&dir, false);
+        let h = fs.handle();
+        let entry = DirEntry::local("a.txt", false, 7, 1_700_000_000);
+        let node = fs.insert_node(INodeNo::ROOT, "a.txt", "/home/a.txt", &entry);
+        assert_ne!(node.file_id, ZERO_FILE_ID, "身份照样算得出来");
+
+        // 三个 nodes 入口都不许炸
+        assert!(h.node_file_id("/home/a.txt").is_none(), "没库就查不到");
+        assert!(h.path_for_file_id(&node.file_id).is_none());
+        assert!(h.remove_remote("/home/a.txt"), "数据操作照常");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ T9：`.qxstate` 头里的 `file_id` 必须是**真身份**（T3 留的位置不是零值）。
+    ///
+    /// 同时守住 T3 的顺序：**签名先过**，签名过了再比身份 —— 一个「内容被换掉、
+    /// 大小 mtime 恰好不变」的缓存文件必须被拒（身份对不上 → 退回按需水合）。
+    #[test]
+    fn t9_cached_state_carries_the_real_identity_and_it_is_checked() {
+        let dir = m7_tmpdir("t9-state");
+        let payload: Vec<u8> = (0..300 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let (ino, cache) = {
+            let fs = test_fs(&dir, false);
+            let (ino, cache) = hydrated_node(&fs, "a.bin", "/home/a.bin", &payload, 1000);
+            let node = fs.node_by_remote("/home/a.bin").unwrap();
+            assert_ne!(node.file_id, ZERO_FILE_ID);
+            // 落盘状态里带的就是这个身份
+            let st = state_load(&cache).unwrap();
+            assert_eq!(st.file_id, node.file_id, ".qxstate 里的身份不能是零值");
+            // 认领时按身份核过 → 能复用
+            assert!(fs.cache_file_for(ino).is_ok());
+            (ino, cache)
+        };
+        assert!(cache.exists());
+
+        // 换一个身份（模拟「内容被换掉但大小 mtime 没变」）→ 认领必须失败
+        {
+            let mut st = state_load(&cache).unwrap();
+            st.file_id = compute_file_id(false, payload.len() as u64, 9999, "a.bin", "/home");
+            state_save(&cache, &st).unwrap();
+        }
+        let fs2 = test_fs(&dir, false);
+        assert!(
+            fs2.cache_file_for(ino).is_err(),
+            "身份对不上就不能认领这份缓存（宁可退回按需水合）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ================================================================ ★ M15/T8
+
+    /// T8 用的干净节点（`dirty=false` / `in_sync=true` / 无进度）。
+    fn t8_node() -> Node {
+        let attr = FileAttr {
+            ino: INodeNo(9),
+            size: 1000,
+            blocks: 0,
+            atime: UNIX_EPOCH,
+            mtime: UNIX_EPOCH,
+            ctime: UNIX_EPOCH,
+            crtime: UNIX_EPOCH,
+            kind: FileType::RegularFile,
+            perm: 0o644,
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            blksize: 4096,
+            flags: 0,
+        };
+        Node {
+            ino: INodeNo(9),
+            parent: INodeNo::ROOT,
+            name: "a.bin".into(),
+            remote: "/home/a.bin".into(),
+            attr,
+            cache: None,
+            chunks_done: vec![true],
+            file_id: ZERO_FILE_ID,
+            whole_xxhash: NO_HASH,
+            dirty: false,
+            in_sync: true,
+            progress: None,
+            open_count: 0,
+            last_access: UNIX_EPOCH,
+            op_lock: Arc::new(Mutex::new(())),
+            pending: None,
+            refreshing: false,
+            refresh_attempts: 0,
+        }
+    }
+
+    /// ★ T8：`in_sync` 的判定规则 —— 三个源任意一个不干净就「未同步」。
+    #[test]
+    fn t8_in_sync_is_combined_from_three_sources() {
+        // 干净：已同步
+        assert!(combine_in_sync(false, false, 0));
+        // 有本地未上传改动 → 未同步
+        assert!(!combine_in_sync(true, false, 0));
+        // 队列里还排着作业 → 未同步（「我改完了但 NAS 上还没有」正是这个窗口）
+        assert!(!combine_in_sync(false, true, 0));
+        // 有待裁决冲突 → 未同步
+        assert!(!combine_in_sync(false, false, 1));
+        assert!(!combine_in_sync(false, false, 3), "冲突数不是布尔，>0 都不算已同步");
+        // 三个都干净才是已同步
+        assert!(combine_in_sync(false, false, 0));
+    }
+
+    /// ★ T8：`set_dirty` 是 `dirty`/`in_sync` 的唯一入口，两者不能自相矛盾。
+    #[test]
+    fn t8_set_dirty_keeps_dirty_and_in_sync_consistent() {
+        let mut n = t8_node();
+        n.set_dirty(true);
+        assert!(n.dirty);
+        assert!(!n.in_sync, "标脏必须同时把 in_sync 拉下来");
+        // 清脏**不**置 true：队列里可能还排着别的作业、也可能有待裁决冲突
+        n.set_dirty(false);
+        assert!(!n.dirty);
+        assert!(!n.in_sync, "清脏不等于已同步（另两个源还没查）");
+    }
+
+    /// ★ T8：下载进度**单调不减**，且完成即清空。
+    #[test]
+    fn t8_node_progress_is_monotonic_and_clears_on_completion() {
+        let mut n = t8_node();
+        // 分片按完成顺序到达（8 路并发，谁先谁后不确定）
+        assert!(n.note_progress(128 * 1024, 1000 * 1024));
+        assert_eq!(n.progress, Some((128 * 1024, 1000 * 1024)));
+        // 乱序到达（后完成的分片先回调）→ 只能向前走，绝不能倒退
+        assert!(!n.note_progress(64 * 1024, 1000 * 1024), "没变化就不算改动");
+        assert_eq!(n.progress, Some((128 * 1024, 1000 * 1024)), "进度不能倒退");
+        // 继续推进
+        assert!(n.note_progress(900 * 1024, 1000 * 1024));
+        assert_eq!(n.progress, Some((900 * 1024, 1000 * 1024)));
+        // 到量 → 清空（不能停在 100% 装成「还有作业在跑」）
+        assert!(n.note_progress(1000 * 1024, 1000 * 1024));
+        assert_eq!(n.progress, None, "传完就没有在传的作业了");
+        // 清完之后再来一次超量的回调（并发取块：最后一个分片可能不是本线程收的）
+        assert!(!n.note_progress(2000 * 1024, 1000 * 1024));
+        assert_eq!(n.progress, None);
+    }
+
+    /// ★ T8：`total == 0` 不能变成「除以零」或「永远 0%」。
+    #[test]
+    fn t8_node_progress_handles_zero_total() {
+        let mut n = t8_node();
+        assert!(!n.note_progress(10, 0));
+        assert_eq!(n.progress, None, "总量未知就不显示进度（不是 0%）");
+    }
+
+    /// ★ T8：`clear_progress` 幂等，且如实报告是否真的清掉了什么。
+    #[test]
+    fn t8_clear_progress_is_idempotent() {
+        let mut n = t8_node();
+        assert!(!n.clear_progress(), "本来就没有进度");
+        n.note_progress(10, 100);
+        assert_eq!(n.progress, Some((10, 100)));
+        assert!(n.clear_progress());
+        assert_eq!(n.progress, None);
+        assert!(!n.clear_progress(), "清第二次没有可清的");
+    }
+
+    /// ★ T8：展示文案（CLI 与 GUI 共用同一套）。
+    #[test]
+    fn t8_sync_state_label_covers_all_shapes() {
+        // 已同步
+        assert_eq!(sync_state_label(true, None, 0), "已同步");
+        // 传输中优先于「已同步」（还没传完，说已同步是错的）
+        assert_eq!(sync_state_label(true, Some((420, 1000)), 0), "同步中 42%");
+        assert_eq!(sync_state_label(false, Some((0, 1000)), 0), "同步中 0%");
+        // 未同步：分不清 dirty / pending 时如实说「未同步」，不猜
+        assert_eq!(sync_state_label(false, None, 0), "未同步");
+        // 未同步 + 有冲突 → 带上冲突数
+        assert_eq!(sync_state_label(false, None, 2), "未同步（2 个冲突待处理）");
+    }
+
+    /// ★ T8：百分比算法（GUI 也用同一个，防两边算出不同的数）。
+    #[test]
+    fn t8_progress_percent_is_floor_and_zero_safe() {
+        assert_eq!(progress_percent(0, 100), 0);
+        assert_eq!(progress_percent(50, 100), 50);
+        assert_eq!(progress_percent(999, 1000), 99, "向下取整，不引入假精度");
+        assert_eq!(progress_percent(1, 0), 0, "总量为 0 不能除出 NaN/panic");
+        assert_eq!(progress_percent(u64::MAX, 1), 100, "超量夹到 100%，不能溢出");
+    }
+
+    /// ★ T8：`transfer_meter` 累加原子、夹住 total、从 `start_done` 接着算。
+    #[test]
+    fn t8_transfer_meter_accumulates_and_clamps() {
+        let seen = Arc::new(Mutex::new(Vec::<(u64, u64)>::new()));
+        let s2 = seen.clone();
+        let (hook, meter) = transfer_meter(
+            move |d, t| s2.lock().unwrap().push((d, t)),
+            500,
+        );
+        // 「本次收到的字节数」→ 累加出单调的累计值
+        invoke_progress_hook(&Some(hook.clone()), 300, 1000);
+        invoke_progress_hook(&Some(hook.clone()), 200, 1000);
+        assert_eq!(meter.load(Ordering::Relaxed), 1000);
+        assert_eq!(*seen.lock().unwrap(), vec![(800, 1000), (1000, 1000)]);
+        // 超量 → 停在 100%，绝不越界（用户把文件改大了也不会显示 120%）
+        invoke_progress_hook(&Some(hook), 9999, 1000);
+        let v = seen.lock().unwrap();
+        assert_eq!(v.last().unwrap(), &(1000, 1000));
+    }
+
+    /// ★ T8：**回调 panic 不能影响读路径**（M7 在上传侧踩过同款坑）。
+    #[test]
+    fn t8_progress_hook_panic_is_isolated() {
+        let n = Arc::new(AtomicU64::new(0));
+        let n2 = n.clone();
+        let hook: ProgressHook = Arc::new(move |_, _| {
+            n2.fetch_add(1, Ordering::Relaxed);
+            panic!("进度回调里的 bug");
+        });
+        // 第一次 panic 被隔离
+        invoke_progress_hook(&Some(hook.clone()), 1, 10);
+        // 后续照常执行 —— 传输不能因为一次上报失败就停摆
+        invoke_progress_hook(&Some(hook), 1, 10);
+        assert_eq!(n.load(Ordering::Relaxed), 2);
+        // `None` = 不上报，直接返回
+        invoke_progress_hook(&None, 1, 10);
+    }
+
+    /// ★ T8：分片回调传的是**增量**，节点上的进度是累计 —— 两者不能搞混。
+    #[test]
+    fn t8_progress_hook_receives_delta_not_cumulative() {
+        let got = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let g2 = got.clone();
+        let hook: ProgressHook = Arc::new(move |delta, _t| g2.lock().unwrap().push(delta));
+        // `fetch_chunk_bytes` 收完一个分片报的是这一片的字节数
+        invoke_progress_hook(&Some(hook.clone()), 128 * 1024, 1000 * 1024);
+        invoke_progress_hook(&Some(hook.clone()), 128 * 1024, 1000 * 1024);
+        assert_eq!(*got.lock().unwrap(), vec![128 * 1024, 128 * 1024]);
+    }
+
+    /// ★ T8：`FsHandle::file_states` 的端到端行为 ——
+    /// 三个源（dirty / 待传作业 / 待裁决冲突）任意一个变，`in_sync` 就跟着变。
+    #[test]
+    fn t8_file_states_reflects_all_three_sources() {
+        let dir = m7_tmpdir("t8-states");
+        let fs = test_fs(&dir, false);
+        let payload = vec![7u8; 1000];
+        let (ino, _cache) = hydrated_node(&fs, "a.bin", "/home/a.bin", &payload, 1000);
+        let h = fs.handle();
+
+        // 1) 干净 → 已同步（读时校准把结果写回节点）
+        let s = h.file_states("/home/a.bin", Some(0)).expect("节点在");
+        assert!(s.in_sync, "干净文件就是已同步");
+        assert!(!s.dirty);
+        assert!(!s.pending_upload);
+        assert_eq!(s.conflicts, 0);
+        assert!(s.conflicts_known);
+        assert_eq!(s.progress, None);
+        assert_eq!(s.percent(), None, "没有在传的作业就没有百分比");
+        assert_eq!(s.label(), "已同步");
+
+        // 2) 有本地未上传改动 → 未同步
+        {
+            let mut g = fs.inner.lock().unwrap();
+            g.nodes.get_mut(&ino).unwrap().set_dirty(true);
+        }
+        let s = h.file_states("/home/a.bin", Some(0)).unwrap();
+        assert!(!s.in_sync, "有未上传改动就不能说已同步");
+        assert!(s.dirty);
+        assert_eq!(s.label(), "未同步");
+
+        // 清脏但**还有待裁决冲突** → 依然未同步（三源是「与」的关系）
+        {
+            let mut g = fs.inner.lock().unwrap();
+            g.nodes.get_mut(&ino).unwrap().set_dirty(false);
+        }
+        let s = h.file_states("/home/a.bin", Some(2)).unwrap();
+        assert!(!s.in_sync, "冲突没裁决就不算已同步");
+        assert_eq!(s.conflicts, 2);
+        assert_eq!(s.label(), "未同步（2 个冲突待处理）");
+
+        // 3) 查不到冲突信息 → `conflicts_known=false`，且不谎报「无冲突」
+        let s = h.file_states("/home/a.bin", None).unwrap();
+        assert!(!s.conflicts_known, "查不到必须如实说不知道");
+        assert_eq!(s.conflicts, 0, "这个 0 的含义是「没查到」");
+        assert!(s.in_sync, "没查到冲突时按无冲突算（保守：宁可少说冲突）");
+
+        // 4) 路径不在节点表 → `None`（未知），不谎报已同步
+        assert!(h.file_states("/home/nope.bin", Some(0)).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ T8：进度条读的是节点上的进度，`label()` 优先显示「同步中 N%」。
+    #[test]
+    fn t8_file_states_reports_progress() {
+        let dir = m7_tmpdir("t8-progress");
+        let fs = test_fs(&dir, false);
+        let payload = vec![7u8; 1000];
+        hydrated_node(&fs, "a.bin", "/home/a.bin", &payload, 1000);
+        let h = fs.handle();
+
+        h.note_progress("/home/a.bin", 420, 1000);
+        let s = h.file_states("/home/a.bin", Some(0)).unwrap();
+        assert_eq!(s.progress, Some((420, 1000)));
+        assert_eq!(s.percent(), Some(42));
+        assert_eq!(s.label(), "同步中 42%");
+
+        // 传完 → 清进度，label 回到「已同步」
+        h.clear_progress("/home/a.bin");
+        let s = h.file_states("/home/a.bin", Some(0)).unwrap();
+        assert_eq!(s.progress, None);
+        assert_eq!(s.label(), "已同步");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ T8：上传侧的在途进度以**队列**为准（节点上那份可能更旧）。
+    #[test]
+    fn t8_file_states_prefers_upload_queue_progress() {
+        let dir = m7_tmpdir("t8-upload-progress");
+        let fs = test_fs(&dir, true);
+        let payload = vec![7u8; 1000];
+        hydrated_node(&fs, "a.bin", "/home/a.bin", &payload, 1000);
+        let q = UploadQueue::new(
+            Arc::new(Client::new(&test_link()).unwrap()),
+            fs.rt.handle(),
+            dir.join("queue"),
+        )
+        .unwrap();
+        let fs = fs.with_upload_queue(q.clone());
+        let h = fs.handle();
+
+        // 队列说在传 30%，节点上是 10%（旧值）→ 以队列为准
+        h.note_progress("/home/a.bin", 100, 1000);
+        q.note_progress("/home/a.bin", Some((300, 1000)));
+        let s = h.file_states("/home/a.bin", Some(0)).unwrap();
+        assert_eq!(s.progress, Some((300, 1000)), "队列是上传进度的权威源");
+        assert_eq!(s.percent(), Some(30));
+
+        // 队列撤了（作业结束）→ 队列的 hook 同时清掉节点那份 → 没有在传作业。
+        // 这正是「单一写者」的好处：上传在途时节点那份不会被落成脏进度。
+        q.note_progress("/home/a.bin", None);
+        let s = h.file_states("/home/a.bin", Some(0)).unwrap();
+        assert_eq!(s.progress, None, "作业结束后不能留着进度");
+        assert_eq!(s.label(), "已同步");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ T8：下载侧在途汇总（`status` 的传输数就靠它）。
+    #[test]
+    fn t8_download_transfers_counts_only_in_flight_nodes() {
+        let dir = m7_tmpdir("t8-dl-sum");
+        let fs = test_fs(&dir, false);
+        let payload = vec![7u8; 1000];
+        hydrated_node(&fs, "a.bin", "/home/a.bin", &payload, 1000);
+        hydrated_node(&fs, "b.bin", "/home/b.bin", &payload, 1000);
+        let h = fs.handle();
+        // 没有在途作业
+        assert_eq!(h.download_transfers(), (0, 0, 0), "已缓存不等于在传");
+
+        h.note_progress("/home/a.bin", 300, 1000);
+        h.note_progress("/home/b.bin", 100, 1000);
+        assert_eq!(h.download_transfers(), (2, 400, 2000));
+
+        // 传完一个 → 立刻从汇总里消失
+        h.clear_progress("/home/a.bin");
+        assert_eq!(h.download_transfers(), (1, 100, 1000));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

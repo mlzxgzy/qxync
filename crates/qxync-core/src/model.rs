@@ -5,6 +5,7 @@
 //! 遇到未知字段一律忽略（服务端加字段不应让客户端解析失败）。
 
 use crate::error::{Error, Result};
+use crate::file_id::{FileId, ZERO_FILE_ID};
 use crate::status::ServerStatus;
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -85,10 +86,24 @@ pub struct DirEntry {
     /// 人类可读时间（服务端给的 `mt`，形如 `2023/01/17 00:59:01`）。
     #[serde(default, rename = "mt")]
     pub mtime_text: Option<String>,
+    /// ★ M15/T9：稳定文件身份。
+    ///
+    /// **服务端不提供这个字段**（QTS 的 `get_list` / `stat` 返回里根本没有 id），
+    /// 所以它只有本地来源：`DirEntry::local` 造出来的条目恒为
+    /// [`ZERO_FILE_ID`]，真正的值由调用方用
+    /// [`crate::file_id::file_id_for_entry`] 按「父目录 + 本条目」算出来填上。
+    ///
+    /// `#[serde(default)]` 是必须的：老的服务端响应 / IPC 客户端都要能反序列化。
+    #[serde(default)]
+    pub file_id: FileId,
 }
 
 impl DirEntry {
     /// 本地新建的文件/目录（M2b 写路径用）。
+    ///
+    /// ★ M15/T9：`file_id` 留 [`ZERO_FILE_ID`] —— 这里**只有名字**，
+    /// 没有父目录也算不出稳定身份（退化算法要父目录兜底）。调用方拿到父目录后
+    /// 用 [`crate::file_id::file_id_for_entry`] 补算。
     pub fn local(filename: impl Into<String>, is_folder: bool, size: u64, epochmt: i64) -> Self {
         Self {
             filename: filename.into(),
@@ -100,7 +115,14 @@ impl DirEntry {
             privilege: None,
             versioning_support: false,
             mtime_text: None,
+            file_id: ZERO_FILE_ID,
         }
+    }
+
+    /// ★ M15/T9：按父目录补算 `file_id` 并写回自身（原地）。
+    pub fn with_file_id(mut self, parent: &str) -> Self {
+        self.file_id = crate::file_id::file_id_for_entry(parent, &self);
+        self
     }
 
     /// 占位符要展示的大小：目录不关心，文件用真实字节数。

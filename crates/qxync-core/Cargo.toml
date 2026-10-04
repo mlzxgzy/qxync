@@ -19,3 +19,5 @@ percent-encoding.workspace = true
 libc = "0.2"
 # M5 状态库（游标/baseline/pin）。`bundled` = 自带 SQLite 源码，不依赖系统 libsqlite3。
 rusqlite = { version = "0.40", features = ["bundled"] }
+# ★ M15/T9：file_id 与 T3 的 chunk 校验和共用同一个散列（seed=0 的 xxh64 必须保持不变）。
+xxhash-rust = { version = "0.8.19", features = ["xxh64"] }
