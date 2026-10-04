@@ -193,7 +193,8 @@ async fn stream_upload_memory_stays_flat() {
     let _ = client.mkdir(&fixture_root(), "rust-mem").await;
 
     let size = 64 * 1024 * 1024u64;
-    let tmpdir = std::env::var("QXYNC_TEST_TMPDIR").map(std::path::PathBuf::from)
+    let tmpdir = std::env::var("QXYNC_TEST_TMPDIR")
+        .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir());
     let local = tmpdir.join("qxync-mem-probe.bin");
     // 分块写磁盘，不在测试进程里造 64 MiB 的 Vec
@@ -302,18 +303,20 @@ async fn stream_upload_matches_bytes_upload() {
             "{name}: upload_file 应返回真正发出的字节数 {size}"
         );
 
-        let e = client
-            .stat(&dir, &name)
-            .await
-            .expect("stat")
-            .expect("存在");
+        let e = client.stat(&dir, &name).await.expect("stat").expect("存在");
         assert_eq!(e.filesize, size, "{name}: 服务端落盘大小不对");
 
         // 逐字节回读（小文件全量；大文件抽头尾 + 中段，避免测试本身跑很久）
         let back = if size <= 4096 {
-            client.download_range(&dir, &name, 0, size - 1).await.expect("回读")
+            client
+                .download_range(&dir, &name, 0, size - 1)
+                .await
+                .expect("回读")
         } else {
-            let head = client.download_range(&dir, &name, 0, 4095).await.expect("回读头");
+            let head = client
+                .download_range(&dir, &name, 0, 4095)
+                .await
+                .expect("回读头");
             let mid = client
                 .download_range(&dir, &name, size / 2, size / 2 + 4095)
                 .await
@@ -685,7 +688,8 @@ async fn ranged_download_is_byte_stable() {
                 .await
                 .expect("前一区间");
             assert_eq!(
-                prev.len() as u64, cs,
+                prev.len() as u64,
+                cs,
                 "前一区间长度异常（末区间不完整时应为 start..=end）"
             );
         }

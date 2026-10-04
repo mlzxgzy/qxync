@@ -817,8 +817,7 @@ fn collect_renames(
     _report: &mut SyncReport,
 ) -> Vec<qxync_core::sync::RenamePair> {
     let root = view.remote_root.trim_end_matches('/').to_string();
-    let under_root =
-        |p: &str| p == root || p.starts_with(&format!("{root}/"));
+    let under_root = |p: &str| p == root || p.starts_with(&format!("{root}/"));
 
     // 新增侧：远端有、本地没见过。
     let mut added: Vec<RenameCandidate> = Vec::new();
@@ -849,7 +848,11 @@ fn collect_renames(
         if node.file_id == qxync_core::file_id::ZERO_FILE_ID {
             continue;
         }
-        removed.push(RenameCandidate::new(path.clone(), node.file_id, node.is_dir));
+        removed.push(RenameCandidate::new(
+            path.clone(),
+            node.file_id,
+            node.is_dir,
+        ));
     }
     if removed.is_empty() {
         return Vec::new();
@@ -859,7 +862,11 @@ fn collect_renames(
 
 /// 算出「远端新增项」的身份。新增侧本地还没有节点，只能按远端签名算 ——
 /// 与本地节点用的是同一个算法（`compute_file_id`），所以两边算出来的 id 可比。
-fn candidate_file_id(view: &MountView, path: &str, sig: &Sig) -> Option<qxync_core::file_id::FileId> {
+fn candidate_file_id(
+    view: &MountView,
+    path: &str,
+    sig: &Sig,
+) -> Option<qxync_core::file_id::FileId> {
     use qxync_core::file_id::{compute_file_id, ZERO_FILE_ID};
     let name = path.rsplit_once('/').map(|(_, n)| n).unwrap_or(path);
     let parent = path.rsplit_once('/').map(|(d, _)| d).unwrap_or("/");

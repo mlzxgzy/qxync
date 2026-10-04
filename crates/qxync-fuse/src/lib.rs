@@ -7076,21 +7076,35 @@ mod tests {
             !h.rename_remote("/home/old.txt", "/home/taken.txt"),
             "目标已被占用时必须拒绝迁移"
         );
-        assert!(fs.node_by_remote("/home/old.txt").is_some(), "拒绝时不该动原节点");
+        assert!(
+            fs.node_by_remote("/home/old.txt").is_some(),
+            "拒绝时不该动原节点"
+        );
 
         // 正常改名
         assert!(h.rename_remote("/home/old.txt", "/home/new.txt"));
-        assert!(fs.node_by_remote("/home/old.txt").is_none(), "旧路径不该还在");
+        assert!(
+            fs.node_by_remote("/home/old.txt").is_none(),
+            "旧路径不该还在"
+        );
         let moved = fs.node_by_remote("/home/new.txt").expect("新路径要有节点");
         assert_eq!(moved.file_id, id, "改名绝不能改身份");
         assert_eq!(moved.name, "new.txt");
 
         // ★ 这条是本测试的核心：索引行必须**搬**而不是**新增**。
         // 漏了它 → 同一 file_id 两行 → 按身份反查恒失效（P1 bug）。
-        assert_eq!(store.nodes_len().unwrap(), 2, "搬家不应新增行（1 行原样搬过去）");
+        assert_eq!(
+            store.nodes_len().unwrap(),
+            2,
+            "搬家不应新增行（1 行原样搬过去）"
+        );
         assert!(store.node_by_path("/home/old.txt").unwrap().is_none());
         assert_eq!(
-            store.node_by_path("/home/new.txt").unwrap().unwrap().file_id,
+            store
+                .node_by_path("/home/new.txt")
+                .unwrap()
+                .unwrap()
+                .file_id,
             id
         );
         // 身份反查必须仍能给出**唯一**答案（上传队列就靠这个落地）
@@ -7256,7 +7270,10 @@ mod tests {
         assert!(!combine_in_sync(false, true, 0));
         // 有待裁决冲突 → 未同步
         assert!(!combine_in_sync(false, false, 1));
-        assert!(!combine_in_sync(false, false, 3), "冲突数不是布尔，>0 都不算已同步");
+        assert!(
+            !combine_in_sync(false, false, 3),
+            "冲突数不是布尔，>0 都不算已同步"
+        );
         // 三个都干净才是已同步
         assert!(combine_in_sync(false, false, 0));
     }
@@ -7336,7 +7353,11 @@ mod tests {
         assert_eq!(progress_percent(50, 100), 50);
         assert_eq!(progress_percent(999, 1000), 99, "向下取整，不引入假精度");
         assert_eq!(progress_percent(1, 0), 0, "总量为 0 不能除出 NaN/panic");
-        assert_eq!(progress_percent(u64::MAX, 1), 100, "超量夹到 100%，不能溢出");
+        assert_eq!(
+            progress_percent(u64::MAX, 1),
+            100,
+            "超量夹到 100%，不能溢出"
+        );
     }
 
     /// ★ T8：`transfer_meter` 累加原子、夹住 total、从 `start_done` 接着算。
@@ -7344,10 +7365,7 @@ mod tests {
     fn t8_transfer_meter_accumulates_and_clamps() {
         let seen = Arc::new(Mutex::new(Vec::<(u64, u64)>::new()));
         let s2 = seen.clone();
-        let (hook, meter) = transfer_meter(
-            move |d, t| s2.lock().unwrap().push((d, t)),
-            500,
-        );
+        let (hook, meter) = transfer_meter(move |d, t| s2.lock().unwrap().push((d, t)), 500);
         // 「本次收到的字节数」→ 累加出单调的累计值
         invoke_progress_hook(&Some(hook.clone()), 300, 1000);
         invoke_progress_hook(&Some(hook.clone()), 200, 1000);

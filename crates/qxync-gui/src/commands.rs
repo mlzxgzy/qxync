@@ -539,11 +539,10 @@ pub async fn cache_verify(repair: Option<bool>) -> Result<Value, String> {
     }
     // 校验是纯 CPU/IO 的同步活儿；放阻塞线程池，别占住 Tauri 的 async 运行时。
     let dir = cache_root.clone();
-    let rep = tauri::async_runtime::spawn_blocking(move || {
-        qxync_fuse::verify_cache_dir(&dir, repair)
-    })
-    .await
-    .map_err(|e| format!("校验任务失败: {e}"))?;
+    let rep =
+        tauri::async_runtime::spawn_blocking(move || qxync_fuse::verify_cache_dir(&dir, repair))
+            .await
+            .map_err(|e| format!("校验任务失败: {e}"))?;
     Ok(json!({
         "ok": true,
         "skipped": false,

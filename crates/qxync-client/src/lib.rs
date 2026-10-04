@@ -13,12 +13,12 @@
 //! 因此数据面一律走 FileStation；这也意味着**只读 M0 不依赖 `q_token`**。
 
 use futures_util::StreamExt;
-use std::path::Path;
 use qxync_core::{
     build_query, encode_query_value, model::parse_listing, parse_max_log, parse_nas_uid,
     parse_sync_log, DirEntry, Error, LinkConfig, Listing, MaxLog, NasUid, ProxySettings, ProxySpec,
     Result, ServerStatus, Settings, SyncLogBatch,
 };
+use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -740,19 +740,14 @@ impl Client {
         let len = tokio::fs::metadata(local)
             .await
             .map_err(|e| {
-                Error::Transport(format!(
-                    "upload {filename}: stat {}: {e}",
-                    local.display()
-                ))
+                Error::Transport(format!("upload {filename}: stat {}: {e}", local.display()))
             })?
             .len();
         let file = tokio::fs::File::open(local).await.map_err(|e| {
-            Error::Transport(format!(
-                "upload {filename}: 打开 {}: {e}",
-                local.display()
-            ))
+            Error::Transport(format!("upload {filename}: 打开 {}: {e}", local.display()))
         })?;
-        self.upload_stream_sized(dest_path, filename, file, len).await
+        self.upload_stream_sized(dest_path, filename, file, len)
+            .await
     }
 
     /// 同 [`Client::upload_file`]，但数据源是任意 [`AsyncRead`]，长度由调用方给。
@@ -799,7 +794,10 @@ impl Client {
                     return None;
                 }
                 sent.fetch_add(n as u64, Ordering::Relaxed);
-                Some((Ok::<_, std::io::Error>(buf[..n].to_vec()), (reader, buf, sent)))
+                Some((
+                    Ok::<_, std::io::Error>(buf[..n].to_vec()),
+                    (reader, buf, sent),
+                ))
             },
         );
         // ★ 必须是 `stream_with_length`：QNAP 的 upload.php 对 chunked（无

@@ -810,7 +810,9 @@ pub async fn run(opts: Options) -> Result<()> {
     let n = shutdown_all_mounts(&state).await;
     let _ = std::fs::remove_file(&opts.socket);
     let _ = std::fs::remove_file(&pid_path);
-    tracing::info!("qxyncd 退出（SIGTERM 后转入挂载守护；守护结束于「{why}」；已卸载 {n} 个挂载点）");
+    tracing::info!(
+        "qxyncd 退出（SIGTERM 后转入挂载守护；守护结束于「{why}」；已卸载 {n} 个挂载点）"
+    );
     Ok(())
 }
 
@@ -872,7 +874,10 @@ async fn reload_sync_engine(
 async fn stop_sync_engine(state: &Arc<State>, old: Vec<tokio::task::JoinHandle<()>>) {
     state.sync_epoch.bump();
     for h in old {
-        if tokio::time::timeout(Duration::from_secs(5), h).await.is_err() {
+        if tokio::time::timeout(Duration::from_secs(5), h)
+            .await
+            .is_err()
+        {
             tracing::warn!("同步引擎：有旧任务没在 5s 内退出（继续，不阻塞）");
         }
     }
@@ -2457,7 +2462,13 @@ fn snapshot_mounts(
     }
     tr.active = tr.downloading + tr.uploading;
     let transfers = (tr.active > 0).then_some(tr);
-    (list, HydroStats { count, bytes }, uploads, deletes, transfers)
+    (
+        list,
+        HydroStats { count, bytes },
+        uploads,
+        deletes,
+        transfers,
+    )
 }
 
 async fn shutdown_all_mounts(state: &Arc<State>) -> usize {
@@ -2687,7 +2698,10 @@ fn probe_mount_alive(mp: &Path) -> bool {
             true
         }
         Err(e) if e.raw_os_error() == Some(libc::ENOTCONN) => {
-            tracing::debug!("僵尸挂载清理：{} 探针写入返回 ENOTCONN（已确认僵尸）", mp.display());
+            tracing::debug!(
+                "僵尸挂载清理：{} 探针写入返回 ENOTCONN（已确认僵尸）",
+                mp.display()
+            );
             false
         }
         Err(e) => {
@@ -2705,12 +2719,7 @@ fn probe_mount_alive(mp: &Path) -> bool {
 ///
 /// 懒卸载的理由见 [`cleanup_zombie_mounts`]：挂载点里通常还有进程持有 fd。
 fn lazy_umount(mp: &Path) -> std::io::Result<()> {
-    let try_cmd = |bin: &str| {
-        std::process::Command::new(bin)
-            .arg("-uz")
-            .arg(mp)
-            .output()
-    };
+    let try_cmd = |bin: &str| std::process::Command::new(bin).arg("-uz").arg(mp).output();
     let attempt = match try_cmd("fusermount3") {
         Ok(o) => Ok(o),
         Err(_) => try_cmd("fusermount"),
@@ -3355,7 +3364,10 @@ fn spawn_dehydrator(state: Arc<State>, mut gen: EngineGen) -> tokio::task::JoinH
     tokio::spawn(async move {
         loop {
             let interval = state.dehydrate_cfg.lock().unwrap().interval_secs.max(1);
-            if !gen.sleep(Duration::from_secs(interval.clamp(5, 3600))).await {
+            if !gen
+                .sleep(Duration::from_secs(interval.clamp(5, 3600)))
+                .await
+            {
                 tracing::info!("自动脱水退出（同步引擎已换代）");
                 return;
             }
@@ -3674,7 +3686,10 @@ pub(crate) async fn restore_mounts_on_start(state: &Arc<State>, link_id: &str) {
         }
         // 挂载点目录可能已经被删了（用户清了目录树）—— 建回来，否则 mount() 必失败
         if let Err(e) = std::fs::create_dir_all(mp) {
-            tracing::warn!("恢复挂载：建挂载点 {} 失败（跳过，不影响其它）: {e}", mp.display());
+            tracing::warn!(
+                "恢复挂载：建挂载点 {} 失败（跳过，不影响其它）: {e}",
+                mp.display()
+            );
             continue;
         }
         match mount(
@@ -4302,7 +4317,8 @@ async fn file_states_cmd(state: &Arc<State>, path: String) -> Result<serde_json:
     let mut out = Vec::new();
     let (mut online, mut local, mut always) = (0usize, 0usize, 0usize);
     // ★ T8：同步维度汇总
-    let (mut n_in_sync, mut n_out_sync, mut n_unknown, mut n_transfer) = (0usize, 0usize, 0usize, 0usize);
+    let (mut n_in_sync, mut n_out_sync, mut n_unknown, mut n_transfer) =
+        (0usize, 0usize, 0usize, 0usize);
     for e in entries {
         let remote = format!("{}/{}", dir, e.filename);
         let cand = handle.candidate(&remote);
@@ -4809,10 +4825,7 @@ mod tests {
     #[test]
     fn t7_probe_is_only_reached_for_our_own_mounts() {
         // subtype 不是 qxync 时，判定在探针之前就返回了
-        assert!(matches!(
-            zombie_action(true, false),
-            ZombieAction::Skip(_)
-        ));
+        assert!(matches!(zombie_action(true, false), ZombieAction::Skip(_)));
         // 自己挂的才继续走探针（Unmount 分支的语义）
         assert_eq!(zombie_action(true, true), ZombieAction::Unmount);
     }
@@ -4827,10 +4840,7 @@ mod tests {
         assert!(is_qxync_type("fuse.qxync"));
         // 常见的别的东西，一律不是自己的
         for other in ["tmpfs", "ext4", "fuse.sshfs", "overlay", "fuse", ""] {
-            assert!(
-                !is_qxync_type(other),
-                "{other:?} 不该被当成 qxync 挂载"
-            );
+            assert!(!is_qxync_type(other), "{other:?} 不该被当成 qxync 挂载");
         }
     }
 
@@ -4841,7 +4851,10 @@ mod tests {
     #[test]
     fn t7_mount_subtype_parses_proc_mounts_line() {
         let line = "qxync /home/kami/qxync fuse.qxync rw,nosuid,nodev,relatime 0 0";
-        assert_eq!(parse_mounts_line(line, "/home/kami/qxync"), Some("fuse.qxync".into()));
+        assert_eq!(
+            parse_mounts_line(line, "/home/kami/qxync"),
+            Some("fuse.qxync".into())
+        );
 
         // 含空格的挂载点：内核把空格写成 \040
         let line = "qxync /home/kami/my\\040mount fuse.qxync rw 0 0";
@@ -4855,7 +4868,10 @@ mod tests {
         assert_eq!(parse_mounts_line(line, "/other"), None);
         // 别的文件系统
         let line = "/dev/sda1 /home/kami/qxync ext4 rw,relatime 0 0";
-        assert_eq!(parse_mounts_line(line, "/home/kami/qxync"), Some("ext4".into()));
+        assert_eq!(
+            parse_mounts_line(line, "/home/kami/qxync"),
+            Some("ext4".into())
+        );
         // 残行不能 panic（`/proc` 读出来的东西不保证格式）
         assert_eq!(parse_mounts_line("", "/x"), None);
         assert_eq!(parse_mounts_line("only-one-field", "/x"), None);
@@ -4920,8 +4936,12 @@ mod tests {
             resolution: res.map(|s| s.to_string()),
         };
         store.decision_upsert(&mk("/home/a.txt", None)).unwrap();
-        store.decision_upsert(&mk("/home/b.txt", Some("keep_local"))).unwrap();
-        store.decision_upsert(&mk("/home/c.txt", Some("keep_both"))).unwrap();
+        store
+            .decision_upsert(&mk("/home/b.txt", Some("keep_local")))
+            .unwrap();
+        store
+            .decision_upsert(&mk("/home/c.txt", Some("keep_both")))
+            .unwrap();
 
         let m = pending_conflicts_by_path(store.decisions()).expect("查得到");
         assert_eq!(m.get("/home/a.txt"), Some(&1), "待裁决的要算进去");
