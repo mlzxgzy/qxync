@@ -1192,30 +1192,75 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn spawn_detached_runs_even_when_setsid_is_unavailable() {
-        let mnt = std::env::temp_dir().join(format!("qxync-spawn-mnt-{}", std::process::id()));
+        // 目录名带上 pid + 一个测试内自增序号：并行跑多个测试二进制时别互相踩。
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let mnt = std::env::temp_dir().join(format!(
+            "qxync-spawn-mnt-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&mnt);
         std::fs::create_dir_all(&mnt).unwrap();
-        let sh = which("sh").expect("PATH 里应有 sh");
-        // `spawn_detached` 只会追加**一个**参数（要打开的目录），所以用 `sh -c` 时
-        // 「脚本」得由 `sh` 自己在 `-c` 之后的位置取 —— 追加的目录会落到 `$0`，用 `$0` 读。
-        let script = format!("exec -a \"$0\" sleep 30");
-        let r = spawn_detached(
-            sh.to_str().unwrap(),
-            &PathBuf::from(format!(
-                "-c {script} {}",
-                shell_quote(&mnt.display().to_string())
-            )),
-        );
+        // ★ `spawn_detached(prog, arg)` 只会产生 `argv = [prog, arg]` —— **只有一个**参数。
+        //
+        //   所以任何「`sh -c <脚本> <参数>`」的写法在这里都做不到：`Command::arg` 会把
+        //   整串当成**一个** argv 元素，sh 看到的是**一个**以 `-c ` 开头的整体选项，
+        //   没有把 -c 和脚本分开，直接报 `sh: - : 无效的选项` 并以 2 退出
+        //   （本机实测 returncode=2，`/proc/<pid>/cmdline` 读出来是空的 ——
+        //   进程转瞬即死，怎么等都找不到）。
+        //
+        //   于是「找不到带目录的进程」是**必然**，不是偶发：机器空闲时看起来能过，
+        //   是因为空 cmdline 的短命进程有时还没被回收，而判据
+        //   `contains(target) && contains("sleep")` 又恰好命中了
+        //   **cmdline 里含有本测试脚本文本的父 shell**（bwrap/bash）—— 靠误命中过关。
+        //   这也是它在满载机器上随机红的原因：父 shell 何时被回收 / 短命进程何时
+        //   真正消失，都会变。本机满载复现：15 次挂 8 次；空闲时 25 次全过。
+        //
+        //   修法：把辅助脚本**落成一个文件**再执行，于是 `argv = [脚本, 目录]`。
+        //
+        // ★ 脚本内容必须**纯 POSIX**。开发机的 /bin/sh 是 bash，Ubuntu 22.04 的
+        //   /bin/sh 是 **dash** —— 同一份测试在开发机永远绿、在 CI 上必然红：
+        //   `exec -a`（改 argv0）是 bash 扩展，dash 不认，脚本直接失败退出，
+        //   `/proc` 里永远找不到那个进程，测试要卡满 30s 才报错。
+        //   现在脚本只有一行 `sleep 30`，两边行为一致。
+        let helper = mnt.join("holder.sh");
+        // 不用 `exec`：exec 会**替换**进程映像，argv 随之被换成 sleep 自己的，
+        // 追加的目录就没了（实测 argv 变成 `sleep 30`）。直接跑 `sleep`，
+        // sh 会 fork 出一个带着完整 argv（脚本路径 + 目录）的子进程 —— 那正是要验的。
+        std::fs::write(&helper, "#!/bin/sh\nsleep 30\n").unwrap();
+        let mut perms = std::fs::metadata(&helper).unwrap().permissions();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o755);
+        }
+        std::fs::set_permissions(&helper, perms).unwrap();
+        let r = spawn_detached(helper.to_str().unwrap(), &mnt);
         assert!(r.is_ok(), "spawn_detached 不应因 setsid 失败而报错: {r:?}");
-        // 从 /proc 找到刚起的那个孩子，验证它的 cmdline 里确实带着目录
+        // 从 /proc 找到刚起的那个孩子，验证它**带着要打开的目录**这个参数。
+        //
+        // 判据：argv 里同时出现「辅助脚本路径」与「目标目录」。
+        //   * 为什么不用「argv0 == 目录」：那需要 `exec -a`（bash 扩展，dash 没有）。
+        //   * 为什么不用「cmdline 含 sleep」：`#!` 脚本最终跑的是 sleep，但
+        //     sh 可能做 exec 优化把 argv 换成 `sleep 30`，字样时有时无。
+        //   * 只判「含 target」也不够：父 shell（bwrap/bash）的 cmdline 里含有
+        //     本测试的脚本文本，会误命中 —— 所以要求**同时**出现脚本路径。
         let target = mnt.display().to_string();
+        let script_arg = helper.display().to_string();
         let mut found = false;
-        for _ in 0..40 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
             if let Ok(rd) = std::fs::read_dir("/proc") {
                 for e in rd.flatten() {
                     let cmdline = e.path().join("cmdline");
                     if let Ok(b) = std::fs::read(&cmdline) {
-                        let s = String::from_utf8_lossy(&b).replace('\0', " ");
-                        if s.contains(&target) && s.contains("sleep") {
+                        if b.is_empty() {
+                            continue;
+                        }
+                        let joined = String::from_utf8_lossy(&b).replace('\0', "\n");
+                        let argv: Vec<&str> = joined.lines().map(str::trim).collect();
+                        if argv.iter().any(|a| *a == script_arg)
+                            && argv.iter().any(|a| *a == target)
+                        {
                             found = true;
                             break;
                         }
@@ -1227,13 +1272,10 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        assert!(found, "被拉起的程序应带着要打开的目录 {target}");
+        assert!(
+            found,
+            "被拉起的进程 argv 应含脚本 {script_arg} 与要打开的目录 {target}（实际扫到的进程需含两者）"
+        );
         let _ = std::fs::remove_dir_all(&mnt);
-    }
-
-    /// 给 `sh -c` 用的单引号转义（测试辅助）。
-    #[cfg(unix)]
-    fn shell_quote(s: &str) -> String {
-        format!("'{}'", s.replace('\'', r"'\''"))
     }
 }
