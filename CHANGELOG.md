@@ -7,6 +7,52 @@
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-10-18
+
+### 新增
+
+- **两步验证（2SV / TOTP）支持（M17）**：账号在 QTS 里开了两步验证后，qxync 以前**永远登不上**
+  —— `authLogin.cgi` 的第一份表单就决定给不给 sid，而我们只发 `user + pwd(base64)`，服务端回
+  `authPassed=0 / need_2sv=1`，后续所有端点都拿不到 sid。真机实测（2026-10-18）的结论是：
+  **同一份表单多带 `security_code=<6 位 TOTP>` 就能拿到 `authPassed=1` + `authSid`**，
+  其余字段一个不动。实现照 QTS Web UI 走两步：**第一次请求与 v0.6.1 逐字节相同**，
+  只有 NAS 回 `need_2sv=1` 时才发带 `security_code` 的第二次（所以「未开 2SV 行为一字不改」
+  是结构性的，不靠服务端忽略未知字段）。实现：
+  - 纯 Rust 内置 TOTP（RFC 6238：SHA-1 / 30 秒 / 6 位；Base32 密钥；直接粘贴 `otpauth://`
+    URI 也认），**不新增依赖**；
+  - 凭据新增可选 `otp_secret`（与口令同文件、`0600`、按连接一份；旧文件**零迁移**，
+    缺字段 = 未配置 2SV）；
+  - CLI 全局 `--otp-secret`（或 `QXNYC_OTP_SECRET`，会随凭据保存）与 `--otp-code`
+    （或 `QXNYC_OTP_CODE`，一次性、不保存）；
+  - daemon **每次重登录现算验证码**（只存密钥、不缓存验证码）——长时间挂载不会因为验证码
+    过期掉线；`Request::Login` 支持一次性 `otp`；
+  - GUI「设置 → 连接」新增「两步验证（可选）」字段（填密钥 = 保存，填 6 位码 = 一次性），
+    编辑连接时显示「已配置」，登录结果显示两步验证是否通过，**密钥不回显**；
+  - 设计与协议证据见 [M17-两步验证.md](docs/M17-两步验证.md)。
+
+### 修复
+
+- **2SV 账号的登录报错不再误导**：以前 `authPassed=0` 一律附加「检查口令编码：必须是 base64」，
+  账号开了两步验证时这句话是错的。现在区分两种分支：「账号要 2SV 但没提供第二因素」→
+  提示用 `--otp-code` / `--otp-secret` 或 GUI 里的位置；「提供了但被拒」→ 提示验证码可能
+  已过期（30 秒一换）或本机时钟偏移。提示与日志都**不含**密钥 / 验证码。
+
+### 变更
+
+- **未开 2SV 的账号行为一字不改**：登录请求体不带 `security_code`，凭据文件不新增字段。
+- 旧凭据文件直接可读（无 `otp_secret` = 未配置）；新凭据给**旧版本**读只多一个被忽略的字段。
+- `IPC_VERSION` **不 bump**：`Request::Login.otp` 与 `LoginData.two_step` 都是 `serde(default)`，
+  新旧进程可混跑（与 M16 同一口径）。
+- 回退 v0.6.1：2SV 账号重新登不上，其余功能不受影响。
+
+### 已知问题（本轮未修）
+
+- **只支持 TOTP** 一种第二因素；QNAP 还有的安全问题 / 邮件验证码 / 二维码批准 / 设备批准
+  **均未实现**。
+- 依赖本机时钟；`otp_secret` 与口令一样明文存 `0600` 文件（keyring 是后续工作）。
+- 协议侧未测：`dont_verify_2sv_again=1`（记住设备）、**连续**输错验证码的锁定 / 限流行为
+  （只测了单次错码：被拒、未锁定）。
+
 ## [0.6.1] - 2026-10-18
 
 ### 新增
@@ -901,6 +947,7 @@ NAS 设置名 `QSYNC_FOLDERPAIR_USE_SPACE_SAVING`、Windows 客户端注册表�
 - 验收结论从 README 抽出为 [`docs/验收记录.md`](docs/验收记录.md)。
 - 采用 **MIT OR Apache-2.0** 双许可（`LICENSE-MIT` / `LICENSE-APACHE`）。
 
+[0.6.2]: https://github.com/mlzxgzy/qxync/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/mlzxgzy/qxync/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/mlzxgzy/qxync/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/mlzxgzy/qxync/compare/v0.5.0...v0.5.1

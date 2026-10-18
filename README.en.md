@@ -63,6 +63,7 @@ against a real NAS.
 | **LAN direct** | qxync↔qxync peer protocol: device pairing, event fast path, direct local range transfer (any failure silently falls back to the NAS) | [M7](docs/M7-选择性同步与LAN直连.md) |
 | **Sync tasks** | mount registrations persisted in `tasks/<id>.json`, pause/resume per task, restorable after a restart with `--restore-tasks` | [M8](docs/M8-向Qsync-Client-6靠拢.md) |
 | **Multiple NAS connections** | **one `qxyncd` process per connection** (its own socket / pid / log / state store / cache / upload queue); `default` keeps the legacy paths; many tasks per connection; CLI `qxync links` / `daemon … --all`, GUI connection list and "current connection" switcher | [M16](docs/M16-多NAS连接.md) |
+| **Two-step verification (2SV)** | supports **TOTP** (authenticator apps) in QNAP's two-step verification: the `security_code` goes into the login form directly, and once the TOTP secret is stored the daemon computes a fresh code on every re-login (long-running mounts do not drop when a code expires); CLI `--otp-secret` / `--otp-code`, or the field under GUI Settings → Connections. Other second factors (security questions / email codes / QR-code approval / device approval) are **not implemented** | [M17](docs/M17-两步验证.md) |
 | **Sync log** | the `journal` table of `sync.db` plus background batched writes and rotation, driving the GUI's "File Update Center / error list" | [M8](docs/M8-向Qsync-Client-6靠拢.md) |
 | **Desktop GUI** | Home / Tasks / Files / Updates / Errors / Settings / Diagnostics; tray + notifications + autostart + file picker + **"Open folder"** on task cards (opens the local mount point with the desktop's default directory tool) | [M4](docs/M4-GUI.md) · [M8](docs/M8-向Qsync-Client-6靠拢.md) |
 | **Settings center** | three proxy modes (Auto-detect / No proxy / Manual), automatic space freeing, five conflict policies, three file states | [M8](docs/M8-向Qsync-Client-6靠拢.md) |
@@ -184,6 +185,22 @@ cargo run -p qxync-cli -- \
 
 > `--insecure` = accept self-signed certificates. **Keep the password out of your shell history**:
 > `--password` can also be replaced by the `QXNYC_PASSWORD` environment variable.
+
+If the account has **two-step verification (2SV)** enabled, add a TOTP secret (recommended —
+after that the daemon computes codes for every re-login by itself):
+
+```bash
+# store the secret (Base32, or paste the authenticator's otpauth:// URI)
+qxync login --otp-secret '<TOTP secret>'
+# or use a code for this login only (not stored; rotates every 30 s)
+qxync login --otp-code 123456
+```
+
+> Both can also be passed on the first login by putting `--otp-secret '<TOTP secret>'` before
+> `login`. The environment-variable versions are `QXNYC_OTP_SECRET` / `QXNYC_OTP_CODE` (they stay
+> out of your shell history). Accounts **without** 2SV do not need either flag and behave exactly
+> as before; details and limits are in [`docs/M17-两步验证.md`](docs/M17-两步验证.md).
+> (The `cargo run -p qxync-cli --` prefix shown above works the same way.)
 
 ### 4. Mount the on-demand sync view
 
@@ -376,11 +393,12 @@ Qsync protocol (it is not a config field).
   hiding the window in a tray that nobody draws.
 * The "last triggered" timestamp of **"free up space by frequency"** lives only in memory and restarts
   its clock when the daemon restarts ("when space is below X%" is unaffected).
-* **i18n covers UI strings only**: `ui/i18n.js` is a zh-CN string table (163 entries) + a
-  **reserved empty en table** (an empty table = the whole entry falls back to zh-CN, so nothing ever
-  comes out blank). Diagnostic logs and the mixed-markup paragraphs with inline `<code>` in
-  `index.html` are **deliberately left out of the table**. The string table is guarded by the
-  two-way `ui_spec` self-check in `qxync-gui --self-test`, and **no i18n framework is introduced**.
+* **i18n covers UI strings only**: `ui/i18n.js` is a zh-CN string table plus an `en` table (from
+  v0.6.2 the four two-step-verification strings exist in both languages; every other key still
+  **falls back** to zh-CN, so nothing ever comes out blank). Diagnostic logs and the mixed-markup
+  paragraphs with inline `<code>` in `index.html` are **deliberately left out of the table**. The
+  string table is guarded by the two-way `ui_spec` self-check in `qxync-gui --self-test`, and
+  **no i18n framework is introduced**.
 * **In direct mode (`--direct`), editing `settings.json` only writes the file**: a running daemon must
   be restarted before it reads the new settings.
 * **Two boundaries of multiple NAS connections (M16)**: (1) do **not** bidirectionally sync the same
@@ -388,6 +406,11 @@ Qsync protocol (it is not a config field).
   own baseline, so the two would read each other's writes as local changes); (2) non-default
   connections **do not exist in older versions** — rolling back makes them unavailable (`default` is
   unaffected). See [`M16-多NAS连接.md`](docs/M16-多NAS连接.md).
+* **Two-step verification covers TOTP only** (authenticator apps): security questions / email
+  codes / QR-code approval / device approval are **not implemented**; codes depend on the local
+  clock, and a badly skewed clock is rejected by the NAS. The secret is plaintext in a `0600`
+  credentials file, same as the password (keyring support is future work). See
+  [`M17-两步验证.md`](docs/M17-两步验证.md).
 * **Capability gating rather than capability assumptions**: when the NAS has no historical versions,
   delta goes through the gate and the real path is still a whole-file transfer
   (see [`M5-SQLite与delta.md`](docs/M5-SQLite与delta.md)).
@@ -571,7 +594,9 @@ Real-NAS integration tests (`#[ignore]`, needing your own NAS credentials):
 export QXNYC_TEST_HOST=... QXNYC_TEST_PORT=9834
 export QXNYC_TEST_USER=... QXNYC_TEST_PASSWORD='...'
 export QXNYC_TEST_FIXTURE=/home/qxync-test
+export QXNYC_TEST_TOTP_SECRET='...'   # TOTP secret when the account has 2SV enabled
 cargo test -p qxync-proto-test -- --ignored --test-threads=1 --nocapture  # 5 protocol items + 1 IPC end-to-end item
+cargo test -p qxync-proto-test --test two_step -- --ignored --nocapture  # M17: TOTP login round trip / missing second factor
 cargo test -p qxync-daemon -- --ignored --test-threads=1 --nocapture     # M2c engine (conflicted copy / delete protection)
 ```
 
@@ -597,6 +622,7 @@ cargo test -p qxync-daemon -- --ignored --test-threads=1 --nocapture     # M2c e
 | [`docs/M7-选择性同步与LAN直连.md`](docs/M7-选择性同步与LAN直连.md) | exclude rule engine, peer protocol wire format, event fast path, direct transfer |
 | [`docs/M8-向Qsync-Client-6靠拢.md`](docs/M8-向Qsync-Client-6靠拢.md) | GUI rework research + M8.1–M8.6 execution plan and decision log |
 | [`docs/M16-多NAS连接.md`](docs/M16-多NAS连接.md) | Multiple NAS connections: one daemon per connection, namespacing and storage layout, legacy migration, CLI/GUI entry points, safety boundaries and acceptance |
+| [`docs/M17-两步验证.md`](docs/M17-两步验证.md) | Two-step verification (2SV): the measured `security_code` contract of `authLogin.cgi`, the built-in TOTP, `otp_secret` storage, CLI/GUI usage, fresh codes on daemon re-login, security boundaries |
 | [`docs/验收记录.md`](docs/验收记录.md) | Milestone-level acceptance conclusions (what was run, what the result was) |
 | [`docs/发布清单-v0.1.0.md`](docs/发布清单-v0.1.0.md) | Pre-release checklist (for maintainers) |
 | [`CHANGELOG.md`](CHANGELOG.md) | Changelog |

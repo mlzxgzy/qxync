@@ -58,6 +58,7 @@ NAS 上的文件在本地只是一个「占位符」，`ls -l` 显示真实大�
 | **LAN 直连** | qxync↔qxync 自研对等协议：设备配对、事件快路径、本地区间直传（失败一律静默回落 NAS） | [M7](docs/M7-选择性同步与LAN直连.md) |
 | **同步任务** | `tasks/<id>.json` 持久化的挂载登记，逐任务暂停/继续，重启可 `--restore-tasks` 恢复 | [M8](docs/M8-向Qsync-Client-6靠拢.md) |
 | **多 NAS 连接** | **一条连接一个 `qxyncd` 进程**（各自独立 socket / pid / 日志 / 状态库 / 缓存 / 上传队列），default 保持旧路径；每条连接下可建多个任务；CLI `qxync links` / `daemon … --all`，GUI 连接列表与「当前连接」切换 | [M16](docs/M16-多NAS连接.md) |
+| **两步验证（2SV）** | 支持 QNAP 两步验证里的 **TOTP**（authenticator app）：`security_code` 直接带进登录表单，存一次 TOTP 密钥后 daemon 每次重登现算验证码（长时间挂载不会因验证码过期掉线）；CLI `--otp-secret` / `--otp-code`，GUI「设置 → 连接」可填。其它第二因素（安全问题 / 邮件码 / 二维码批准 / 设备批准）**未实现** | [M17](docs/M17-两步验证.md) |
 | **同步日志** | `sync.db` 的 `journal` 表 + 后台批量落库与轮转，驱动 GUI 的「文件更新中心 / 错误列表」 | [M8](docs/M8-向Qsync-Client-6靠拢.md) |
 | **桌面 GUI** | 主页 / 任务 / 文件 / 更新 / 错误 / 设置 / 诊断；托盘 + 通知 + 开机自启 + 文件选择器 + **任务卡「打开目录」**（用系统里用户自己配的默认目录工具打开本地挂载点） | [M4](docs/M4-GUI.md) · [M8](docs/M8-向Qsync-Client-6靠拢.md) |
 | **设置中心** | 代理三模式（Auto-detect / No proxy / Manual）、自动释放空间、冲突策略五选、文件三态 | [M8](docs/M8-向Qsync-Client-6靠拢.md) |
@@ -172,6 +173,20 @@ cargo run -p qxync-cli -- \
 
 > `--insecure` = 接受自签证书。**口令不要写进 shell 历史**：
 > `--password` 也可以用 `QXNYC_PASSWORD` 环境变量代替。
+
+账号开了**两步验证（2SV）**时，补一个 TOTP 密钥（推荐，之后 daemon 重登自动算验证码）：
+
+```bash
+# 保存密钥（Base32，或直接粘贴 authenticator 的 otpauth:// URI）
+qxync login --otp-secret '<TOTP密钥>'
+# 或者只用于这一次登录（不保存；30 秒一换）
+qxync login --otp-code 123456
+```
+
+> 也可以在首次登录时一起给：`--otp-secret '<TOTP密钥>'` 加在 `login` 前面。
+> 环境变量版是 `QXNYC_OTP_SECRET` / `QXNYC_OTP_CODE`（不进 shell 历史）。
+> 没开 2SV 的账号**不用带**这两个参数，行为与以前完全一样；细节与能力边界见
+> [`docs/M17-两步验证.md`](docs/M17-两步验证.md)。（上面 `cargo run -p qxync-cli --` 的前缀同样适用。）
 
 ### 4. 挂载按需同步视图
 
@@ -344,15 +359,18 @@ pin=pinned/excluded、未上传改动/队列在途、打开的 fd、被 mmap（�
   **不可见时关闭窗口会真的关闭**，不会把窗口藏进一个没人画的托盘里。
 * **「按频率」自动释放空间**的「上次触发时间」只在内存里，daemon 重启会重新计时
   （「当空间少于 X%」不受影响）。
-* **i18n 只覆盖界面文案**：`ui/i18n.js` 是 zh-CN 文案表（163 条）+ **预留的 en 空表**
-  （空表 = 整条回落到 zh-CN，不会出现空白）。诊断日志与 `index.html` 里带内联 `<code>` 的
-  混合标记段落**有意不进表**。文案表由 `qxync-gui --self-test` 的 `ui_spec` 双向自检守住，
-  **不引入任何 i18n 框架**。
+* **i18n 只覆盖界面文案**：`ui/i18n.js` 是 zh-CN 文案表 + `en` 表（v0.6.2 起两步验证的
+  4 条文案中英都有；其余键仍**逐条回落**到 zh-CN，不会出现空白）。诊断日志与 `index.html`
+  里带内联 `<code>` 的混合标记段落**有意不进表**。文案表由 `qxync-gui --self-test` 的
+  `ui_spec` 双向自检守住，**不引入任何 i18n 框架**。
 * **直连（`--direct`）模式下改 `settings.json` 只写文件**，跑着的 daemon 要重启才读到新设置。
 * **多 NAS 连接（M16）的两条边界**：① 同一台 NAS 上的两条连接**不要同时双向同步同一个
   远端目录**（各有独立 baseline，会互相判成对方的改动）；② 非 default 连接的数据在**旧版本里
   不存在**，回退旧版本会让这些连接失效（default 不受影响）。详见
   [`M16-多NAS连接.md`](docs/M16-多NAS连接.md)。
+* **两步验证只做了 TOTP**（authenticator app）：安全问题 / 邮件验证码 / 二维码批准 /
+  设备批准**都没实现**；验证码依赖本机时钟，时间偏差太大会被 NAS 拒。密钥与口令一样
+  明文存 `0600` 凭据文件（keyring 是后续工作）。见 [`M17-两步验证.md`](docs/M17-两步验证.md)。
 * **能力门控而非能力假设**：NAS 侧没有历史版本时，delta 走门控、真实路径仍是整文件传输
   （见 [`M5-SQLite与delta.md`](docs/M5-SQLite与delta.md)）。
 * 本项目只在 **QNAP TS-464C / QTS 5.2.9 / Qsync QPKG 5.0.0.7（build 20260723）**
@@ -525,7 +543,9 @@ xtask/tests/gui-matrix.sh --no-window #    无 DISPLAY 的机器只跑自检
 export QXNYC_TEST_HOST=... QXNYC_TEST_PORT=9834
 export QXNYC_TEST_USER=... QXNYC_TEST_PASSWORD='...'
 export QXNYC_TEST_FIXTURE=/home/qxync-test
+export QXNYC_TEST_TOTP_SECRET='...'   # 账号开了两步验证（2SV）时给 TOTP 密钥
 cargo test -p qxync-proto-test -- --ignored --test-threads=1 --nocapture  # 协议 5 项 + IPC 端到端 1 项
+cargo test -p qxync-proto-test --test two_step -- --ignored --nocapture  # M17：TOTP 登录往返 / 缺第二因素报错
 cargo test -p qxync-daemon -- --ignored --test-threads=1 --nocapture     # M2c 引擎（冲突副本 / 删除保护）
 ```
 
@@ -551,6 +571,7 @@ cargo test -p qxync-daemon -- --ignored --test-threads=1 --nocapture     # M2c �
 | [`docs/M7-选择性同步与LAN直连.md`](docs/M7-选择性同步与LAN直连.md) | exclude 规则引擎、对等协议线格式、事件快路径、直传 |
 | [`docs/M8-向Qsync-Client-6靠拢.md`](docs/M8-向Qsync-Client-6靠拢.md) | GUI 改造研究 + M8.1–M8.6 执行方案与决策记录 |
 | [`docs/M16-多NAS连接.md`](docs/M16-多NAS连接.md) | 多 NAS：一连接一 daemon、命名空间与存储布局、旧数据迁移、CLI/GUI 入口、安全边界与验收 |
+| [`docs/M17-两步验证.md`](docs/M17-两步验证.md) | 两步验证（2SV）：`authLogin.cgi` 的 `security_code` 实测结论、内置 TOTP、`otp_secret` 存储、CLI/GUI 用法、daemon 重登现算、安全边界 |
 | [`docs/验收记录.md`](docs/验收记录.md) | 里程碑级验收结论（跑了什么、结果是什么） |
 | [`docs/发布清单-v0.1.0.md`](docs/发布清单-v0.1.0.md) | 发版前检查清单（维护者用） |
 | [`CHANGELOG.md`](CHANGELOG.md) | 变更日志 |

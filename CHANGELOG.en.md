@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-10-18
+
+### Added
+
+- **Two-step verification (2SV / TOTP) support (M17)**: once an account enabled two-step
+  verification in QTS, qxync **could never log in** — the *first* `authLogin.cgi` form decides
+  whether a sid is issued, and qxync only sent `user + pwd(base64)`, so the server answered
+  `authPassed=0 / need_2sv=1` and every later endpoint had no sid. The real-NAS conclusion
+  (2026-10-18): **add `security_code=<6-digit TOTP>` to that same form and the response is
+  `authPassed=1` + `authSid`**; nothing else changes. The implementation follows the QTS Web UI's
+  two-step flow: **the first request is byte-for-byte identical to v0.6.1**, and the second one
+  (carrying `security_code`) is only sent when the NAS answers `need_2sv=1` — so "accounts
+  without 2SV are unchanged" is structural rather than relying on the server ignoring unknown
+  fields. Implementation:
+  - a pure-Rust built-in TOTP (RFC 6238: SHA-1 / 30 s / 6 digits; Base32 secrets; a pasted
+    `otpauth://` URI works too) with **no new dependencies**;
+  - the credentials file gains an optional `otp_secret` (same file as the password, `0600`,
+    one per connection; old files need **zero migration** — a missing field means "2SV not
+    configured");
+  - CLI globals `--otp-secret` (or `QXNYC_OTP_SECRET`, saved with the credentials) and
+    `--otp-code` (or `QXNYC_OTP_CODE`, one-shot and never saved);
+  - the daemon **computes a fresh code on every re-login** (only the secret is stored, codes are
+    never cached), so long-running mounts do not drop when a code expires; `Request::Login`
+    accepts a one-shot `otp`;
+  - the GUI's Settings → Connections gains a "two-step verification (optional)" field (a secret is
+    saved; a 6-digit code is one-shot); editing a connection shows "configured", the login result
+    shows whether 2SV passed, and the secret is **never echoed back**;
+  - design and protocol evidence: [M17-两步验证.md](docs/M17-两步验证.md).
+
+### Fixed
+
+- **Login errors for 2SV accounts are no longer misleading**: an `authPassed=0` used to always
+  append "check the password encoding: it must be base64", which is wrong when two-step
+  verification is enabled. The two branches are now distinct: "the account needs 2SV but no
+  second factor was supplied" → tell the user about `--otp-code` / `--otp-secret` (and where to
+  find them in the GUI); "supplied but rejected" → mention that the code may have expired
+  (30-second window) or that the local clock may be skewed. Neither the message nor the logs
+  ever contain the secret or the code.
+
+### Changed
+
+- **Accounts without 2SV are byte-for-byte unchanged**: the login body carries no
+  `security_code` and the credentials file gains no field.
+- Old credentials files stay readable (no `otp_secret` = not configured); an old version reading
+  a new file just ignores the extra field.
+- `IPC_VERSION` is **not bumped**: `Request::Login.otp` and `LoginData.two_step` both use
+  `serde(default)`, so old and new processes can run side by side (same reasoning as M16).
+- Rolling back to v0.6.1: 2SV accounts stop logging in again; everything else is unaffected.
+
+### Known limitations (not fixed in this batch)
+
+- **TOTP only**; QNAP's security questions / email codes / QR-code approval / device approval are
+  **not implemented**.
+- Depends on the local clock; `otp_secret` is plaintext in a `0600` file just like the password
+  (keyring support is future work).
+- Not measured on the protocol side: `dont_verify_2sv_again=1` ("remember this device") and
+  account lockout / rate limiting after **repeated** wrong codes (only a single wrong code was
+  tested: rejected, no lockout).
+
 ## [0.6.1] - 2026-10-18
 
 ### Added
@@ -1099,6 +1158,7 @@ Verified on **QNAP TS-464C / QTS 5.2.9 / Qsync QPKG 5.0.0.7 (build 20260723)**.
 - Acceptance results were split out of the README into [`docs/验收记录.md`](docs/验收记录.md).
 - Dual-licensed under **MIT OR Apache-2.0** (`LICENSE-MIT` / `LICENSE-APACHE`).
 
+[0.6.2]: https://github.com/mlzxgzy/qxync/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/mlzxgzy/qxync/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/mlzxgzy/qxync/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/mlzxgzy/qxync/compare/v0.5.0...v0.5.1
