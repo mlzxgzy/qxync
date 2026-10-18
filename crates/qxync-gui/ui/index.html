@@ -203,17 +203,17 @@
                      placeholder="/home/.Qsync">
             </label>
             <p class="hint">
-              ★ **一对一**：本地文件夹 ⇄ 这**一个** NAS 文件夹；挂载点里**直接**就是它的内容，
-              不会再套一层目录名（NAS 选 <code>/home</code>，挂载点里就是家目录，不是
-              <code>挂载点/home</code>）。候选来自「NAS 上登记的 Qsync 同步文件夹」与家目录；
-              选不到就点「浏览…」逐层挑，或选「手动输入」。要同步多个 NAS 文件夹 → 建多个任务
-              （提交时会检查本地文件夹重复/嵌套、NAS 文件夹重复）。
+              ★ <strong>一对一</strong>：本地文件夹 ⇄ 这<strong>一个</strong> NAS 文件夹；挂载点里
+              <strong>直接</strong>就是它的内容，不会再套一层目录名（NAS 选 <code>/home</code>，
+              挂载点里就是家目录，不是 <code>挂载点/home</code>）。候选来自「NAS 上登记的 Qsync
+              同步文件夹」与家目录；选不到就点「浏览…」逐层挑，或选「手动输入」。要同步多个
+              NAS 文件夹 → 建多个任务（提交时会检查本地文件夹重复/嵌套、NAS 文件夹重复）。
               <strong>能不能写由 NAS 决定</strong>：Qsync 里登记成同步文件夹的目录可以写，
               没登记过的共享文件夹会被服务端拒绝（<code>status:20</code>）—— 勾了「读写」仍失败的话，
               错误会进「更新 / 错误」页，客户端不会替你改只读。
             </p>
-            <div class="row-2">
-              <label>任务 id（也是文件名；默认取 NAS 文件夹名）
+            <div class="row-2 row-wide">
+              <label>任务 id（也是文件名）
                 <input type="text" id="t-id" class="mono" spellcheck="false"
                        placeholder="home">
               </label>
@@ -268,9 +268,10 @@
               <label class="check"><input type="checkbox" id="t-do-mount" checked> 保存后立即挂载</label>
             </div>
             <p class="hint">
-              保存位置 <code>~/.config/qxync/tasks/&lt;id&gt;.json</code>；**只登记参数，不动 NAS 上的任何数据**。
+              保存位置 <code>~/.config/qxync/tasks/&lt;id&gt;.json</code>；
+              <strong>只登记参数，不动 NAS 上的任何数据</strong>。
               冲突策略与节省空间模式已经接到后端；选择性同步（勾选子文件夹）仍是 M9 的事，
-              现在用「多任务」近似 —— **一个任务 = 一个配对文件夹（一对一）**。
+              现在用「多任务」近似 —— <strong>一个任务 = 一个配对文件夹（一对一）</strong>。
             </p>
             <div class="btn-row">
               <button type="submit" id="btn-task-save" class="primary">保存任务</button>

@@ -1023,6 +1023,8 @@ table.tbl tbody tr:focus-within td { box-shadow: inset 0 -1px 0 var(--focus); }
 }
 
 .row-2 { grid-template-columns: 120px 1fr; }
+/* ★ M18：任务 id 最长 64 字符，120px 的列太窄（标签会折行、长 id 看不全） */
+.row-2.row-wide { grid-template-columns: minmax(220px, 340px) 1fr; }
 .row-3 { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
 .row-checks { grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
 
