@@ -69,6 +69,15 @@ struct Cli {
     #[arg(long, global = true, env = "QXNYC_PASSWORD", hide_env_values = true)]
     password: Option<String>,
 
+    /// ★ M17：两步验证（2SV）的 TOTP 密钥（Base32，或 otpauth:// URI）。
+    /// 会随凭据保存（0600），之后 daemon 重登自动现算验证码。
+    #[arg(long, global = true, env = "QXNYC_OTP_SECRET", hide_env_values = true)]
+    otp_secret: Option<String>,
+
+    /// ★ M17：两步验证的一次性 6 位验证码（只用于本次登录，不保存）。
+    #[arg(long, global = true, env = "QXNYC_OTP_CODE", hide_env_values = true)]
+    otp_code: Option<String>,
+
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -76,6 +85,9 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// 登录并把凭据写入 ~/.config/qxync/credentials.json (0600)
+    ///
+    /// 开了两步验证（2SV）的账号：加 `--otp-secret <Base32密钥>`（会随凭据保存），
+    /// 或 `--otp-code <6位验证码>`（只用于本次登录）。
     Login,
     /// 会话状态 + 服务端信息（max_log / uid / 迁移状态）
     Status,
@@ -553,6 +565,39 @@ fn resolve_password(cli: &Cli, link: &LinkConfig) -> Result<String> {
     bail!("没有口令：用 --password / QXNYC_PASSWORD，或先跑 `qxync login --password` 写凭据")
 }
 
+/// ★ M17：本次登录要用的两步验证输入。
+///
+/// 优先级：`--otp-code`（一次性）> `--otp-secret`（本次）> 凭据里保存的 `otp_secret`。
+/// 返回 `None` 表示没提供 —— 账号没开 2SV 时完全不影响登录。
+fn resolve_otp(cli: &Cli, link: &LinkConfig) -> Option<String> {
+    if let Some(code) = &cli.otp_code {
+        return Some(code.clone());
+    }
+    if let Some(secret) = &cli.otp_secret {
+        return Some(secret.clone());
+    }
+    Credentials::load_for(&paths().ok()?, link)
+        .ok()
+        .and_then(|c| c.otp_secret)
+}
+
+/// ★ M17：命令行给的 `--otp-secret` 归一化成可保存的 Base32 密钥。
+///
+/// 传 6 位验证码是**用错参数**（那是一次性的，不该落盘）→ 明确报错，
+/// 不静默当成密钥存下来。
+fn cli_otp_secret(cli: &Cli) -> Result<Option<String>> {
+    let Some(raw) = &cli.otp_secret else {
+        return Ok(None);
+    };
+    match qxync_core::totp::normalize_otp(raw)? {
+        qxync_core::Otp::Secret(secret) => Ok(Some(secret)),
+        qxync_core::Otp::Code(_) => bail!(
+            "--otp-secret 要的是 TOTP 密钥（Base32），不是 6 位验证码；\
+             一次性验证码请用 --otp-code（不会保存）"
+        ),
+    }
+}
+
 async fn connect(cli: &Cli, need_creds: bool) -> Result<(Client, LinkConfig)> {
     let link = resolve_link(cli)?;
     // ★ M8.4：直连模式也走 settings.json 里的代理（否则「设置里配了代理」在 CLI 直连时失效）
@@ -562,8 +607,9 @@ async fn connect(cli: &Cli, need_creds: bool) -> Result<(Client, LinkConfig)> {
     };
     if need_creds {
         let pw = resolve_password(cli, &link)?;
+        let otp = resolve_otp(cli, &link);
         client
-            .login(&link.user, &pw)
+            .login_with_otp(&link.user, &pw, otp.as_deref())
             .await
             .with_context(|| format!("登录 {}@{} 失败", link.user, link.host))?;
     }
@@ -657,15 +703,25 @@ async fn main() -> Result<()> {
             let link = resolve_link(&cli)?;
             let mut client = Client::new(&link)?;
             let pw = resolve_password(&cli, &link)?;
-            let session = client.login(&link.user, &pw).await?;
+            // 先校验命令行给的密钥格式：别等登录成功了才因为 --otp-secret 里是
+            // 6 位验证码而报错（那样凭据没写、用户还白登了一次）。
+            let cli_secret = cli_otp_secret(&cli)?;
+            let otp = resolve_otp(&cli, &link);
+            let session = client
+                .login_with_otp(&link.user, &pw, otp.as_deref())
+                .await
+                .with_context(|| format!("登录 {}@{} 失败", link.user, link.host))?;
             paths()?.ensure_dirs()?;
             let link_path = link.save(&paths()?)?;
-            let cred_path = Credentials {
-                host: link.host.clone(),
-                user: link.user.clone(),
-                password: pw,
-            }
-            .save_for(&paths()?, &link)?;
+            // 空输入 = 不改：保留已保存的 2SV 密钥（只换口令时别把它抹掉）
+            let existing_secret = Credentials::load_for(&paths()?, &link)
+                .ok()
+                .and_then(|c| c.otp_secret);
+            let otp_secret = cli_secret.or(existing_secret);
+            let cred = Credentials::new(link.host.clone(), link.user.clone(), pw)
+                .with_otp_secret(otp_secret);
+            let has_otp = cred.has_otp();
+            let cred_path = cred.save_for(&paths()?, &link)?;
             println!("✅ 登录成功");
             println!("   sid        : {}", session.sid);
             println!("   user       : {}", session.username);
@@ -676,6 +732,17 @@ async fn main() -> Result<()> {
                 session.nas.qpkg_version.as_deref().unwrap_or("-"),
                 session.nas.build.as_deref().unwrap_or("-")
             );
+            println!(
+                "   两步验证   : {}",
+                if session.two_step {
+                    "已通过（TOTP）"
+                } else {
+                    "未启用 / 本次未使用"
+                }
+            );
+            if has_otp {
+                println!("   TOTP 密钥  : 已保存（daemon 重登时自动现算验证码）");
+            }
             if let Some(reason) = session.busy_reason() {
                 println!("   ⚠️  {reason} —— 同步应暂停");
             }
@@ -1003,6 +1070,7 @@ fn to_request(cli: &Cli) -> Option<Request> {
         Cmd::Login => Request::Login {
             user: cli.user.clone(),
             password: cli.password.clone(),
+            otp: cli.otp_code.clone().or_else(|| cli.otp_secret.clone()),
         },
         Cmd::Status => Request::Status,
         Cmd::Ls { path } => Request::Ls { path: path.clone() },
@@ -2773,6 +2841,7 @@ async fn links_cmd(json: bool) -> Result<()> {
             }
         }
         let cred = Credentials::present_for(&p, link);
+        let otp = Credentials::present_otp_for(&p, link);
         rows.push(serde_json::json!({
             "id": link.id,
             "host": link.host,
@@ -2782,6 +2851,8 @@ async fn links_cmd(json: bool) -> Result<()> {
             "user": link.user,
             "socket": socket.display().to_string(),
             "credential_present": cred.is_some(),
+            // ★ M17：只报「有没有存 2SV 密钥」，绝不回传密钥本身
+            "otp_present": otp,
             "daemon": {
                 "running": running,
                 "pid": pid,
@@ -2816,11 +2887,13 @@ async fn links_cmd(json: bool) -> Result<()> {
         let running = r["daemon"]["running"].as_bool().unwrap_or(false);
         let logged = r["daemon"]["logged_in"].as_bool().unwrap_or(false);
         let cred = r["credential_present"].as_bool().unwrap_or(false);
+        let otp = r["otp_present"].as_bool().unwrap_or(false);
         println!(
-            "- {id:<10} {user}@{host}:{port}  daemon={}  login={}  credential={}{}",
+            "- {id:<10} {user}@{host}:{port}  daemon={}  login={}  credential={}  2sv={}{}",
             if running { "运行" } else { "停止" },
             if logged { "已登录" } else { "未登录" },
             if cred { "有" } else { "无" },
+            if otp { "已配置" } else { "无" },
             if running {
                 format!("  socket={}", r["socket"].as_str().unwrap_or("?"))
             } else {

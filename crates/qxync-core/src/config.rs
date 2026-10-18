@@ -542,9 +542,45 @@ pub struct Credentials {
     pub host: String,
     pub user: String,
     pub password: String,
+    /// ★ M17：两步验证（2SV）的 TOTP 密钥（Base32，已归一化）。
+    ///
+    /// `None` = 该账号没开两步验证，或开了但用户选择每次手输验证码。
+    /// 密钥与口令同级敏感，所以和口令放在同一个 0600 文件里；旧版凭据文件
+    /// 没有这个字段也能正常读（`serde(default)`），不需要迁移。
+    ///
+    /// **验证码本身绝不落盘** —— 30 秒就过期，存了也没用；daemon 每次重登现算。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otp_secret: Option<String>,
 }
 
 impl Credentials {
+    /// 新凭据（不含两步验证密钥）。要带 2SV 就再设 [`Credentials::otp_secret`]。
+    pub fn new(
+        host: impl Into<String>,
+        user: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        Self {
+            host: host.into(),
+            user: user.into(),
+            password: password.into(),
+            otp_secret: None,
+        }
+    }
+
+    /// 这个账号是否存了两步验证密钥。
+    pub fn has_otp(&self) -> bool {
+        self.otp_secret
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+    }
+
+    /// 保留旧凭据里的 2SV 密钥（GUI/daemon 只改口令时别把它抹掉）。
+    pub fn with_otp_secret(mut self, otp_secret: Option<String>) -> Self {
+        self.otp_secret = otp_secret.filter(|s| !s.trim().is_empty());
+        self
+    }
+
     pub fn load(paths: &ConfigPaths) -> Result<Self> {
         let p = paths.credentials_file();
         let raw = std::fs::read(&p).map_err(|e| Error::Io(format!("读取 {}: {e}", p.display())))?;
@@ -628,6 +664,14 @@ impl Credentials {
             }
             Err(_) => None,
         }
+    }
+
+    /// ★ M17：这条连接的凭据里是否存了两步验证密钥（GUI 展示「已配置」用；
+    /// **绝不回传密钥本身**）。
+    pub fn present_otp_for(paths: &ConfigPaths, link: &LinkConfig) -> bool {
+        Self::load_for(paths, link)
+            .map(|c| c.has_otp())
+            .unwrap_or(false)
     }
 
     /// 写 0600：先 build 到临时文件再 rename，避免出现半截的凭据文件。
@@ -742,6 +786,7 @@ mod tests {
             host: "nas.local".into(),
             user: "test1".into(),
             password: "p@ss".into(),
+            otp_secret: None,
         };
         let p = cred.save(&paths).unwrap();
         #[cfg(unix)]
@@ -957,6 +1002,7 @@ mod tests {
             host: "a.local".into(),
             user: "u1".into(),
             password: "pw-default".into(),
+            otp_secret: None,
         };
         let p = cd.save_for(&paths, &d).unwrap();
         assert_eq!(p, paths.credentials_file(), "default 必须继续用旧文件");
@@ -969,6 +1015,7 @@ mod tests {
             host: "b.local".into(),
             user: "u2".into(),
             password: "pw-nas2".into(),
+            otp_secret: None,
         };
         let pn = cn.save_for(&paths, &n).unwrap();
         assert_eq!(pn, paths.link_credentials_file("nas2"));
@@ -985,6 +1032,42 @@ mod tests {
         // host/user 不匹配 → 明确报错，不能拿 A 的密码去登 B
         let wrong = mk_link("nas2", "other.local", "u2");
         assert!(Credentials::load_for(&paths, &wrong).is_err());
+        std::fs::remove_dir_all(paths.data_dir.parent().unwrap()).ok();
+    }
+
+    /// ★ M17：两步验证密钥是**可选字段** —— 旧凭据文件无需迁移；写回后 0600 且能读回。
+    #[test]
+    fn m17_credentials_otp_secret_is_optional_and_roundtrips() {
+        let paths = m16_paths("otp");
+        let link = mk_link("default", "nas.local", "test2");
+
+        // 0.6.1 及更早写出的凭据（没有 otp_secret 字段）必须能读
+        let legacy = br#"{"host":"nas.local","user":"test2","password":"p@ss"}"#;
+        std::fs::write(paths.credentials_file(), legacy).unwrap();
+        let c = Credentials::load_for(&paths, &link).unwrap();
+        assert!(c.otp_secret.is_none());
+        assert!(!c.has_otp(), "没有密钥 = 未配置 2SV");
+        assert!(!Credentials::present_otp_for(&paths, &link));
+
+        // 带上密钥写回：字段出现、权限不变、能读回
+        let saved = c
+            .with_otp_secret(Some("JBSWY3DPEHPK3PXP".into()))
+            .save_for(&paths, &link)
+            .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&saved).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "带 2SV 密钥的凭据文件也必须 0600");
+        }
+        let back = Credentials::load_for(&paths, &link).unwrap();
+        assert_eq!(back.password, "p@ss");
+        assert_eq!(back.otp_secret.as_deref(), Some("JBSWY3DPEHPK3PXP"));
+        assert!(Credentials::present_otp_for(&paths, &link));
+
+        // 空字符串按「没配」处理，避免 GUI 清空后留下一个空密钥
+        let cleared = back.with_otp_secret(Some("   ".into()));
+        assert!(cleared.otp_secret.is_none());
         std::fs::remove_dir_all(paths.data_dir.parent().unwrap()).ok();
     }
 }

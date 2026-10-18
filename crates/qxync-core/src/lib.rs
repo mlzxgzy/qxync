@@ -34,6 +34,7 @@ pub mod status;
 pub mod store;
 pub mod sync;
 pub mod tasks;
+pub mod totp;
 pub mod trash;
 
 pub use config::{ConfigPaths, Credentials, LinkConfig, PeerConfig, PeerRegistry};
@@ -59,6 +60,7 @@ pub use sync::{
     SyncLogBatch,
 };
 pub use tasks::{Task, DIR_2WAY, DIR_DOWN, DIR_UP};
+pub use totp::Otp;
 pub use trash::{is_trash_path, is_trash_segment};
 
 /// 普通用户的 Qsync 家目录根（不是 `/home/<user>`）。

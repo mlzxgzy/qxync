@@ -976,7 +976,7 @@ pub async fn run(opts: Options) -> Result<()> {
         state.link.id
     );
     if opts.auto_login {
-        match login_internal(&state, None, None).await {
+        match login_internal(&state, None, None, None).await {
             Ok(s) => tracing::info!("自动登录成功 user={} sid={}", s.username, mask_sid(&s.sid)),
             Err(e) => tracing::warn!("自动登录失败（可稍后 `qxync login`）: {}", e.message),
         }
@@ -1127,7 +1127,7 @@ async fn reload_sync_engine(
     // 顺带重登：会话过期正是用户想「重启同步」的常见起因。失败不阻塞 ——
     // poller 的懒登录会自己再试（`spawn_poller` 里那句 `login_internal`）。
     if state.client.lock().await.sid().is_none() {
-        match login_internal(state, None, None).await {
+        match login_internal(state, None, None, None).await {
             Ok(s) => tracing::info!("SIGHUP 重载：重新登录成功 user={}", s.username),
             Err(e) => tracing::warn!(
                 "SIGHUP 重载：重新登录失败（poller 会懒登录重试）: {}",
@@ -1339,15 +1339,20 @@ async fn dispatch(state: &Arc<State>, req: Request, shutdown: &mpsc::Sender<()>)
             uptime_secs: state.started.elapsed().as_secs(),
         }),
         Request::Status => status(state).await,
-        Request::Login { user, password } => {
-            login_internal(state, user, password).await.and_then(|s| {
+        Request::Login {
+            user,
+            password,
+            otp,
+        } => login_internal(state, user, password, otp)
+            .await
+            .and_then(|s| {
                 to_value(LoginData {
                     sid_masked: mask_sid(&s.sid),
                     user: s.username.clone(),
                     uid: s.uid.clone(),
+                    two_step: s.two_step,
                 })
-            })
-        }
+            }),
         Request::Logout => logout(state).await,
         Request::Ls { path } => ls(state, path).await,
         Request::Stat { dir, name } => stat(state, dir, name).await,
@@ -1598,7 +1603,7 @@ async fn ensure_session(state: &Arc<State>) -> Result<(), IpcError> {
         return Ok(());
     }
     tracing::info!("首次请求需要会话，尝试用凭据登录");
-    login_internal(state, None, None).await.map(|_| ())
+    login_internal(state, None, None, None).await.map(|_| ())
 }
 
 async fn require_sid(state: &State) -> Result<String, IpcError> {
@@ -1612,10 +1617,15 @@ async fn require_sid(state: &State) -> Result<String, IpcError> {
 }
 
 /// 登录：参数 → 凭据文件 → 报错。成功则写回凭据（0600）。
+///
+/// ★ M17：`otp` 是两步验证的一次性输入（6 位验证码 / Base32 密钥 / otpauth URI）；
+/// 省略时用凭据里保存的 `otp_secret`。**验证码不落盘**，每次登录（含会话保活
+/// 重登、挂载点重登）都由 `Client::login_with_otp` 现算。
 async fn login_internal(
     state: &Arc<State>,
     user: Option<String>,
     password: Option<String>,
+    otp: Option<String>,
 ) -> Result<Session, IpcError> {
     let paths = ConfigPaths::discover().map_err(|e| IpcError::new(ErrorKind::Io, e.to_string()))?;
     let creds = Credentials::load_for(&paths, &state.link).ok();
@@ -1630,10 +1640,21 @@ async fn login_internal(
                 "没有口令：用 `qxync login --password <口令>` 或先在 CLI 登录一次",
             )
         })?;
+    // 本次请求给的优先；否则用凭据里保存的密钥（daemon 定时重登走这一支）。
+    let otp = otp.or_else(|| creds.as_ref().and_then(|c| c.otp_secret.clone()));
+    // IPC 传进来的若是密钥（不是 6 位验证码），归一化后写回凭据；验证码不落盘。
+    let new_secret = match otp.as_deref().map(qxync_core::totp::normalize_otp) {
+        Some(Ok(qxync_core::Otp::Secret(secret))) => Some(secret),
+        _ => None,
+    };
+    let otp_secret = new_secret.or_else(|| creds.as_ref().and_then(|c| c.otp_secret.clone()));
 
     let session = {
         let mut client = state.client.lock().await;
-        client.login(&user, &password).await.map_err(map_err)?
+        client
+            .login_with_otp(&user, &password, otp.as_deref())
+            .await
+            .map_err(map_err)?
     };
     if let Some(reason) = session.busy_reason() {
         tracing::warn!("NAS 状态：{reason}（同步应暂停）");
@@ -1642,17 +1663,15 @@ async fn login_internal(
     // ★ M10：把新 sid **热推**给所有挂载点。挂载点各自持有自己的 `Client`，
     //   挂载时拷的是当时那个 sid；不推的话它会一直 EIO 到重新挂载。
     push_sid_to_mounts(state, &session.sid, &session.username);
-    // 凭据回写（如果这次是从命令行传进来的）
-    let _ = Credentials {
-        host: state.link.host.clone(),
-        user: user.clone(),
-        password,
-    }
-    .save_for(&paths, &state.link);
+    // 凭据回写（如果这次是从命令行传进来的）；2SV 密钥原样保留/补齐。
+    let _ = Credentials::new(state.link.host.clone(), user.clone(), password)
+        .with_otp_secret(otp_secret)
+        .save_for(&paths, &state.link);
     tracing::info!(
-        "登录成功 user={} sid={}",
+        "登录成功 user={} sid={} two_step={}",
         session.username,
-        mask_sid(&session.sid)
+        mask_sid(&session.sid),
+        session.two_step
     );
     Ok(session)
 }
@@ -1751,7 +1770,7 @@ fn spawn_session_broker(state: &Arc<State>) -> qxync_fuse::SidRefresher {
                     }
                 }
             }
-            match login_internal(&st, None, None).await {
+            match login_internal(&st, None, None, None).await {
                 Ok(s) => {
                     last_ok = Some(Instant::now());
                     let _ = reply.send(Some(s.sid));
@@ -1836,7 +1855,7 @@ fn spawn_session_keeper(state: Arc<State>, mut gen: EngineGen) -> tokio::task::J
                 }
                 KeeperStep::Relogin => {
                     tracing::warn!("会话保活：sid 已失效（{probe:?}），重登并推给挂载点");
-                    if let Err(e) = login_internal(&state, None, None).await {
+                    if let Err(e) = login_internal(&state, None, None, None).await {
                         tracing::warn!("会话保活重登失败: {}", e.message);
                     }
                 }
@@ -1857,7 +1876,7 @@ macro_rules! with_client {
             Ok(v) => Ok(v),
             Err(e) if is_auth_error(&e) => {
                 tracing::warn!("会话失效（{e}），重登后重试");
-                login_internal($state, None, None).await?;
+                login_internal($state, None, None, None).await?;
                 let guard = $state.client.lock().await;
                 let $c = &*guard;
                 $body.await.map_err(map_err)
@@ -3263,7 +3282,7 @@ fn spawn_poller(state: Arc<State>, mut gen: EngineGen) -> tokio::task::JoinHandl
             }
             if state.client.lock().await.sid().is_none() {
                 // 懒登录：没会话就不轮询（避免每次都发一个必然失败的请求）
-                match login_internal(&state, None, None).await {
+                match login_internal(&state, None, None, None).await {
                     Ok(_) => {}
                     Err(e) => {
                         tracing::debug!("轮询等待登录: {}", e.message);
@@ -3283,7 +3302,7 @@ fn spawn_poller(state: Arc<State>, mut gen: EngineGen) -> tokio::task::JoinHandl
                             "轮询遇会话失效（本轮已记录），立即重登后下一轮继续: {:?}",
                             r.errors
                         );
-                        if let Err(e2) = login_internal(&state, None, None).await {
+                        if let Err(e2) = login_internal(&state, None, None, None).await {
                             tracing::warn!("轮询重登失败: {}", e2.message);
                         }
                     }
@@ -3308,7 +3327,7 @@ fn spawn_poller(state: Arc<State>, mut gen: EngineGen) -> tokio::task::JoinHandl
                     //   以前这里只是记一条错误，sid 死了就每一轮都失败。
                     if e.kind == ErrorKind::Auth {
                         tracing::warn!("轮询遇会话失效，重登后下一轮继续");
-                        if let Err(e2) = login_internal(&state, None, None).await {
+                        if let Err(e2) = login_internal(&state, None, None, None).await {
                             tracing::warn!("轮询重登失败: {}", e2.message);
                         }
                     }

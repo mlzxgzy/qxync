@@ -57,6 +57,11 @@ pub struct Session {
     pub uid: Option<String>,
     pub user_cuid: Option<String>,
     pub nas: NasUid,
+    /// ★ M17：本次登录是否通过了两步验证（2SV）。
+    ///
+    /// 只是给 UI/日志展示用：`false` = 账号没开 2SV，或这次登录没用到；
+    /// 不影响会话本身。
+    pub two_step: bool,
 }
 
 impl Session {
@@ -175,19 +180,136 @@ impl Client {
     // ---------------------------------------------------------------- 登录
 
     /// 阶段 3：`authLogin.cgi`。
+    ///
+    /// 账号开了两步验证（2SV）时会明确报错并提示改用 [`Client::login_with_otp`]。
     pub async fn login(&mut self, user: &str, password: &str) -> Result<Session> {
+        self.login_with_otp(user, password, None).await
+    }
+
+    /// ★ M17：阶段 3 —— `authLogin.cgi`，支持两步验证（2SV / TOTP）。
+    ///
+    /// `otp` 接受三种输入（见 [`qxync_core::totp::normalize_otp`]）：
+    /// * 6 位一次性验证码；
+    /// * Base32 密钥（`GHH5...`，大小写/空格/连字符都容忍）；
+    /// * `otpauth://totp/...?secret=...` URI。
+    ///
+    /// 流程与 QTS Web UI（`qos-core-login.js`）一致：
+    ///
+    /// 1. 先发**不带** `security_code` 的登录请求；
+    /// 2. 若响应 `authPassed=1` → 账号没开 2SV，正常返回；
+    /// 3. 若响应 `need_2_step_verification=1` / `need_2sv=1`，再发一次带
+    ///    `security_code=<6 位验证码>` 的请求。
+    ///
+    /// 之所以不把 `security_code` 塞进第一次请求：万一 NAS 在未开 2SV 时对未知
+    /// 字段的处理将来变了，两步流程对两种账号都成立，而 Web UI 走的就是这条路径。
+    /// 传密钥时**每次调用现算**验证码 —— daemon 定时重登也走这里，绝不会拿到
+    /// 30 秒前的旧码。
+    pub async fn login_with_otp(
+        &mut self,
+        user: &str,
+        password: &str,
+        otp: Option<&str>,
+    ) -> Result<Session> {
+        // 先把输入归一化：密钥格式不对就不必白跑一趟 NAS。
+        let otp = match otp {
+            Some(raw) => Some(qxync_core::totp::normalize_otp(raw)?),
+            None => None,
+        };
+        let first = self.auth_login(user, password, None).await?;
+        let passed = xml_text(&first, "authPassed").unwrap_or("0");
+        let need_2sv = xml_text(&first, "need_2_step_verification")
+            .or_else(|| xml_text(&first, "need_2sv"))
+            .unwrap_or("0");
+
+        let (text, two_step) = if passed == "1" {
+            (first, false)
+        } else if need_2sv == "1" {
+            let code = match &otp {
+                Some(qxync_core::totp::Otp::Code(code)) => code.clone(),
+                Some(qxync_core::totp::Otp::Secret(secret)) => qxync_core::totp::code_now(secret)?,
+                None => {
+                    return Err(Error::Auth(format!(
+                        "该账号已开启两步验证（2SV），但这次没有提供验证码或 TOTP 密钥\
+                         （need_2sv=1 / authPassed=0）：用 `--otp-secret <Base32密钥>` \
+                         保存密钥，或 `--otp-code <6位验证码>` 只用于本次登录。\
+                         NAS 响应：{}",
+                        self.auth_failure_summary(&first)
+                    )))
+                }
+            };
+            let second = self.auth_login(user, password, Some(&code)).await?;
+            let passed = xml_text(&second, "authPassed").unwrap_or("0");
+            if passed != "1" {
+                let still = xml_text(&second, "need_2_step_verification")
+                    .or_else(|| xml_text(&second, "need_2sv"))
+                    .unwrap_or("0");
+                let hint = if still == "1" {
+                    "验证码被 NAS 拒绝：检查 TOTP 密钥是否正确、验证码是否已过期\
+                     （30 秒一换）、本机与 NAS 的时钟是否一致"
+                } else {
+                    "两步验证后 NAS 仍未放行"
+                };
+                return Err(Error::Auth(format!(
+                    "两步验证失败：{hint}。NAS 响应：{}",
+                    self.auth_failure_summary(&second)
+                )));
+            }
+            (second, true)
+        } else {
+            let err = xml_text(&first, "errorValue").unwrap_or("?");
+            return Err(Error::Auth(format!(
+                "authPassed=0 errorValue={err} need_2sv={need_2sv}\
+                 （检查用户名/口令；口令编码必须是 base64）"
+            )));
+        };
+
+        let sid = xml_text(&text, "authSid")
+            .ok_or_else(|| Error::Auth("authPassed=1 但响应里没有 authSid".into()))?
+            .to_string();
+        self.set_sid(sid.clone());
+
+        let username = xml_text(&text, "username").unwrap_or(user).to_string();
+
+        // 阶段 4：NAS UID（替代已 404 的 qsyncsrvPrepare.cgi）
+        let nas = self.nas_uid().await.unwrap_or_else(|_| parse_uid_stub());
+        Ok(Session {
+            sid,
+            username,
+            uid: nas.uid.clone(),
+            user_cuid: nas.user_cuid.clone(),
+            nas,
+            two_step,
+        })
+    }
+
+    /// 发一次 `authLogin.cgi`，返回响应 XML 原文。
+    ///
+    /// `security_code` 只在两步验证的第二次请求里出现；其余字段与 0.6.1 一致
+    /// （真机验证过：`serviceKey=1` + base64 口令是必需的）。
+    async fn auth_login(
+        &self,
+        user: &str,
+        password: &str,
+        security_code: Option<&str>,
+    ) -> Result<String> {
         use base64::Engine as _;
         let pwd = base64::engine::general_purpose::STANDARD.encode(password.as_bytes());
-        let body = [
-            ("user", user),
-            ("serviceKey", "1"),
-            ("client_app", "Qsync"),
-            ("client_agent", concat!("qxync/", env!("CARGO_PKG_VERSION"))),
-            ("gen_client_id", "1"),
-            ("remme", "1"),
-            ("dont_verify_2sv_again", "0"),
-            ("pwd", pwd.as_str()),
+        let mut body: Vec<(&str, String)> = vec![
+            ("user", user.to_string()),
+            ("serviceKey", "1".to_string()),
+            ("client_app", "Qsync".to_string()),
+            (
+                "client_agent",
+                concat!("qxync/", env!("CARGO_PKG_VERSION")).to_string(),
+            ),
+            ("gen_client_id", "1".to_string()),
+            ("remme", "1".to_string()),
+            ("dont_verify_2sv_again", "0".to_string()),
+            ("pwd", pwd),
         ];
+        if let Some(code) = security_code {
+            body.push(("security_code", code.to_string()));
+        }
         let url = self.url("cgi-bin/authLogin.cgi", &[]);
         let resp = self
             .http
@@ -205,31 +327,18 @@ impl Client {
         if !status.is_success() {
             return Err(Error::Auth(format!("authLogin.cgi HTTP {status}")));
         }
+        Ok(text)
+    }
 
-        let passed = xml_text(&text, "authPassed").unwrap_or("0");
-        if passed != "1" {
-            let err = xml_text(&text, "errorValue").unwrap_or("?");
-            let need2sv = xml_text(&text, "need_2sv").unwrap_or("0");
-            return Err(Error::Auth(format!(
-                "authPassed={passed} errorValue={err} need_2sv={need2sv}（检查口令编码：必须是 base64）"
-            )));
-        }
-        let sid = xml_text(&text, "authSid")
-            .ok_or_else(|| Error::Auth("authPassed=1 但响应里没有 authSid".into()))?
-            .to_string();
-        self.set_sid(sid.clone());
-
-        let username = xml_text(&text, "username").unwrap_or(user).to_string();
-
-        // 阶段 4：NAS UID（替代已 404 的 qsyncsrvPrepare.cgi）
-        let nas = self.nas_uid().await.unwrap_or_else(|_| parse_uid_stub());
-        Ok(Session {
-            sid,
-            username,
-            uid: nas.uid.clone(),
-            user_cuid: nas.user_cuid.clone(),
-            nas,
-        })
+    /// 把 authLogin 失败响应的关键字段拼成一句可读摘要（**不含口令**）。
+    fn auth_failure_summary(&self, text: &str) -> String {
+        let field = |name: &str| xml_text(text, name).unwrap_or("-");
+        format!(
+            "authPassed={} errorValue={} need_2sv={}",
+            field("authPassed"),
+            field("errorValue"),
+            field("need_2sv")
+        )
     }
 
     /// 登出（失败不视为错误）。

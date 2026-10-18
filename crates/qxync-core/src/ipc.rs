@@ -113,11 +113,16 @@ pub enum Request {
     /// 状态快照（**不触发登录**）。
     Status,
     /// 登录；`user`/`password` 省略时读 `credentials.json`。
+    ///
+    /// ★ M17：`otp` 是两步验证（2SV）的一次性输入 —— 6 位验证码，或 Base32 密钥 /
+    /// `otpauth://` URI。省略时用凭据里保存的 `otp_secret`；验证码本身不落盘。
     Login {
         #[serde(default)]
         user: Option<String>,
         #[serde(default)]
         password: Option<String>,
+        #[serde(default)]
+        otp: Option<String>,
     },
     Logout,
     Ls {
@@ -987,6 +992,9 @@ pub struct LoginData {
     pub sid_masked: String,
     pub user: String,
     pub uid: Option<String>,
+    /// ★ M17：这次登录是否通过了两步验证（给 GUI 显示，不影响会话）。
+    #[serde(default)]
+    pub two_step: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

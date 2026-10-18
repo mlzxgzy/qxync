@@ -141,6 +141,7 @@ async fn daemon_ipc_round_trip() {
             Request::Login {
                 user: None,
                 password: None,
+                otp: None,
             },
         )
         .await

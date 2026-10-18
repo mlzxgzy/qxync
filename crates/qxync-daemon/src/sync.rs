@@ -2231,8 +2231,12 @@ mod tests {
 
     async fn logged_in() -> Option<Client> {
         let (link, pw) = env_creds()?;
+        // ★ M17：真机若开了两步验证，测试也走 TOTP（env 里给 Base32 密钥）。
+        let otp = std::env::var("QXNYC_TEST_TOTP_SECRET").ok();
         let mut c = Client::new(&link).expect("构造 client");
-        c.login(&link.user, &pw).await.expect("登录失败");
+        c.login_with_otp(&link.user, &pw, otp.as_deref())
+            .await
+            .expect("登录失败");
         Some(c)
     }
 
