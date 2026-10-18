@@ -355,9 +355,10 @@
     }
     if (cmd === 'link_save' || cmd === 'credential_save' || cmd === 'login_flow') {
       var inp = isObj(a.input) ? a.input : {};
-      // 注意：绝不记录 password
+      // 注意：绝不记录 password，也**绝不记录两步验证密钥/验证码**（只记「填了」）。
       return 'host=' + str(inp.host) + ' user=' + str(inp.user) + ' port=' + str(inp.port) +
-        (inp.password ? ' password=***' : '');
+        (inp.password ? ' password=***' : '') +
+        (inp.otp_secret ? ' otp=***' : '');
     }
     return '';
   }
@@ -2560,6 +2561,20 @@
   function setFormValue(id, v) { var n = $(id); if (n) { n.value = v; } }
   function setFormChecked(id, v) { var n = $(id); if (n) { n.checked = !!v; } }
 
+  /** 凭据提示：有没有凭据 + ★ M17 两步验证（2SV）是否已配置。
+   *  只按 `credential_present` 回的布尔渲染 —— 密钥本身永远不会到前端。 */
+  function credHintText(present) {
+    var txt = (present && present.present)
+      ? T('connect.cred_present', {
+        user: str(present.user), host: str(present.host), path: str(present.path)
+      })
+      : T('connect.cred_missing', { path: str(present ? present.path : '') });
+    txt += ' · ' + (present && present.otp === true
+      ? T('connect.otp_configured')
+      : T('connect.otp_missing'));
+    return txt;
+  }
+
   /** 把 link_read 的结果填进「连接配置」表单（新建时 info.link 为空 = 全清空）。 */
   function fillConnectForm(info, present) {
     var hint = $('connect-hint');
@@ -2585,6 +2600,17 @@
     setFormChecked('f-ipv4-only', link ? link.ipv4_only === true : false);
     var pw = $('f-password');
     if (pw) { pw.value = ''; }
+    // ★ M17：两步验证密钥**绝不回显**（和口令一样：只写不读）。但只在「表单换到了
+    //   另一条连接 / 进入新建态」时清空 —— 不能每次填表都清：切页/保存后/当前连接被
+    //   外部改掉时都会重新 fillConnectForm，无脑清空会在用户正输入密钥时把它抹掉。
+    var formTarget = (link
+      ? str(link.id) + '|' + str(link.host) + '|' + str(link.user)
+      : 'new') + '|' + editing;
+    if (formTarget !== state.otpFormTarget) {
+      state.otpFormTarget = formTarget;
+      var otpEl = $('f-otp-secret');
+      if (otpEl) { otpEl.value = ''; }
+    }
 
     // 表单标题 / 编辑提示 / 编辑态按钮
     setText('conn-form-title', editing
@@ -2600,16 +2626,7 @@
     show('conn-edit-actions', !!editing);
 
     var cred = $('cred-hint');
-    if (cred) {
-      if (present && present.present) {
-        cred.textContent = T('connect.cred_present', {
-          user: str(present.user), host: str(present.host), path: str(present.path)
-        });
-      } else {
-        cred.textContent = T('connect.cred_missing',
-          { path: str(present ? present.path : '') });
-      }
-    }
+    if (cred) { cred.textContent = credHintText(present); }
   }
 
   function renderAppInfo(info) {
@@ -2658,6 +2675,8 @@
         str(l.user), str(l.host), str(l.port),
         l.link_exists === false ? 0 : 1,
         l.credential_present ? 1 : 0,
+        // ★ M17：2SV 是否已配置会影响连接行的徽标，必须进签名，否则轮询不会重画。
+        l.otp === true ? 1 : 0,
         d.running ? 1 : 0,
         st && st.logged_in ? 1 : 0,
         taskCount,
@@ -2725,6 +2744,10 @@
     }
     badges.appendChild(el('span', 'badge ' + (link.credential_present ? 'badge-on' : 'badge-off'),
       link.credential_present ? T('links.cred_present') : T('links.cred_missing')));
+    // ★ M17：只标「配没配」，徽标里绝不出现密钥。
+    if (link.otp === true) {
+      badges.appendChild(el('span', 'badge badge-on', T('links.otp_badge')));
+    }
     if (link.link_exists === false) {
       badges.appendChild(el('span', 'badge badge-warn', T('links.link_missing')));
     }
@@ -2852,11 +2875,7 @@
       } else {
         // 正在编辑另一条连接：只更新凭据提示，别把表单冲掉
         var c = $('cred-hint');
-        if (c && cred) {
-          c.textContent = cred.present
-            ? T('connect.cred_present', { user: str(cred.user), host: str(cred.host), path: str(cred.path) })
-            : T('connect.cred_missing', { path: str(cred.path) });
-        }
+        if (c) { c.textContent = credHintText(cred); }
       }
       renderConnList();
       renderConnSelect();
@@ -2883,6 +2902,12 @@
     if (withPassword) {
       input.password = str($('f-password') ? $('f-password').value : '');
     }
+    // ★ M17：两步验证（2SV）字段。「保存连接」与「保存并登录」两条路径都带上；
+    //   值为空 = 后端保留该连接已保存的密钥（编辑时不填 = 不改）。
+    //   注意：它属于凭据文件，link_save 会忽略它，只有 credential_save / login_flow 用。
+    var otpEl = $('f-otp-secret');
+    var otpVal = otpEl ? str(otpEl.value).trim() : '';
+    if (otpVal) { input.otp_secret = otpVal; }
     return { input: input };
   }
 
@@ -2897,6 +2922,8 @@
         state.editingLinkId = lid;
         state.creatingLink = false;   // ★ M16.1：编辑已有连接 = 退出「新建」态
         fillConnectForm(r.data, c.ok ? c.data : null);
+        // ★ M17：重新进入编辑态 = 重新开始，清掉可能残留的密钥/验证码输入。
+        clearOtpField();
         var pw = $('f-password');
         if (pw) { pw.focus(); }
         return r;
@@ -2909,6 +2936,8 @@
     state.editingLinkId = '';
     state.creatingLink = true;
     fillConnectForm({ exists: false, path: T('conn.path_pending'), link: null }, null);
+    // ★ M17：新建 = 空白表单，清掉残留的两步验证输入。
+    clearOtpField();
     // ★ M16.1：表单在「连接配置」卡片里，点完按钮如果不把卡片滚进视野、也不给一句日志，
     //   看上去就是「点了没反应」（不少人就是这么以为界面上没有新建入口的）。
     var card = $('link-form-card');
@@ -2951,6 +2980,25 @@
     box.appendChild(dl);
   }
 
+  /** ★ M17：把「两步验证」结果行追加到结果表（只在后端明确给了信息时）。
+   *  `otp_saved` = 本次保存了密钥；`otp_note` = 例如「一次性验证码不会保存」。
+   *  **绝不显示密钥/验证码本身**（后端也不会回传）。 */
+  function appendOtpRows(rows, d) {
+    if (!d) { return; }
+    if (d.otp_saved === true) {
+      rows.push(['两步验证', '密钥已保存（之后自动生成验证码）']);
+    }
+    if (d.otp_note) {
+      rows.push(['两步验证', str(d.otp_note)]);
+    }
+  }
+
+  /** ★ M17：清空两步验证输入框 —— 密钥只写不读，保存/登录完不在屏幕上留。 */
+  function clearOtpField() {
+    var n = $('f-otp-secret');
+    if (n) { n.value = ''; }
+  }
+
   /** 保存连接配置（不登录）。新连接保存后自动切为当前连接。 */
   function doLinkSave() {
     var built = buildLinkInput(false);
@@ -2968,13 +3016,35 @@
       var savedId = str(d.link && d.link.id);
       state.editingLinkId = savedId;
       state.creatingLink = false;   // ★ M16.1：保存成功 → 表单切回「编辑这条连接」
-      renderResult('login-result', true, T('links.saved'), [
+      var rows = [
         ['连接 id', savedId],
         ['文件', str(d.path)],
         ['NAS', str(d.link && d.link.user) + '@' + str(d.link && d.link.host) + ':' + str(d.link && d.link.port)],
         ['https', d.link && d.link.https ? '是' : '否']
-      ]);
-      logOk('连接配置已保存：' + savedId);
+      ];
+      // ★ M17：`link_save` 只写 link 文件，不写凭据（凭据是「保存并登录」的职责）。
+      //   所以用户在这张表单里填了密钥/验证码时**不能静默丢掉输入**：明确告知
+      //   「未保存」，并保留输入框内容，让用户能接着点「保存并登录」。
+      var pendingOtp = !!str(built.input.otp_secret);
+      if (pendingOtp) {
+        rows.push(['两步验证', '未保存 —— 点「保存并登录」才会写入凭据']);
+        // ★ M17(a)：保存成功后 `loadConnect()` 会重填表单（新建连接尤其会从「新建态」
+        //   切到「编辑态」）。预先把「保存后的表单目标」记进 state.otpFormTarget，
+        //   免得 fillConnectForm 把刚保留下来的两步验证输入清掉。
+        var savedLink = isObj(d.link) ? d.link : null;
+        state.otpFormTarget = (savedLink
+          ? str(savedLink.id || savedId) + '|' + str(savedLink.host) + '|' + str(savedLink.user)
+          : 'new') + '|' + savedId;
+      } else {
+        // ★ M17：如果后端顺手保存了两步验证密钥（或明确说「验证码不保存」），
+        //   如实显示 —— 但这只是提示，**密钥本身不会出现在任何返回值里**。
+        appendOtpRows(rows, d);
+      }
+      renderResult('login-result', true, T('links.saved'), rows);
+      logOk('连接配置已保存：' + savedId + (pendingOtp ? '（两步验证输入未保存，保留在输入框）' : ''));
+      // ★ M17：没填两步验证时字段用完就清（绝不回显已保存内容）；
+      //   填了则**保留**，否则用户接下来点「保存并登录」会发现输入没了。
+      if (!pendingOtp) { clearOtpField(); }
       return refreshStatus(true).then(function () {
         if (savedId && savedId !== state.currentLink) { return setCurrentLink(savedId); }
         return null;
@@ -3017,7 +3087,14 @@
         rows.push(['sid', str(login.data.sid_masked)]);
         rows.push(['user', str(login.data.user)]);
         rows.push(['uid', optText(login.data.uid)]);
+        // ★ M17：这次登录是否走了两步验证。`two_step=true` = NAS 要求 2SV 且
+        //   验证码通过了；false = 账号没开 2SV（或本次没用上）。
+        rows.push(['两步验证', login.data.two_step === true
+          ? '已通过（TOTP）'
+          : '未启用 / 本次未使用']);
       }
+      // ★ M17：本次是否保存了密钥 / 填的是不是一次性验证码（密钥本身不回传）。
+      appendOtpRows(rows, d);
       if (d.error) { rows.push(['错误', str(d.error)]); }
       if (login && isObj(login.error)) {
         rows.push(['登录错误', str(login.error.kind) + ': ' + str(login.error.message)]);
@@ -3026,8 +3103,11 @@
       renderResult('login-result', ok, ok ? '登录成功' : '登录失败', rows);
       if (ok) {
         logOk('登录成功（' + (wantId || '新连接') + '）');
+        // ★ M17：密钥/验证码用完就清（绝不回显；失败时也清，避免显眼看得到的过期码）。
+        clearOtpField();
         return adoptLink(wantId, built.input).then(function () { return loadConnect(); }).then(function () { return r; });
       }
+      clearOtpField();
       return refreshStatus(true).then(function () { return r; });
     });
   }

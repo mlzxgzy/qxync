@@ -3,10 +3,13 @@
 //! 约定：
 //! * 所有**业务动作**都封装成 `{v,ok,data,error}` 信封（与 `qxync-core::ipc::Response` 同形），
 //!   前端只需要一套渲染逻辑；`Err(String)` 只用于「参数不合法」这类本地错误。
-//! * 口令只在 `credential_save` / `login_flow` 的入参里出现，**从不回传**。
+//! * 口令与两步验证（2SV）密钥只在 `credential_save` / `login_flow` 的入参里出现，
+//!   **从不回传**（`credential_present` / `links_status` 只回「有没有配」的布尔值）。
+//! * 一次性 6 位验证码**不落盘**：只随本次登录请求发给 daemon，30 秒就过期。
 
 use crate::ipc;
 use qxync_core::ipc::{ErrorKind, PingData, Request, RequestEnvelope, StatusData, IPC_VERSION};
+use qxync_core::totp::{normalize_otp, Otp};
 use qxync_core::{ConfigPaths, Credentials, LinkConfig, Settings};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -167,6 +170,13 @@ struct LinkInput {
     peer_name: Option<String>,
     #[serde(default)]
     password: Option<String>,
+    /// ★ M17：两步验证（2SV）的 TOTP 密钥（Base32 / `otpauth://` URI）或一次性
+    /// 6 位验证码。**它属于凭据文件，不属于 link 配置** —— 这里只是随同一个表单
+    /// 传进来；`link_save` 会忽略它，只有 `credential_save` / `login_flow` 用它。
+    ///
+    /// 留空 = 保留该连接已有凭据里的密钥（编辑时「不填 = 不改」）。
+    #[serde(default)]
+    otp_secret: Option<String>,
 }
 
 fn default_port() -> u16 {
@@ -430,6 +440,61 @@ pub async fn link_save(input: Value) -> Result<Value, String> {
     Ok(json!({"ok": true, "path": path.display().to_string(), "link": link}))
 }
 
+/// ★ M17：「两步验证」输入 → 要写进凭据文件的密钥 + 本次登录要提交的一次性验证码。
+///
+/// 规则（`credential_save` 与 `login_flow` 共用，避免两个入口各写一套）：
+///
+/// * 输入为空 → **保留**该连接已有凭据里的 `otp_secret`（编辑时不填 = 不改）；
+/// * 输入是 Base32 密钥 / `otpauth://` URI → 归一化后保存；
+/// * 输入是 6 位验证码 → **不保存**（30 秒就过期），保留已有密钥，只用于本次登录；
+/// * 格式不合法 → 明确报错，**绝不静默吞掉**（否则用户以为存了密钥，下次重登
+///   还是过不了 2SV）。
+#[derive(Debug, Clone, Default)]
+struct OtpSave {
+    /// 归一化后的 Base32 密钥（`None` = 该连接没有存 2SV 密钥）。
+    secret: Option<String>,
+    /// 本次登录要提交的一次性 6 位验证码（只有输入是验证码时才有）。
+    code: Option<String>,
+    /// 输入是「一次性验证码」→ 界面提示「验证码不会保存」。
+    code_input: bool,
+    /// 本次是否保存了密钥（输入是密钥时为真）。
+    saved: bool,
+}
+
+fn resolve_otp_for_save(
+    paths: &ConfigPaths,
+    link: &LinkConfig,
+    input: Option<&str>,
+) -> Result<OtpSave, String> {
+    // 已有密钥读不出来（没凭据 / 换过 host 或账号）就当没有，不能因此阻塞保存口令。
+    let existing = Credentials::load_for(paths, link)
+        .ok()
+        .and_then(|c| c.otp_secret)
+        .filter(|s| !s.trim().is_empty());
+    let raw = input.map(str::trim).unwrap_or("");
+    if raw.is_empty() {
+        return Ok(OtpSave {
+            secret: existing,
+            ..OtpSave::default()
+        });
+    }
+    let otp = normalize_otp(raw).map_err(|e| format!("两步验证密钥格式不对：{e}"))?;
+    Ok(match otp {
+        Otp::Secret(secret) => OtpSave {
+            secret: Some(secret),
+            code: None,
+            code_input: false,
+            saved: true,
+        },
+        Otp::Code(code) => OtpSave {
+            secret: existing,
+            code: Some(code),
+            code_input: true,
+            saved: false,
+        },
+    })
+}
+
 /// ★ M16：写某个连接的凭据（`credentials.json` 或 `links/<id>.credentials.json`，0600）。
 #[tauri::command]
 pub async fn credential_save(input: Value) -> Result<Value, String> {
@@ -444,16 +509,22 @@ pub async fn credential_save(input: Value) -> Result<Value, String> {
         Ok(existing) => existing,
         Err(_) => li.link_with_existing_and_id(&p, id),
     };
-    let cred = Credentials {
-        host: link.host.clone(),
-        user: link.user.clone(),
-        password,
-    };
+    // ★ M17：空输入 = 保留旧密钥；验证码不落盘；密钥归一化后保存。
+    let otp = resolve_otp_for_save(&p, &link, li.otp_secret.as_deref())?;
+    let cred = Credentials::new(link.host.clone(), link.user.clone(), password)
+        .with_otp_secret(otp.secret);
     let path = cred.save_for(&p, &link).map_err(|e| e.to_string())?;
-    Ok(json!({"ok": true, "path": path.display().to_string(), "id": link.id}))
+    Ok(json!({
+        "ok": true,
+        "path": path.display().to_string(),
+        "id": link.id,
+        // 只回「有没有配」，**绝不回密钥本身**。
+        "otp": cred.has_otp(),
+        "otp_note": if otp.code_input { Some("一次性验证码不会保存") } else { None },
+    }))
 }
 
-/// 凭据是否存在（只回 host/user，绝不回口令）。
+/// 凭据是否存在（只回 host/user 与「有没有配 2SV」，绝不回口令/密钥）。
 #[tauri::command]
 pub async fn credential_present(link_id: Option<String>) -> Result<Value, String> {
     let p = paths()?;
@@ -469,9 +540,11 @@ pub async fn credential_present(link_id: Option<String>) -> Result<Value, String
                 "path": target.display().to_string(),
                 "id": id,
                 "link_missing": true,
+                "otp": false,
             }))
         }
     };
+    let otp = Credentials::present_otp_for(&p, &link);
     match Credentials::present_for(&p, &link) {
         Some((host, user, path)) => Ok(json!({
             "present": true,
@@ -479,11 +552,13 @@ pub async fn credential_present(link_id: Option<String>) -> Result<Value, String
             "user": user,
             "path": path.display().to_string(),
             "id": id,
+            "otp": otp,
         })),
         None => Ok(json!({
             "present": false,
             "path": target.display().to_string(),
             "id": id,
+            "otp": otp,
         })),
     }
 }
@@ -573,14 +648,17 @@ pub async fn login_flow(input: Value) -> Result<Value, String> {
                 link.user, link.host, link.port),
         }));
     }
+    // ★ M17：两步验证输入。点「保存并登录」时 **空输入 = 保留已有密钥**；
+    //   填密钥 → 归一化后写进凭据（daemon 之后每次重登自己现算验证码）；
+    //   填 6 位验证码 → 不落盘，只随下面这条 Login 请求发过去。
+    //
+    // 必须放在 `link.save` **之前**：密钥格式不对时直接报错返回，一个文件都不写
+    // （否则会留下「link 已存、凭据没存」的半保存状态，用户重试时无从判断）。
+    let otp = resolve_otp_for_save(&p, &link, li.otp_secret.as_deref())?;
     let link_path = link.save(&p).map_err(|e| e.to_string())?;
-    let cred_path = Credentials {
-        host: link.host.clone(),
-        user: link.user.clone(),
-        password: password.clone(),
-    }
-    .save_for(&p, &link)
-    .map_err(|e| e.to_string())?;
+    let cred = Credentials::new(link.host.clone(), link.user.clone(), password.clone())
+        .with_otp_secret(otp.secret.clone());
+    let cred_path = cred.save_for(&p, &link).map_err(|e| e.to_string())?;
 
     let socket = ipc::socket_path_for(&link.id);
     let mut restarted = false;
@@ -632,6 +710,9 @@ pub async fn login_flow(input: Value) -> Result<Value, String> {
         Request::Login {
             user: Some(link.user.clone()),
             password: Some(password),
+            // 只有「一次性验证码」需要显式传；密钥已经写进凭据文件，daemon 自己读
+            // （而且 daemon 每次重登都会重新读，不会拿旧密钥去算）。
+            otp: otp.code.clone(),
         },
     )
     .await;
@@ -641,6 +722,9 @@ pub async fn login_flow(input: Value) -> Result<Value, String> {
         "link_path": link_path.display().to_string(),
         "credential_path": cred_path.display().to_string(),
         "restarted": restarted,
+        // 本次是否存了密钥（密钥**本身**绝不进返回值/日志）。
+        "otp_saved": otp.saved,
+        "otp_note": if otp.code_input { Some("一次性验证码不会保存") } else { None },
         "login": login,
     }))
 }
@@ -670,6 +754,7 @@ pub async fn links_status() -> Result<Value, String> {
                 "user": "",
                 "link_exists": false,
                 "credential_present": false,
+                "otp": false,
                 "socket": st.socket,
                 "daemon": st,
             }));
@@ -695,6 +780,8 @@ async fn link_status_one(p: &ConfigPaths, link: &LinkConfig) -> Value {
         "user": link.user,
         "link_exists": true,
         "credential_present": cred.is_some(),
+        // ★ M17：是否存了两步验证密钥（只回布尔，绝不回密钥）。
+        "otp": Credentials::present_otp_for(p, link),
         "socket": daemon.socket,
         "daemon": daemon,
     })
@@ -1405,6 +1492,85 @@ pub async fn tray_emit(app: tauri::AppHandle, action: String) -> Result<Value, S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn m17_paths(tag: &str) -> ConfigPaths {
+        let dir = std::env::temp_dir().join(format!(
+            "qxync-m17-gui-{}-{}-{}",
+            std::process::id(),
+            tag,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let p = ConfigPaths {
+            config_dir: dir.join("config"),
+            data_dir: dir.join("data"),
+            state_dir: dir.join("state"),
+        };
+        p.ensure_dirs().unwrap();
+        p
+    }
+
+    /// ★ M17：GUI「两步验证」输入的写入规则（凭据保存与「保存并登录」共用）——
+    /// 空输入=保留旧密钥、密钥=归一化后保存、6 位验证码=只用于本次登录且**不落盘**、
+    /// 格式不对=明确报错（绝不静默吞掉）。
+    #[test]
+    fn m17_otp_input_rules() {
+        let p = m17_paths("otp-rules");
+        let link = LinkConfig {
+            id: "default".into(),
+            host: "nas.local".into(),
+            port: 9834,
+            https: true,
+            insecure: false,
+            user: "test2".into(),
+            ipv4_only: false,
+            exclude: vec![],
+            filter_temp: true,
+            peer_listen: None,
+            peer_name: None,
+        };
+        // 先存一份带 2SV 密钥的凭据（等价于用户上次填过密钥）
+        Credentials::new(link.host.clone(), link.user.clone(), "pw")
+            .with_otp_secret(Some("JBSWY3DPEHPK3PXP".into()))
+            .save_for(&p, &link)
+            .unwrap();
+
+        // ① 空输入 → 保留已保存的密钥（编辑时不填 = 不改）
+        let keep = resolve_otp_for_save(&p, &link, None).unwrap();
+        assert_eq!(keep.secret.as_deref(), Some("JBSWY3DPEHPK3PXP"));
+        assert!(!keep.saved && !keep.code_input);
+        assert_eq!(keep.code, None);
+        let blank = resolve_otp_for_save(&p, &link, Some("   ")).unwrap();
+        assert_eq!(
+            blank.secret.as_deref(),
+            Some("JBSWY3DPEHPK3PXP"),
+            "纯空白也算「不改」"
+        );
+
+        // ② 密钥 → 归一化（大小写/空格/连字符都容忍）后要保存
+        let sec = resolve_otp_for_save(&p, &link, Some("jbswy3dp ehpk-3pxp")).unwrap();
+        assert_eq!(sec.secret.as_deref(), Some("JBSWY3DPEHPK3PXP"));
+        assert!(sec.saved && !sec.code_input);
+        assert_eq!(sec.code, None, "密钥形式不需要把密钥再发给 daemon");
+
+        // ③ 6 位验证码 → 只用于本次登录，**不落盘**，已有密钥保留
+        let code = resolve_otp_for_save(&p, &link, Some("123456")).unwrap();
+        assert!(code.code_input && !code.saved);
+        assert_eq!(code.code.as_deref(), Some("123456"));
+        assert_eq!(
+            code.secret.as_deref(),
+            Some("JBSWY3DPEHPK3PXP"),
+            "验证码不能覆盖/清掉已保存的密钥"
+        );
+
+        // ④ 非法密钥 → 明确报错
+        let err = resolve_otp_for_save(&p, &link, Some("not-a-secret!!")).unwrap_err();
+        assert!(err.contains("两步验证密钥格式不对"), "{err}");
+
+        std::fs::remove_dir_all(p.config_dir.parent().unwrap()).ok();
+    }
 
     #[test]
     fn link_input_defaults_and_trim() {

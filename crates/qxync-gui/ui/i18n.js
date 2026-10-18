@@ -315,6 +315,8 @@
     'links.login_unknown': '登录状态未知',
     'links.cred_present': '凭据已存',
     'links.cred_missing': '无凭据',
+    // ★ M17：只标「配没配」，徽标里绝不会出现密钥
+    'links.otp_badge': '两步验证',
     'links.link_missing': '无 link 文件',
     'links.task_count': '任务 {n}',
     'links.act_current': '设为当前',
@@ -338,6 +340,10 @@
     'conn.path_pending': '新建连接，保存后写入 links/<id>.json',
     'connect.cred_present': '已保存凭据：{user}@{host}（{path}）',
     'connect.cred_missing': '无凭据（{path}）；保存并登录时需要输入口令。',
+    // ★ M17：两步验证（2SV / TOTP）—— 输入框提示与凭据状态后缀
+    'connect.otp_hint': '开了两步验证才需要：填 TOTP 密钥会保存下来，之后自动生成验证码；填 6 位验证码只用于本次登录。密钥与口令一样保存在 0600 凭据文件里。',
+    'connect.otp_configured': '两步验证：已配置',
+    'connect.otp_missing': '两步验证：未配置',
     'home.conn_no_daemon': '连接 {label} 的 daemon 未运行 —— 点顶部「启动 daemon」',
     'home.sync_title': '同步',
     'home.sync_link': '{label}',
@@ -379,7 +385,13 @@
   // ---------------------------------------------------------------- en（预留）
   // 空表 = 全部回落到 zh-CN。加词条时**只加需要改的**，不用整份复制：
   //   t() 的回落顺序是 en → zh-CN → key 本身。
-  var EN = {};
+  // ★ M17：这里只补了两步验证（2SV）的 4 条 —— 其余键继续回落 zh-CN。
+  var EN = {
+    'connect.otp_hint': 'Only needed when 2-step verification is enabled: a TOTP secret is saved and used to generate codes later; a 6-digit code is used for this login only. The secret is stored in the 0600 credentials file, same as the password.',
+    'connect.otp_configured': '2-step verification: configured',
+    'connect.otp_missing': '2-step verification: not configured',
+    'links.otp_badge': '2-step'
+  };
 
   var TABLES = { 'zh-CN': ZH, en: EN };
   var FALLBACK = 'zh-CN';

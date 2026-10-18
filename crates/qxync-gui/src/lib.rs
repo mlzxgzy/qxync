@@ -223,6 +223,13 @@ async fn self_test_login_inner() -> Value {
         || stopped["already"].as_bool().unwrap_or(false);
 
     // 2) 走 GUI 的「保存并登录」整条链（含 daemon_start）
+    //
+    // ★ M17：机器上的账号开了两步验证时，凭据里会存 TOTP 密钥 —— 自检也要把它带上，
+    //   否则这条链路对 2SV 账号永远失败（daemon 重启后自己重登时同样需要它）。
+    //   密钥**只作为 login_flow 入参**，不打印、不进输出（下面只报布尔）。
+    let password = cred.password.clone();
+    let otp_secret = cred.otp_secret.clone();
+    let otp_configured = otp_secret.is_some();
     let login = commands::login_flow(json!({
         "id": link.id,
         "host": link.host,
@@ -231,7 +238,8 @@ async fn self_test_login_inner() -> Value {
         "insecure": link.insecure,
         "user": link.user,
         "ipv4_only": link.ipv4_only,
-        "password": cred.password,
+        "password": password,
+        "otp_secret": otp_secret,
     }))
     .await
     .unwrap_or(Value::Null);
@@ -252,6 +260,8 @@ async fn self_test_login_inner() -> Value {
         "login_ok": login_ok,
         "login_error": login["login"]["error"]["message"],
         "login_data": login["login"]["data"],
+        "otp_configured": otp_configured,
+        "otp_saved": login["otp_saved"],
         "link_path": login["link_path"],
         "credential_path": login["credential_path"],
         "restarted": login["restarted"],

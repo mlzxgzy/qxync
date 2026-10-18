@@ -427,6 +427,11 @@
                 <label>口令
                   <input type="password" id="f-password" autocomplete="current-password" placeholder="留空则不解写凭据">
                 </label>
+                <label>两步验证（可选）
+                  <input type="password" id="f-otp-secret" autocomplete="off"
+                         placeholder="TOTP 密钥（Base32）或 6 位验证码；留空则保持不变">
+                </label>
+                <p class="hint" data-i18n="connect.otp_hint">开了两步验证才需要：填 TOTP 密钥会保存下来，之后自动生成验证码；填 6 位验证码只用于本次登录。密钥与口令一样保存在 0600 凭据文件里。</p>
                 <div class="row-checks">
                   <label class="check"><input type="checkbox" id="f-https" checked> 使用 HTTPS</label>
                   <label class="check"><input type="checkbox" id="f-insecure"> 自签证书：跳过 TLS 校验</label>
