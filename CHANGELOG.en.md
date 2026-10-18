@@ -5,9 +5,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [中文](CHANGELOG.md) · [README](README.en.md) · [Acceptance log](docs/验收记录.md)
 
-## [Unreleased]
+## [0.6.3] - 2026-10-18
 
 ### Added
+
+- **Delete related data (M19)**: previously "delete task registration" and "remove connection"
+  deliberately left every byte of data behind — hydration cache, `sync/<ns>/sync.db`
+  (baseline / journal / decisions), `upload-queue/<ns>/` and logs stayed on disk with no way
+  out of the UI. Three scopes can now clean them up:
+  - **task**: registration + that task's hydration cache + `baseline` / `journal` / `decisions`
+    rows under its NAS folder subtree (unmounts first; per-connection queues / pins / nodes are
+    left alone);
+  - **connection**: task registrations + link / credentials / peers + `sync/<ns>` +
+    `cache/<ns>` + `upload-queue/<ns>` + mount records + that connection's logs + socket / pid;
+  - **everything**: the config / data / state roots (factory reset), stopping all daemons first.
+  - **No scope ever deletes NAS data or files inside the mountpoint**; shared caches / shared
+    NAS folders are skipped with a warning instead of guessed; symlinks are removed as links only.
+  - GUI: task-card "Delete…", connection-row "Remove", Settings → Advanced → **Danger zone**
+    (must tick the acknowledgement); all three share one confirmation dialog that first lists
+    what would be deleted and how big it is, with the data checkbox **off by default**.
+  - CLI: `qxync purge --task <id>` / `--connection` / `--all`, **preview by default**,
+    `--yes` to execute, `--json` for scripts.
+  - New `qxync-gui --self-test-purge`, `xtask/tests/m19-purge.sh` (isolated-XDG e2e, wired into
+    CI) and core unit tests; `link_delete` gained an optional `purgeData` argument and behaves
+    exactly as before when omitted.
+  - Design notes and boundaries: [M19-删除相关数据.md](docs/M19-删除相关数据.md) (Chinese).
 
 - **New-task default paths are derived from the connection and the task id (M18)**: previously
   the task id, local folder and hydration cache dir all had the *same* default for every task
@@ -1184,6 +1206,7 @@ Verified on **QNAP TS-464C / QTS 5.2.9 / Qsync QPKG 5.0.0.7 (build 20260723)**.
 - Acceptance results were split out of the README into [`docs/验收记录.md`](docs/验收记录.md).
 - Dual-licensed under **MIT OR Apache-2.0** (`LICENSE-MIT` / `LICENSE-APACHE`).
 
+[0.6.3]: https://github.com/mlzxgzy/qxync/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/mlzxgzy/qxync/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/mlzxgzy/qxync/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/mlzxgzy/qxync/compare/v0.5.1...v0.6.0

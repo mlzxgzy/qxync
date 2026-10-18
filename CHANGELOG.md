@@ -5,9 +5,27 @@
 
 [English](CHANGELOG.en.md) · [README](README.md) · [验收记录](docs/验收记录.md)
 
-## [Unreleased]
+## [0.6.3] - 2026-10-18
 
 ### 新增
+
+- **删除相关数据（M19）**：以前「删除任务登记」「移除连接」都刻意不碰数据 —— 水合缓存、
+  `sync/<ns>/sync.db`（baseline / 日志 / 待裁决）、`upload-queue/<ns>/`、日志会永远留在本机，
+  界面上没有任何出口。现在三个作用域都能把相关数据一起删：
+  - **任务**：登记 + 该任务水合缓存 + `baseline` / `journal` / `decisions` 里落在该 NAS
+    文件夹子树的**行**（先卸载；按连接共享的队列 / pins / nodes 不动）；
+  - **连接**：任务登记 + link / 凭据 / peers + `sync/<ns>` + `cache/<ns>` +
+    `upload-queue/<ns>` + 挂载记录 + 该连接日志 + socket / pid；
+  - **本机全部**：配置 / 数据 / 状态三个根（恢复出厂），会先停掉所有 daemon。
+  - **任何作用域都不删 NAS 数据、不删挂载点里的文件**；共用缓存 / 共用 NAS 文件夹时不猜，
+    跳过并警告；符号链接只删链接本身。
+  - GUI：任务卡「删除…」、连接行「移除」、设置 → 高级 → **危险区**（必须勾选才可确认）；
+    三处共用一个确认弹窗，先展示「会删什么 / 多大 / 多少状态库行」，复选框默认不勾选。
+  - CLI：`qxync purge --task <id>` / `--connection` / `--all`，**默认只预览**，
+    `--yes` 才执行，`--json` 可脚本化。
+  - 新增 `qxync-gui --self-test-purge`、`xtask/tests/m19-purge.sh`（隔离 XDG 的 e2e，
+    CI 已接入）与 core 单测；`link_delete` 新增可选 `purgeData` 参数，不传时行为与旧版一致。
+  - 设计取舍与边界见 [M19-删除相关数据.md](docs/M19-删除相关数据.md)。
 
 - **新建任务的默认路径按「连接 + id」派生（M18）**：以前新建任务时，任务 id / 本地文件夹 /
   水合缓存三处默认值对所有任务都一样（`default` / `~/qxync-mnt` / 按连接共享的缓存根），
@@ -969,6 +987,7 @@ NAS 设置名 `QSYNC_FOLDERPAIR_USE_SPACE_SAVING`、Windows 客户端注册表�
 - 验收结论从 README 抽出为 [`docs/验收记录.md`](docs/验收记录.md)。
 - 采用 **MIT OR Apache-2.0** 双许可（`LICENSE-MIT` / `LICENSE-APACHE`）。
 
+[0.6.3]: https://github.com/mlzxgzy/qxync/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/mlzxgzy/qxync/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/mlzxgzy/qxync/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/mlzxgzy/qxync/compare/v0.5.1...v0.6.0

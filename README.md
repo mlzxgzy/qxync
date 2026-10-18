@@ -59,6 +59,7 @@ NAS 上的文件在本地只是一个「占位符」，`ls -l` 显示真实大�
 | **同步任务** | `tasks/<id>.json` 持久化的挂载登记，逐任务暂停/继续，重启可 `--restore-tasks` 恢复 | [M8](docs/M8-向Qsync-Client-6靠拢.md) |
 | **多 NAS 连接** | **一条连接一个 `qxyncd` 进程**（各自独立 socket / pid / 日志 / 状态库 / 缓存 / 上传队列），default 保持旧路径；每条连接下可建多个任务；CLI `qxync links` / `daemon … --all`，GUI 连接列表与「当前连接」切换 | [M16](docs/M16-多NAS连接.md) |
 | **两步验证（2SV）** | 支持 QNAP 两步验证里的 **TOTP**（authenticator app）：`security_code` 直接带进登录表单，存一次 TOTP 密钥后 daemon 每次重登现算验证码（长时间挂载不会因验证码过期掉线）；CLI `--otp-secret` / `--otp-code`，GUI「设置 → 连接」可填。其它第二因素（安全问题 / 邮件码 / 二维码批准 / 设备批准）**未实现** | [M17](docs/M17-两步验证.md) |
+| **删除相关数据** | 任务 / 连接 / 本机全部三级 purge：**先给计划**（会删什么、多大、多少状态库行），GUI 弹窗确认、CLI 默认只预览；任何作用域都**不删 NAS 数据、不删挂载点里的文件**，共用缓存 / 共用 NAS 文件夹会跳过并警告 | [M19](docs/M19-删除相关数据.md) |
 | **同步日志** | `sync.db` 的 `journal` 表 + 后台批量落库与轮转，驱动 GUI 的「文件更新中心 / 错误列表」 | [M8](docs/M8-向Qsync-Client-6靠拢.md) |
 | **桌面 GUI** | 主页 / 任务 / 文件 / 更新 / 错误 / 设置 / 诊断；托盘 + 通知 + 开机自启 + 文件选择器 + **任务卡「打开目录」**（用系统里用户自己配的默认目录工具打开本地挂载点） | [M4](docs/M4-GUI.md) · [M8](docs/M8-向Qsync-Client-6靠拢.md) |
 | **设置中心** | 代理三模式（Auto-detect / No proxy / Manual）、自动释放空间、冲突策略五选、文件三态 | [M8](docs/M8-向Qsync-Client-6靠拢.md) |
@@ -249,6 +250,7 @@ qxync daemon start
 # 无窗口自检（脚本 / CI 用；daemon 在跑时退出码 0）
 ./target/debug/qxync-gui --self-test
 ./target/debug/qxync-gui --self-test-login   # 额外跑一遍「保存并登录」整条链（会重启 daemon）
+./target/debug/qxync-gui --self-test-purge   # 删除相关数据（任务/连接/全局）隔离自检
 ```
 
 界面左侧是图标栏：**主页 / 任务 / 文件 / 更新 / 错误 / 设置 / 诊断**。
@@ -272,6 +274,11 @@ Thunar…）打开该任务的本地挂载点：先按 `xdg-mime` 查出默认�
 （「重置为默认路径」可恢复）。已保存任务的路径不会被搬动。详见
 [`docs/M18-任务默认路径.md`](docs/M18-任务默认路径.md)。
 
+删除任务 / 移除连接时，弹窗会**先列出**「会一并删除哪些本地数据」（水合缓存 / 同步状态 /
+日志，以及各多大）：**默认不勾选**，不勾选就是旧行为（只删登记）。「设置 → 高级 → 危险区」
+可以删除本机全部 qxync 数据（恢复出厂），必须勾选确认。任何入口都**不删 NAS 数据、
+不删挂载点里的文件**。详见 [`docs/M19-删除相关数据.md`](docs/M19-删除相关数据.md)。
+
 ### 6. 常用命令速查
 
 ```bash
@@ -282,6 +289,7 @@ qxync roots [--json]             # NAS 上登记的同步文件夹（配对时�
 qxync rules [--match <路径>]     # 选择性同步规则判定（visible / excluded / temp / outside-roots）
 qxync sync [--once]              # 变更发现状态；--force-deletes 放行批量删除
 qxync task list|add|pause|resume|rm
+qxync purge --task <id>|--connection|--all [--yes]   # 删除相关数据（默认只预览；不动 NAS 与挂载点文件）
 qxync journal [--level error]    # 同步活动日志（--level error 就是「错误列表」）
 qxync settings [--set k=v]       # 代理 / 开机自启 / 通知 / 释放空间
 qxync space [--now]              # 释放空间状态 / 立即释放

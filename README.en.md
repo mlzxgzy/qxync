@@ -64,6 +64,7 @@ against a real NAS.
 | **Sync tasks** | mount registrations persisted in `tasks/<id>.json`, pause/resume per task, restorable after a restart with `--restore-tasks` | [M8](docs/M8-向Qsync-Client-6靠拢.md) |
 | **Multiple NAS connections** | **one `qxyncd` process per connection** (its own socket / pid / log / state store / cache / upload queue); `default` keeps the legacy paths; many tasks per connection; CLI `qxync links` / `daemon … --all`, GUI connection list and "current connection" switcher | [M16](docs/M16-多NAS连接.md) |
 | **Two-step verification (2SV)** | supports **TOTP** (authenticator apps) in QNAP's two-step verification: the `security_code` goes into the login form directly, and once the TOTP secret is stored the daemon computes a fresh code on every re-login (long-running mounts do not drop when a code expires); CLI `--otp-secret` / `--otp-code`, or the field under GUI Settings → Connections. Other second factors (security questions / email codes / QR-code approval / device approval) are **not implemented** | [M17](docs/M17-两步验证.md) |
+| **Delete related data** | Three-scope purge (task / connection / everything): **a plan first** (what would be deleted, how big, how many state rows), GUI confirmation dialog, CLI preview by default. No scope ever deletes NAS data or files inside the mountpoint; shared caches / shared NAS folders are skipped with a warning | [M19](docs/M19-删除相关数据.md) |
 | **Sync log** | the `journal` table of `sync.db` plus background batched writes and rotation, driving the GUI's "File Update Center / error list" | [M8](docs/M8-向Qsync-Client-6靠拢.md) |
 | **Desktop GUI** | Home / Tasks / Files / Updates / Errors / Settings / Diagnostics; tray + notifications + autostart + file picker + **"Open folder"** on task cards (opens the local mount point with the desktop's default directory tool) | [M4](docs/M4-GUI.md) · [M8](docs/M8-向Qsync-Client-6靠拢.md) |
 | **Settings center** | three proxy modes (Auto-detect / No proxy / Manual), automatic space freeing, five conflict policies, three file states | [M8](docs/M8-向Qsync-Client-6靠拢.md) |
@@ -267,6 +268,7 @@ qxync daemon start
 # headless self-test (for scripts / CI; exit code 0 while the daemon is running)
 ./target/debug/qxync-gui --self-test
 ./target/debug/qxync-gui --self-test-login   # additionally runs the whole "save and log in" chain (restarts the daemon)
+./target/debug/qxync-gui --self-test-purge   # delete-related-data self-test (task / connection / all), isolated
 ```
 
 The left edge of the window is an icon bar: **Home / Tasks / Files / Updates / Errors / Settings / Diagnostics**.
@@ -292,6 +294,13 @@ Pick the NAS folder first — the id and both paths follow it; fields you edit b
 overwritten ("reset to default paths" restores them). Existing tasks are never moved. See
 [`docs/M18-任务默认路径.md`](docs/M18-任务默认路径.md) (Chinese).
 
+When deleting a task or removing a connection, the dialog **first lists** the local data that
+would go with it (hydration cache / sync state / logs, with sizes): **the checkbox is off by
+default**, and leaving it off keeps the old behaviour (registration only). Settings → Advanced →
+**Danger zone** wipes all qxync data on this machine (factory reset) and requires an explicit
+acknowledgement. No entry point ever deletes NAS data or files inside the mountpoint. See
+[`docs/M19-删除相关数据.md`](docs/M19-删除相关数据.md) (Chinese).
+
 ### 6. Common commands cheat sheet
 
 ```bash
@@ -302,6 +311,7 @@ qxync roots [--json]             # sync folders registered on the NAS (the NAS f
 qxync rules [--match <path>]     # selective-sync rule verdict (visible / excluded / temp / outside-roots)
 qxync sync [--once]              # change-discovery status; --force-deletes releases bulk deletes
 qxync task list|add|pause|resume|rm
+qxync purge --task <id>|--connection|--all [--yes]   # delete related data (preview by default; never touches NAS / mountpoint files)
 qxync journal [--level error]    # sync activity log (--level error is exactly the "error list")
 qxync settings [--set k=v]       # proxy / autostart / notifications / free up space
 qxync space [--now]              # free-up-space status / free up space now
