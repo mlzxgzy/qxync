@@ -102,8 +102,10 @@ baseline = **上次同步成功时远端的样子**（`path → {exists,is_dir,s
 | 远端大批删除 → 不要批量清本地 | 引擎一轮对账里 `DeleteLocal` 计数超限 → **整批挡住** | >50 项，或 >25%（baseline≥20 项时） | GUI：提示行/任务卡上的「放行删除」<br>CLI：`qxync sync --force-deletes` |
 | 本地大批删除 → 不要清空远端 | FUSE `unlink/rmdir` 的滑动窗口熔断（`DeleteGuard`） | 60 秒内 >100 次 | 同上（一次放行同时解两侧），或重新挂载 |
 
-* 远端删除判定**只认** `status 4/5/6`（不存在/无权限）；网络错误、超时**绝不**当成删除
-  ——否则一次抖动就会清空本地。
+* 远端删除判定**只认** `status 4/5/6`（不存在/无权限）**且必须由 `stat` 正向确认
+  `exist=0`** —— 4/5 同时是权限拒绝 / 会话失效的码，光凭列举错误就删会误删本地；
+  网络错误、超时、HTTP 层失败**绝不**当成删除，否则一次抖动就会清空本地。
+  `stat` 说仍存在、或 `stat` 也失败 → 该目录本轮不判定；4/5 同时置 `auth_failed` 触发重登。
 * 熔断期间被删掉的远端文件**本地节点与缓存都保留**（`ls` 是实时的，但节点/缓存不清），
   避免「远端误删 → 本地缓存也没了」的双重损失。
 
@@ -162,9 +164,49 @@ GUI：三处「有删除被熔断挡住」告警一直亮着（问题恢复/放�
 
 * **列举失败不能当远端删除**：旧实现里目录 `client.list()` 网络失败只记一条 error，
   `remote_map` 因此缺项 → 这些路径被判 `DeleteLocal` → 本地节点与缓存被删。
-  现在 `reconcile_view` 统计非 404 的列举失败，>0 时**暂缓本视图删除判定**并在 note 里
-  说明；下一轮列全后恢复。（`status 4/5/6` 是确定的「不存在」，不算列举失败。）
-  这就是上面 §5 那条「网络错误绝不当成删除」的显式实现。
+  现在 `reconcile_view` 统计非 404 的列举失败，**该目录下的条目不判定**并在 note 里
+  说明，同一视图里其它已列全的目录照常判定。这就是上面 §5 那条「网络错误绝不当成删除」
+  的显式实现。
+* **4/5 不能直接当「已删」，必须 `stat` 正向确认**（2026-10-18 复核补修）：真机
+  `/Download`（存在但当前会话不可见）回 `status 5`、`/homes` 回 `status 4`，而 4/5
+  同时是会话失效码。旧实现把 4/5 当「确定不存在」→ 权限/ACL 变更或 sid 中途失效时
+  会把该目录所有候选判 `DeleteLocal`（本地节点 + 缓存 + baseline），且不会触发重登。
+  现在：列举返回 4/5/6 时先用 `stat` 确认，只有 `exist=0` 才进「已确认不存在」集合；
+  stat 说存在 → **目录条目本身记进 `remote_map`**（防止「父目录列举漏了它」时目录自身被
+  判 `DeleteLocal`、连整棵子树 + 缓存一起删），目录内容本轮不判定；stat 也失败 → 目录
+  存在性未知，目录自身进 `unresolved_dirs`（候选循环与改名配对都跳过），内容也不判定。
+  stat 成功本身证明会话有效，所以**不**置 `auth_failed`（否则永久 ACL 隐藏目录会每轮
+  重登 + 刷 WARN）；只有 stat 也 auth 失败或根 4/5 才置。远端根例外：挂载根不可能凭空
+  消失，根上的 4/5/6 一律按权限 / 会话 / 卸载处理（不做 stat 猜测、不删根下条目）。
+  覆盖：`listing_status_4_or_5_never_deletes_without_stat_confirmation`、
+  `listing_root_status_4_or_5_defers_instead_of_deleting`、
+  `directory_missing_from_parent_listing_but_stat_exists_is_not_deleted`、
+  `stat_failure_keeps_directory_and_subtree`。
+* **HTTP 层失败不再被读成「空目录」**：`get_list` / `stat` 先检查 HTTP 状态，
+  反代 502/504 的 JSON 错误体（`{"error":…}`）不再能通过 `Listing` 的全默认反序列化
+  被当成「0 项 / 不存在」；HTTP 200 但形状不是列表/stat JSON（缺 `status`/`datas`/
+  `total`/`real_total`/`exist`）同样按解析失败处理；`list_limit` 也不会再把缺失的
+  `total` 当 0 在第一页就 break（目录 >200 项时不再静默截断）。
+* **目录数超 `max_dirs_per_poll` 时的永久推迟**（2026-10-18 真机反馈后补修）：
+  旧实现每轮都从排序开头 `take(max)`，目录数一旦超过上限，排序在后的目录**每轮都
+  轮不到**；而「未扫到的目录本轮不判定」这条安全阀因此永久生效 —— 那些目录里的远端
+  删除（以及上传 / 刷新判定）永远不会执行（真机 228 个目录时每轮都在重复同一条说明）。
+  现在：
+  * 每轮**轮转**：远端根恒定参与，其余目录从上一轮停下的目录之后接着列、到尾回绕；
+    游标落在 `sync.db` 的 `meta`（`reconcile_scan_cursor:<mountpoint>`），
+    `qxync sync --once` 跨进程也接得上；
+  * 「视图完整」按**目录**成立：只有本轮列过（列举成功或确定 404）的目录里的候选才判定，
+    其余一律暂不判定 —— 不再「一个目录抖动挡住整个视图的删除」；
+  * 改名配对的已删侧同样过滤「父目录本轮列过」，不把「没看到」配成一次改名；
+  * **固有代价**：目录树远超单轮上限时，每个目录要隔若干轮才轮到一次（上限越小 / 目录
+    越多，删除与上传/刷新判定的延迟越大）；轮转只保证「最终会轮到、不会永久漏」。要更快
+    就提高上限（`SyncConfig::max_dirs_per_poll`）或缩小同步范围；note 里会写明本轮轮转
+    覆盖了多少个目录。
+  * 覆盖测试：`scan_window_rotates_and_covers_every_directory`、
+    `scan_window_survives_a_deleted_cursor_directory`、
+    `reconcile_rotates_scan_window_instead_of_starving_deletions`、
+    `listing_failure_only_defers_its_own_directory`、
+    `listing_status_4_or_5_never_deletes_without_stat_confirmation`。
 * **baseline 的删除/改名永远落不了盘**（pre-existing）：`persist()` 只按 mtime 取较新
   签名做增量合并，从**本轮快照**里删掉的条目会被内存里旧 `g.baseline` 复活 → 下一轮
   又写回库。于是「规则排除清理」「回收站清理」「已执行删除的 baseline」「改名迁移的

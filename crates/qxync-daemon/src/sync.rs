@@ -810,20 +810,6 @@ async fn reconcile_view(
     let root = view.remote_root.trim_end_matches('/').to_string();
     let under_root = |p: &str| p == root || p.starts_with(&format!("{root}/"));
 
-    // 要对账的目录：挂载视图里已知的目录 + baseline 里出现过的目录
-    let mut dirs: BTreeSet<String> = BTreeSet::new();
-    for d in view.view.known_dirs() {
-        if under_root(&d) && d != root && view.hidden(&d, true).is_none() {
-            dirs.insert(d);
-        }
-    }
-    for p in baseline.entries.keys() {
-        if under_root(p) && p != &root && view.hidden(p, true).is_none() {
-            dirs.insert(parent_dir(p));
-        }
-    }
-    dirs.insert(root.clone());
-
     // 候选路径：本地节点 + baseline 条目
     let mut candidates: BTreeSet<String> = BTreeSet::new();
     for n in view.view.nodes() {
@@ -837,16 +823,71 @@ async fn reconcile_view(
         }
     }
 
+    // 要对账的目录：挂载视图里已知的目录 + baseline 里出现过的目录 + **候选条目的父目录**。
+    //
+    // ★ 候选的父目录必须进 `dirs`：判定一条候选前要先「看见」它所在的目录。父目录不在
+    //   集合里 → 永远不会被列 → 这条候选永远等不到判定（见下面轮转与按目录判定的注释）。
+    let mut dirs: BTreeSet<String> = BTreeSet::new();
+    for d in view.view.known_dirs() {
+        if under_root(&d) && d != root && view.hidden(&d, true).is_none() {
+            dirs.insert(d);
+        }
+    }
+    for p in baseline.entries.keys() {
+        if under_root(p) && p != &root && view.hidden(p, true).is_none() {
+            dirs.insert(parent_dir(p));
+        }
+    }
+    for p in &candidates {
+        let d = parent_dir(p);
+        if d != root && view.hidden(&d, true).is_none() {
+            dirs.insert(d);
+        }
+    }
+    dirs.insert(root.clone());
+
+    // ★ 大目录轮转：目录数超过单轮上限时，**不能每轮都从排序开头扫**。
+    //   旧实现 `dirs.iter().take(max)` 顺序固定 → 排序在后的目录每轮都轮不到，
+    //   于是「远端视图不完整 → 本轮暂缓删除判定」变成**永久**：删除永远不执行
+    //   （真机原话：「目录数 228 超过单轮上限 200…本轮跳过删除判定」每轮重复）。
+    //   现在把「上轮扫到哪」落进状态库的 `meta`（`sync --once` 也接得上）：每轮从
+    //   游标之后接着列、到尾回绕，扫满一圈内每个目录都会轮到。
+    //   远端根恒定参与 —— 顶层变化与根下的文件必须每轮都看得见。
+    let total_dirs = dirs.len();
+    let rotating = rotation_active(total_dirs, cfg.max_dirs_per_poll);
+    let cursor_key = format!("reconcile_scan_cursor:{}", view.mountpoint.display());
+    let start_after = if rotating {
+        match state_store.lock().unwrap().store.meta(&cursor_key) {
+            Ok(v) => v,
+            Err(e) => {
+                report.error(format!("读取对账轮转游标失败: {e}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let (scan_window, next_cursor) =
+        dirs_for_round(&dirs, &root, cfg.max_dirs_per_poll, start_after.as_deref());
+
     // 列每个目录 → 远端子项签名表
     let mut remote_map: BTreeMap<String, Sig> = BTreeMap::new();
     let mut scanned = 0usize;
     // ★ 非 404 的列举失败数（网络错误 / 权限 / 服务端忙…）。
-    //   见下面「远端视图不完整时暂缓删除判定」。
     let mut list_failures = 0usize;
-    for dir in dirs.iter().take(cfg.max_dirs_per_poll) {
+    // ★ 本轮**已经看见全集**的目录：列举成功（含空目录）或确定不存在（404）。
+    //   只有这些目录下的候选才允许判定 —— 其它目录里的条目只是「没看到」，不是
+    //   「远端删了」。这条把旧的「整个视图不完整就整轮不判」收窄到**按目录**：
+    //   200 个目录里有 1 个超时，另外 199 个目录的删除照常执行。
+    let mut observed_dirs: BTreeSet<String> = BTreeSet::new();
+    // ★ 存在性**未知**的目录（列举 4/5/6 且 stat 也失败）：目录条目自身本轮也不能判，
+    //   否则「父目录列举漏了它 + stat 抖动」会把整棵子树连缓存一起删。
+    let mut unresolved_dirs: BTreeSet<String> = BTreeSet::new();
+    for dir in &scan_window {
         match client.list(dir).await {
             Ok(entries) => {
                 scanned += 1;
+                observed_dirs.insert(dir.clone());
                 // ★ M9：把这份 NAS 文件列表推给挂载视图 —— 「映射」就是它的本地物化。
                 //   之后 `readdir`/`lookup` 都吃快照，不再每次往 NAS 跑（ls 不再等网）。
                 view.view.apply_listing(dir, &entries);
@@ -860,13 +901,58 @@ async fn reconcile_view(
                 }
             }
             Err(e) if is_not_found(&e) => {
-                // 目录本身没了 → 里面的候选在 remote_map 里缺失，自然按「远端不存在」处理
-                tracing::debug!("对账：目录已不存在 {dir}");
-                view.view.drop_listing(dir);
+                // ★ 数据安全：`4/5/6` 都不能**直接**当成「目录真的没了」——
+                //   4/5 同时是「会话失效 / 权限拒绝」的码（真机：存在但当前会话看不到的
+                //   /Download、/homes 就回 5/4）。所以先用一次 stat 正向确认：只有 stat
+                //   明确说「不存在」（占位条目 exist=0）才敢把该目录当已删除；stat 说存在
+                //   或 stat 也报错 → 按「没看到」处理（该目录本轮不判定；4/5 触发重登）。
+                //   远端根例外：**挂载根不可能凭空消失**，4/5/6 一律按权限/会话/卸载处理。
+                if dir == &root {
+                    list_failures += 1;
+                    if e.is_auth() {
+                        report.auth_failed = true;
+                    }
+                    report.error(format!(
+                        "对账：远端根 {dir} 列举返回不存在（{e}）→ 本轮不判定（按权限/会话/卸载处理）"
+                    ));
+                } else {
+                    match stat_path(client, dir).await {
+                        Ok(sig) if !sig.exists => {
+                            observed_dirs.insert(dir.clone());
+                            tracing::debug!("对账：目录已不存在（stat 已确认）{dir}");
+                            view.view.drop_listing(dir);
+                        }
+                        Ok(sig) => {
+                            // stat 确认目录**还存在**：把它记进 remote_map。
+                            // 父目录的列举可能漏掉了它（权限过滤 / ACL 隐藏），此时
+                            // 「远端缺失」是假象 —— 目录条目自身若不进 remote_map，
+                            // 候选循环会把它判 `DeleteLocal` 连整棵子树 + 缓存一起删。
+                            // 注意：只证明「目录还在」，内容没列过 → 不进 observed_dirs，
+                            // 目录下的条目本轮仍然不判定。
+                            list_failures += 1;
+                            remote_map.insert(dir.clone(), sig);
+                            tracing::debug!("对账：目录 {dir} 列举不可见但 stat 确认存在");
+                            report.error(format!(
+                                "对账列举 {dir} 说不存在（{e}），但 stat 显示仍存在 → 本轮不删该目录、不判定其内容"
+                            ));
+                        }
+                        Err(e2) => {
+                            list_failures += 1;
+                            // stat 也失败：目录是否存在**未知** → 目录条目自身也不能判。
+                            if e2.is_auth() {
+                                report.auth_failed = true;
+                            }
+                            unresolved_dirs.insert(dir.clone());
+                            report.error(format!(
+                                "对账列举 {dir} 失败（{e}），stat 确认也失败（{e2}）→ 本轮不判定该目录及其内容"
+                            ));
+                        }
+                    }
+                }
             }
             Err(e) => {
-                // ★ 这不是「远端不存在」，而是**我们没看到**。记错误，并由调用方
-                //   暂缓本视图的删除判定（下面 `defer_deletes`）。
+                // ★ 这不是「远端不存在」，而是**我们没看到**。记错误；该目录下的候选
+                //   本轮不判定（由下面按目录的 `observed_dirs` 决定）。
                 list_failures += 1;
                 if e.is_auth() {
                     report.auth_failed = true;
@@ -876,12 +962,28 @@ async fn reconcile_view(
         }
     }
     report.dirs_scanned += scanned;
-    if dirs.len() > cfg.max_dirs_per_poll {
-        report.note(format!(
-            "目录数 {} 超过单轮上限 {}，本轮只对账了前 {}",
-            dirs.len(),
+    if let Some(next) = next_cursor {
+        if let Err(e) = state_store
+            .lock()
+            .unwrap()
+            .store
+            .set_meta(&cursor_key, &next)
+        {
+            report.error(format!("保存对账轮转游标失败: {e}"));
+        }
+    }
+    // 本轮视图不完整的两个来源（用于下面「哪些条目本轮暂不判定」的说明）。
+    let mut partial_why: Vec<String> = Vec::new();
+    if list_failures > 0 {
+        partial_why.push(format!(
+            "{list_failures} 个目录本轮没列成（失败/不可见/存在性未确认）"
+        ));
+    }
+    if rotating {
+        partial_why.push(format!(
+            "目录数 {total_dirs} 超过单轮上限 {}（本轮按轮转列了 {} 个）",
             cfg.max_dirs_per_poll,
-            cfg.max_dirs_per_poll
+            scan_window.len()
         ));
     }
 
@@ -945,7 +1047,15 @@ async fn reconcile_view(
     // 保守性由 `pair_renames` 保证（唯一+ 互斥 + 类型一致才配），这里再做一层：
     // `rename_remote` 返回 false（视图不支持 / 目标已被占）就**不配**，
     // 退回原有的增删判定。
-    let renames = collect_renames(view, baseline, &candidates, &remote_map, report);
+    let renames = collect_renames(
+        view,
+        baseline,
+        &candidates,
+        &remote_map,
+        &observed_dirs,
+        &unresolved_dirs,
+        report,
+    );
     let mut renamed_set: BTreeSet<String> = BTreeSet::new();
     for pair in &renames {
         if !view.view.rename_remote(&pair.old_path, &pair.new_path) {
@@ -972,44 +1082,35 @@ async fn reconcile_view(
         ));
     }
 
-    // ★ 数据安全阀：远端视图**不完整**时，本轮不做删除判定。
+    // ★ 数据安全阀（按目录）：一条候选只有在**它所在的目录本轮被看见**时才允许判定。
     //
-    //   两种来源都算「不完整」，判据在 [`delete_verdict_is_reliable`]：
-    //   1. 某个目录**列举失败**（非 404 的网络/权限/服务端错误）—— 其中所有条目
-    //      都不在 remote_map 里；
-    //   2. **目录数超过单轮扫描上限**（排序在后的目录这轮根本没扫）—— 同样地，
-    //      那些目录里的条目全都不在 remote_map 里。这一种**没有错误、没有失败计数**，
-    //      比 1 更隐蔽：漏判就会把「没看到」当成「远端已删」，真删本地节点（缓存一起没）
-    //      并清掉 baseline。真机 dirs=38 没触发，但目录多的任务会中。
-    //
-    //   最坏情况：某个目录一次超时/没扫到 → 其中所有文件都不在 remote_map 里 →
-    //   `decide` 对「本地干净」的条目判 `DeleteLocal`。所以这一轮**暂缓删除判定**
-    //   （其它决策照常），下一轮列全了再说。
-    let dirs_truncated = dirs.len() > cfg.max_dirs_per_poll;
-    let defer_deletes =
-        !delete_verdict_is_reliable(list_failures, dirs.len(), cfg.max_dirs_per_poll);
-    if defer_deletes {
-        let mut why: Vec<String> = Vec::new();
-        if list_failures > 0 {
-            why.push(format!("{list_failures} 个目录列举失败"));
-        }
-        if dirs_truncated {
-            why.push(format!(
-                "目录数 {} 超过单轮上限 {}（后 {} 个本轮没扫）",
-                dirs.len(),
-                cfg.max_dirs_per_poll,
-                dirs.len() - cfg.max_dirs_per_poll
-            ));
-        }
-        report.note(format!(
-            "对账：{} → 本轮跳过删除判定（远端视图不完整，不敢按缺失删本地）",
-            why.join("；")
-        ));
-    }
-
+    //   旧实现是「整个视图不完整 → 整轮不删」，而「目录数超过单轮上限」又每轮都成立
+    //   （固定顺序从开头扫）→ 删除判定被永久推迟。现在视图不完整按目录收窄：
+    //   没列到的目录里的条目不参与任何判定（不上传、不刷新、更不删），列到的目录照常
+    //   判定与删除。轮转保证每个目录都会轮到，不会再有「永远等不到」的条目。
     let mut deletes: Vec<String> = Vec::new();
+    // 本轮因为「所在目录没列到」而推迟的候选数（轮转没轮到 / 列举失败）。
+    let mut deferred = 0usize;
     for path in &candidates {
         if renamed_set.contains(path) {
+            continue;
+        }
+        // ★ 存在性未知的目录条目自身也不能判（stat 也失败的 4/5/6 目录）。
+        //   否则父目录列举漏掉它时，会把它连整棵子树当「远端已删」。
+        if unresolved_dirs.contains(path) {
+            deferred += 1;
+            tracing::trace!("对账：目录存在性未确认，推迟判定 {path}");
+            continue;
+        }
+        // 「父目录本轮看见全集」= 列举成功或确定 404。两者之外都只有「没看到」这一个事实。
+        if !observed_dirs.contains(&parent_dir(path)) {
+            // 若它的某个祖先是本轮待删目录（`remove_remote` 会连子树一起删掉这条候选），
+            // 就不计入「暂不判定」的条数 —— 否则数字会被即将消失的路径虚高。
+            if deletes.iter().any(|d| path.starts_with(&format!("{d}/"))) {
+                continue;
+            }
+            deferred += 1;
+            tracing::trace!("对账：父目录本轮没列到，推迟判定 {path}");
             continue;
         }
         let remote = remote_map.get(path).copied().unwrap_or(Sig::MISSING);
@@ -1023,15 +1124,21 @@ async fn reconcile_view(
             );
         }
         match d {
-            Decision::DeleteLocal => {
-                if !defer_deletes {
-                    deletes.push(path.clone());
-                }
-            }
+            Decision::DeleteLocal => deletes.push(path.clone()),
             _ => {
                 apply_decision(client, view, path, d, remote, baseline, report, state_store).await;
             }
         }
+    }
+    // 只在「确实有东西被推迟」或「有目录列举失败」时说明；单纯轮转不是告警，
+    // 不往 `last_note` 里常驻一条看似出错的提示。
+    if !partial_why.is_empty() && (deferred > 0 || list_failures > 0) {
+        let tail = if deferred > 0 {
+            format!("；未列到的目录下 {deferred} 项本轮暂不判定（不按缺失删本地）")
+        } else {
+            String::new()
+        };
+        report.note(format!("对账：{}{tail}", partial_why.join("；")));
     }
 
     // 远端新出现的未知子项：登记 baseline（占位符天然「已同步」），下次不再重复处理
@@ -1071,21 +1178,66 @@ async fn reconcile_view(
     }
 }
 
-/// 本轮「按远端缺失删本地」的判定是否可信。
+/// 本轮是否启用轮转窗口（`max == 0` 视为不限，永不轮转）。
+fn rotation_active(total_dirs: usize, max: usize) -> bool {
+    max > 0 && total_dirs > max
+}
+
+/// 一轮对账要列的目录（**大目录轮转**的核心，纯函数便于单测）。
 ///
-/// 远端视图**不完整**的两种来源，任何一种都禁止按缺失删本地：
+/// * `max == 0` → 视为**不限**，全列（0 是「没配上限」的直觉含义；不能让它退化成
+///   「一轮什么都不列」—— 那就是本次修复要消灭的「永久暂不判定」）。
+/// * `dirs.len() <= max` → 全列（常规情况，与旧行为完全一致；返回的游标为 `None`）。
+/// * 否则 → 只列一个窗口：**远端根恒定参与**（顶层变化 / 根下文件必须每轮可见），
+///   其余目录从 `start_after` 严格之后按排序取 `max-1` 个，到尾再从头回绕。
+///   返回的第二个值是下一轮的起点（本轮窗口的最后一个目录）。
+///   `max == 1` 是退化配置：根 + 1 个轮转目录（超上限 1 个）也要保证轮转不饿死。
 ///
-/// 1. 本视图有**非 404** 的目录列举失败（网络/权限/服务端错误）——
-///    `remote_map` 里缺的项**不代表 NAS 上没有了**，只代表这轮没看到；
-///    「远端确实不存在」走 404/2/6（[`is_not_found`]），**不算**列举失败。
-/// 2. **目录数超过单轮扫描上限**（[`SyncConfig::max_dirs_per_poll`]）——
-///    排序在后的目录这轮**根本没扫**，其中所有条目同样会从 `remote_map` 里缺失。
-///    这一种最危险：没有错误、没有失败计数，漏判就会把「没看到」当成
-///    「远端已删」，真删本地节点/缓存并清 baseline。
+/// 为什么必须轮转：旧实现每轮都 `take(max)` 排序最前的目录，目录数一旦超过上限，
+/// 排序在后的目录**永远**轮不到；而「未扫到的目录里的条目本轮不判定」这条安全阀
+/// 也随之永久生效 → 删除永远不执行。轮转保证每个目录在一个周期内至少被列一次。
+fn dirs_for_round(
+    dirs: &BTreeSet<String>,
+    root: &str,
+    max: usize,
+    start_after: Option<&str>,
+) -> (Vec<String>, Option<String>) {
+    let all: Vec<String> = dirs.iter().cloned().collect();
+    if max == 0 || all.len() <= max {
+        // 常规路径：一轮列全（注：root 必然在 dirs 里）；max=0 视为不限。
+        return (all, None);
+    }
+    let mut out: Vec<String> = Vec::with_capacity(max.max(2));
+    out.push(root.to_string());
+    let rotating: Vec<String> = all.into_iter().filter(|d| d != root).collect();
+    let budget = max.saturating_sub(1).max(1);
+    let (mut window, next) = pick_scan_window(&rotating, start_after, budget);
+    out.append(&mut window);
+    (out, next)
+}
+
+/// 从**已排序**的 `items` 里取 `max` 个：先取 `start_after` 严格之后的，不够再从头回绕。
 ///
-/// 判定不可信时调用方**暂缓删除判定**（其它决策照常），下一轮列全了再说。
-fn delete_verdict_is_reliable(list_failures: usize, dirs_total: usize, max_dirs: usize) -> bool {
-    list_failures == 0 && dirs_total <= max_dirs
+/// 返回（窗口，下一轮起点 = 窗口最后一项）。`start_after` 指向的目录可能已经不存在
+/// （用户在两次轮询之间删了它）—— 按字符串序定位仍然有效，不会丢一个周期。
+fn pick_scan_window(
+    items: &[String],
+    start_after: Option<&str>,
+    max: usize,
+) -> (Vec<String>, Option<String>) {
+    if max == 0 || items.is_empty() {
+        return (Vec::new(), None);
+    }
+    let start = match start_after {
+        Some(after) => items.partition_point(|d| d.as_str() <= after),
+        None => 0,
+    };
+    let mut out: Vec<String> = items[start..].iter().take(max).cloned().collect();
+    if out.len() < max {
+        out.extend(items.iter().take(max - out.len()).cloned());
+    }
+    let next = out.last().cloned();
+    (out, next)
 }
 
 /// ★ M15/T9：收集本轮可能的改名对 —— 「远端已删」×「远端新增」，按 `file_id` 配。
@@ -1105,11 +1257,17 @@ fn delete_verdict_is_reliable(list_failures: usize, dirs_total: usize, max_dirs:
 ///
 /// 返回的候选对**只是候选** —— 调用方还要看 `rename_remote` 是否真的迁移成功，
 /// 失败就整对作废（退回增删判定）。
+///
+/// **新增侧永远安全**（`remote_map` 里的条目只来自本轮真正列过的目录）；
+/// **已删侧必须过滤**：`candidates` 里可能有「父目录本轮没列到」的条目 —— 那只是
+/// 没看到，不是远端已删，拿它去和新增侧配对会凭空造出一次改名。
 fn collect_renames(
     view: &MountView,
     baseline: &Baseline,
     candidates: &BTreeSet<String>,
     remote_map: &BTreeMap<String, Sig>,
+    observed_dirs: &BTreeSet<String>,
+    unresolved_dirs: &BTreeSet<String>,
     _report: &mut SyncReport,
 ) -> Vec<qxync_core::sync::RenamePair> {
     let root = view.remote_root.trim_end_matches('/').to_string();
@@ -1134,6 +1292,14 @@ fn collect_renames(
     let mut removed: Vec<RenameCandidate> = Vec::new();
     for path in candidates {
         if remote_map.contains_key(path) || !under_root(path) {
+            continue;
+        }
+        // ★ 父目录本轮没看见全集 → 「远端已删」不成立，不许拿它去配改名。
+        if !observed_dirs.contains(&parent_dir(path)) {
+            continue;
+        }
+        // ★ 目录存在性未确认（stat 也失败的 4/5/6 目录）→ 不能参与改名配对。
+        if unresolved_dirs.contains(path) {
             continue;
         }
         let Some(node) = view.view.node(path) else {
@@ -1931,8 +2097,10 @@ fn local_sig(view: &MountView, path: &str) -> LocalSig {
     }
 }
 
-/// 远端条目「不存在」的判定：只有这几个 status 才是真不存在；
-/// 其它错误（网络/权限）绝不能当成删除，否则会误删本地。
+/// 服务端「这个路径看不到 / 不存在」的 status：4（权限拒绝）、5（路径不存在/无权限）、
+/// 6（不存在）。**它只是候选**，不能单独当删除依据 —— 4/5 同时用于「会话失效」，所以
+/// 调用方必须再用 `stat` 正向确认 `exist=0` 才允许按「远端已删」处理（见 `reconcile_view`）。
+/// 其它错误（网络/超时/解析）绝不能当成删除。
 fn is_not_found(e: &CoreError) -> bool {
     matches!(e, CoreError::Status { status, .. } if matches!(status.0, 4 | 5 | 6))
 }
@@ -2054,6 +2222,24 @@ mod tests {
                     cache,
                     // ★ M15/T9：测试替身没有真实身份计算 → 留全零 = 「身份未知」。
                     // 全零在 `pair_renames` 里一律不配，行为退回 T9 之前的增删判定。
+                    file_id: qxync_core::file_id::ZERO_FILE_ID,
+                },
+            );
+        }
+
+        /// 加一个目录节点（用于「目录条目自身被误删」类回归）。
+        fn add_dir(&self, remote: &str) {
+            let name = remote.rsplit('/').next().unwrap_or("").to_string();
+            self.nodes.lock().unwrap().insert(
+                remote.to_string(),
+                LocalNode {
+                    remote: remote.to_string(),
+                    name,
+                    is_dir: true,
+                    size: 0,
+                    mtime: 0,
+                    dirty: false,
+                    cache: None,
                     file_id: qxync_core::file_id::ZERO_FILE_ID,
                 },
             );
@@ -3000,40 +3186,74 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------- ★ 对账：视图不完整时暂缓删除
+    // ------------------------------------------------- ★ 对账：大目录轮转 + 按目录判定
 
-    /// 判据本身：只有「没有任何非 404 列举失败」**且「目录没被扫描上限截断」**
-    /// 才允许按远端缺失删本地。
+    /// 轮转窗口：目录数超过单轮上限时，远端根每轮都在，其余按游标推进，
+    /// 一个周期内覆盖全部目录 —— **不允许有目录永远排在窗口之外**。
+    ///
+    /// 修前：`dirs.iter().take(200)` 顺序固定，228 个目录里排序在后的 28 个每轮
+    /// 都轮不到；「未扫到的目录本轮不判定」因此永久生效，删除永远不执行。
     #[test]
-    fn delete_verdict_requires_a_fully_listed_remote_view() {
-        // 正常：全部目录都列出来了、总量没超上限 → 删除判定可信（真机实测 dirs=38）
-        assert!(delete_verdict_is_reliable(0, 38, 200));
-        for n in [1, 3, 200] {
-            assert!(
-                !delete_verdict_is_reliable(n, 38, 200),
-                "{n} 个目录没列出来时绝不许按「远端缺失」删本地"
-            );
+    fn scan_window_rotates_and_covers_every_directory() {
+        let root = HOME_ROOT;
+        let mut dirs: BTreeSet<String> = BTreeSet::new();
+        dirs.insert(root.to_string());
+        for i in 0..228 {
+            dirs.insert(format!("{root}/d{i:03}"));
         }
+        let (w1, c1) = dirs_for_round(&dirs, root, 200, None);
+        assert_eq!(w1.len(), 200, "上限 200 = 根 + 199 个轮转目录");
+        assert_eq!(w1[0], root, "远端根必须每轮都列");
+        let c1 = c1.expect("超过上限必须有下一轮游标");
+        let set1: BTreeSet<&String> = w1.iter().collect();
+        assert_eq!(set1.len(), w1.len(), "窗口内不能有重复目录");
 
-        // ★ 目录数被截断 = 排序在后的目录**根本没扫**，里面的条目会全部「缺失」。
-        //   这一种没有错误、没有失败计数，最容易漏判成「远端已删」→ 真删本地节点。
-        assert!(
-            !delete_verdict_is_reliable(0, 201, 200),
-            "目录数超上限 → 未扫目录下的 baseline 会被当成「远端已删」"
-        );
-        assert!(!delete_verdict_is_reliable(0, 2001, 200));
-        assert!(
-            delete_verdict_is_reliable(0, 200, 200),
-            "恰好等于上限 = 全都扫了，不算截断"
+        let (w2, _) = dirs_for_round(&dirs, root, 200, Some(c1.as_str()));
+        assert_eq!(w2.len(), 200);
+        let union: BTreeSet<&String> = w1.iter().chain(w2.iter()).collect();
+        assert_eq!(
+            union.len(),
+            dirs.len(),
+            "两轮窗口必须覆盖全部 {} 个目录（旧实现排序在后的 28 个永远轮不到）",
+            dirs.len()
         );
 
-        // 两种来源同时发生也不可信（任一成立即不可信）
-        assert!(!delete_verdict_is_reliable(1, 201, 200));
+        // 常规情况（没超上限）：一轮全列、游标为空 —— 与旧行为逐字一致
+        let (all, none) = dirs_for_round(&dirs, root, 1000, Some(c1.as_str()));
+        assert_eq!(all.len(), dirs.len());
+        assert_eq!(none, None, "没超上限不需要轮转游标");
+
+        // max=0 = 不限（全列）；不能让退化配置变成「一轮什么目录都不列」
+        let (all0, next0) = dirs_for_round(&dirs, root, 0, None);
+        assert_eq!(all0.len(), dirs.len());
+        assert_eq!(next0, None);
+
+        // max=1 退化配置：根 + 1 个轮转目录（略超上限），也必须能轮转、不永久饿死
+        let (one1, c1) = dirs_for_round(&dirs, root, 1, None);
+        assert_eq!(one1[0], root);
+        assert_eq!(one1.len(), 2);
+        let (one2, _) = dirs_for_round(&dirs, root, 1, c1.as_deref());
+        assert_ne!(one1[1], one2[1], "上限 1 也不能永远只列同一个目录");
+    }
+
+    /// 游标指向的目录在两次轮询之间被删掉也不能让轮转停住；回绕不丢目录。
+    #[test]
+    fn scan_window_survives_a_deleted_cursor_directory() {
+        let items: Vec<String> = (0..10).map(|i| format!("/home/d{i:02}")).collect();
+        let (w1, next) = pick_scan_window(&items, Some("/home/d04"), 4);
+        assert_eq!(w1, vec!["/home/d05", "/home/d06", "/home/d07", "/home/d08"]);
+        assert_eq!(next.as_deref(), Some("/home/d08"));
+        // 游标指向一个已经不存在的路径：按字符串序继续，不 panic、不空窗
+        let (w2, _) = pick_scan_window(&items, Some("/home/d99"), 4);
+        assert_eq!(w2, vec!["/home/d00", "/home/d01", "/home/d02", "/home/d03"]);
+        // 到尾回绕
+        let (w3, _) = pick_scan_window(&items, Some("/home/d08"), 4);
+        assert_eq!(w3, vec!["/home/d09", "/home/d00", "/home/d01", "/home/d02"]);
     }
 
     /// ★ 数据安全回归（真机级）：对账时目录列举失败（网络错误 / 超时），
     /// 旧逻辑把「没看到」当成「远端已删」→ 把本地干净节点连缓存一起删掉。
-    /// 现在必须**跳过删除判定**：节点与 baseline 都保持不动，只记错误 + 说明。
+    /// 现在该目录下的候选**不做判定**：节点与 baseline 都保持不动，只记错误 + 说明。
     ///
     /// 用 127.0.0.1:1 造一个必然 `connection refused` 的客户端 —— 不需要真机 NAS。
     #[tokio::test]
@@ -3085,9 +3305,642 @@ mod tests {
         );
         assert!(baseline.get(&path).exists, "baseline 也不能清");
         assert!(
-            report.notes.iter().any(|n| n.contains("跳过删除判定")),
-            "要向用户说明为什么这轮没删: {report:?}"
+            report.notes.iter().any(|n| n.contains("暂不判定")),
+            "要向用户说明这些条目这轮为什么没判: {report:?}"
         );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    // ------------------------------------------------- ★ 大目录轮转（真实 reconcile_view）
+
+    /// 用 `host:port` 造一个真实 `Client`，sid 直接塞好（跳过登录）。
+    fn client_for(host: &str, port: u16) -> Client {
+        let link = LinkConfig {
+            id: "t".into(),
+            host: host.into(),
+            port,
+            https: false,
+            insecure: true,
+            user: "test1".into(),
+            ipv4_only: false,
+            exclude: Vec::new(),
+            filter_temp: true,
+            peer_listen: None,
+            peer_name: None,
+        };
+        let client = Client::new(&link).expect("构造 client 不该需要联网");
+        client.set_sid("test-sid");
+        client
+    }
+
+    fn mount_view(view: Arc<FakeLocal>, root: &str, mountpoint: &str) -> MountView {
+        MountView {
+            mountpoint: PathBuf::from(mountpoint),
+            remote_root: root.to_string(),
+            view,
+            upload: None,
+            read_only: false,
+            rules: Arc::new(Rules::temp_only(true)),
+            conflict: qxync_core::tasks::DEFAULT_CONFLICT.to_string(),
+        }
+    }
+
+    /// mock NAS 的行为配置（只覆盖对账用到的两跳）。
+    #[derive(Default)]
+    struct MockNasSpec {
+        /// `get_list path` → 目录条目
+        listings: BTreeMap<String, Vec<qxync_core::DirEntry>>,
+        /// `get_list` 这些路径 → HTTP 500
+        fail: BTreeSet<String>,
+        /// `get_list` 这些路径 → HTTP 200 + 非列表 JSON（模拟反代/WAF 的 `{"error":…}`）
+        soft_fail: BTreeSet<String>,
+        /// `get_list` 这些路径 → JSON `status`（模拟 QTS 的 4/5/6 错误出口）
+        force_status: BTreeMap<String, i64>,
+        /// `stat` 认为存在的完整路径；不在集合里 → 占位条目 `exist=0`
+        existing: BTreeSet<String>,
+        /// `stat` 这些完整路径 → HTTP 500
+        stat_fail: BTreeSet<String>,
+        /// `stat` 这些完整路径 → JSON `status`
+        stat_status: BTreeMap<String, i64>,
+    }
+
+    /// 极简 NAS HTTP 服务：实现对账用到的 `get_list` 与 `stat` 两跳。
+    ///
+    /// 足够在无真机环境下跑**真实** `reconcile_view`：真 Client、真 HTTP、真分页、
+    /// 真「列举失败 / 不存在 / stat 确认」路径。
+    async fn spawn_listing_server(
+        listings: BTreeMap<String, Vec<qxync_core::DirEntry>>,
+        fail: BTreeSet<String>,
+    ) -> (
+        String,
+        u16,
+        Arc<Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        spawn_nas_server(MockNasSpec {
+            listings,
+            fail,
+            ..Default::default()
+        })
+        .await
+    }
+
+    async fn spawn_nas_server(
+        spec: MockNasSpec,
+    ) -> (
+        String,
+        u16,
+        Arc<Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let MockNasSpec {
+            listings,
+            fail,
+            soft_fail,
+            force_status,
+            existing,
+            stat_fail,
+            stat_status,
+        } = spec;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_task = seen.clone();
+        let listings = Arc::new(listings);
+        let fail = Arc::new(fail);
+        let soft_fail = Arc::new(soft_fail);
+        let force_status = Arc::new(force_status);
+        let existing = Arc::new(existing);
+        let stat_fail = Arc::new(stat_fail);
+        let stat_status = Arc::new(stat_status);
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let seen = seen_task.clone();
+                let listings = listings.clone();
+                let fail = fail.clone();
+                let soft_fail = soft_fail.clone();
+                let force_status = force_status.clone();
+                let existing = existing.clone();
+                let stat_fail = stat_fail.clone();
+                let stat_status = stat_status.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let mut req = Vec::new();
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                        if req.windows(4).any(|w| w == b"\r\n\r\n") || req.len() > 65536 {
+                            break;
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&req);
+                    let first = text.lines().next().unwrap_or("");
+                    let target = first.split_whitespace().nth(1).unwrap_or("/");
+                    let query = target.split_once('?').map(|(_, q)| q).unwrap_or("");
+                    let params: BTreeMap<String, String> = query
+                        .split('&')
+                        .filter_map(|kv| kv.split_once('='))
+                        .map(|(k, v)| (k.to_string(), percent_decode(v)))
+                        .collect();
+                    let func = params.get("func").map(String::as_str).unwrap_or("");
+                    let (code, body) = if func == "stat" {
+                        let parent = params.get("path").cloned().unwrap_or_default();
+                        let name = params.get("file_name").cloned().unwrap_or_default();
+                        let full = format!("{parent}/{name}");
+                        if stat_fail.contains(&full) {
+                            (
+                                "500 Internal Server Error",
+                                r#"{"error":"bad gateway"}"#.to_string(),
+                            )
+                        } else if let Some(status) = stat_status.get(&full) {
+                            (
+                                "200 OK",
+                                serde_json::json!({"status": status, "msg": "forced"}).to_string(),
+                            )
+                        } else if existing.contains(&full) {
+                            let entry = qxync_core::DirEntry::local(name, true, 0, 0);
+                            (
+                                "200 OK",
+                                serde_json::json!({
+                                    "total": 1, "exist": 1, "datas": [entry],
+                                })
+                                .to_string(),
+                            )
+                        } else {
+                            // 不存在的路径：QTS 也会回占位条目，但 exist=0
+                            (
+                                "200 OK",
+                                serde_json::json!({
+                                    "total": 0, "exist": 0,
+                                    "datas": [{
+                                        "filename": name, "isfolder": 1,
+                                        "filesize": 0, "epochmt": 0, "exist": 0,
+                                    }],
+                                })
+                                .to_string(),
+                            )
+                        }
+                    } else {
+                        let path = params.get("path").cloned().unwrap_or_default();
+                        seen.lock().unwrap().push(path.clone());
+                        if let Some(status) = force_status.get(&path) {
+                            (
+                                "200 OK",
+                                serde_json::json!({"status": status, "msg": "forced"}).to_string(),
+                            )
+                        } else if fail.contains(&path) {
+                            // 非 404 的传输/服务端错误：对账必须当成「没看到」，不是「已删」。
+                            // 刻意回**合法 JSON**：反代的错误体就是这种形状，不能被
+                            // `Listing` 的全默认反序列化读成「空目录」（HTTP 状态必须先挡）。
+                            (
+                                "500 Internal Server Error",
+                                r#"{"error":"bad gateway"}"#.to_string(),
+                            )
+                        } else if soft_fail.contains(&path) {
+                            // HTTP 200 + 非列表 JSON：形状校验必须把它当解析失败。
+                            ("200 OK", r#"{"error":"soft failure"}"#.to_string())
+                        } else if let Some(entries) = listings.get(&path) {
+                            let body =
+                                serde_json::json!({ "total": entries.len(), "datas": entries });
+                            ("200 OK", body.to_string())
+                        } else {
+                            // 目录确实不存在（QTS 的统一错误出口：status 6 = not found）
+                            (
+                                "200 OK",
+                                serde_json::json!({"status": 6, "msg": "not found"}).to_string(),
+                            )
+                        }
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {code}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        ("127.0.0.1".to_string(), port, seen, handle)
+    }
+
+    /// 只解 `%XX`（测试里的路径只有 ASCII）。
+    fn percent_decode(s: &str) -> String {
+        let b = s.as_bytes();
+        let mut out = Vec::with_capacity(b.len());
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'%' && i + 2 < b.len() {
+                if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                    out.push(v);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(b[i]);
+            i += 1;
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// ★ 真机症状的回归：228 个目录 > 单轮上限 200。
+    ///
+    /// 旧行为：每轮都扫排序前 200 个 → 后 28 个目录**永远**轮不到 → 删除判定被永久
+    /// 推迟（真机笔记「目录数 228 超过单轮上限 200…本轮跳过删除判定」重复 87 轮）。
+    ///
+    /// 期望：第 1 轮删掉窗口内 d000 的远端删除；第 2 轮轮转到 d210 再删；
+    /// **未扫目录里的条目一次都不许误删**；两轮窗口合起来覆盖全部目录。
+    #[tokio::test]
+    async fn reconcile_rotates_scan_window_instead_of_starving_deletions() {
+        use qxync_core::DirEntry;
+        let home = HOME_ROOT;
+        let n = 228usize;
+        let remote_dirs: Vec<String> = (0..n).map(|i| format!("{home}/d{i:03}")).collect();
+        let mut listings: BTreeMap<String, Vec<DirEntry>> = BTreeMap::new();
+        // 根：228 个子目录
+        listings.insert(
+            home.to_string(),
+            remote_dirs
+                .iter()
+                .map(|d| DirEntry::local(d.rsplit('/').next().unwrap(), true, 0, 0))
+                .collect(),
+        );
+        // 每个目录一个文件；d000 / d210 的远端文件已被删（目录还在、清单为空）
+        for (i, d) in remote_dirs.iter().enumerate() {
+            let mut entries = Vec::new();
+            if i != 0 && i != 210 {
+                entries.push(DirEntry::local("f.txt", false, 10, 100));
+            }
+            listings.insert(d.clone(), entries);
+        }
+        let (host, port, seen, srv) = spawn_listing_server(listings, BTreeSet::new()).await;
+
+        let work = tmpdir("reconcile-rotate");
+        let view = FakeLocal::new(home, work.join("stash"));
+        let mut baseline = Baseline::default();
+        for d in &remote_dirs {
+            let p = format!("{d}/f.txt");
+            view.add_file(&p, 10, 100, false, None);
+            baseline.put(p, Sig::file(10, 100));
+        }
+        let store = Mutex::new(SyncState::load(work.join("state")).unwrap());
+        let mv = mount_view(view.clone(), home, "/tmp/reconcile-rotate");
+        let client = client_for(&host, port);
+        let cfg = SyncConfig::default(); // max_dirs_per_poll = 200
+
+        // ---- 第 1 轮：窗口从排序开头开始
+        let mut r1 = SyncReport::default();
+        reconcile_view(&client, &mv, &cfg, &mut baseline, &mut r1, &store).await;
+        assert_eq!(r1.deleted, 1, "窗口内的 d000 远端删除必须执行: {r1:?}");
+        assert!(view.node(&format!("{home}/d000/f.txt")).is_none());
+        assert!(
+            view.node(&format!("{home}/d210/f.txt")).is_some(),
+            "未扫目录里的干净文件不许被当成「远端已删」"
+        );
+        assert!(baseline.get(&format!("{home}/d210/f.txt")).exists);
+        assert!(
+            r1.notes.iter().any(|x| x.contains("轮转")),
+            "要告诉用户本轮是轮转扫描: {r1:?}"
+        );
+
+        // ---- 第 2 轮：从游标接着轮转，d210 这次必须在窗口里
+        let mut r2 = SyncReport::default();
+        reconcile_view(&client, &mv, &cfg, &mut baseline, &mut r2, &store).await;
+        assert_eq!(
+            r2.deleted, 1,
+            "轮转必须为排序在后的目录补上删除判定: {r2:?}"
+        );
+        assert!(view.node(&format!("{home}/d210/f.txt")).is_none());
+
+        // 其余 226 个都还在：没有误删
+        let still = remote_dirs
+            .iter()
+            .filter(|d| view.node(&format!("{d}/f.txt")).is_some())
+            .count();
+        assert_eq!(still, 226, "除 d000 / d210 外一个都不许删");
+
+        // 两轮窗口合起来覆盖全部 228 个目录（旧实现后 28 个永远不出现）
+        let seen = seen.lock().unwrap().clone();
+        for d in &remote_dirs {
+            assert!(seen.iter().any(|p| p == d), "第 1/2 轮合起来必须列过 {d}");
+        }
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// 单个目录列举失败**只影响它自己**：同一视图里其它目录的远端删除照常执行。
+    ///
+    /// 旧实现是「整个视图只要有 1 个目录失败 → 整轮不删」，目录一多就会因为一个
+    /// 抖动目录把全视图的删除长期挡住。按目录判定后，失败目录里的条目不动，
+    /// 其它目录不做「陪绑」。
+    #[tokio::test]
+    async fn listing_failure_only_defers_its_own_directory() {
+        use qxync_core::DirEntry;
+        let home = HOME_ROOT;
+        let bad = format!("{home}/bad");
+        let good = format!("{home}/good");
+        let soft = format!("{home}/soft");
+        let mut listings: BTreeMap<String, Vec<DirEntry>> = BTreeMap::new();
+        listings.insert(
+            home.to_string(),
+            vec![
+                DirEntry::local("bad", true, 0, 0),
+                DirEntry::local("good", true, 0, 0),
+                DirEntry::local("soft", true, 0, 0),
+            ],
+        );
+        listings.insert(bad.clone(), vec![DirEntry::local("f.txt", false, 10, 100)]);
+        // good 的远端文件已被删
+        listings.insert(good.clone(), Vec::new());
+        listings.insert(soft.clone(), vec![DirEntry::local("f.txt", false, 10, 100)]);
+        let mut fail: BTreeSet<String> = BTreeSet::new();
+        fail.insert(bad.clone());
+        let mut soft_fail: BTreeSet<String> = BTreeSet::new();
+        soft_fail.insert(soft.clone());
+        let (host, port, _seen, srv) = spawn_nas_server(MockNasSpec {
+            listings,
+            fail,
+            soft_fail,
+            ..Default::default()
+        })
+        .await;
+
+        let work = tmpdir("reconcile-partial-fail");
+        let view = FakeLocal::new(home, work.join("stash"));
+        let mut baseline = Baseline::default();
+        for dir in [&bad, &good, &soft] {
+            let p = format!("{dir}/f.txt");
+            view.add_file(&p, 10, 100, false, None);
+            baseline.put(p, Sig::file(10, 100));
+        }
+        let store = Mutex::new(SyncState::load(work.join("state")).unwrap());
+        let mv = mount_view(view.clone(), home, "/tmp/reconcile-partial-fail");
+        let client = client_for(&host, port);
+        let cfg = SyncConfig::default();
+        let mut report = SyncReport::default();
+        reconcile_view(&client, &mv, &cfg, &mut baseline, &mut report, &store).await;
+
+        assert_eq!(
+            report.deleted, 1,
+            "good 目录的远端删除不能被 bad/soft 的失败陪绑: {report:?}"
+        );
+        assert!(view.node(&format!("{good}/f.txt")).is_none());
+        assert!(
+            view.node(&format!("{bad}/f.txt")).is_some(),
+            "列举失败的目录里「没看到」不等于「远端已删」"
+        );
+        assert!(
+            view.node(&format!("{soft}/f.txt")).is_some(),
+            "HTTP 200 + 非列表 JSON 也必须当失败，不能读成空目录"
+        );
+        assert!(baseline.get(&format!("{bad}/f.txt")).exists);
+        assert!(baseline.get(&format!("{soft}/f.txt")).exists);
+        assert!(
+            report.notes.iter().any(|x| x.contains("暂不判定")),
+            "要说明哪些条目被推迟: {report:?}"
+        );
+        assert!(
+            report.errors.iter().any(|x| x.contains("对账列举")),
+            "失败必须如实记错误: {report:?}"
+        );
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// ★ 数据安全红线：`get_list` 回 status 4/5（权限 / 会话）**不能**当成「目录已删」。
+    ///
+    /// 真机证据：`/Download`（存在但当前会话不可见）回 status 5、`/homes` 回 status 4；
+    /// 而 4/5 同时是「会话失效」的码（`Error::is_auth`）。修法：只有 `stat` 正向确认
+    /// `exist=0` 才允许按「远端已删」处理；stat 说仍存在 → 该目录不删（目录条目记进
+    /// 远端视图），其内容本轮不判定。stat 成功本身证明会话有效，所以**不**置
+    /// `auth_failed`（否则永久 ACL 隐藏的目录会每轮重登 + 刷 WARN）。
+    #[tokio::test]
+    async fn listing_status_4_or_5_never_deletes_without_stat_confirmation() {
+        use qxync_core::DirEntry;
+        let home = HOME_ROOT;
+        let sec = format!("{home}/sec"); // 列举 status 5，但 stat 说存在
+        let gone = format!("{home}/gone"); // 列举 status 6，stat 确认不存在
+        let mut listings: BTreeMap<String, Vec<DirEntry>> = BTreeMap::new();
+        listings.insert(
+            home.to_string(),
+            vec![
+                DirEntry::local("sec", true, 0, 0),
+                DirEntry::local("gone", true, 0, 0),
+            ],
+        );
+        let mut force: BTreeMap<String, i64> = BTreeMap::new();
+        force.insert(sec.clone(), 5);
+        force.insert(gone.clone(), 6);
+        let mut existing: BTreeSet<String> = BTreeSet::new();
+        existing.insert(sec.clone());
+        let (host, port, _seen, srv) = spawn_nas_server(MockNasSpec {
+            listings,
+            force_status: force,
+            existing,
+            ..Default::default()
+        })
+        .await;
+
+        let work = tmpdir("reconcile-status-confirm");
+        let view = FakeLocal::new(home, work.join("stash"));
+        let mut baseline = Baseline::default();
+        for dir in [&sec, &gone] {
+            let p = format!("{dir}/f.txt");
+            view.add_file(&p, 10, 100, false, None);
+            baseline.put(p, Sig::file(10, 100));
+        }
+        let store = Mutex::new(SyncState::load(work.join("state")).unwrap());
+        let mv = mount_view(view.clone(), home, "/tmp/reconcile-status-confirm");
+        let client = client_for(&host, port);
+        let cfg = SyncConfig::default();
+        let mut report = SyncReport::default();
+        reconcile_view(&client, &mv, &cfg, &mut baseline, &mut report, &store).await;
+
+        // sec：stat 确认存在 → 绝不删；stat 成功也证明会话有效，不许置 auth_failed
+        assert!(
+            view.node(&format!("{sec}/f.txt")).is_some(),
+            "4/5 不能当删除依据"
+        );
+        assert!(baseline.get(&format!("{sec}/f.txt")).exists);
+        assert!(
+            !report.auth_failed,
+            "stat 已成功 = 会话有效；置 auth_failed 会让永久 ACL 目录每轮重登/刷 WARN: {report:?}"
+        );
+        assert!(
+            report.errors.iter().any(|x| x.contains("stat 显示仍存在")),
+            "要说明为什么这轮没删: {report:?}"
+        );
+        // gone：stat 确认不存在 → 删除照常执行（正向确认不能把真删除也挡死）
+        assert_eq!(
+            report.deleted, 1,
+            "stat 确认 exist=0 时必须照常删: {report:?}"
+        );
+        assert!(view.node(&format!("{gone}/f.txt")).is_none());
+        assert!(!baseline.get(&format!("{gone}/f.txt")).exists);
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// 远端根列举回 4/5：按权限 / 会话 / 卸载处理，**绝不**把根下文件当「远端已删」。
+    ///
+    /// 根不可能凭空消失，所以这一条连 `stat` 正向确认都不做（stat 在这些故障下也可能
+    /// 给出不可信的占位结果）。
+    #[tokio::test]
+    async fn listing_root_status_4_or_5_defers_instead_of_deleting() {
+        let home = HOME_ROOT;
+        let path = format!("{home}/keep.txt");
+        let mut force: BTreeMap<String, i64> = BTreeMap::new();
+        force.insert(home.to_string(), 4);
+        let (host, port, _seen, srv) = spawn_nas_server(MockNasSpec {
+            force_status: force,
+            ..Default::default()
+        })
+        .await;
+
+        let work = tmpdir("reconcile-root-status");
+        let view = FakeLocal::new(home, work.join("stash"));
+        view.add_file(&path, 10, 100, false, None);
+        let mut baseline = Baseline::default();
+        baseline.put(path.clone(), Sig::file(10, 100));
+        let store = Mutex::new(SyncState::load(work.join("state")).unwrap());
+        let mv = mount_view(view.clone(), home, "/tmp/reconcile-root-status");
+        let client = client_for(&host, port);
+        let cfg = SyncConfig::default();
+        let mut report = SyncReport::default();
+        reconcile_view(&client, &mv, &cfg, &mut baseline, &mut report, &store).await;
+
+        assert_eq!(report.deleted, 0, "根 4/5 时不许删任何东西: {report:?}");
+        assert!(view.node(&path).is_some());
+        assert!(baseline.get(&path).exists);
+        assert!(report.auth_failed, "4/5 要触发会话重登: {report:?}");
+        assert!(
+            report.errors.iter().any(|x| x.contains("远端根")),
+            "要说明根为什么没判定: {report:?}"
+        );
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// ★ 复核补的回归（F1）：目录被**父目录列举漏掉**（权限过滤 / 服务端隐藏）时，
+    /// 目录条目自身不能按「远端缺失」删 —— stat 说它存在就必须把目录记进远端视图，
+    /// 否则 `remove_remote` 会连整棵子树 + 缓存 + baseline 一起清掉。
+    ///
+    /// 触发条件比原 P0 更窄（父目录列举必须漏掉一个实际存在的目录），但后果是整棵子树。
+    #[tokio::test]
+    async fn directory_missing_from_parent_listing_but_stat_exists_is_not_deleted() {
+        let home = HOME_ROOT;
+        let hidden = format!("{home}/hidden");
+        let child = format!("{hidden}/f.txt");
+        // 根列举**没有** hidden 这个条目（模拟权限过滤掉整个目录）
+        let mut listings: BTreeMap<String, Vec<qxync_core::DirEntry>> = BTreeMap::new();
+        listings.insert(home.to_string(), Vec::new());
+        // list(hidden) 回 status 5（存在但不可见）；stat(hidden) 说存在
+        let mut force: BTreeMap<String, i64> = BTreeMap::new();
+        force.insert(hidden.clone(), 5);
+        let mut existing: BTreeSet<String> = BTreeSet::new();
+        existing.insert(hidden.clone());
+        let (host, port, _seen, srv) = spawn_nas_server(MockNasSpec {
+            listings,
+            force_status: force,
+            existing,
+            ..Default::default()
+        })
+        .await;
+
+        let work = tmpdir("reconcile-hidden-dir");
+        let view = FakeLocal::new(home, work.join("stash"));
+        view.add_dir(&hidden);
+        view.add_file(&child, 10, 100, false, None);
+        let mut baseline = Baseline::default();
+        baseline.put(hidden.clone(), Sig::dir());
+        baseline.put(child.clone(), Sig::file(10, 100));
+        let store = Mutex::new(SyncState::load(work.join("state")).unwrap());
+        let mv = mount_view(view.clone(), home, "/tmp/reconcile-hidden-dir");
+        let client = client_for(&host, port);
+        let cfg = SyncConfig::default();
+        let mut report = SyncReport::default();
+        reconcile_view(&client, &mv, &cfg, &mut baseline, &mut report, &store).await;
+
+        assert_eq!(
+            report.deleted, 0,
+            "目录被父目录漏掉但 stat 说存在 → 不许删: {report:?}"
+        );
+        assert!(
+            view.node(&hidden).is_some(),
+            "★ 目录条目自身不能被当成「远端已删」"
+        );
+        assert!(view.node(&child).is_some(), "子树不能被连坐");
+        assert!(baseline.get(&hidden).exists);
+        assert!(baseline.get(&child).exists);
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// stat 确认也失败 → 目录存在性未知：目录条目与内容都不判定（保守方向）。
+    #[tokio::test]
+    async fn stat_failure_keeps_directory_and_subtree() {
+        let home = HOME_ROOT;
+        // 两种 stat 失败：HTTP 层失败 + status 4/5（会话失效）—— 都必须保守不判定
+        let unknown_http = format!("{home}/unknown_http");
+        let unknown_auth = format!("{home}/unknown_auth");
+        let mut listings: BTreeMap<String, Vec<qxync_core::DirEntry>> = BTreeMap::new();
+        listings.insert(home.to_string(), Vec::new());
+        let mut force: BTreeMap<String, i64> = BTreeMap::new();
+        force.insert(unknown_http.clone(), 6);
+        force.insert(unknown_auth.clone(), 5);
+        let mut stat_fail: BTreeSet<String> = BTreeSet::new();
+        stat_fail.insert(unknown_http.clone());
+        let mut stat_status: BTreeMap<String, i64> = BTreeMap::new();
+        stat_status.insert(unknown_auth.clone(), 5);
+        let (host, port, _seen, srv) = spawn_nas_server(MockNasSpec {
+            listings,
+            force_status: force,
+            stat_fail,
+            stat_status,
+            ..Default::default()
+        })
+        .await;
+
+        let work = tmpdir("reconcile-stat-fail");
+        let view = FakeLocal::new(home, work.join("stash"));
+        let mut baseline = Baseline::default();
+        for (dir, child) in [
+            (&unknown_http, format!("{unknown_http}/f.txt")),
+            (&unknown_auth, format!("{unknown_auth}/f.txt")),
+        ] {
+            view.add_dir(dir);
+            view.add_file(&child, 10, 100, false, None);
+            baseline.put(dir.clone(), Sig::dir());
+            baseline.put(child.clone(), Sig::file(10, 100));
+        }
+        let store = Mutex::new(SyncState::load(work.join("state")).unwrap());
+        let mv = mount_view(view.clone(), home, "/tmp/reconcile-stat-fail");
+        let client = client_for(&host, port);
+        let cfg = SyncConfig::default();
+        let mut report = SyncReport::default();
+        reconcile_view(&client, &mv, &cfg, &mut baseline, &mut report, &store).await;
+
+        assert_eq!(report.deleted, 0, "存在性未知时不许删: {report:?}");
+        for dir in [&unknown_http, &unknown_auth] {
+            let child = format!("{dir}/f.txt");
+            assert!(view.node(dir).is_some(), "目录 {dir} 不能删");
+            assert!(view.node(&child).is_some(), "子树不能被连坐");
+            assert!(baseline.get(dir).exists);
+            assert!(baseline.get(&child).exists);
+        }
+        assert!(
+            report.errors.iter().any(|x| x.contains("stat 确认也失败")),
+            "要说明为什么没判定: {report:?}"
+        );
+        assert!(report.auth_failed, "stat 也回 4/5 时要触发重登: {report:?}");
+        srv.abort();
         let _ = std::fs::remove_dir_all(&work);
     }
 

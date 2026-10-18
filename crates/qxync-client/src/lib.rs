@@ -565,7 +565,10 @@ impl Client {
             let got = listing.datas.len();
             let total = listing.total;
             out.extend(listing.datas);
-            if got == 0 || got < limit || (total >= 0 && out.len() as i64 >= total) {
+            // ★ 只有 `total` **明确给了正数**才用它提前收尾：`total` 缺省是 0，
+            //   拿 0 当「总数 0」会在第一页就 break，把 200+ 项的目录静默截断。
+            //   没有 total 时靠分页本身收敛（got < limit / 空页）。
+            if got == 0 || got < limit || (total > 0 && out.len() as i64 >= total) {
                 break;
             }
             start += got;
@@ -603,13 +606,47 @@ impl Client {
             .send()
             .await
             .map_err(|e| Error::Transport(format!("get_list {path}: {e}")))?;
+        // ★ HTTP 层失败**不能**当「目录是空的」：反代 502/504 的 JSON 错误体
+        //   （如 `{"error":...}`）能通过 `Listing` 的全默认反序列化 + `ensure_ok`，
+        //   于是被读成「0 项」→ 对账把该目录所有条目当成「远端已删」。
+        if !resp.status().is_success() {
+            return Err(Error::Transport(format!(
+                "get_list {path}: HTTP {}",
+                resp.status()
+            )));
+        }
         let body = resp
             .bytes()
             .await
             .map_err(|e| Error::Transport(e.to_string()))?;
+        Self::ensure_listing_shape(&body, &format!("get_list {path}"))?;
         let listing: Listing = parse_listing(&body)?;
         listing.ensure_ok(format!("get_list {path}"))?;
         Ok(listing)
+    }
+
+    /// 校验响应体至少「长得像」`get_list` / `stat` 的 JSON。
+    ///
+    /// 为什么需要：HTTP 200 + `{"error":…}`（某些反代 / WAF）能通过 `Listing` 的
+    /// 全默认反序列化，被读成「0 项 / 不存在」，对账会据此删本地。合法响应至少带
+    /// `status` / `datas` / `total` / `real_total` / `exist` 之一。
+    fn ensure_listing_shape(body: &[u8], context: &str) -> Result<()> {
+        let v: serde_json::Value = serde_json::from_slice(body).map_err(|e| {
+            Error::Parse(format!(
+                "{context} 响应不是合法 JSON: {e}；原文前 200B: {}",
+                String::from_utf8_lossy(&body[..body.len().min(200)])
+            ))
+        })?;
+        let shape_ok = ["status", "datas", "total", "real_total", "exist"]
+            .iter()
+            .any(|k| v.get(*k).is_some());
+        if !shape_ok {
+            return Err(Error::Parse(format!(
+                "{context} 响应不像列表/stat JSON（缺 status/datas/total/real_total/exist）: 原文前 200B: {}",
+                String::from_utf8_lossy(&body[..body.len().min(200)])
+            )));
+        }
+        Ok(())
     }
 
     /// `func=stat`：**必须**是 `path=<所在目录>&file_name=<名字>&file_total=1`。
@@ -631,10 +668,19 @@ impl Client {
             .send()
             .await
             .map_err(|e| Error::Transport(format!("stat {dir}/{file_name}: {e}")))?;
+        // ★ stat 的 `Ok(None)` 会被对账当成「确认不存在」并据此删本地 ——
+        //   HTTP 层失败绝不能长成「不存在」。
+        if !resp.status().is_success() {
+            return Err(Error::Transport(format!(
+                "stat {dir}/{file_name}: HTTP {}",
+                resp.status()
+            )));
+        }
         let body = resp
             .bytes()
             .await
             .map_err(|e| Error::Transport(e.to_string()))?;
+        Self::ensure_listing_shape(&body, &format!("stat {dir}/{file_name}"))?;
         let listing: Listing = parse_listing(&body)?;
         listing.ensure_ok(format!("stat {dir}/{file_name}"))?;
         // ★ 只能靠 `exist` 判定：不存在的路径也会返回「占位条目」
