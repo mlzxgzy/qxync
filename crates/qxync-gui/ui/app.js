@@ -603,6 +603,216 @@
     }
   }
 
+  // ==================================================== ★ purge（删除可带相关数据）
+  // 三层（任务卡 / 连接行 / 设置→高级）共用同一个弹窗：后端先给一份 purge 计划
+  // （`purge_plan`），前端把「会删什么」摊开，复选框**默认不勾选** = 保持旧行为。
+  // 条目一律用 createElement + textContent 构造（路径用 mono 样式），不拼 HTML。
+  //
+  // 弹出的是独立弹窗（#purge-modal），**不复用** #modal：后者是「一个输入框」的形状，
+  // 而且 focus/Enter 的语义是「返回输入值」，与这里的「确认 + 一个复选框」完全不同。
+  var purgeResolve = null;
+  var purgeLastFocus = null;
+  var purgeOptRequired = false;
+
+  /** 计划条目里的 kind → 文案 key。未知 kind 回落到后端给的原字符串（绝不显示成 key）。 */
+  var PURGE_KIND_KEYS = {
+    task: 'purge.kind.task',
+    link: 'purge.kind.link',
+    credentials: 'purge.kind.credentials',
+    peers: 'purge.kind.peers',
+    cache: 'purge.kind.cache',
+    sync: 'purge.kind.sync',
+    queue: 'purge.kind.queue',
+    log: 'purge.kind.log',
+    mounts: 'purge.kind.mounts',
+    socket: 'purge.kind.socket',
+    pid: 'purge.kind.pid',
+    config: 'purge.kind.config',
+    data: 'purge.kind.data',
+    state: 'purge.kind.state'
+  };
+
+  function purgeKindLabel(kind) {
+    var k = str(kind);
+    var key = PURGE_KIND_KEYS[k];
+    if (!key) { return k; }
+    var v = T(key);
+    return (v === key) ? k : v;
+  }
+
+  function purgeSizeText(bytes, files) {
+    var b = num(bytes, 0);
+    var f = num(files, 0);
+    if (f > 0) { return T('purge.total', { size: humanSize(b), files: f }); }
+    return humanSize(b);
+  }
+
+  /** 计划条目列表：label · 种类徽标 · 路径（mono）· 大小；optional 的标「仅勾选后删除」。 */
+  function fillPurgeItems(items) {
+    var ul = $('purge-items');
+    if (!ul) { return; }
+    clear(ul);
+    var list = Array.isArray(items) ? items : [];
+    for (var i = 0; i < list.length; i++) {
+      var it = list[i];
+      if (!isObj(it)) { continue; }
+      var optional = it.optional === true;
+      var kindText = str(it.kind) ? purgeKindLabel(it.kind) : '';
+      var labelText = str(it.label) || kindText;
+      var li = el('li', 'purge-item' + (optional ? ' purge-item-opt' : ''));
+      li.appendChild(el('span', 'purge-item-label', labelText));
+      // 后端 label 一般就是 kind 的中文名：相同就不再挂一个重复徽标。
+      if (kindText && kindText !== labelText) {
+        li.appendChild(document.createTextNode(' '));
+        li.appendChild(el('span', 'badge', kindText));
+      }
+      if (str(it.path)) {
+        li.appendChild(el('span', 'purge-item-sep', ' · '));
+        li.appendChild(el('span', 'mono purge-item-path', str(it.path)));
+      }
+      if (num(it.bytes, 0) > 0 || num(it.files, 0) > 0) {
+        li.appendChild(el('span', 'purge-item-sep', ' · '));
+        li.appendChild(el('span', 'purge-item-size', purgeSizeText(it.bytes, it.files)));
+      }
+      if (optional) {
+        li.appendChild(document.createTextNode(' '));
+        li.appendChild(el('span', 'badge badge-warn purge-item-mark', T('purge.optional_mark')));
+      }
+      ul.appendChild(li);
+    }
+  }
+
+  /** 「合计 + db_rows」一行：baseline / 日志 / 待裁决 与总量（都为空就不显示）。 */
+  function purgeExtraText(o) {
+    var parts = [];
+    var db = isObj(o.dbRows) ? o.dbRows : null;
+    if (db) {
+      var b = num(db.baseline, 0);
+      var j = num(db.journal, 0);
+      var d = num(db.decisions, 0);
+      if (b + j + d > 0) {
+        parts.push(T('purge.db_rows', { baseline: b, journal: j, decisions: d }));
+      }
+    }
+    if (num(o.totalBytes, 0) > 0 || num(o.totalFiles, 0) > 0) {
+      parts.push(T('purge.total', { size: humanSize(o.totalBytes), files: num(o.totalFiles, 0) }));
+    }
+    return parts.join(' · ');
+  }
+
+  /** 后端的 warnings：一条一个黄色 alert（文字一律 textContent）。 */
+  function fillPurgeWarnings(list) {
+    var box = $('purge-warn');
+    if (!box) { return; }
+    clear(box);
+    var ws = Array.isArray(list) ? list : [];
+    for (var i = 0; i < ws.length; i++) {
+      box.appendChild(el('div', 'alert alert-warn', T('purge.warn_prefix') + str(ws[i])));
+    }
+  }
+
+  /**
+   * 打开删除确认弹窗 → Promise<{confirmed, purge}>。
+   *
+   *   confirmed=false：取消 / Esc / 点遮罩（什么都不删）
+   *   purge=true     ：勾了复选框（调用方走「连本地数据一起删」的新命令）
+   *   optRequired    ：危险操作（purge_all）必须勾选，未勾选时确认按钮 disabled。
+   */
+  function openPurgeDialog(opts) {
+    var box = $('purge-modal');
+    if (!box) { return Promise.resolve({ confirmed: false, purge: false }); }
+    var o = isObj(opts) ? opts : {};
+    // 防御：同一时刻只允许一个 purge 弹窗（连点/键盘重复触发）。旧的按「取消」收掉，
+    // 否则它的 Promise 永远不会 resolve，调用方就一直挂着。
+    if (isFn(purgeResolve)) {
+      var stale = purgeResolve;
+      purgeResolve = null;
+      stale({ confirmed: false, purge: false });
+    }
+    setText('purge-title', str(o.title));
+    setText('purge-message', str(o.message));
+    fillPurgeItems(o.items);
+    fillPurgeWarnings(o.warnings);
+
+    var extra = purgeExtraText(o);
+    var extraEl = $('purge-extra');
+    if (extraEl) {
+      extraEl.hidden = !extra;
+      extraEl.textContent = extra;
+    }
+    var optLabel = $('purge-opt-label');
+    if (optLabel) { optLabel.textContent = str(o.optLabel); }
+    var optHint = $('purge-opt-hint');
+    if (optHint) {
+      optHint.hidden = !str(o.optHint);
+      optHint.textContent = str(o.optHint);
+    }
+    var opt = $('purge-opt');
+    if (opt) { opt.checked = false; }
+    purgeOptRequired = o.optRequired === true;
+    var ok = $('purge-ok');
+    if (ok) {
+      ok.textContent = str(o.confirmText) || T('purge.confirm_delete');
+      ok.disabled = purgeOptRequired;
+    }
+
+    purgeLastFocus = document.activeElement;
+    box.hidden = false;
+    if (opt) { opt.focus(); }
+    else {
+      var cancelBtn = $('purge-cancel');
+      if (cancelBtn) { cancelBtn.focus(); }
+    }
+    return new Promise(function (resolve) {
+      purgeResolve = resolve;
+    });
+  }
+
+  function closePurgeDialog(confirmed) {
+    var box = $('purge-modal');
+    var opt = $('purge-opt');
+    var optOn = !!(opt && opt.checked === true);
+    // 必须勾选却没勾：把「确认」当取消处理（按钮本来 disabled，这里再兜一层）
+    var yes = (confirmed === true) && (!purgeOptRequired || optOn);
+    if (box) { box.hidden = true; }
+    if (purgeLastFocus && isFn(purgeLastFocus.focus)) { purgeLastFocus.focus(); }
+    purgeLastFocus = null;
+    var r = purgeResolve;
+    purgeResolve = null;
+    if (isFn(r)) { r({ confirmed: yes, purge: yes && optOn }); }
+  }
+
+  function wirePurgeModal() {
+    var box = $('purge-modal');
+    var ok = $('purge-ok');
+    var cancel = $('purge-cancel');
+    var opt = $('purge-opt');
+    if (ok) { ok.addEventListener('click', function () { closePurgeDialog(true); }); }
+    if (cancel) { cancel.addEventListener('click', function () { closePurgeDialog(false); }); }
+    if (opt) {
+      opt.addEventListener('change', function () {
+        var b = $('purge-ok');
+        if (b) { b.disabled = purgeOptRequired ? (opt.checked !== true) : false; }
+      });
+    }
+    if (box) {
+      // 点遮罩 = 取消（焦点在弹窗内，Esc / Tab 与 #modal 同一套处理）
+      box.addEventListener('click', function (ev) {
+        if (ev.target === box) { closePurgeDialog(false); }
+      });
+      box.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Escape') { ev.preventDefault(); closePurgeDialog(false); return; }
+        if (ev.key !== 'Tab') { return; }
+        var f = box.querySelectorAll('input, select, textarea, button, [href], [tabindex]:not([tabindex="-1"])');
+        if (!f.length) { return; }
+        var first = f[0];
+        var last = f[f.length - 1];
+        if (ev.shiftKey && document.activeElement === first) { ev.preventDefault(); last.focus(); }
+        else if (!ev.shiftKey && document.activeElement === last) { ev.preventDefault(); first.focus(); }
+      });
+    }
+  }
+
   // ============================================================ KV 渲染
   function kvRow(dl, key, value, cls) {
     if (!dl) { return; }
@@ -1165,11 +1375,8 @@
     if (full && t) {
       var bDel = el('button', 'mini danger', T('task.act_delete'));
       bDel.type = 'button';
-      bDel.addEventListener('click', function () {
-        if (!window.confirm('删除任务登记？\n' + t.id + '\n\n只删 ~/.config/qxync/tasks/' + t.id +
-          '.json，**不动挂载点里的文件，也不动 NAS 上的数据**。')) { return; }
-        doTaskAction('delete', t.id, '删除登记', bDel, linkId);
-      });
+      bDel.setAttribute('data-act', 'task-delete');
+      bDel.addEventListener('click', function () { doTaskDelete(t, linkId, bDel); });
       act.appendChild(bDel);
     }
 
@@ -1640,6 +1847,63 @@
         logErr(label + ' ' + id + ' 失败（' + linkLabelById(lid) + '）：' + str(r.error));
       }
       return refreshTasks().then(function () { return refreshStatus(true); }).then(function () { return r; });
+    });
+  }
+
+  /**
+   * ★ 删除任务：先问后端「删它会连带哪些本地数据」（`purge_plan`），再弹自定义弹窗。
+   *
+   *   * 复选框**不勾** → 旧路径：`tasks delete` 只删任务登记（挂载点里的文件 / NAS 数据不动）；
+   *   * 勾了 → `task_purge`：任务登记 + 水合缓存 / 同步状态 / 日志一起删。
+   *
+   * 取消 / Esc / 点遮罩 → 什么都不发（连 purge_plan 之外没有请求）。
+   */
+  function doTaskDelete(t, linkId, btn) {
+    var lid = str(linkId) || currentId();
+    var id = str(t && t.id);
+    if (!id) { return Promise.resolve(null); }
+    return withBusy({ buttons: btn ? [btn] : [] }, function () {
+      return call('purge_plan', { scope: 'task', linkId: lid, taskId: id });
+    }).then(function (r) {
+      if (!r.ok) {
+        logErr('读取删除计划失败（' + linkLabelById(lid) + '）：' + str(r.error));
+        return null;
+      }
+      var plan = isObj(r.data) ? r.data : {};
+      return openPurgeDialog({
+        title: T('purge.task_title', { id: id }),
+        message: T('purge.task_message'),
+        items: plan.items,
+        dbRows: plan.db_rows,
+        totalBytes: plan.total_bytes,
+        totalFiles: plan.total_files,
+        warnings: plan.warnings,
+        optLabel: T('purge.opt_task', { size: humanSize(plan.optional_bytes) }),
+        optHint: T('purge.opt_hint'),
+        confirmText: T('purge.confirm_delete')
+      }).then(function (ans) {
+        if (!ans.confirmed) {
+          logInfo('已取消删除任务 ' + id);
+          return null;
+        }
+        // 旧行为：只删任务登记（保持与以前完全一致，包括日志文案与刷新）
+        if (!ans.purge) {
+          return doTaskAction('delete', id, '删除登记', btn, lid);
+        }
+        return withBusy({ buttons: btn ? [btn] : [] }, function () {
+          return call('task_purge', { linkId: lid, taskId: id });
+        }).then(function (r2) {
+          if (!r2.ok) {
+            logErr('删除任务 ' + id + ' 失败（' + linkLabelById(lid) + '）：' + str(r2.error));
+            return r2;
+          }
+          var d = isObj(r2.data) ? r2.data : {};
+          logOk(T('purge.done_task', {
+            id: id, size: humanSize(d.bytes), files: num(d.files, 0)
+          }));
+          return refreshTasks().then(function () { return refreshStatus(true); }).then(function () { return r2; });
+        });
+      });
     });
   }
 
@@ -2908,6 +3172,7 @@
     // 移除（没有 link 文件的合成项不可移除：删不了不存在的东西）
     var bDel = el('button', 'mini danger', T('links.act_remove'));
     bDel.type = 'button';
+    bDel.setAttribute('data-act', 'link-remove');
     if (link.link_exists === false) {
       bDel.disabled = true;
       bDel.setAttribute('aria-disabled', 'true');
@@ -2939,12 +3204,18 @@
     clear(ul);
     setBusyState('conn-list', state.linksLoading === true);
     var ls = linksList();
-    setText('links-count', ls.length ? T('links.count', { n: ls.length }) : '');
+    // ★ purge_all 之后一条真实连接都不剩：后端/前端都会合成一个「未配置」占位项
+    //   （让「启动 / 添加」仍有落点），这里据此显示空态文案，而不是假装列表里还有东西。
+    var realCount = 0;
+    for (var ri = 0; ri < ls.length; ri++) {
+      if (ls[ri] && ls[ri].link_exists !== false) { realCount++; }
+    }
+    setText('links-count', realCount ? T('links.count', { n: realCount }) : '');
     if (state.linksError) {
       setListState('conn-list-empty', 'error', T('list.error', { msg: state.linksError }));
     } else if (state.linksLoading && !ls.length) {
       setListState('conn-list-empty', 'loading', T('links.loading'));
-    } else if (!ls.length) {
+    } else if (!realCount) {
       setListState('conn-list-empty', 'empty', T('links.empty'));
     } else {
       setListState('conn-list-empty', 'ready');
@@ -3334,51 +3605,59 @@
     });
   }
 
-  /** 移除连接：先不带 deleteTasks 探一次；needs_confirm 时把「会删 N 个任务登记」摊开再确认。 */
+  /**
+   * ★ 移除连接：先取 `purge_plan`（会删哪些任务登记 / 本地数据、各多大），再弹自定义弹窗。
+   *
+   *   * 复选框**不勾** → `link_delete(deleteTasks:true, purgeData:false)`：停 daemon、
+   *     卸载挂载点、删任务登记与 link/凭据，**缓存 / 同步状态 / 队列 / 日志留着**；
+   *   * 勾了 → `purgeData:true`：上面这些 + 该连接的全部本地数据一起删。
+   *
+   * 旧的「先探测 needs_confirm 再 window.confirm」两段式**已由这个计划弹窗取代**
+   * （计划里本来就列了任务登记；后端仍然保留 needs_confirm 兜底，这里不再依赖它）。
+   */
   function doLinkDelete(linkId, btn) {
     var id = str(linkId);
     var link = linkById(id);
     if (!link) { return Promise.resolve(null); }
     var label = linkLabel(link);
-    var callDelete = function (deleteTasks) {
-      return call('link_delete', { linkId: id, deleteTasks: !!deleteTasks });
-    };
-    // ★ 先问一次再动手：没有任何任务时后端会**直接删掉**，如果先探测后确认就变成
-    //   「已经删了才问要不要删」（而且点取消也回不去了）。有任务时后端只回
-    //   needs_confirm，不删任何东西，所以这个顺序对两种情况都安全。
-    if (!window.confirm(T('links.confirm_delete', { label: label }))) {
-      logInfo('已取消移除连接 ' + id);
-      return Promise.resolve(null);
-    }
-    return withBusy({ buttons: btn ? [btn] : [] }, function () { return callDelete(false); }).then(function (r) {
+    return withBusy({ buttons: btn ? [btn] : [] }, function () {
+      return call('purge_plan', { scope: 'link', linkId: id });
+    }).then(function (r) {
       if (!r.ok) {
-        renderError('login-result', '移除连接失败', str(r.error));
-        logErr('移除连接 ' + id + ' 失败：' + str(r.error));
-        return r;
+        renderError('login-result', '读取删除计划失败', str(r.error));
+        logErr('读取移除连接计划失败（' + label + '）：' + str(r.error));
+        return null;
       }
-      var d = isObj(r.data) ? r.data : {};
-      if (d.needs_confirm === true) {
-        var tasks = (d.tasks || []).filter(isObj);
-        var lines = [];
-        for (var i = 0; i < tasks.length; i++) {
-          lines.push('  · ' + str(tasks[i].id) + '  ' + str(tasks[i].mountpoint) + ' ⇄ NAS ' + str(tasks[i].root));
-        }
-        var bad = (d.bad_task_files || []).filter(isObj);
-        for (var bi = 0; bi < bad.length; bi++) {
-          lines.push('  · [无法解析的任务文件] ' + str(bad[bi].path) + '：' + str(bad[bi].error));
-        }
-        var ok = window.confirm(T('links.confirm_delete_tasks', {
-          label: label, n: num(d.task_count, tasks.length), tasks: lines.join('\n')
-        }));
-        if (!ok) {
+      var plan = isObj(r.data) ? r.data : {};
+      var items = Array.isArray(plan.items) ? plan.items : [];
+      var taskCount = 0;
+      for (var i = 0; i < items.length; i++) {
+        if (isObj(items[i]) && str(items[i].kind) === 'task') { taskCount++; }
+      }
+      return openPurgeDialog({
+        title: T('purge.link_title', { label: label }),
+        message: T('purge.link_message', { label: label, n: taskCount }),
+        items: plan.items,
+        dbRows: plan.db_rows,
+        totalBytes: plan.total_bytes,
+        totalFiles: plan.total_files,
+        warnings: plan.warnings,
+        optLabel: T('purge.opt_link', { size: humanSize(plan.optional_bytes) }),
+        optHint: T('purge.opt_hint'),
+        confirmText: T('purge.confirm_remove')
+      }).then(function (ans) {
+        if (!ans.confirmed) {
           logInfo('已取消移除连接 ' + id);
-          return r;
+          return null;
         }
-        return withBusy({ buttons: btn ? [btn] : [] }, function () { return callDelete(true); }).then(function (r2) {
+        return withBusy({ buttons: btn ? [btn] : [] }, function () {
+          return call('link_delete', {
+            linkId: id, deleteTasks: true, purgeData: ans.purge === true
+          });
+        }).then(function (r2) {
           return afterLinkRemoved(id, r2);
         });
-      }
-      return afterLinkRemoved(id, r);
+      });
     });
   }
 
@@ -3388,14 +3667,112 @@
       return r;
     }
     var d = isObj(r.data) ? r.data : {};
-    logOk('已移除连接 ' + id + '（删除任务登记 ' + num(d.tasks_deleted, 0) + ' 个；' +
-      '本地文件 / NAS 数据 / 缓存未动）');
+    var p = isObj(d.purged) ? d.purged : null;
+    var tasksDeleted = num(d.tasks_deleted, 0);
+    if (p && p.error) {
+      logErr('清除连接 ' + id + ' 的本地数据失败：' + str(p.error));
+    }
+    var msg;
+    if (p) {
+      msg = T('purge.done_link', {
+        label: id, size: humanSize(p.bytes), files: num(p.files, 0)
+      }) + '（删除任务登记 ' + tasksDeleted + ' 个）';
+    } else {
+      msg = '已移除连接 ' + id + '（删除任务登记 ' + tasksDeleted + ' 个；本地数据保留）';
+    }
+    logOk(msg + '；本地文件 / NAS 数据未动');
     if (str(state.editingLinkId) === id) { state.editingLinkId = ''; }
     state.creatingLink = false;   // ★ M16.1：移除后回到「展示当前连接」而不是停在新建态
     // 当前连接被删掉后，refreshStatus 里的 ensureCurrentLink 会自动切到第一个剩余连接
     return refreshStatus(true).then(function () {
       return loadConnect().then(function () { return refreshCurrentPage(); });
     }).then(function () { return r; });
+  }
+
+  /**
+   * ★ 设置 → 高级 → 危险区：删除本机所有 qxync 数据。
+   *
+   * 先看计划（各根目录 + 大小）→ 弹窗（必须勾选「我了解…」才能确认）→ `purge_all`。
+   * 成功后把前端状态清零（连接 / 任务 / 缓存），并清掉 localStorage 里的当前连接；
+   * 然后按**空连接**重新渲染 —— 删完没有连接时应显示空态，而不是白屏或报错。
+   */
+  function doPurgeAll(btn) {
+    return withBusy({ buttons: btn ? [btn] : ['btn-purge-all'] }, function () {
+      return call('purge_plan', { scope: 'all' });
+    }).then(function (r) {
+      if (!r.ok) {
+        renderError('advanced-result', '读取删除计划失败', str(r.error));
+        logErr('读取删除计划失败：' + str(r.error));
+        return null;
+      }
+      var plan = isObj(r.data) ? r.data : {};
+      return openPurgeDialog({
+        title: T('purge.all_title'),
+        message: T('purge.all_message'),
+        items: plan.items,
+        dbRows: plan.db_rows,
+        totalBytes: plan.total_bytes,
+        totalFiles: plan.total_files,
+        warnings: plan.warnings,
+        optLabel: T('purge.opt_all'),
+        optHint: T('purge.opt_hint'),
+        optRequired: true,
+        confirmText: T('purge.confirm_delete')
+      }).then(function (ans) {
+        if (!ans.confirmed) {
+          logInfo('已取消删除本机全部 qxync 数据');
+          return null;
+        }
+        return withBusy({ buttons: btn ? [btn] : ['btn-purge-all'] }, function () {
+          return call('purge_all', {});
+        }).then(function (r2) {
+          if (!r2.ok) {
+            renderError('advanced-result', '删除失败', str(r2.error));
+            logErr('删除本机全部 qxync 数据失败：' + str(r2.error));
+            return r2;
+          }
+          var d = isObj(r2.data) ? r2.data : {};
+          var warnings = Array.isArray(d.warnings) ? d.warnings : [];
+          for (var wi = 0; wi < warnings.length; wi++) {
+            logErr('purge_all 警告：' + str(warnings[wi]));
+          }
+          logOk(T('purge.done_all', { size: humanSize(d.bytes), files: num(d.files, 0) }));
+          // 前端状态清零：连接 / 任务 / 各按连接分桶的缓存全部作废
+          state.links = [];
+          state.linksBad = [];
+          state.linksError = '';
+          state.linksLoaded = true;
+          state.linksSig = '';
+          state.currentLink = '';
+          state.statuses = {};
+          state.tasksByLink = {};
+          state.journalByLink = {};
+          state.errorsByLink = {};
+          state.decisionsByLink = {};
+          state.editingLinkId = '';
+          state.creatingLink = false;
+          try { window.localStorage.removeItem(CURRENT_LINK_KEY); } catch (e) { /* 隐私模式忽略 */ }
+          renderTop();
+          renderConnSelect();
+          renderConnList();
+          renderScopeHints();
+          return refreshStatus(true).then(function () {
+            return loadConnect();
+          }).then(function () {
+            return refreshCurrentPage();
+          }).then(function () {
+            // 删完没有真实连接：明确显示空态（合成项还在，但它是「未配置」占位）
+            var ls = linksList();
+            var real = 0;
+            for (var ri = 0; ri < ls.length; ri++) {
+              if (ls[ri] && ls[ri].link_exists !== false) { real++; }
+            }
+            if (!real) { setListState('conn-list-empty', 'empty', T('links.empty')); }
+            return r2;
+          });
+        });
+      });
+    });
   }
 
   /** 顶部「立即登录」：用**当前连接**已保存的凭据 + 账密登录（不碰表单里的口令）。 */
@@ -5991,6 +6368,8 @@
     on('btn-proxy-save', 'click', function () { doProxySave(); });
     on('btn-personal-save', 'click', function () { doPersonalSave(); });
     on('btn-advanced-save', 'click', function () { doAdvancedSave(); });
+    // ★ 设置 → 高级 → 危险区：删除本机所有 qxync 数据（先看计划，必须勾选才能确认）
+    on('btn-purge-all', 'click', function (ev) { doPurgeAll(ev && ev.currentTarget); });
     on('btn-free-save', 'click', function () { doFreeSave(); });
     on('btn-free-now', 'click', function () { doFreeNow(); });
     on('btn-space-refresh', 'click', function () { refreshSpace(); });
@@ -6148,6 +6527,7 @@
       document.title = T('app.title');
     }
     wireModal();
+    wirePurgeModal();
     wireLogBox();
     wireRowMenu();
     wireTray();

@@ -53,6 +53,10 @@ pub fn run() {
             commands::links_status,
             commands::tasks_config,
             commands::link_delete,
+            // ★ M19：删除相关数据（预览 / 任务级 / 全局）
+            commands::purge_plan,
+            commands::task_purge,
+            commands::purge_all,
             commands::login_flow,
             // ★ M8.4：托盘 / 通知 / 选择器 / opener / 窗口控制
             commands::m84_info,
@@ -421,7 +425,7 @@ async fn self_test_multi_inner() -> Value {
         .is_some_and(|a| a.iter().any(|t| t["task"]["id"] == "t2"));
 
     // 移除连接：先探测（有任务时只回 needs_confirm、不删），确认后才真删。
-    let del_probe = commands::link_delete("nas2".into(), None)
+    let del_probe = commands::link_delete("nas2".into(), None, None)
         .await
         .unwrap_or(Value::Null);
     let probe_needs_confirm = del_probe["needs_confirm"].as_bool() == Some(true)
@@ -431,7 +435,7 @@ async fn self_test_multi_inner() -> Value {
         .unwrap_or(Value::Null)["tasks"]
         .as_array()
         .is_some_and(|a| a.iter().any(|t| t["task"]["id"] == "t2"));
-    let del_done = commands::link_delete("nas2".into(), Some(true))
+    let del_done = commands::link_delete("nas2".into(), Some(true), None)
         .await
         .unwrap_or(Value::Null);
     let delete_ok = del_done["deleted"].as_bool() == Some(true)
@@ -480,6 +484,211 @@ async fn self_test_multi_inner() -> Value {
         "link_delete_ok": delete_ok,
         "stop_all_ok": stopped_ok,
         "note": "假连接 127.0.0.1:1：只验证多 daemon/任务隔离，不验证 NAS 同步",
+    })
+}
+
+/// ★ M19「删除相关数据」自检（`qxync-gui --self-test-purge`）：无窗口、无 daemon、无 NAS。
+///
+/// 直接用隔离的 XDG 目录跑**真实命令函数**（`purge_plan` / `task_purge` /
+/// `link_delete(purge_data=true)` / `purge_all`），证明三件事：
+/// 1. 计划里有「任务登记 + 水合缓存 + 同步状态」，体积/行数不是 0；
+/// 2. 执行后这些真的没了，而**挂载点里的用户文件一个都没少**（这是本功能的安全底线）；
+/// 3. 三个作用域都能把对应目录收干净（连接级留下空父目录是有意的，见文档）。
+pub fn self_test_purge() -> bool {
+    let root = std::env::temp_dir().join(format!("qxync-gui-purge-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    for d in ["config/qxync/links", "data", "state", "run", "mnt/home"] {
+        let _ = std::fs::create_dir_all(root.join(d));
+    }
+    // 进程跑完就退出，env 改动没有副作用；必须在任何 `ConfigPaths::discover()` 之前设好。
+    std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
+    std::env::set_var("XDG_DATA_HOME", root.join("data"));
+    std::env::set_var("XDG_STATE_HOME", root.join("state"));
+    std::env::set_var("XDG_RUNTIME_DIR", root.join("run"));
+    std::env::remove_var("QXNYC_SOCKET");
+
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            println!(
+                "{}",
+                json!({"ok": false, "error": format!("建 tokio 运行时失败: {e}")})
+            );
+            return false;
+        }
+    };
+    let out = rt.block_on(self_test_purge_inner(&root));
+    let ok = out["ok"].as_bool().unwrap_or(false);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".into())
+    );
+    let _ = std::fs::remove_dir_all(&root);
+    ok
+}
+
+async fn self_test_purge_inner(root: &std::path::Path) -> Value {
+    let cfg = root.join("config/qxync");
+    let data = root.join("data/qxync");
+    let state = root.join("state/qxync");
+    let mnt = root.join("mnt/home");
+    let ns = "nas.local";
+    let link = json!({
+        "id": "default", "host": ns, "port": 1u16, "https": false, "insecure": true,
+        "user": "u", "ipv4_only": true,
+    });
+    let write_link = || -> std::io::Result<()> {
+        std::fs::write(
+            cfg.join("links/default.json"),
+            serde_json::to_vec_pretty(&link).unwrap(),
+        )
+    };
+    let task = || -> Value {
+        json!({
+            "id": "home", "link_id": "default", "name": "home", "enabled": true,
+            "mountpoint": mnt.display().to_string(),
+            "cache_dir": data.join("cache/tasks/default/home").display().to_string(),
+            "root": "/home", "read_write": false, "cache_mode": "pagecache",
+            "conflict": "rename_local", "direction": "2way",
+        })
+    };
+    let write_task = || -> std::io::Result<()> {
+        std::fs::write(
+            cfg.join("tasks/home.json"),
+            serde_json::to_vec_pretty(&task()).unwrap(),
+        )
+    };
+    // 用户放在挂载点里的文件：任何作用域都不许删它。
+    let keep = mnt.join("keep.txt");
+    for step in [
+        cfg.join("tasks"),
+        data.join("cache/tasks/default/home").join(ns).join("sub"),
+        state.join("log"),
+    ] {
+        if let Err(e) = std::fs::create_dir_all(&step) {
+            return json!({"ok": false, "error": format!("建目录 {} 失败: {e}", step.display())});
+        }
+    }
+    if let Err(e) = write_link().and_then(|_| write_task()) {
+        return json!({"ok": false, "error": format!("写配置失败: {e}")});
+    }
+    if let Err(e) = std::fs::write(&keep, "user data") {
+        return json!({"ok": false, "error": format!("写挂载点文件失败: {e}")});
+    }
+    let cache_file = data.join("cache/tasks/default/home").join(ns).join("a.bin");
+    let _ = std::fs::write(&cache_file, b"hello");
+    let _ = std::fs::write(
+        data.join("cache/tasks/default/home")
+            .join(ns)
+            .join("sub/b.bin"),
+        b"x",
+    );
+
+    // ① 任务级：计划 → 执行
+    let plan = commands::purge_plan("task".into(), Some("default".into()), Some("home".into()))
+        .await
+        .unwrap_or(Value::Null);
+    let plan_kinds: Vec<String> = plan["items"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|i| i["kind"].as_str().unwrap_or("?").to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    let plan_has_cache = plan_kinds.iter().any(|k| k == "cache");
+    let plan_optional_bytes = plan["optional_bytes"].as_u64().unwrap_or(0);
+    let purged_task = commands::task_purge(Some("default".into()), "home".into())
+        .await
+        .unwrap_or(Value::Null);
+    let task_ok = purged_task["purged"].as_bool() == Some(true)
+        && purged_task["files"].as_u64().unwrap_or(0) >= 2
+        && !cfg.join("tasks/home.json").exists()
+        && !cache_file.exists()
+        && keep.exists()
+        && plan_has_cache
+        && plan_optional_bytes > 0;
+
+    // ② 连接级：重建任务与数据，确认 purge_data 后整条连接的数据都收干净
+    let _ = write_link().and_then(|_| write_task());
+    for (path, body) in [
+        (data.join("sync").join(ns).join("sync.db"), "db"),
+        (data.join("cache").join(ns).join("x.bin"), "cache"),
+        (data.join("upload-queue").join(ns).join("queue.db"), "q"),
+        (state.join("log/qxyncd.log.1"), "log"),
+    ] {
+        let _ = std::fs::create_dir_all(path.parent().unwrap());
+        let _ = std::fs::write(path, body);
+    }
+    let plan_link = commands::purge_plan("link".into(), Some("default".into()), None)
+        .await
+        .unwrap_or(Value::Null);
+    let link_kinds: Vec<String> = plan_link["items"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|i| i["kind"].as_str().unwrap_or("?").to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    let del = commands::link_delete("default".into(), Some(true), Some(true))
+        .await
+        .unwrap_or(Value::Null);
+    let link_ok = del["deleted"].as_bool() == Some(true)
+        && del["purged"]["files"].as_u64().unwrap_or(0) >= 3
+        && !cfg.join("links/default.json").exists()
+        && !data.join("sync").join(ns).exists()
+        && !data.join("cache").join(ns).exists()
+        && !data.join("upload-queue").join(ns).exists()
+        && keep.exists()
+        && ["sync", "cache", "queue", "log"]
+            .iter()
+            .all(|k| link_kinds.iter().any(|x| x == k));
+
+    // ③ 全局：清完 config/data/state 三个根，挂载点仍然保留
+    let _ = write_link().and_then(|_| write_task());
+    let _ = std::fs::create_dir_all(data.join("sync").join(ns));
+    let _ = std::fs::write(data.join("sync").join(ns).join("sync.db"), "db");
+    let plan_all = commands::purge_plan("all".into(), None, None)
+        .await
+        .unwrap_or(Value::Null);
+    let all_plan_ok = plan_all["items"].as_array().map(Vec::len).unwrap_or(0) >= 3;
+    let wiped = commands::purge_all().await.unwrap_or(Value::Null);
+    let all_ok = wiped["purged"].as_bool() == Some(true)
+        && all_plan_ok
+        && !cfg.exists()
+        && !data.exists()
+        && !state.exists()
+        && keep.exists();
+
+    json!({
+        "ok": task_ok && link_ok && all_ok,
+        "task": {
+            "ok": task_ok,
+            "plan_kinds": plan_kinds,
+            "plan_optional_bytes": plan_optional_bytes,
+            "purged": purged_task["purged"],
+            "bytes": purged_task["bytes"],
+            "files": purged_task["files"],
+            "db_rows": purged_task["db_rows"],
+        },
+        "link": {
+            "ok": link_ok,
+            "plan_kinds": link_kinds,
+            "purged_files": del["purged"]["files"],
+            "purged_bytes": del["purged"]["bytes"],
+        },
+        "all": {
+            "ok": all_ok,
+            "plan_items": plan_all["items"].as_array().map(Vec::len),
+            "bytes": wiped["bytes"],
+            "files": wiped["files"],
+        },
+        "mountpoint_kept": keep.exists(),
+        "note": "隔离 XDG；证明删除相关数据不会动挂载点里的用户文件",
     })
 }
 
@@ -700,8 +909,34 @@ pub fn ui_spec() -> Value {
     });
     let task_defaults_ok = task_defaults["ok"].as_bool().unwrap_or(false);
 
+    // 6) ★ M19：删除相关数据 —— 三条入口（任务卡 / 连接行 / 危险区）必须真的接到
+    //    预览 + 执行命令上，而且共用一个必须能显示清单的弹窗。只检查「有没有按钮」
+    //    不够：弹窗缺 `purge-items` 时用户看不到会删什么，等于盲删。
+    let purge_ok = index.contains("id=\"purge-modal\"")
+        && index.contains("id=\"purge-items\"")
+        && index.contains("id=\"purge-opt\"")
+        && index.contains("id=\"btn-purge-all\"")
+        && app.contains("function openPurgeDialog")
+        && app.contains("purge_plan")
+        && app.contains("task_purge")
+        && app.contains("purge_all")
+        && app.contains("purgeData");
+    let purge = json!({
+        "ok": purge_ok,
+        "modal": index.contains("purge-modal"),
+        "items_slot": index.contains("purge-items"),
+        "opt_checkbox": index.contains("purge-opt"),
+        "danger_button": index.contains("btn-purge-all"),
+        "dialog_helper": app.contains("function openPurgeDialog"),
+        "plan_call": app.contains("'purge_plan'"),
+        "task_exec": app.contains("'task_purge'"),
+        "all_exec": app.contains("'purge_all'"),
+        "link_purge_flag": app.contains("purgeData"),
+    });
+    let purge_ok = purge["ok"].as_bool().unwrap_or(false);
+
     json!({
-        "ok": sinks.is_empty() && i18n_ok && a11y_ok && states_ok && task_defaults_ok,
+        "ok": sinks.is_empty() && i18n_ok && a11y_ok && states_ok && task_defaults_ok && purge_ok,
         "html_sinks": sinks,
         "i18n": {
             "ok": i18n_ok,
@@ -716,6 +951,7 @@ pub fn ui_spec() -> Value {
         "a11y": a11y,
         "states": states,
         "task_defaults": task_defaults,
+        "purge": purge,
     })
 }
 

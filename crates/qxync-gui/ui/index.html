@@ -616,6 +616,18 @@
               <p class="note" id="unsupported-note" hidden></p>
             </div>
           </div>
+
+          <!-- ★ 危险区：删除本机所有 qxync 数据（连接 / 凭据 / 任务 / 缓存 / 同步状态 / 日志）。
+               放在高级分区**最后**：破坏性操作不跟日常设置混在一起；NAS 数据与挂载点不动。 -->
+          <div class="card danger-card">
+            <h2 data-i18n="danger.title">危险区</h2>
+            <p class="hint" data-i18n="danger.hint">
+              删除本机所有 qxync 数据（连接 / 凭据 / 任务 / 缓存 / 同步状态 / 日志）；NAS 上的数据与挂载点里的文件不动。
+            </p>
+            <div class="btn-row">
+              <button type="button" id="btn-purge-all" class="danger" data-i18n="danger.purge_all">删除本机所有 qxync 数据…</button>
+            </div>
+          </div>
         </div>
 
         <!-- ---------------- 设置 6：释放空间（Qsync「释放空间」tab） ---------------- -->
@@ -967,6 +979,29 @@
     </div>
     <ul class="plain-list mono" id="nas-picker-list"></ul>
     <p class="empty-hint" id="nas-picker-empty" hidden data-state="ready"></p>
+  </div>
+</div>
+
+<!-- ===================== 删除 / 移除：可一并删除相关数据（purge） =====================
+     任务卡「删除…」、连接行「移除」、设置→高级「删除本机所有 qxync 数据…」共用这一个弹窗。
+     条目全部由 app.js 用 createElement/textContent 构造（label 用文本、路径用 mono 样式），
+     不碰 innerHTML；复选框默认不勾选 = 保持旧行为。危险操作（purge_all）必须勾选才允许确认。 -->
+<div id="purge-modal" class="modal" hidden>
+  <div class="modal-card modal-wide" role="dialog" aria-modal="true" aria-labelledby="purge-title">
+    <h3 id="purge-title" data-i18n="purge.title">删除确认</h3>
+    <p id="purge-message" class="hint"></p>
+    <ul class="plain-list" id="purge-items"></ul>
+    <p id="purge-extra" class="hint" hidden></p>
+    <div id="purge-warn" class="alert-stack"></div>
+    <label class="check purge-opt">
+      <input type="checkbox" id="purge-opt">
+      <span id="purge-opt-label"></span>
+    </label>
+    <p id="purge-opt-hint" class="hint" hidden></p>
+    <div class="btn-row">
+      <button type="button" id="purge-ok" class="primary danger" data-i18n="purge.confirm_delete">删除</button>
+      <button type="button" id="purge-cancel" data-i18n="modal.cancel">取消</button>
+    </div>
   </div>
 </div>
 

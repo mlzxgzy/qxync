@@ -143,7 +143,7 @@
     'task.act_add': '＋ 添加任务',
     'task.act_add_pair': '＋ 添加配对文件夹',
     'task.act_settings': '设置',
-    'task.act_delete': '删除登记',
+    'task.act_delete': '删除…',
 
     // ---- 三态（节省空间模式）
     'state.online': '仅在线',
@@ -379,7 +379,53 @@
     'settings.broadcast': '已写入 {ok}/{total} 个运行中的 daemon',
     'decisions.resolved_pending': '（已裁决，待执行）',
     'decisions.pending': '（待裁决）',
-    'decisions.clear_partial': '；{n} 个连接失败'
+    'decisions.clear_partial': '；{n} 个连接失败',
+
+    // ---- ★ 删除 / 移除：可一并删除相关数据（purge）
+    // 三层（任务卡 / 连接行 / 设置→高级）共用一套弹窗，只有标题、说明与复选框文案不同。
+    // 复选框默认**不勾选** = 保持旧行为（只删登记/连接，本地数据留着）。
+    'purge.title': '删除确认',
+    'purge.confirm_delete': '删除',
+    'purge.confirm_remove': '移除',
+    'purge.task_title': '删除任务「{id}」？',
+    'purge.task_message': '先卸载挂载点，再删除这条任务登记。NAS 上的文件与挂载点里的文件都不会删。',
+    'purge.link_title': '移除连接「{label}」？',
+    'purge.link_message': '会停止 daemon、卸载挂载点、删除该连接的 {n} 个任务登记。NAS 上的文件与挂载点里的文件都不会删。',
+    'purge.all_title': '删除本机所有 qxync 数据？',
+    'purge.all_message': '不可恢复；会先停止所有 daemon。NAS 上的数据与挂载点里的文件不动。',
+    'purge.opt_task': '同时删除相关数据（水合缓存 / 同步状态 / 日志）· 约 {size}',
+    'purge.opt_link': '同时删除该连接的全部本地数据（缓存 / 同步状态 / 队列 / 日志）· 约 {size}',
+    'purge.opt_all': '我了解这会清空所有连接与任务，且不可恢复',
+    'purge.opt_hint': '不勾选 = 只删登记 / 连接本身，本地数据（缓存、同步状态、日志等）保留。',
+    'purge.optional_mark': '仅勾选后删除',
+    'purge.total': '{files} 个文件 · {size}',
+    'purge.db_rows': 'baseline {baseline} 条 / 日志 {journal} 条 / 待裁决 {decisions} 条',
+    'purge.warn_prefix': '注意：',
+    'purge.done_task': '已删除任务 {id}，并清除相关数据（{size} · {files} 个文件）',
+    'purge.done_task_kept': '已删除任务 {id}（本地数据保留）',
+    'purge.done_link': '已移除连接 {label}，并清除本地数据（{size} · {files} 个文件）',
+    'purge.done_all': '已删除本机所有 qxync 数据（{size} · {files} 个文件）',
+    // 条目「种类」：未知 kind 回落到后端给的原字符串（绝不显示成 key）
+    'purge.kind.task': '任务登记',
+    'purge.kind.link': '连接配置',
+    'purge.kind.credentials': '凭据',
+    'purge.kind.peers': 'LAN 对端记录',
+    'purge.kind.cache': '水合缓存',
+    'purge.kind.sync': '同步状态',
+    'purge.kind.queue': '待裁决队列',
+    'purge.kind.log': '日志',
+    'purge.kind.mounts': '挂载点',
+    'purge.kind.socket': 'socket',
+    'purge.kind.pid': 'pid 文件',
+    'purge.kind.config': '配置目录',
+    'purge.kind.data': '数据目录',
+    'purge.kind.state': '状态目录',
+
+    // ---- ★ 设置 → 高级：危险区
+    'danger.title': '危险区',
+    'danger.hint': '删除本机所有 qxync 数据（连接 / 凭据 / 任务 / 缓存 / 同步状态 / 日志）；NAS 上的数据与挂载点里的文件不动。',
+    'danger.purge_all': '删除本机所有 qxync 数据…',
+    'danger.opt': '我了解这会清空所有连接与任务，且不可恢复'
   };
 
   // ---------------------------------------------------------------- en（预留）

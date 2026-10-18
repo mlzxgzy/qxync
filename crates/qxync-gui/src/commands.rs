@@ -829,29 +829,201 @@ pub async fn tasks_config(link_id: String) -> Result<Value, String> {
     serde_json::to_value(data).map_err(|e| e.to_string())
 }
 
+/// ★ M19：某个连接的全部 id（含「文件在但解析失败」的兜底）。
+fn all_link_ids_for(p: &ConfigPaths, link_id: &str) -> Vec<String> {
+    let (all_links, _bad) = LinkConfig::list(p);
+    let mut ids: Vec<String> = all_links.into_iter().map(|l| l.id).collect();
+    if !ids.iter().any(|id| id == link_id) {
+        ids.push(link_id.to_string());
+    }
+    ids.sort();
+    ids
+}
+
+/// ★ M19：某个连接的任务（按 id 排序）。
+fn tasks_for_link(
+    p: &ConfigPaths,
+    link_id: &str,
+) -> (Vec<qxync_core::Task>, Vec<(PathBuf, String)>) {
+    let ids = all_link_ids_for(p, link_id);
+    qxync_core::tasks::Task::list_for_link(p, link_id, &ids)
+}
+
+/// ★ M19：只读打开某个连接的状态库（预览用；库不存在返回 `None`，绝不新建）。
+fn open_link_db(p: &ConfigPaths, link: &LinkConfig) -> Option<qxync_core::Store> {
+    let db = p.sync_dir_for(link).join(qxync_core::store::DB_FILE);
+    qxync_core::Store::open_readonly(db).ok().flatten()
+}
+
+/// ★ M19：预览「删除相关数据」将删什么（task / link / all）。
+///
+/// **只读**：不删任何东西、不停 daemon、不建目录。GUI 用它把清单和体积摆给用户确认。
+#[tauri::command]
+pub async fn purge_plan(
+    scope: String,
+    link_id: Option<String>,
+    task_id: Option<String>,
+) -> Result<Value, String> {
+    let p = paths()?;
+    let plan = match scope.as_str() {
+        qxync_core::purge::SCOPE_TASK => {
+            let lid = link_id
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "task 作用域需要 linkId".to_string())?;
+            let tid = task_id
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "task 作用域需要 taskId".to_string())?;
+            let link = LinkConfig::load(&p, &lid).map_err(|e| e.to_string())?;
+            let t = qxync_core::Task::load(&p, &tid).map_err(|e| e.to_string())?;
+            let (others, _bad) = tasks_for_link(&p, &lid);
+            let db = open_link_db(&p, &link);
+            qxync_core::purge::plan_task(&p, &link, &t, &others, db.as_ref())
+        }
+        qxync_core::purge::SCOPE_LINK => {
+            let lid = link_id
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "link 作用域需要 linkId".to_string())?;
+            let link = LinkConfig::load(&p, &lid).map_err(|e| e.to_string())?;
+            let (tasks, _bad) = tasks_for_link(&p, &lid);
+            qxync_core::purge::plan_link(&p, &link, &tasks)
+        }
+        qxync_core::purge::SCOPE_ALL => {
+            let (links, _bad) = LinkConfig::list(&p);
+            qxync_core::purge::plan_all(&p, &links)
+        }
+        other => {
+            return Err(format!(
+                "未知的 purge 作用域：{other:?}（只支持 task / link / all）"
+            ))
+        }
+    };
+    qxync_core::purge::validate_plan(&plan).map_err(|e| e.to_string())?;
+    serde_json::to_value(plan).map_err(|e| e.to_string())
+}
+
+/// ★ M19：删除一条任务**及其相关数据**（登记 + 水合缓存 + baseline / 日志 / 待裁决）。
+///
+/// **daemon 在跑时一定走 IPC**：挂载表、`SyncState` 内存副本都在它手里；
+/// 绕过它删缓存/库行会被下一轮 `persist` 写回来，而且正在挂载的缓存不能从下面抽走。
+/// daemon 不在时直接操作磁盘（此时挂载会话也已不在）。
+#[tauri::command]
+pub async fn task_purge(link_id: Option<String>, task_id: String) -> Result<Value, String> {
+    let p = paths()?;
+    let t = qxync_core::Task::load(&p, &task_id).map_err(|e| e.to_string())?;
+    let (all_links, _bad) = LinkConfig::list(&p);
+    let ids: Vec<String> = all_links.into_iter().map(|l| l.id).collect();
+    let lid = link_id
+        .filter(|s| !s.is_empty())
+        .or_else(|| t.effective_link_id(&ids))
+        .unwrap_or_else(|| "default".into());
+    let link = LinkConfig::load(&p, &lid).map_err(|e| e.to_string())?;
+    let (others, _bad) = tasks_for_link(&p, &lid);
+
+    let socket = ipc::socket_path_for(&lid);
+    if ipc::available(&socket).await {
+        return ipc::call_typed::<Value>(
+            &socket,
+            Request::Tasks {
+                action: "purge".into(),
+                id: Some(task_id),
+                task: None,
+            },
+        )
+        .await
+        .map_err(|e| e.message);
+    }
+
+    // daemon 没在跑：本进程直接算计划并执行。
+    let db = open_link_db(&p, &link);
+    let plan = qxync_core::purge::plan_task(&p, &link, &t, &others, db.as_ref());
+    qxync_core::purge::validate_plan(&plan).map_err(|e| e.to_string())?;
+    let out = qxync_core::purge::execute(&plan);
+    qxync_core::purge::forget_mount_record(&p, &link, &t.mountpoint);
+
+    let root = t.effective_root();
+    let shared_root = others
+        .iter()
+        .filter(|o| o.id != t.id)
+        .any(|o| o.effective_root() == root);
+    let mut rows = qxync_core::purge::PurgeDbRows::default();
+    if !shared_root && db.is_some() {
+        // 上一段用的是只读句柄（预览）；真要删行必须换读写句柄。
+        let db_path = p.sync_dir_for(&link).join(qxync_core::store::DB_FILE);
+        let store = qxync_core::Store::open(&db_path).map_err(|e| e.to_string())?;
+        rows = qxync_core::purge::delete_task_rows(&store, &root).map_err(|e| e.to_string())?;
+    }
+    Ok(json!({
+        "purged": true,
+        "task_id": task_id,
+        "link_id": lid,
+        "unmounted": false,
+        "deleted_paths": out.deleted_paths,
+        "bytes": out.bytes,
+        "files": out.files,
+        "db_rows": {
+            "baseline": rows.baseline,
+            "journal": rows.journal,
+            "decisions": rows.decisions,
+        },
+        "warnings": out.warnings,
+        "notes": out.notes,
+    }))
+}
+
+/// ★ M19：删除本机**所有** qxync 数据（连接 / 凭据 / 任务 / 缓存 / 状态 / 日志）。
+///
+/// 会先停掉所有 daemon；NAS 数据与挂载点目录不动。
+#[tauri::command]
+pub async fn purge_all() -> Result<Value, String> {
+    let p = paths()?;
+    let (links, bad) = LinkConfig::list(&p);
+    for l in &links {
+        let _ = daemon_stop(Some(l.id.clone())).await;
+    }
+    // 解析失败的 link 文件也可能还有 daemon 在跑（删完配置它就成了孤儿进程）。
+    for (path, _err) in &bad {
+        if let Some(id) = path.file_stem().and_then(|s| s.to_str()) {
+            let _ = daemon_stop(Some(id.to_string())).await;
+        }
+    }
+    let plan = qxync_core::purge::plan_all(&p, &links);
+    qxync_core::purge::validate_plan(&plan).map_err(|e| e.to_string())?;
+    let out = qxync_core::purge::execute(&plan);
+    Ok(json!({
+        "purged": true,
+        "deleted_paths": out.deleted_paths,
+        "bytes": out.bytes,
+        "files": out.files,
+        "warnings": out.warnings,
+        "notes": out.notes,
+    }))
+}
+
 /// ★ M16：移除一个连接。
 ///
 /// 安全边界：
 /// * 有本连接的任务时，**必须** `delete_tasks=true` 才继续（先返回 `needs_confirm`，
 ///   此阶段**不停 daemon、不删任何东西**，用户取消后连接仍在运行）；
 /// * 确认后才停 daemon（会真正卸载该连接的挂载点）；
-/// * 只删任务登记 / link / 凭据 / peers；**不删本地文件、不删 NAS 数据、不动 cache/state**。
+/// * 默认只删任务登记 / link / 凭据 / peers；**不删本地文件、不删 NAS 数据、不动 cache/state**。
+/// * ★ M19：`purge_data=true` 时**额外**删除该连接的全部本地数据
+///   （`sync/<ns>` / `cache/<ns>` / `upload-queue/<ns>` / 挂载记录 / 该连接的日志与 socket/pid），
+///   仍然不删本地文件与 NAS 数据。
 #[tauri::command]
-pub async fn link_delete(link_id: String, delete_tasks: Option<bool>) -> Result<Value, String> {
+pub async fn link_delete(
+    link_id: String,
+    delete_tasks: Option<bool>,
+    purge_data: Option<bool>,
+) -> Result<Value, String> {
     if !LinkConfig::is_valid_id(&link_id) {
         return Err(format!("连接 id 不合法：{link_id:?}"));
     }
+    let purge_data = purge_data.unwrap_or(false);
     let p = paths()?;
     let link = LinkConfig::load(&p, &link_id).map_err(|e| e.to_string())?;
 
     // 任务归属要在删 link 之前算：删掉之后 legacy owner 可能就变了。
-    let (all_links, _bad) = LinkConfig::list(&p);
-    let mut ids: Vec<String> = all_links.into_iter().map(|l| l.id).collect();
-    if !ids.iter().any(|id| id == &link_id) {
-        ids.push(link_id.clone());
-    }
-    ids.sort();
-    let (tasks, bad_tasks) = qxync_core::tasks::Task::list_for_link(&p, &link_id, &ids);
+    let (tasks, bad_tasks) = tasks_for_link(&p, &link_id);
     // 坏任务文件也算「有东西可能属于这条连接」：解析不出归属时不能静默删连接，
     // 否则那些文件会变成永远没人管的孤儿。
     if (!tasks.is_empty() || !bad_tasks.is_empty()) && !delete_tasks.unwrap_or(false) {
@@ -872,6 +1044,8 @@ pub async fn link_delete(link_id: String, delete_tasks: Option<bool>) -> Result<
             "note": "移除连接会停止 daemon、卸载挂载点并删除这些任务登记；不会删除本地文件或 NAS 数据",
         }));
     }
+    // 计划要在删任务/连接**之前**算：清单里包含这些文件，删完再算就什么都统计不到了。
+    let plan = purge_data.then(|| qxync_core::purge::plan_link(&p, &link, &tasks));
     // 用户还没确认任务怎么处理时先不动 daemon：取消移除不该把正在同步的连接停掉。
     let stop = daemon_stop(Some(link_id.clone())).await?;
     let mut deleted_tasks = 0usize;
@@ -881,6 +1055,20 @@ pub async fn link_delete(link_id: String, delete_tasks: Option<bool>) -> Result<
         }
     }
     let existed = LinkConfig::delete(&p, &link_id).map_err(|e| e.to_string())?;
+    let purged = match plan {
+        Some(plan) => {
+            qxync_core::purge::validate_plan(&plan).map_err(|e| e.to_string())?;
+            let out = qxync_core::purge::execute(&plan);
+            json!({
+                "bytes": out.bytes,
+                "files": out.files,
+                "deleted_paths": out.deleted_paths,
+                "warnings": out.warnings,
+                "notes": out.notes,
+            })
+        }
+        None => Value::Null,
+    };
     Ok(json!({
         "deleted": existed,
         "needs_confirm": false,
@@ -889,7 +1077,12 @@ pub async fn link_delete(link_id: String, delete_tasks: Option<bool>) -> Result<
         "user": link.user,
         "tasks_deleted": deleted_tasks,
         "stopped": stop,
-        "note": "已删除连接与任务登记；本地文件 / NAS 数据 / cache / 状态库均未删除",
+        "purged": purged,
+        "note": if purge_data {
+            "已删除连接、任务登记与该连接的全部本地数据；本地文件 / NAS 数据未删除"
+        } else {
+            "已删除连接与任务登记；本地文件 / NAS 数据 / cache / 状态库均未删除"
+        },
     }))
 }
 

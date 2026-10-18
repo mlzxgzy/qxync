@@ -1362,3 +1362,42 @@ button.ghost:hover { color: var(--fg-dim); }
 @media (prefers-reduced-motion: reduce) {
   * { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
 }
+
+/* ============================================================================
+ * ★ purge（删除 / 移除：可一并删除相关数据）
+ *
+ * 三层共用 #purge-modal：任务卡「删除…」、连接行「移除」、设置→高级「删除本机所有…」。
+ * 列表要能滚动（一个连接可能有几十个任务登记 / 缓存条目），路径用 mono 且允许断行，
+ * 「仅勾选后删除」的条目标黄，确认按钮是**实心红**（primary + danger 同时出现时，
+ * 原来的 `button.danger` 会把背景改回透明 —— 危险操作的最终确认要一眼能认出来）。
+ * ==========================================================================*/
+#purge-items {
+  max-height: 240px;
+  overflow: auto;
+  word-break: break-word;
+}
+
+.purge-item { margin: 3px 0; }
+.purge-item-label { color: var(--fg); }
+.purge-item-path { color: var(--fg-dim); }
+.purge-item-size { color: var(--fg-faint); }
+.purge-item-mark { margin-left: 4px; }
+.purge-item-opt .purge-item-label { color: var(--warn); }
+.purge-item .badge { vertical-align: baseline; }
+
+.purge-opt { margin: 10px 0 2px; align-items: flex-start; }
+.purge-opt input { margin-top: 1px; }
+
+button.primary.danger {
+  background: var(--err);
+  border-color: var(--err);
+  color: var(--accent-fg);
+}
+button.primary.danger:hover:not(:disabled) {
+  background: var(--err);
+  border-color: var(--err);
+  filter: brightness(1.08);
+}
+
+/* 危险区卡片：左侧一条红边，和普通设置卡片区分开（内层仍是同一套卡片样式） */
+.danger-card { border-left: 3px solid var(--err); }

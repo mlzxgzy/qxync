@@ -22,6 +22,10 @@ fn main() {
         std::process::exit(if qxync_gui::self_test_multi() { 0 } else { 1 });
     }
     // ★ M8.4：通知链路的无窗口自检（真发一条，供 dbus-monitor 抓 Notify 调用）。
+    // ★ M19：删除相关数据（任务 / 连接 / 全部）的无窗口自检
+    if args.iter().any(|a| a == "--self-test-purge") {
+        std::process::exit(if qxync_gui::self_test_purge() { 0 } else { 1 });
+    }
     if args.iter().any(|a| a == "--self-test-notify") {
         std::process::exit(if qxync_gui::self_test_notify() { 0 } else { 1 });
     }
