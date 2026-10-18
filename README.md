@@ -260,6 +260,18 @@ Thunar…）打开该任务的本地挂载点：先按 `xdg-mime` 查出默认�
 没有配默认目录工具时回落到 `xdg-open` 那条链。详见
 [`docs/M4-GUI.md`](docs/M4-GUI.md) §4.1.1。
 
+新建任务（「＋ 添加配对文件夹」）的默认值按 **连接 + id** 派生，不同任务不会撞在一起：
+
+| 字段 | 默认值 | 例子（连接 `default`、NAS 选 `/home`） |
+|---|---|---|
+| 任务 id | NAS 文件夹名（重名自动 `-2`） | `home` / `home-2` |
+| 本地文件夹 | `~/qxync/<连接 id>/<任务 id>` | `~/qxync/default/home` |
+| 水合缓存 | `<data_dir>/cache/tasks/<连接 id>/<任务 id>`（父目录） | `~/.local/share/qxync/cache/tasks/default/home` |
+
+表单里先选 NAS 文件夹，id 与两条路径会跟着变；手改过的字段不再被自动覆盖
+（「重置为默认路径」可恢复）。已保存任务的路径不会被搬动。详见
+[`docs/M18-任务默认路径.md`](docs/M18-任务默认路径.md)。
+
 ### 6. 常用命令速查
 
 ```bash

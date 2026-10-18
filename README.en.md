@@ -279,6 +279,19 @@ entry's `Exec=` line before launching (the ID `xdg-mime` prints is not an execut
 it as-is fails). With no default directory handler configured, it falls back to the `xdg-open`
 chain. See [`docs/M4-GUI.md`](docs/M4-GUI.md) §4.1.1.
 
+Defaults for a new task ("+ Add paired folder") are derived from the **connection + task id**, so
+different tasks never collide:
+
+| Field | Default | Example (connection `default`, NAS folder `/home`) |
+|---|---|---|
+| Task id | NAS folder name (suffixed `-2` on collision) | `home` / `home-2` |
+| Local folder | `~/qxync/<connection id>/<task id>` | `~/qxync/default/home` |
+| Hydration cache | `<data_dir>/cache/tasks/<connection id>/<task id>` (parent dir) | `~/.local/share/qxync/cache/tasks/default/home` |
+
+Pick the NAS folder first — the id and both paths follow it; fields you edit by hand are not
+overwritten ("reset to default paths" restores them). Existing tasks are never moved. See
+[`docs/M18-任务默认路径.md`](docs/M18-任务默认路径.md) (Chinese).
+
 ### 6. Common commands cheat sheet
 
 ```bash

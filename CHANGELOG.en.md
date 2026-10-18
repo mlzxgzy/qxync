@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **New-task default paths are derived from the connection and the task id (M18)**: previously
+  the task id, local folder and hydration cache dir all had the *same* default for every task
+  (`default` / `~/qxync-mnt` / the per-connection cache root), so the second task always collided
+  on the id or the mountpoint and you had to edit three fields by hand. Now:
+  - the task id is taken from the NAS folder name (`/home` → `home`, suffixed `-2` on collision);
+  - the local folder is `~/qxync/<connection id>/<task id>`;
+  - the hydration cache is `<data_dir>/cache/tasks/<connection id>/<task id>` (a **parent**
+    directory; the daemon still appends the M16 per-connection namespace on disk);
+  - the form asks for the NAS folder first; changing it (or the connection) re-derives the rest,
+    **fields you edited by hand are never overwritten** (use "reset to default paths" to restore),
+    and editing an existing task derives nothing;
+  - saving is blocked when the id is empty, illegal, or already used by another task, so a new
+    task can no longer silently overwrite one;
+  - no existing task is moved, and the task file format gains **no new fields** (downgrading is
+    compatible). See [M18-任务默认路径.md](docs/M18-任务默认路径.md) (Chinese).
+
+### Fixed
+
+- **Creating a new task could silently overwrite another one**: `tasks/<id>.json` is a globally
+  unique file name, while the GUI's new-task form always defaulted the id to `default` — creating
+  a second task on the same connection replaced the first task's record while the mount table
+  still used the old task's root (record and mount disagree, invisibly). The GUI now rejects a
+  duplicate id before saving (editing an existing task is unaffected).
+
 ## [0.6.2] - 2026-10-18
 
 ### Added
