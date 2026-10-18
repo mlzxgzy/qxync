@@ -1,0 +1,113 @@
+qxync for Debian / Ubuntu —— 安装后怎么用
+==========================================
+
+（本文件装到 /usr/share/doc/qxync/README.Debian，维护者信息见同目录 README.md）
+
+本包是预编译包：里面的二进制直接来自上游在 GitHub Release 发布的
+`qxync-<版本>-x86_64-unknown-linux-gnu.tar.gz`，没有在 Debian 上重新编译，也**没有 strip**
+（保留 line-tables-only 调试信息，报 bug 时贴的回溯才可读）。因此装完体积约 187 MiB（debian 的 Installed-Size 约 191908 KiB），
+这是有意为之，不是打包漏了 strip。
+
+装了哪三个程序
+--------------
+  /usr/bin/qxync       命令行（挂载 / 卸载 / 脱水 / 查看状态）
+  /usr/bin/qxyncd      常驻同步守护进程（user 服务）
+  /usr/bin/qxync-gui   桌面图形界面
+
+另外还装了：
+  /usr/share/applications/qxync.desktop           应用菜单项
+  /usr/share/icons/hicolor/{32,128,256,512}/apps/qxync.png
+  /usr/lib/systemd/user/qxyncd.service            default 连接
+  /usr/lib/systemd/user/qxyncd@.service           多 NAS 的模板单元
+
+一、先配连接
+------------
+图形界面：应用菜单里搜 qxync；首次使用在「设置 → 连接」里填 NAS 地址 / 用户名 / 口令，
+点「保存并登录」。
+
+命令行：`qxync links` 列出所有连接（配连接用图形界面，详见 `qxync --help` 与 README.md）。
+
+二、把同步守护交给 systemd（推荐）
+----------------------------------
+单元文件已经装好了，但**不会自动启用** —— 它是 **user 单元**（不是 system 单元），
+得在你自己的登录会话里开，普通用户即可，**不需要 root**：
+
+    systemctl --user enable --now qxyncd      # 登录即启动，现在就启动
+    systemctl --user status qxyncd
+    journalctl --user -u qxyncd -f            # 跟日志
+
+想让它**不登录也常驻**（开机就起、注销也不停）：
+
+    sudo loginctl enable-linger "$USER"
+
+「我想让同步重新跑起来」请用：
+
+    systemctl --user reload qxyncd            # = SIGHUP，重载同步引擎，挂载点一秒都不中断
+
+不要用 restart：restart 会「停旧进程 → 等它退出 → 起新进程」，守护进程按设计不会在
+SIGTERM 后立刻退出，于是会等到 TimeoutStopSec 再被 SIGKILL —— 挂载点照样断
+（断掉之后由启动时的自动重挂恢复）。
+
+没有连接配置时 qxyncd 会「空转待命」（不做事但一直活着），所以不需要等网络、也不需要等
+登录，配好连接后它会自己转入同步，不用重启服务。
+
+三、多台 NAS：一条连接一个 daemon
+---------------------------------
+上面装的是 **default** 连接的单元。额外连接用模板单元（<link_id> 是连接名，对应
+~/.config/qxync/links/<link_id>.json，例如 nas2）：
+
+    systemctl --user enable --now qxyncd@nas2
+    systemctl --user status qxyncd@nas2
+    journalctl --user -u qxyncd@nas2 -f
+
+* default 仍用 qxyncd.service，**别**再启用 qxyncd@default（同一条连接会被拉起两个进程，
+  第二个会发现 socket 被占用然后退出，日志里会看到反复重启）。
+* 每条连接一个独立 daemon（独立 socket / pid / 日志），停掉一条不影响其它连接。
+* 图形界面里也能启动 / 停止每个连接：「设置 → 连接」的连接列表。
+
+四、别和 qxync daemon start/stop 混用
+-------------------------------------
+装了 systemd 单元之后，请用 systemctl 管 qxyncd。`qxync daemon start/stop` 是给
+「没有 systemd 单元」的场景准备的：`qxync daemon stop` 会让进程自己退出，
+systemd 看到主进程消失就会按 Restart 策略把它拉起来 —— 两边同时用只会互相打架。
+同理，也别让 GUI 的「启动 / 停止」和 systemd 同时管同一条连接。
+
+五、卸载
+--------
+dpkg -r qxync / apt-get remove qxync 只删程序与本包文档，**不删**：
+
+    ~/.config/qxync/         连接配置、凭据、挂载记录（mounts.json）
+    ~/.local/share/qxync/    缓存、队列、journal、日志
+    FUSE 挂载点
+
+需要清干净的话先逐条 `qxync umount <挂载点>` 卸载（`qxync links` 可看出有哪些连接），再卸载包，
+然后自行删除上面两个目录。卸载前请先 `systemctl --user disable --now qxyncd`。
+
+六、依赖与已知边界
+------------------
+本包的 Depends 是在**打包基线**（Ubuntu 22.04 / Debian 12，取最老的目标发行版）里用
+dpkg-shlibdeps 对三个二进制实测出来的，另外手工加了 `fuse3`（挂载 / 卸载要调
+fusermount3，而二进制本身不链接 libfuse）。
+
+**只有一个包**，不再按发行版拆变体（两个基线算出的依赖逐字相同，payload 也逐字节相同）：
+
+    qxync_<版本>-1_amd64.deb
+
+适用发行版（都是同一条安装命令）：
+
+    Debian 12 (bookworm) / Debian 13 (trixie)
+    Ubuntu 22.04 (jammy) / Ubuntu 24.04 (noble) / Ubuntu 26.04
+
+    sudo apt-get install -y ./qxync_<版本>-1_amd64.deb
+
+* 上游二进制是在 Ubuntu 22.04 上构建的，要求 glibc ≥ 2.34 的 x86_64 Linux；
+  Debian 12（2.36）/ Ubuntu 22.04（2.35）都满足，更老的发行版（Debian 11 / Ubuntu 20.04，
+  glibc 2.31）**跑不了**。
+* 更新的发行版（Ubuntu 24.04+ / Debian 13）里 GTK 3 的包名变成了 libgtk-3-0t64，但它
+  `Provides: libgtk-3-0 (= 3.24.x)`，所以同一份带版本下限的 Depends 仍可满足。
+  如果某天不满足，会报 `libgtk-3-0 : Depends: ... but it is not installable` 之类的错误 ——
+  那是发行版改名，不是包坏了。
+* 从旧的双包版本升级（`0.6.4-1~deb12` / `0.6.4-1~ubuntu22.04`）不用手工处理：
+  `~` 在 dpkg 版本比较里排在「什么都没有」之前，所以 `0.6.4-1~deb12 < 0.6.4-1`，
+  老用户 `apt update && apt upgrade` 会直接把单包升上去。
+* 本包**不**装 man page（上游没有写），`--help` 有完整用法。

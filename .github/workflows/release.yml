@@ -1,7 +1,17 @@
 name: Release
 
-# 推 `v*` tag → 自动构建三个二进制并挂到该 tag 的 Release：
-#   qxync / qxyncd / qxync-gui（三个裸二进制 + 一个 tar.gz）+ SHA256SUMS
+# 推 `v*` tag → 自动构建并挂到该 tag 的 Release，共 7 个资产：
+#   qxync-<版本>-x86_64-unknown-linux-gnu.tar.gz        （三个二进制 + 桌面项/图标/许可证/文档）
+#   qxync-bin-<版本>-1-x86_64.pkg.tar.zst                （Arch：真 makepkg 打，并逐项校验内容）
+#   qxync_<版本>-1_amd64.deb                             （Debian 12+ / Ubuntu 22.04+ 通用 amd64）
+#     └ 从**同一份** tar.gz 重打包（不重新编译，二进制与 tar.gz 里逐字节同源），
+#       并在干净容器矩阵里 `apt-get install` 实装、逐项断言通过才发：
+#       debian:12 / debian:13 / ubuntu:22.04 / ubuntu:24.04 / ubuntu:26.04。
+#       只出一个包、却验五个发行版，是因为 Depends 以 ubuntu:22.04 的库（glibc 2.35 基线）
+#       为下限计算；更新的发行版把 GTK 3 等改名为 t64 包并 `Provides` 旧名，
+#       旧名依赖照样满足，所以同一个包能覆盖两个家族的新旧两端（详见实装校验步骤的注释）。
+#   qxync / qxyncd / qxync-gui（三个裸二进制）
+#   SHA256SUMS
 # 手动重跑同一个 tag：Actions → Release → Run workflow，填 tag；同名资产会被覆盖，
 # 不会重复建 Release。Release 正文优先用 `docs/发布说明-<tag>.md`（存在时），
 # 否则用 GitHub 自动生成的 Release Notes。
@@ -23,6 +33,12 @@ env:
   RUST_BACKTRACE: 1
   # tag 是唯一真值：push 事件取 ref（就是 tag 本身），手动跑取输入。
   TAG: ${{ inputs.tag || github.ref_name }}
+  # .deb 构建 / 实装矩阵校验时容器内的 apt 源。维护者在国内，镜像站在国内直连更快、
+  # 也更稳；这是**唯一出处**：每条 docker 命令都用 `--env QXNYC_APT_MIRROR="${APT_MIRROR:-}"`
+  # 传给容器，xtask/release/apt-mirror.sh 按 os-release 在后面接 /debian 或 /ubuntu。
+  # 海外 runner 或镜像不可用时改这里（或直接设空——apt-mirror.sh 会回落到自带的清华默认值）：
+  #   Debian → http://deb.debian.org         Ubuntu → http://archive.ubuntu.com
+  APT_MIRROR: http://mirrors.tuna.tsinghua.edu.cn
 
 # 发版不取消进行中的跑批：宁可排队，也不要留下「产物传了一半」的 Release。
 concurrency:
@@ -129,6 +145,102 @@ jobs:
             [ "$in_pkg" = "$on_disk" ] || { echo "❌ 包里的 $b 与 dist/$b 不一致"; exit 1; }
           done
           echo "✅ Arch 包内容检查通过（${pkgs[0]}）"
+
+      # ── Debian / Ubuntu .deb（单包）────────────────────────────────────────
+      # 与 Arch 包同一个来源：把上一步的 tar.gz 解包后重打包（**不重新编译**），
+      # 所以三个二进制与 tar.gz / Arch 包里的**逐字节同源**（由 package-deb.sh 保证）。
+      # 只出一个包，版本串不带发行版后缀（`<版本>-1`）：Depends 在 ubuntu:22.04 里用
+      # dpkg-shlibdeps 对三个二进制实测（glibc 2.35 是基线）、再手工补 fuse3。
+      # 合并的理由是实测结论：以前 `~deb12` / `~ubuntu22.04` 两个包除 Version 与
+      # changelog 那一行外**逐字节相同**，Depends 串也完全相同 —— 分两个包只会让用户
+      # 选错（同包名装一个就够了），所以合成一个、改为在五个发行版里**实装验证**它。
+      # 容器里先切国内镜像（apt-mirror.sh 用 QXNYC_APT_MIRROR，见文件头 env 注释），
+      # 否则每次构建都要从境外源拉 libwebkit2gtk 等几十个包，慢且容易超时。
+      # 打包容器里会被装上 dpkg-dev / 运行库；所以「装得上」由后面单独起干净容器来证明。
+      - name: 打 .deb（ubuntu:22.04 容器 + 国内镜像，单包通用）
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --volume "$PWD:/work" \
+            --workdir /work \
+            --env VERSION="${TAG#v}" \
+            --env HOST_UID="$(id -u)" \
+            --env HOST_GID="$(id -g)" \
+            --env QXNYC_APT_MIRROR="${APT_MIRROR:-}" \
+            ubuntu:22.04 \
+            bash -lc 'set -euo pipefail; bash xtask/release/apt-mirror.sh && bash xtask/release/package-deb.sh "$VERSION"'
+          ls -l dist/*.deb
+
+      # 打得出包 ≠ 装得上：另起**干净**容器，走用户真实路径
+      # `apt-get install -y ./dist/<deb>`（依赖由该发行版自己的源解析），再逐项断言。
+      # 刻意不复用上面的打包容器 —— 那里已经装了 dpkg-dev 和一堆运行库，
+      # 在那里面装成功证明不了「用户从零也能装」。任一条断言失败即中断发版。
+      #
+      # 为什么一个包要验五个发行版：单包的 Depends 下限是按 ubuntu:22.04 算的，要证明
+      # 「一个包覆盖两个发行版家族的新旧两端」，就得把两端都真装一遍 ——
+      #   * 旧端 debian:12（glibc 2.36）/ ubuntu:22.04（2.35）：Depends 下限本身；
+      #   * 新端 debian:13 / ubuntu:24.04 / ubuntu:26.04：风险点是 **t64 改名**
+      #     （Debian 13 / Ubuntu 24.04+ 把 libgtk-3-0、libgdk-pixbuf-2.0-0、
+      #     libwebkit2gtk-4.1-0 等改成 `*t64` 包，靠 `Provides: <旧名> (= <版本>)`
+      #     满足旧名依赖）。这正是「不加两个包、但要加验证目标」的原因：
+      #     包不变，变的是证明它在新发行版上装得上。
+      - name: 实装校验 .deb（干净容器矩阵：debian:12/13、ubuntu:22.04/24.04/26.04）
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          want_version="${version}-1"
+          deb="qxync_${want_version}_amd64.deb"
+          [ -f "dist/$deb" ] || { echo "❌ 找不到 dist/$deb（打包步骤没产出？）"; ls -l dist/*.deb || true; exit 1; }
+          for image in debian:12 debian:13 ubuntu:22.04 ubuntu:24.04 ubuntu:26.04; do
+            echo "══ 实装校验：$image ← dist/$deb ══"
+            docker run --rm --interactive \
+              --volume "$PWD:/work" \
+              --workdir /work \
+              --env DEBIAN_FRONTEND=noninteractive \
+              --env QXNYC_APT_MIRROR="${APT_MIRROR:-}" \
+              --env DEB_PATH="$deb" \
+              --env WANT_VERSION="$want_version" \
+              "$image" \
+              bash -s <<'INSTALL_CHECK' || { echo "❌ $image 实装校验失败（容器退出码非 0）"; exit 1; }
+          set -euo pipefail
+
+          echo "→ 切国内 apt 镜像"
+          bash xtask/release/apt-mirror.sh
+          apt-get update
+
+          echo "→ apt-get install -y ./dist/$DEB_PATH（依赖由本发行版自己的源解析）"
+          apt-get install -y "./dist/$DEB_PATH"
+
+          echo "→ qxync --version / qxyncd --version"
+          qxync --version
+          qxyncd --version
+
+          echo "→ qxync-gui --self-test：无 daemon 时退出码非 0 属正常，但必须真的跑起来并打印 JSON"
+          gui_out="$(qxync-gui --self-test 2>&1 || true)"
+          printf '%s\n' "$gui_out"
+          [ -n "$gui_out" ] || { echo "❌ qxync-gui --self-test 没有任何输出"; exit 1; }
+          printf '%s' "$gui_out" | grep -q '"ok"' || { echo "❌ qxync-gui --self-test 的输出不是预期的自检 JSON"; exit 1; }
+
+          echo "→ ldd /usr/bin/qxync-gui 不应有 not found"
+          missing="$(ldd /usr/bin/qxync-gui 2>&1 | grep -c "not found" || true)"
+          [ "$missing" -eq 0 ] || { echo "❌ qxync-gui 有 $missing 个动态库 missing："; ldd /usr/bin/qxync-gui 2>&1 | grep "not found"; exit 1; }
+
+          echo "→ dpkg -L qxync 关键文件"
+          for f in /usr/bin/qxync /usr/bin/qxyncd /usr/bin/qxync-gui \
+                   /usr/share/applications/qxync.desktop \
+                   /usr/lib/systemd/user/qxyncd.service \
+                   /usr/lib/systemd/user/qxyncd@.service; do
+            dpkg -L qxync | grep -qxF "$f" || { echo "❌ dpkg -L qxync 里没有 $f"; exit 1; }
+          done
+
+          echo "→ dpkg -s qxync 版本串（单包：不论哪个发行版，Version 都应是 <版本>-1）"
+          installed="$(dpkg -s qxync | awk '/^Version:/ { print $2 }')"
+          [ "$installed" = "$WANT_VERSION" ] || { echo "❌ 已装版本 $installed，期望 $WANT_VERSION"; exit 1; }
+
+          echo "✅ $DEB_PATH 实装校验通过"
+          INSTALL_CHECK
+            echo "✅ $image 实装校验通过（$deb）"
+          done
 
       - name: 生成 SHA256SUMS
         run: |

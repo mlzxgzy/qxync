@@ -1,0 +1,27 @@
+Package: qxync
+Version: @VERSION@
+Architecture: @ARCH@
+Maintainer: Kami <mlzxgzy@gmail.com>
+Installed-Size: @INSTALLED_SIZE@
+Depends: @DEPENDS@
+Section: net
+Priority: optional
+Homepage: https://github.com/mlzxgzy/qxync
+Description: QNAP Qsync-compatible on-demand sync client (prebuilt)
+ qxync is an unofficial, third-party client for QNAP Qsync built on FUSE.
+ It mounts a QNAP NAS share and keeps files as on-demand placeholders:
+ listing a directory does not download file contents, and reading a file
+ fetches only the blocks that are actually read. Fully cached files can be
+ dehydrated again to reclaim local disk space, and a background daemon
+ keeps the mount alive across login session expiry.
+ .
+ This package ships prebuilt binaries (the qxync CLI, the qxyncd per-user
+ daemon and the qxync-gui Tauri application) plus a desktop entry, hicolor
+ icons and systemd user units. It is repackaged from the upstream release
+ tarball without recompilation and without stripping, so the debug symbols
+ needed for readable backtraces are kept in the binaries.
+ .
+ See /usr/share/doc/qxync/README.Debian for service setup (systemd --user,
+ loginctl enable-linger, one daemon per NAS connection) and
+ /usr/share/doc/qxync/DISCLAIMER.md for the trademark and interoperability
+ boundary.

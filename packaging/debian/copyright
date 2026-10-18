@@ -1,0 +1,54 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: qxync
+Upstream-Contact: Kami <mlzxgzy@gmail.com>
+Source: https://github.com/mlzxgzy/qxync
+Comment: qxync is an unofficial, third-party client for QNAP Qsync. It is not
+ affiliated with, endorsed by, sponsored by or supported by QNAP Systems,
+ Inc. It distributes no QNAP binaries, installers or assets. The
+ interoperability and reverse-engineering boundary is documented in
+ /usr/share/doc/qxync/DISCLAIMER.md, which is part of this package.
+ .
+ The binaries shipped in this package were built by the upstream maintainer
+ from the sources published at the URL above and are redistributed unchanged
+ (only repackaged, neither recompiled nor stripped).
+
+Files: *
+Copyright: 2026 Kami <mlzxgzy@gmail.com>
+License: MIT or Apache-2.0
+Comment: Dual-licensed under MIT OR Apache-2.0, at your option; either license
+ may be chosen. The complete MIT text is reproduced below. For Apache-2.0 the
+ canonical text is installed by the base system (see the Apache-2.0 paragraph).
+
+Files: packaging/debian/*
+Copyright: 2026 Kami <mlzxgzy@gmail.com>
+License: MIT or Apache-2.0
+
+License: MIT
+ MIT License
+ .
+ Copyright (c) 2026 Kami (https://github.com/mlzxgzy)
+ .
+ Permission is hereby granted, free of charge, to any person obtaining a copy
+ of this software and associated documentation files (the "Software"), to deal
+ in the Software without restriction, including without limitation the rights
+ to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ copies of the Software, and to permit persons to whom the Software is
+ furnished to do so, subject to the following conditions:
+ .
+ The above copyright notice and this permission notice shall be included in all
+ copies or substantial portions of the Software.
+ .
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ SOFTWARE.
+
+License: Apache-2.0
+ On Debian systems, the complete text of the Apache License, version 2.0
+ can be found in "/usr/share/common-licenses/Apache-2.0".
+ .
+ The full upstream copy of the license is also available at
+ https://www.apache.org/licenses/LICENSE-2.0
