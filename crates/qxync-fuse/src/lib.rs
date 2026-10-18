@@ -576,6 +576,22 @@ struct Node {
     whole_xxhash: u64,
     /// 本地有未上传的改动。
     dirty: bool,
+    /// ★ M17：这个节点在 NAS 上**有没有副本**。
+    ///
+    /// 与 [`Node::dirty`] 是两个不同的事实：`dirty` 说「本地改过、还没传完」，
+    /// 这里说「远端到底有没有这个名字」。两者不能互相推断：
+    /// * 新建但还没传过 → `dirty=true` + `remote_known=false`（KIO 的 `.part` 就是这类）；
+    /// * 传完了还没清脏（还有下一版排队）→ `dirty=true` + `remote_known=true`。
+    ///
+    /// 用途：改名/删除时决定**要不要打服务端**。远端没有老名字时（本地新建后
+    /// 立刻改名/删除，编辑器的原子保存/临时文件都是这个形态），直接本地处理 +
+    /// 把上传队列改到新名字即可，不必「先传一版老的、再远端改名/删除」。
+    ///
+    /// 维护：从远端清单/`stat` 物化的节点天生是 `true`；`create()` 出来的本地
+    /// 新节点是 `false`；上传成功（[`FsHandle::clear_dirty`] /
+    /// [`FsHandle::mark_remote_known`]）置 `true`。不持久化 —— 重启后节点都从
+    /// 远端清单重建，本来就都是 `true`。
+    remote_known: bool,
     /// ★ M15/T8 **同步维度**：本地与远端是否一致。
     ///
     /// ## 为什么它与 [`Node::dirty`] 不是一回事
@@ -1906,14 +1922,32 @@ impl FsHandle {
     /// ★ T8：清脏**不**顺手把 `in_sync` 置 true —— 队列里可能还排着别的作业，
     /// 也可能有待裁决冲突。真正的判定在 [`FsHandle::file_states`]（调
     /// [`combine_in_sync`]），那里会顺手把结果写回节点。宁可这里保守一点。
+    ///
+    /// ★ M17：无论清不清 dirty，都把 `remote_known` 置 true —— 上传成功意味着
+    /// NAS 上**一定**有这个路径了，紧接着的改名/删除必须知道这件事。
     pub fn clear_dirty(&self, remote: &str) {
-        if self.has_pending(remote) {
-            return;
-        }
+        let pending = self.has_pending(remote);
         let mut g = self.inner.lock().unwrap();
         if let Some(ino) = g.by_remote.get(remote).copied() {
             if let Some(n) = g.nodes.get_mut(&ino) {
-                n.set_dirty(false);
+                n.remote_known = true;
+                if !pending {
+                    n.set_dirty(false);
+                }
+            }
+        }
+    }
+
+    /// ★ M17：记住「这个路径在 NAS 上已经有一份」。**不**清 dirty、不推进 baseline。
+    ///
+    /// 给上传成功 hook 用：上传期间本地又被改了（hook 因此不推进 baseline）时，
+    /// 远端确实已经有了这一版 —— 若不记下来，紧接着的「新建后改名」会被误判成
+    /// 「远端没有老副本」，改名不同步到 NAS，留下一个旧名字的幽灵文件。
+    pub fn mark_remote_known(&self, remote: &str) {
+        let mut g = self.inner.lock().unwrap();
+        if let Some(ino) = g.by_remote.get(remote).copied() {
+            if let Some(n) = g.nodes.get_mut(&ino) {
+                n.remote_known = true;
             }
         }
     }
@@ -2896,6 +2930,8 @@ impl QxyncFs {
             file_id: compute_file_id(true, 0, 0, "", ""),
             whole_xxhash: NO_HASH,
             dirty: false,
+            // 挂载根是服务端给的路径，远端显然有它
+            remote_known: true,
             // ★ T8：目录没有「本地改动 / 待上传」这回事，一律视为已同步。
             in_sync: true,
             progress: None,
@@ -3330,10 +3366,34 @@ impl QxyncFs {
         g.nodes.get(&ino).cloned()
     }
 
+    /// 物化一个**远端确实存在**的节点（清单/`stat` 命中）。
+    ///
+    /// 本地新建（`create`）走 [`Self::insert_node_with`] 并传 `remote_known=false` ——
+    /// 见 [`Node::remote_known`] 的说明。
     fn insert_node(&self, parent: INodeNo, name: &str, remote: &str, entry: &DirEntry) -> Node {
+        self.insert_node_with(parent, name, remote, entry, true)
+    }
+
+    /// ★ M17：物化节点，并显式声明「远端有没有这个名字」。
+    ///
+    /// 只有 `create()` 传 `false`（本地新建、还没上传过）；其余入口（远端清单、
+    /// `stat`、`mkdir` 成功后）都传 `true`。
+    ///
+    /// **已存在的节点一律不改 `remote_known`**：`readdir` 也会把「本地清单快照」
+    /// 里的条目递过来（`create()` 会 `listing_upsert`），那些条目可能只是本地新建、
+    /// 还没上传的 —— 在这里翻成 `true` 会让紧接着的改名误以为远端有老副本。
+    /// 真正「远端有了」的时刻只有一个：上传成功回调（[`FsHandle::clear_dirty`]）。
+    fn insert_node_with(
+        &self,
+        parent: INodeNo,
+        name: &str,
+        remote: &str,
+        entry: &DirEntry,
+        remote_known: bool,
+    ) -> Node {
         let mut g = self.inner.lock().unwrap();
-        if let Some(ino) = g.by_remote.get(remote) {
-            if let Some(n) = g.nodes.get(ino) {
+        if let Some(ino) = g.by_remote.get(remote).copied() {
+            if let Some(n) = g.nodes.get(&ino) {
                 return n.clone();
             }
         }
@@ -3358,6 +3418,8 @@ impl QxyncFs {
             file_id: ZERO_FILE_ID,
             whole_xxhash: NO_HASH,
             dirty: false,
+            // 远端清单/stat 物化出来的条目（本地 create 走 `insert_node_with(.., false)`）
+            remote_known,
             // ★ T8：刚从远端清单物化出来的节点 —— 本地无改动、无待传作业、无冲突。
             //   即便判断错了，`FsHandle::file_states` 读的时候还会用
             //   `combine_in_sync` 重算一遍并刷新本字段。
@@ -3646,12 +3708,37 @@ impl QxyncFs {
             );
             return reply.error(fuser::Errno::EACCES);
         }
+        // ★ M17：删除前只冻结**这个路径**上的上传，不再排空整个队列。
+        //
+        // 旧行为：目标脏 → `drain()` 等整个队列（最多 30s）；实际效果是
+        //   「先把本地新建的临时文件传上去，再从 NAS 删掉」。编辑器关文档/删 swap
+        //   就要多走两个来回，而那个文件可能压根没上过 NAS。
+        // 新行为：
+        //   * 远端**没有**副本（本地新建后立刻删）→ 取消排队作业，远端什么都不用做；
+        //   * 远端**有**副本 → 等在途的传完（它带着老名字、改不了目的地）→ 取消排队
+        //     作业（反正要删，别再传新版）→ 走下面的异步删除。
+        //
+        // 取舍：`remote_known` 是本地视图的认知（来自远端清单/上传成功）。万一远端
+        // 在本地视图之外刚出现了同名文件（别的设备刚建的），这里会当作「从没上传过」
+        // 而跳过远端删除 —— 那个文件下一轮对账会作为远端新增出现，用户能看见；
+        // 比「先传一版本地内容把对方覆盖掉再删」破坏性更小。
+        let mut skip_remote_delete = false;
         if dirty {
             if let Some(q) = &self.upload {
-                if !q.drain(Duration::from_secs(30)) {
-                    tracing::warn!("删除前排空上传队列超时: {remote}");
+                q.pause();
+                if !q.wait_active_under(&remote, Duration::from_secs(30)) {
+                    q.resume();
+                    tracing::warn!("删除前等待在途上传超时: {remote}");
                     return reply.error(fuser::Errno::EBUSY);
                 }
+                // 在途作业刚落地的話，远端可能刚有这个副本 —— 重新读一次再决定
+                let on_remote = self
+                    .node_by_remote(&remote)
+                    .map(|n| n.remote_known)
+                    .unwrap_or(false);
+                q.cancel_under(&remote);
+                q.resume();
+                skip_remote_delete = !on_remote;
             }
         }
         // ★ M11：**异步入队，立刻返回**。
@@ -3664,7 +3751,9 @@ impl QxyncFs {
         //   * 失败自动重试，超限则 `status` 的删除失败计数 + 日志告警
         //
         // 熔断在上面已经生效：**大批量误删仍然被 EACCES 挡住**，不会悄悄进队列。
-        if let Some(q) = &self.delete_queue {
+        if skip_remote_delete {
+            tracing::debug!("删除: 远端没有这个副本（本地新建后未上传），跳过远端删除: {remote}");
+        } else if let Some(q) = &self.delete_queue {
             q.enqueue(DeleteJob {
                 remote_dir: parent_remote.clone(),
                 remote_name: name.to_string(),
@@ -4664,7 +4753,9 @@ impl Filesystem for QxyncFs {
             return reply.error(e);
         }
         let entry = DirEntry::local(name, false, 0, Self::epoch_of(SystemTime::now()));
-        let node = self.insert_node(parent, name, &remote, &entry);
+        // ★ M17：本地新建的文件远端**还没有副本** —— 紧接着的 mk_dirty 会入队上传；
+        //   在它传上去之前如果被改名/删除，远端根本没有老名字，不必先传一版再改。
+        let node = self.insert_node_with(parent, name, &remote, &entry, false);
         // ★ M9：本地新建立刻进「映射」，不然下一次 readdir/lookup 又从旧快照里看不到它
         listing_upsert(&self.inner, &parent_remote, &entry);
         if let Err(e) = self.cache_file_for(node.ino) {
@@ -4788,48 +4879,91 @@ impl Filesystem for QxyncFs {
             return reply.error(e);
         }
 
-        // 有未上传的改动时先冲刷：否则队列里的作业还指着旧名字，会和改名打架
-        if dirty {
-            if let Some(q) = &self.upload {
-                if !q.drain(Duration::from_secs(60)) {
-                    tracing::warn!("改名前排空上传队列超时: {old_remote}");
-                    return reply.error(fuser::Errno::EBUSY);
-                }
+        // ★ M17：**不再排空整个上传队列**。
+        //
+        // 旧行为：有本地改动 → `drain()` 等**整个队列**清空（最多 60s）→ 再远端改名。
+        // 用户看到的就是「保存一个几字节的文本要 1~2 秒」—— 队列里排着编辑器自己的
+        // 临时文件、swap 文件、同目录其它上传，全都要等。
+        //
+        // 新行为：
+        //   1. 只冻结「这个老名字（含子树）」上的上传：等**在途**的那个落地（目的地
+        //      已经发出去，改不了；配合入队去抖通常根本没有），排队中的直接改写到
+        //      新名字（[`UploadQueue::retarget_pending_under`]）；
+        //   2. 远端**有**老副本（[`Node::remote_known`]）才发远端 rename/move ——
+        //      远端没有老名字时（KIO 保存的 `.part`、本地新建后立刻改名）纯本地改名，
+        //      不必先上传一版再让服务端改；
+        //   3. 本地节点/缓存搬完之后再把队列作业改到新名字，最后放开队列。
+        //
+        // 语义不变的部分：远端有老副本时仍然是「先远端改名、再更新本地视图」；
+        // 改名失败时本地视图不动、队列原样保留（还没改写），用户重试仍然正确。
+        let upload = self.upload.clone();
+        let mut paused = false;
+        if let Some(q) = &upload {
+            q.pause();
+            paused = true;
+            // 在途作业可能正发往老名字（甚至已经发出去）→ 等它结束。暂停保证它之后
+            // worker 不会再从队列里取一个老名字的作业。
+            if !q.wait_active_under(&old_remote, Duration::from_secs(60)) {
+                q.resume();
+                tracing::warn!("改名前等待老路径的在途上传超时: {old_remote}");
+                return reply.error(fuser::Errno::EBUSY);
             }
         }
+        // 远端到底有没有老副本？有本地改动时以节点的 `remote_known` 为准（它来自
+        // 远端清单 / 上传成功回调，不是猜的）；没有本地改动时老节点必然来自远端。
+        // 在途作业刚落地的话，上面的等待期间 hook 已经把 `remote_known` 置 true。
+        let on_remote = {
+            let g = self.inner.lock().unwrap();
+            ino.and_then(|i| g.nodes.get(&i))
+                .map(|n| n.remote_known)
+                .unwrap_or(!dirty)
+        };
 
         // ★ M10：会话失效 → 重登一次再重试（rename/move 都要）
-        let res = self.with_session_retry(|| {
-            let client = self.client.clone();
-            if parent_remote == newparent_remote {
-                // 同目录：FileStation rename（实测 body: path/source_name/dest_name；大小写改名可直接成功）
-                let (dir, from, to) =
-                    (parent_remote.clone(), name.to_string(), newname.to_string());
-                self.rt
-                    .block_on(async move { client.rename(&dir, &from, &to).await })
-            } else {
-                // 跨目录：FileStation move 会**忽略 dest_file**（保持原名），
-                // 所以先搬过去，需要改名再在目标目录里 rename 一次。
-                let (fd, nn, td, tn) = (
-                    parent_remote.clone(),
-                    name.to_string(),
-                    newparent_remote.clone(),
-                    newname.to_string(),
-                );
-                let r = self
-                    .rt
-                    .block_on(async { client.move_into(&fd, &nn, &td).await });
-                if r.is_ok() && tn != nn {
-                    let client2 = self.client.clone();
-                    let (td2, nn2) = (td.clone(), nn.clone());
+        let res = if !on_remote {
+            tracing::info!(
+                "改名: 远端没有老副本（本地新建后未上传），只做本地改名: \
+                 {old_remote} -> {new_remote}"
+            );
+            Ok(())
+        } else {
+            self.with_session_retry(|| {
+                let client = self.client.clone();
+                if parent_remote == newparent_remote {
+                    // 同目录：FileStation rename（实测 body: path/source_name/dest_name；大小写改名可直接成功）
+                    let (dir, from, to) =
+                        (parent_remote.clone(), name.to_string(), newname.to_string());
                     self.rt
-                        .block_on(async move { client2.rename(&td2, &nn2, &tn).await })
+                        .block_on(async move { client.rename(&dir, &from, &to).await })
                 } else {
-                    r
+                    // 跨目录：FileStation move 会**忽略 dest_file**（保持原名），
+                    // 所以先搬过去，需要改名再在目标目录里 rename 一次。
+                    let (fd, nn, td, tn) = (
+                        parent_remote.clone(),
+                        name.to_string(),
+                        newparent_remote.clone(),
+                        newname.to_string(),
+                    );
+                    let r = self
+                        .rt
+                        .block_on(async { client.move_into(&fd, &nn, &td).await });
+                    if r.is_ok() && tn != nn {
+                        let client2 = self.client.clone();
+                        let (td2, nn2) = (td.clone(), nn.clone());
+                        self.rt
+                            .block_on(async move { client2.rename(&td2, &nn2, &tn).await })
+                    } else {
+                        r
+                    }
+                }
+            })
+        };
+        if let Err(e) = res {
+            if paused {
+                if let Some(q) = &upload {
+                    q.resume();
                 }
             }
-        });
-        if let Err(e) = res {
             tracing::warn!("rename 失败 {old_remote} -> {new_remote}: {e}");
             return reply.error(fuser::Errno::EIO);
         }
@@ -4882,6 +5016,16 @@ impl Filesystem for QxyncFs {
             // （重算在 mtime<=0 的退化路径下会算出新 id，那就等于「改名变了身份」）。
             e.file_id = node.file_id;
             listing_upsert(&self.inner, &newparent_remote, &e);
+        }
+        // ★ M17：本地名字/缓存都搬完了 → 把队列里还指着老名字的作业改写到新名字
+        // （内容源换成改名后的缓存路径），再放开队列。顺序不能反：先 resume 的话
+        // worker 会立刻取走一个老名字的作业，改名就白做了。
+        if let Some(q) = &upload {
+            let new_cache = self.node_by_remote(&new_remote).and_then(|n| n.cache);
+            q.retarget_pending_under(&old_remote, &new_remote, new_cache.as_deref());
+            if paused {
+                q.resume();
+            }
         }
         tracing::debug!("rename {old_remote} -> {new_remote}");
         reply.ok();
@@ -5532,6 +5676,7 @@ mod tests {
             file_id: ZERO_FILE_ID,
             whole_xxhash: NO_HASH,
             dirty: false,
+            remote_known: true,
             in_sync: true,
             progress: None,
             open_count: 0,
@@ -7581,6 +7726,7 @@ mod tests {
             file_id: ZERO_FILE_ID,
             whole_xxhash: NO_HASH,
             dirty: false,
+            remote_known: true,
             in_sync: true,
             progress: None,
             open_count: 0,
@@ -7869,6 +8015,61 @@ mod tests {
         // 传完一个 → 立刻从汇总里消失
         h.clear_progress("/home/a.bin");
         assert_eq!(h.download_transfers(), (1, 100, 1000));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M17：`remote_known` 的维护 —— 本地新建 false / 远端清单 true /
+    /// 上传成功（`mark_remote_known`、`clear_dirty`）置 true。
+    #[test]
+    fn m17_remote_known_follows_upload_lifecycle() {
+        let dir = m7_tmpdir("m17-known");
+        let fs = test_fs(&dir, true);
+
+        // 本地新建的节点：远端没有
+        let e = DirEntry::local("save.txt.part", false, 0, 1_700_000_000);
+        let _ = fs.insert_node_with(
+            INodeNo::ROOT,
+            "save.txt.part",
+            "/home/save.txt.part",
+            &e,
+            false,
+        );
+        assert!(
+            !fs.node_by_remote("/home/save.txt.part")
+                .unwrap()
+                .remote_known,
+            "create 出来的本地新节点，远端还没有"
+        );
+
+        // 远端清单物化的节点：有
+        let r = DirEntry::local("remote.txt", false, 5, 1_700_000_001);
+        let _ = fs.insert_node(INodeNo::ROOT, "remote.txt", "/home/remote.txt", &r);
+        assert!(fs.node_by_remote("/home/remote.txt").unwrap().remote_known);
+
+        // 远端清单再次物化同一个名字时**不许**把它翻成 true：清单快照里也可能
+        // 是本地新建的条目（readdir 会把本地 create 的那条递过来），翻了就会让
+        // 紧接着的改名误以为远端有老副本。真正的「远端有了」只认上传成功回调。
+        let _ = fs.insert_node(INodeNo::ROOT, "save.txt.part", "/home/save.txt.part", &e);
+        assert!(
+            !fs.node_by_remote("/home/save.txt.part")
+                .unwrap()
+                .remote_known,
+            "清单物化不能替「上传成功」作证"
+        );
+
+        // 再建一个本地的：上传成功回调把它置 true
+        let e2 = DirEntry::local("a.bin", false, 1, 1_700_000_002);
+        let _ = fs.insert_node_with(INodeNo::ROOT, "a.bin", "/home/a.bin", &e2, false);
+        assert!(!fs.node_by_remote("/home/a.bin").unwrap().remote_known);
+        fs.handle().mark_remote_known("/home/a.bin");
+        assert!(fs.node_by_remote("/home/a.bin").unwrap().remote_known);
+
+        // 上传成功 hook 走的 `clear_dirty` 必须做同样的事（dirty 清不清是另一回事）
+        let e3 = DirEntry::local("b.bin", false, 1, 1_700_000_003);
+        let _ = fs.insert_node_with(INodeNo::ROOT, "b.bin", "/home/b.bin", &e3, false);
+        fs.handle().clear_dirty("/home/b.bin");
+        assert!(fs.node_by_remote("/home/b.bin").unwrap().remote_known);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

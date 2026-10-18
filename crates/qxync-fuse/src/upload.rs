@@ -24,7 +24,23 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// ★ M17：作业入队后先压这么久再真正发出去。
+///
+/// 为什么值得这 250ms：编辑器（KIO / Kate / gedit …）的「保存」是
+/// **写临时文件 → rename 覆盖目标**。临时文件刚建出来就被写 + 立刻改名，
+/// 如果 worker 立刻开传，就变成「先传一版 0 字节 / 一版旧内容，再改名」——
+/// 既慢又给 NAS 留下临时文件名。压这一小会儿有三件事同时成立：
+///
+/// 1. 同一路径的多次写入被合并成**一次**上传（末尾那一版）；
+/// 2. 改名时队列里是「还没发」的作业，可以直接改写到新名字（见
+///    [`UploadQueue::retarget_pending_under`]），不必等它传完；
+/// 3. 删除同理：本地新建后立刻删掉的文件，远端根本没被创建过。
+///
+/// 与 `QXNYC_TEST_UPLOAD_HOLD_MS`（M8.4，仅验收用）是两件事：那个是**测试注入**，
+/// 这个是生产行为；重试/崩溃恢复出来的作业**不**再压（它们本来就该立刻发）。
+const DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// 上传队列状态库文件名，放在 `marker_dir` 下。
 ///
@@ -257,6 +273,21 @@ struct State {
     pending: VecDeque<UploadJob>,
     /// 正在上传的作业（用于 drain 等待）
     active: bool,
+    /// ★ M17：worker 当前处理的作业**发往哪个路径**（= 作业取走后、按身份复查过的目的地）。
+    ///
+    /// 只给 [`UploadQueue::drain_path_under`] / [`UploadQueue::wait_active_under`] 用：
+    /// 改名/删除只等「自己这条路径」上的在途作业，不再等整个队列。
+    active_path: Option<String>,
+    /// ★ M17：暂不开始新作业（在途作业照常跑完）。
+    ///
+    /// 改名/删除的临界区里需要「队列冻结」：否则刚把排队作业改写到新名字，
+    /// worker 就从老名字里取一个开始传，前功尽弃。用暂停而不是持锁跨网络调用，
+    /// 是因为改名还要打 NAS（几百毫秒），持锁会把所有写路径一起堵住。
+    paused: bool,
+    /// ★ M17：每个路径**最近一次入队**的时刻 —— worker 据此先压一小会儿再发
+    /// （见 [`DEBOUNCE`]）。作业被取走后这份时间戳不清：同一路径再来新作业会覆盖它，
+    /// 从而把「安静期」往后推，最终只传最后一版。
+    recent: std::collections::HashMap<String, Instant>,
     /// ★ M8.4：**已被取消**的远端路径。
     ///
     /// 为什么需要它：`cancel()` 原本只能清掉「还没被 worker 取走」的作业，
@@ -264,6 +295,16 @@ struct State {
     /// 「cancel + drain + 重新 stat」来避免「在途上传把远端改回本地内容」，
     /// 那个窄窗口就落在这里。worker 在真正发请求前查一次这个集合即可关掉窗口。
     cancelled: std::collections::BTreeSet<String>,
+}
+
+/// ★ M17：worker 取到作业后「安静期」检查的结果（见 [`UploadQueue::hold_for_debounce`]）。
+enum Hold {
+    /// 安静期过了（或本来就是重试/崩溃恢复出来的作业）→ 可以发。
+    Ready,
+    /// 队列被暂停 → 放回队列，等恢复后再取。
+    Requeue,
+    /// 队列里已有更新的一版同路径作业 → 这一版直接丢弃。
+    Superseded,
 }
 
 impl UploadQueue {
@@ -340,6 +381,9 @@ impl UploadQueue {
             state: Mutex::new(State {
                 pending,
                 active: false,
+                active_path: None,
+                paused: false,
+                recent: std::collections::HashMap::new(),
                 cancelled: std::collections::BTreeSet::new(),
             }),
             cv: Condvar::new(),
@@ -457,9 +501,17 @@ impl UploadQueue {
         self.persist_put(&job);
         {
             let mut st = self.state.lock().unwrap();
+            // ★ M17：记下「这个路径刚刚又变了」—— worker 发之前据此等安静期。
+            let path = job.remote_path();
+            st.recent.insert(path.clone(), Instant::now());
             // 同一路径已在队列里 → 用新作业替换（后写覆盖先写；库里由 upsert 保证一行）
             st.pending.retain(|j| j.remote_path() != job.remote_path());
             st.pending.push_back(job);
+            // 长时间运行后清一次：只保留最近一分钟内活跃过的路径（每次入队最多一次 O(n)）
+            if st.recent.len() > 4096 {
+                st.recent
+                    .retain(|_, t| t.elapsed() < Duration::from_secs(60));
+            }
         }
         self.stats
             .pending
@@ -471,6 +523,185 @@ impl UploadQueue {
     /// 是否有作业正在上传（在途）。
     pub fn is_active(&self) -> bool {
         self.state.lock().unwrap().active
+    }
+
+    /// 路径是否命中 `root`（`root` 本身或其子路径；文件路径只会命中本身）。
+    ///
+    /// 用**段级**前缀判断，`/home/a.txt` 不会命中 `/home/a.txt.bak`。
+    fn path_under(path: &str, root: &str) -> bool {
+        path == root
+            || (path.len() > root.len()
+                && path.as_bytes()[root.len()] == b'/'
+                && path.starts_with(root))
+    }
+
+    /// ★ M17：暂停从队列里取新作业（在途作业跑完为止；队列不丢作业）。
+    ///
+    /// 改名/删除的临界区用它：先把「还会往老名字传」的作业冻住，再一次性改写到新名字。
+    /// 必须与 [`Self::resume`] 成对使用 —— 忘了 resume，上传队列会一直停着。
+    pub fn pause(&self) {
+        self.state.lock().unwrap().paused = true;
+    }
+
+    /// ★ M17：恢复取作业（与 [`Self::pause`] 成对）。
+    pub fn resume(&self) {
+        {
+            self.state.lock().unwrap().paused = false;
+        }
+        self.cv.notify_all();
+    }
+
+    /// 队列当前是否处于暂停状态。
+    pub fn is_paused(&self) -> bool {
+        self.state.lock().unwrap().paused
+    }
+
+    /// ★ M17：等「`root` 这一条路径上的在途作业」结束（别的路径照常传，不等）。
+    ///
+    /// 返回 `false` = 超时。改名/删除前用它替代原来的全局 `drain`：在途作业已经
+    /// 带着老名字发出去了，目的地改不了，只能等它落地；而其它路径上的作业与本操作无关。
+    pub fn wait_active_under(&self, root: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut st = self.state.lock().unwrap();
+        while st
+            .active_path
+            .as_deref()
+            .is_some_and(|p| Self::path_under(p, root))
+        {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (g, _) = self
+                .cv
+                .wait_timeout(st, deadline.saturating_duration_since(now))
+                .unwrap();
+            st = g;
+        }
+        true
+    }
+
+    /// ★ M17：等「`root` 这一条路径」上**没有任何待传/在传作业**。
+    ///
+    /// 与 [`Self::drain`] 的区别：只等这一棵子树，队列里别的文件（Kate 的 swap、
+    /// 同目录其它上传）一律不等 —— 改名/删除之前需要「这个名字的作业先落地」时用它。
+    pub fn drain_path_under(&self, root: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut st = self.state.lock().unwrap();
+        while st
+            .active_path
+            .as_deref()
+            .is_some_and(|p| Self::path_under(p, root))
+            || st
+                .pending
+                .iter()
+                .any(|j| Self::path_under(&j.remote_path(), root))
+        {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (g, _) = self
+                .cv
+                .wait_timeout(st, deadline.saturating_duration_since(now))
+                .unwrap();
+            st = g;
+        }
+        true
+    }
+
+    /// `root` 这条路径（含子路径）上是否有排队的作业。
+    pub fn has_pending_under(&self, root: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .pending
+            .iter()
+            .any(|j| Self::path_under(&j.remote_path(), root))
+    }
+
+    /// ★ M17：把排队中的、发往 `old_path`（含子树）的作业改写到 `new_path`。
+    ///
+    /// - `local`：作业目标就是 `old_path` 本身时要换的内容源（改名会把缓存文件也搬走，
+    ///   不换的话 worker 会去读一个已经不存在的路径）。子路径作业内容源不动。
+    /// - 主键 `remote_path` 变了 → 状态库同步 rekey（旧行删、新行写），保持「表 = 未完成作业」。
+    ///
+    /// 返回改写的作业数。调用前应先 [`Self::pause`]，否则 worker 可能正好取走一个。
+    pub fn retarget_pending_under(
+        &self,
+        old_path: &str,
+        new_path: &str,
+        local: Option<&Path>,
+    ) -> usize {
+        let mut changes: Vec<(String, UploadJob)> = Vec::new();
+        {
+            let mut st = self.state.lock().unwrap();
+            for job in st.pending.iter_mut() {
+                let path = job.remote_path();
+                if !Self::path_under(&path, old_path) {
+                    continue;
+                }
+                let target = if path == old_path {
+                    new_path.to_string()
+                } else {
+                    format!("{new_path}{}", &path[old_path.len()..])
+                };
+                if job.retarget(&target) {
+                    if path == old_path {
+                        if let Some(l) = local {
+                            job.local = l.to_path_buf();
+                        }
+                    }
+                    changes.push((path, job.clone()));
+                }
+            }
+        }
+        for (old, job) in &changes {
+            // 先删旧主键再写新主键：库里的「未完成作业」不能同时留两个名字
+            self.persist_delete(old);
+            self.persist_put(job);
+        }
+        if !changes.is_empty() {
+            tracing::info!(
+                "上传队列跟着改名: {old_path} -> {new_path}（{} 个排队作业）",
+                changes.len()
+            );
+            self.stats
+                .pending
+                .store(self.pending_len(), Ordering::Relaxed);
+            self.cv.notify_all();
+        }
+        changes.len()
+    }
+
+    /// ★ M17：取消 `root` 这条路径（含子树）上**还没开始**的作业（不动在途作业）。
+    ///
+    /// 删除/改名时用它清掉「准备传老名字」的作业；调用前先
+    /// [`Self::wait_active_under`] 把在途的等完，就没有漏网的了。
+    pub fn cancel_under(&self, root: &str) -> usize {
+        let mut removed: Vec<String> = Vec::new();
+        {
+            let mut st = self.state.lock().unwrap();
+            let mut kept = VecDeque::new();
+            while let Some(j) = st.pending.pop_front() {
+                if Self::path_under(&j.remote_path(), root) {
+                    removed.push(j.remote_path());
+                } else {
+                    kept.push_back(j);
+                }
+            }
+            st.pending = kept;
+        }
+        for p in &removed {
+            self.persist_delete(p);
+        }
+        if !removed.is_empty() {
+            self.stats
+                .pending
+                .store(self.pending_len(), Ordering::Relaxed);
+            tracing::info!("已取消 {root} 的 {} 个待上传作业（子树）", removed.len());
+        }
+        removed.len()
     }
 
     /// 取消某路径**还没开始**的上传作业（含状态库里的行）。
@@ -606,9 +837,13 @@ impl UploadQueue {
             let job = {
                 let mut st = self.state.lock().unwrap();
                 loop {
-                    if let Some(j) = st.pending.pop_front() {
-                        st.active = true;
-                        break Some(j);
+                    // ★ M17：暂停期间不取新作业（在途作业照常跑完）。
+                    if !st.paused {
+                        if let Some(j) = st.pending.pop_front() {
+                            st.active = true;
+                            st.active_path = Some(j.remote_path());
+                            break Some(j);
+                        }
                     }
                     if self.shutdown.load(Ordering::Relaxed) {
                         break None;
@@ -627,6 +862,21 @@ impl UploadQueue {
             self.stats
                 .pending
                 .store(self.pending_len(), Ordering::Relaxed);
+
+            // ★ M17：刚入队的作业先压一小会儿 —— 让「写临时文件 → 改名」的保存流程
+            // 合并成一版上传，并让改名能把这个作业直接改写目的地（见 [`DEBOUNCE`]）。
+            // 暂停/取消/被更新的一版取代时立刻让路，不等安静期。
+            match self.hold_for_debounce(&job) {
+                Hold::Ready => {}
+                Hold::Requeue => {
+                    self.release_popped(job, true);
+                    continue;
+                }
+                Hold::Superseded => {
+                    self.release_popped(job, false);
+                    continue;
+                }
+            }
 
             // ★ M8.4：**仅验收用**的注入点 —— 取到作业后先等一会儿再发。
             //
@@ -652,6 +902,7 @@ impl UploadQueue {
                 {
                     let mut st = self.state.lock().unwrap();
                     st.active = false;
+                    st.active_path = None;
                 }
                 self.stats
                     .pending
@@ -668,6 +919,11 @@ impl UploadQueue {
             if self.retarget_by_identity(&mut job) {
                 self.persist_delete(&job_pre_retarget_path);
                 self.persist_put(&job);
+            }
+            // ★ M17：在途作业的**真实目的地**（drain_path 按它判断要不要等）。
+            {
+                let mut st = self.state.lock().unwrap();
+                st.active_path = Some(job.remote_path());
             }
 
             // ★ T8：发之前把总量记下来（**只用于展示**）。baseline 推进仍然用
@@ -738,12 +994,61 @@ impl UploadQueue {
             {
                 let mut st = self.state.lock().unwrap();
                 st.active = false;
+                st.active_path = None;
             }
             self.stats
                 .pending
                 .store(self.pending_len(), Ordering::Relaxed);
             self.cv.notify_all();
         }
+    }
+
+    /// ★ M17：安静期 / 冻结的处理结果（见 [`UploadQueue::hold_for_debounce`]）。
+    fn hold_for_debounce(&self, job: &UploadJob) -> Hold {
+        let path = job.remote_path();
+        loop {
+            let now = Instant::now();
+            let deadline = {
+                let st = self.state.lock().unwrap();
+                if st.paused {
+                    return Hold::Requeue;
+                }
+                // 同一路径已经有更新的一版在排队 → 这一版内容作废（内容源相同，
+                // 最终版马上会由 pending 那一版传上去），不必先传一版旧的。
+                if st.pending.iter().any(|j| j.remote_path() == path) {
+                    return Hold::Superseded;
+                }
+                match st.recent.get(&path) {
+                    // 崩溃恢复 / 退避重试出来的作业没有时间戳 → 不压，本来就该立刻发
+                    Some(t) => *t + DEBOUNCE,
+                    None => return Hold::Ready,
+                }
+            };
+            if now >= deadline {
+                return Hold::Ready;
+            }
+            std::thread::sleep((deadline - now).min(Duration::from_millis(20)));
+        }
+    }
+
+    /// ★ M17：把「取走了但没发」的作业放回队列（`keep`）或丢弃（被更新的一版取代）。
+    ///
+    /// 放回时如果队列里已经有一版更新的同路径作业，旧的直接丢 —— 内容源相同，
+    /// 传最终版就够了；库里的主键也是同一行，不用改。
+    fn release_popped(&self, job: UploadJob, keep: bool) {
+        let path = job.remote_path();
+        {
+            let mut st = self.state.lock().unwrap();
+            if keep && !st.pending.iter().any(|j| j.remote_path() == path) {
+                st.pending.push_front(job);
+            }
+            st.active = false;
+            st.active_path = None;
+        }
+        self.stats
+            .pending
+            .store(self.pending_len(), Ordering::Relaxed);
+        self.cv.notify_all();
     }
 
     /// 单个作业：上传内容 → 对齐 mtime → 记 write log（尽力而为）。
@@ -1354,6 +1659,172 @@ mod tests {
         assert_eq!(q.progress_of(p), Some((10, 100)));
         q.note_progress(p, None);
         assert_eq!(q.progress_of(p), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    // ================================================================ ★ M17
+
+    /// ★ M17：改名把排队作业改写到新名字 + **主键 rekey**；子树按路径前缀搬。
+    #[test]
+    fn m17_retarget_pending_under_rewrites_paths_and_rekeys_store() {
+        let dir = tmpdir("m17-retarget");
+        let marker = dir.join("queue");
+        let (q, _rt) = test_queue(&marker);
+
+        // 三个作业：源文件本身 / 子树里的一个 / 无关的一个
+        q.enqueue(job(&dir, "save.txt.part")).unwrap();
+        let nested = UploadJob {
+            remote_dir: "/home/qxync-test/sub".into(),
+            remote_name: "kid.txt".into(),
+            ..job(&dir, "kid.txt")
+        };
+        q.enqueue(nested).unwrap();
+        q.enqueue(job(&dir, "other.txt")).unwrap();
+
+        let new_local = dir.join("cache").join("save.txt");
+        let n = q.retarget_pending_under(
+            "/home/qxync-test/save.txt.part",
+            "/home/qxync-test/save.txt",
+            Some(&new_local),
+        );
+        assert_eq!(n, 1, "只改写源文件那一个作业");
+        assert!(!q.has_pending_under("/home/qxync-test/save.txt.part"));
+        assert!(q.has_pending("/home/qxync-test/save.txt"));
+        {
+            let st = q.state.lock().unwrap();
+            let j = st
+                .pending
+                .iter()
+                .find(|j| j.remote_path() == "/home/qxync-test/save.txt")
+                .expect("改写后的作业要在队列里");
+            assert_eq!(j.local, new_local, "内容源要换成改名后的缓存路径");
+        }
+        assert!(
+            q.has_pending("/home/qxync-test/other.txt"),
+            "无关作业原样保留"
+        );
+
+        // 状态库 rekey：旧主键没了、新主键在
+        let rows = Store::open(marker.join(QUEUE_DB_FILE))
+            .unwrap()
+            .uploads()
+            .unwrap();
+        assert!(rows
+            .iter()
+            .any(|r| r.remote_path() == "/home/qxync-test/save.txt"));
+        assert!(!rows
+            .iter()
+            .any(|r| r.remote_path() == "/home/qxync-test/save.txt.part"));
+
+        // 目录改名的子树重定向（内容源不动）
+        assert_eq!(
+            q.retarget_pending_under("/home/qxync-test/sub", "/home/qxync-test/sub2", None),
+            1
+        );
+        assert!(q.has_pending("/home/qxync-test/sub2/kid.txt"));
+        assert!(!q.has_pending("/home/qxync-test/sub/kid.txt"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M17：`path_under` 是**段级**前缀 —— 同前缀的兄弟文件不能被误伤。
+    #[test]
+    fn m17_path_under_is_segment_scoped() {
+        assert!(UploadQueue::path_under("/home/a.txt", "/home/a.txt"));
+        assert!(UploadQueue::path_under("/home/dir/x", "/home/dir"));
+        assert!(!UploadQueue::path_under("/home/a.txt.bak", "/home/a.txt"));
+        assert!(!UploadQueue::path_under("/home/ab/x", "/home/a"));
+        assert!(!UploadQueue::path_under("/home/a", "/home/a/b"));
+    }
+
+    /// ★ M17：只等「这条路径」上的在途/待传作业；别的路径不等。
+    #[test]
+    fn m17_drain_and_active_waits_are_path_scoped() {
+        let dir = tmpdir("m17-drain");
+        let (q, _rt) = test_queue(&dir.join("queue"));
+        q.enqueue(job(&dir, "mine.txt")).unwrap();
+
+        // 只有 mine 有待传作业 → mine drain 不掉，别的路径立刻 true
+        assert!(!q.drain_path_under("/home/qxync-test/mine.txt", Duration::from_millis(1)));
+        assert!(q.drain_path_under("/home/qxync-test/other.txt", Duration::ZERO));
+
+        // 在途的是 other → 等 mine 不该被 other 拖住
+        {
+            let mut st = q.state.lock().unwrap();
+            st.active = true;
+            st.active_path = Some("/home/qxync-test/other.txt".into());
+        }
+        assert!(q.wait_active_under("/home/qxync-test/mine.txt", Duration::ZERO));
+        assert!(!q.wait_active_under("/home/qxync-test/other.txt", Duration::from_millis(1)));
+
+        // mine 的排队作业清掉后：mine 立刻可 drain，other 仍被在途作业挡住
+        assert_eq!(q.cancel_under("/home/qxync-test/mine.txt"), 1);
+        assert!(q.drain_path_under("/home/qxync-test/mine.txt", Duration::ZERO));
+        assert!(!q.drain_path_under("/home/qxync-test/other.txt", Duration::from_millis(1)));
+        {
+            let mut st = q.state.lock().unwrap();
+            st.active = false;
+            st.active_path = None;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M17：暂停/恢复是成对的开关（改名/删除的临界区靠它冻住队列）。
+    #[test]
+    fn m17_pause_resume_and_cancel_under() {
+        let dir = tmpdir("m17-pause");
+        let (q, _rt) = test_queue(&dir.join("queue"));
+        q.enqueue(job(&dir, "a.txt")).unwrap();
+        q.enqueue(job(&dir, "b.txt")).unwrap();
+        assert!(!q.is_paused());
+        q.pause();
+        assert!(q.is_paused());
+        // 暂停时作业仍在队列里（只是不发）
+        assert!(q.has_pending("/home/qxync-test/a.txt"));
+        q.resume();
+        assert!(!q.is_paused());
+        // cancel_under 只清目标路径
+        assert_eq!(q.cancel_under("/home/qxync-test/a.txt"), 1);
+        assert!(!q.has_pending("/home/qxync-test/a.txt"));
+        assert!(q.has_pending("/home/qxync-test/b.txt"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M17：刚入队的作业要先等安静期；暂停时立刻让路；被更新的一版取代时直接丢弃。
+    #[test]
+    fn m17_debounce_waits_then_yields() {
+        let dir = tmpdir("m17-debounce");
+        let (q, _rt) = test_queue(&dir.join("queue"));
+
+        // 模拟 worker 取走：队列里没有它了，但 recent 里还有入队时间
+        let fresh = job(&dir, "save.part");
+        q.enqueue(fresh.clone()).unwrap();
+        q.state.lock().unwrap().pending.clear();
+        let t0 = Instant::now();
+        let held = q.hold_for_debounce(&fresh);
+        assert!(matches!(held, Hold::Ready), "安静期过后应 Ready");
+        assert!(
+            t0.elapsed() >= Duration::from_millis(150),
+            "刚入队的作业不能被立刻发出去（实际 {:?}）",
+            t0.elapsed()
+        );
+
+        // 暂停 → 立刻让路（Requeue），不睡满安静期
+        let paused = job(&dir, "p.part");
+        q.enqueue(paused.clone()).unwrap();
+        q.state.lock().unwrap().pending.clear();
+        q.pause();
+        let t0 = Instant::now();
+        assert!(matches!(q.hold_for_debounce(&paused), Hold::Requeue));
+        assert!(t0.elapsed() < Duration::from_millis(100));
+        q.resume();
+
+        // 同路径已有更新的一版 → Superseded
+        let stale = job(&dir, "s.part");
+        q.enqueue(stale.clone()).unwrap();
+        q.state.lock().unwrap().pending.clear();
+        let mut newer = stale.clone();
+        newer.mtime = 9999;
+        q.enqueue(newer).unwrap();
+        assert!(matches!(q.hold_for_debounce(&stale), Hold::Superseded));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -2407,6 +2407,10 @@ async fn mount(
         // 回调里现取锁 —— 上传 worker 线程只在这一小段持锁。
         let st = state.clone();
         q.set_success_hook(Arc::new(move |remote: &str, sig: (u64, i64)| {
+            // ★ M17：上传成功 = NAS 上**一定**已经有这个路径了。哪怕下面因为
+            // 「上传期间本地又变了」不推进 baseline，也必须把这个事实记进节点，
+            // 否则紧接着的改名会误判成「远端没有老副本」而漏掉远端改名。
+            h.mark_remote_known(remote);
             let (size, mtime) = match h.node(remote) {
                 // 上传期间用户又改了这个文件 → 节点上已经不是刚传上去的那一版了。
                 // 此刻推进 baseline 到「刚传上去的签名」是**错的**：远端真有的是那
