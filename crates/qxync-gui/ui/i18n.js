@@ -282,6 +282,9 @@
     // 顶栏：N/M 聚合（每个 daemon 各自独立，不能混算）
     'top.switch': '当前连接',
     'top.switch_aria': '切换当前连接',
+    // ★ M16.1：「当前连接」旁边的新建入口
+    'top.add_link_title': '添加新的 NAS 连接',
+    'top.add_link_aria': '添加新的 NAS 连接',
     'top.daemon_count': 'daemon {up}/{total} 运行',
     'top.login_count': '已登录 {up}/{total}',
     'top.conn_unconfigured': '连接：未配置',
@@ -297,6 +300,12 @@
     'links.start_all': '全部启动',
     'links.stop_all': '全部停止',
     'links.add': '＋ 添加 NAS',
+    // ★ M16.1：从「主页 / 任务表单」直达新建连接 —— 原来只有设置页最里面那个按钮，
+    //   用户盯着「连接」卡片和「NAS 连接」下拉时找不到新建入口。
+    'home.add_link': '＋ 添加连接',
+    'home.add_link_title': '添加新的 NAS 连接',
+    'task.link_new': '＋ 新建连接…',
+    'task.link_new_hint': '已跳到「设置 → 连接」：填好新连接并「保存并登录」后，回到「任务」页继续这条文件夹对。',
     'links.daemon_running': 'daemon 运行中',
     'links.daemon_stopped': 'daemon 未运行',
     'links.daemon_down_suffix': '（daemon 未运行）',
@@ -325,7 +334,8 @@
     'conn.edit_hint': '正在编辑连接「{id}」（id 只读：换 id 等于换一个连接）。',
     'conn.remove': '移除这个连接',
     'conn.cancel_edit': '取消编辑',
-    'conn.path_pending': '（新建连接，保存后写入 links/<id>.json）',
+    // ★ M16.1：不带外层括号 —— 它会被塞进「尚无连接配置（{path}）」里，自己带括号会套两层
+    'conn.path_pending': '新建连接，保存后写入 links/<id>.json',
     'connect.cred_present': '已保存凭据：{user}@{host}（{path}）',
     'connect.cred_missing': '无凭据（{path}）；保存并登录时需要输入口令。',
     'home.conn_no_daemon': '连接 {label} 的 daemon 未运行 —— 点顶部「启动 daemon」',

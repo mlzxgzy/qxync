@@ -90,6 +90,11 @@
           <span data-i18n="top.switch">当前连接</span>
           <select id="conn-select" aria-label="当前连接" data-i18n-aria-label="top.switch_aria"></select>
         </label>
+        <!-- ★ M16.1：「加连接」必须有显眼入口 —— 老用户会盯着「当前连接」找新建，
+             可原来这里没有任何按钮，只能自己摸到「设置 → 连接」卡片右上角。 -->
+        <button type="button" id="btn-top-add-link" class="conn-add"
+                title="添加新的 NAS 连接" aria-label="添加新的 NAS 连接"
+                data-i18n-title="top.add_link_title" data-i18n-aria-label="top.add_link_aria">＋</button>
 
         <div class="topbar-actions">
           <button id="btn-daemon-start" type="button">启动 daemon</button>
@@ -115,6 +120,9 @@
             <span class="conn-dot" id="home-dot"></span>
             <span class="mono" id="home-conn-text">—</span>
             <span class="home-conn-actions">
+              <button type="button" class="mini" id="btn-home-add-link"
+                      data-i18n="home.add_link" data-i18n-title="home.add_link_title"
+                      title="添加新的 NAS 连接">＋ 添加连接</button>
               <button type="button" class="mini" id="btn-home-settings">连接设置</button>
               <button type="button" class="mini" id="btn-home-sync-now">立即同步</button>
               <button type="button" class="mini primary" id="btn-home-add-task" data-i18n="task.act_add">＋ 添加任务</button>
@@ -395,7 +403,7 @@
           </div>
 
           <div class="grid-2">
-            <div class="card">
+            <div class="card" id="link-form-card">
               <h2>连接配置</h2>
               <h3 class="sub" id="conn-form-title" data-i18n="conn.form_title_new">添加 NAS 连接</h3>
               <p class="hint" id="conn-edit-hint" hidden></p>

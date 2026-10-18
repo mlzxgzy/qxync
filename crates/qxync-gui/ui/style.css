@@ -527,6 +527,18 @@ code {
 }
 .conn-picker select { width: auto; max-width: 230px; }
 
+/* ★ M16.1：「当前连接」右边的「＋ 新建连接」——刻意做成一个紧凑的方按钮，
+ * 不抢 topbar 的横向空间；它和 `.mini` 的区别是**不吃** margin-left:auto
+ * （`.mini` 在卡片标题里靠 auto 推到最右，放在这里会把按钮顶到右边去）。 */
+.conn-add {
+  flex: 0 0 auto;
+  margin-left: 0;
+  padding: 1px 8px;
+  font-size: 12px;
+  line-height: 1.6;
+  border-radius: var(--radius);
+}
+
 .conn-list {
   list-style: none;
   margin: 6px 0 0;

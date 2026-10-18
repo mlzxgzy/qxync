@@ -29,6 +29,9 @@
     excluded: '已排除'
   };
 
+  // ★ M16.1：任务表单「NAS 连接」下拉里的伪选项 —— 选中它 = 去新建连接（不是一条真连接）。
+  var NEW_LINK_OPTION = '__new__';
+
   // ★ M8.1：一级目的地（左侧图标栏）。顺序 = 界面顺序。
   var PAGES = ['home', 'tasks', 'files', 'journal', 'errors', 'settings', 'diag'];
   var PAGE_TITLE = {
@@ -122,6 +125,7 @@
     statuses: {},         // linkId -> DaemonStatus
     currentLink: '',      // 当前连接 id（持久化到 localStorage 的 qxync.currentLink）
     editingLinkId: '',    // 连接表单：'' = 新建
+    creatingLink: false,  // ★ M16.1：'' 有两种含义（「展示当前连接」/「正在新建」），用它区分
     taskFormLink: '',     // 任务表单：这条任务属于哪个连接
     taskFormEditing: false,
     tasksByLink: {},      // linkId -> {data, error}
@@ -1907,6 +1911,13 @@
       o.value = str(ls[i].id);
       sel.appendChild(o);
     }
+    // ★ M16.1：新建任务时想连一台还没配的 NAS，就选这一项（它本身不是连接，
+    //   选中后跳到「设置 → 连接」新建；编辑态下拉是只读的，不挂这一项）。
+    if (state.taskFormEditing !== true) {
+      var no = el('option', null, T('task.link_new'));
+      no.value = NEW_LINK_OPTION;
+      sel.appendChild(no);
+    }
     var want = state.taskFormLink || (ls.length ? str(ls[0].id) : '');
     if (want && linkById(want)) { sel.value = want; }
     sel.disabled = state.taskFormEditing === true;
@@ -2829,7 +2840,13 @@
       var info = rs[2].ok ? rs[2].data : null;
       renderAppInfo(info);
       if (str(state.editingLinkId) === '') {
-        fillConnectForm(link, cred);
+        // ★ M16.1：点了「新建连接」时，这次异步回包（读的是**当前连接**）不能把
+        //   已经清空的表单又填回去 —— 否则「新建」表单里会带着上一台 NAS 的地址。
+        if (state.creatingLink === true) {
+          fillConnectForm({ exists: false, path: T('conn.path_pending'), link: null }, cred);
+        } else {
+          fillConnectForm(link, cred);
+        }
       } else if (str(state.editingLinkId) === id) {
         fillConnectForm(link, cred);   // 编辑的就是当前连接：读回来的就是它
       } else {
@@ -2878,6 +2895,7 @@
       }
       return call('credential_present', { linkId: lid }).then(function (c) {
         state.editingLinkId = lid;
+        state.creatingLink = false;   // ★ M16.1：编辑已有连接 = 退出「新建」态
         fillConnectForm(r.data, c.ok ? c.data : null);
         var pw = $('f-password');
         if (pw) { pw.focus(); }
@@ -2889,14 +2907,32 @@
   /** 「＋ 添加 NAS」：清空表单回到新建态（不动已保存的连接）。 */
   function newLink() {
     state.editingLinkId = '';
+    state.creatingLink = true;
     fillConnectForm({ exists: false, path: T('conn.path_pending'), link: null }, null);
+    // ★ M16.1：表单在「连接配置」卡片里，点完按钮如果不把卡片滚进视野、也不给一句日志，
+    //   看上去就是「点了没反应」（不少人就是这么以为界面上没有新建入口的）。
+    var card = $('link-form-card');
+    if (card && typeof card.scrollIntoView === 'function') {
+      card.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    }
     var host = $('f-host');
     if (host) { host.focus(); }
+    logInfo('已打开「添加 NAS 连接」表单：填完点「保存并登录」');
+    return Promise.resolve(null);
+  }
+
+  /** ★ M16.1：统一的「新建连接」入口（主页 / 顶栏 / 任务表单都走这里）：
+   *  切到「设置 → 连接」再把新建表单滚进来。 */
+  function openNewLink(hint) {
+    switchPage('settings', null, 'connect');
+    newLink();
+    if (hint) { logInfo(hint); }
     return Promise.resolve(null);
   }
 
   function cancelLinkEdit() {
     state.editingLinkId = '';
+    state.creatingLink = false;
     show('login-result', false);
     return loadConnect();
   }
@@ -2931,6 +2967,7 @@
       var d = isObj(r.data) ? r.data : {};
       var savedId = str(d.link && d.link.id);
       state.editingLinkId = savedId;
+      state.creatingLink = false;   // ★ M16.1：保存成功 → 表单切回「编辑这条连接」
       renderResult('login-result', true, T('links.saved'), [
         ['连接 id', savedId],
         ['文件', str(d.path)],
@@ -2997,6 +3034,7 @@
 
   /** 登录/保存后把「刚配置的连接」设为当前：优先用已知 id，否则按 host/port/user 找回。 */
   function adoptLink(knownId, input) {
+    state.creatingLink = false;   // ★ M16.1：登录/保存成功后表单不再是「新建」态
     return refreshStatus(true).then(function () {
       var id = str(knownId);
       if (id && linkById(id)) {
@@ -3153,6 +3191,7 @@
     logOk('已移除连接 ' + id + '（删除任务登记 ' + num(d.tasks_deleted, 0) + ' 个；' +
       '本地文件 / NAS 数据 / 缓存未动）');
     if (str(state.editingLinkId) === id) { state.editingLinkId = ''; }
+    state.creatingLink = false;   // ★ M16.1：移除后回到「展示当前连接」而不是停在新建态
     // 当前连接被删掉后，refreshStatus 里的 ensureCurrentLink 会自动切到第一个剩余连接
     return refreshStatus(true).then(function () {
       return loadConnect().then(function () { return refreshCurrentPage(); });
@@ -5582,7 +5621,15 @@
     // ★ M16：任务表单的「NAS 连接」——换连接 = 换 daemon 取候选 + 换保存落点
     on('t-link', 'change', function (ev) {
       if (state.taskFormEditing) { return; }   // 编辑时只读
-      state.taskFormLink = str(ev.target && ev.target.value) || state.taskFormLink;
+      var v = str(ev.target && ev.target.value);
+      if (v === NEW_LINK_OPTION) {
+        // ★ M16.1：选中「＋ 新建连接…」不是换连接，而是去设置页新建；
+        //   先把下拉恢复到真实连接上，否则下次渲染会停在一个不存在的连接 id 上。
+        renderTaskLinkSelect();
+        openNewLink(T('task.link_new_hint'));
+        return;
+      }
+      state.taskFormLink = v || state.taskFormLink;
       renderTaskLinkSelect();
       nasSelectedRefresh();
       loadNasCandidates();
@@ -5608,7 +5655,11 @@
     }
 
     // 主页快捷动作
-    on('btn-home-settings', 'click', function () { switchPage('settings'); });
+    // ★ M16.1：「连接设置」必须落到「设置 → 连接」这一分区，不能沿用「上次看过的设置分区」
+    //   （否则上次停在「关于」，点它会落到关于页，连接列表根本不出现）。
+    on('btn-home-settings', 'click', function () { switchPage('settings', null, 'connect'); });
+    // ★ M16.1：主页连接卡片上的「＋ 添加连接」——这里是用户最容易找「加连接」的地方。
+    on('btn-home-add-link', 'click', function () { openNewLink(); });
     // ★ 主页「＋ 添加任务」= 任务页的「＋ 添加配对文件夹」：切到任务页并直接摊开文件夹对表单。
     //   （别再去诊断 → 挂载：那条路是「先挂载、再登记任务」的专家流程；
     //   任务页的表单提交走 tasks/save + tasks/resume，登记和挂载一步到位。）
@@ -5628,6 +5679,8 @@
       var v = str(ev.target && ev.target.value);
       if (v) { setCurrentLink(v); }
     });
+    // ★ M16.1：顶栏「＋」= 新建连接（就贴在「当前连接」旁边，看着下拉就能找到）
+    on('btn-top-add-link', 'click', function () { openNewLink(); });
 
     // 连接页
     var f = $('form-connect');
