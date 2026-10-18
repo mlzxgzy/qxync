@@ -5,6 +5,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [中文](CHANGELOG.md) · [README](README.en.md) · [Acceptance log](docs/验收记录.md)
 
+## [0.6.5] - 2026-10-18
+
+### Added
+
+- **Debian / Ubuntu package**: the release now ships `qxync_<version>-1_amd64.deb`, **one
+  package for Debian 12 / 13 and Ubuntu 22.04 / 24.04 / 26.04** (amd64). Its three binaries
+  are byte-for-byte the ones in this release's tarball (repackaged, not rebuilt); `Depends`
+  comes from `dpkg-shlibdeps` run against the binaries plus a hand-added `fuse3`
+  (11 entries, all standard packages from the official repositories). The release pipeline
+  installs the package with `apt install` in clean Debian 12 / 13 and Ubuntu 22.04 / 24.04 /
+  26.04 containers and only publishes when every assertion passes.
+- **Packaging scripts**: `xtask/release/package-deb.sh` (builds the `.deb` from the release
+  tarball inside an `ubuntu:22.04` / `debian:12` baseline container) and
+  `xtask/release/apt-mirror.sh` (switches apt to a mainland-China mirror inside containers,
+  Tsinghua by default). Maintainer notes: `packaging/debian/README.md`.
+- **`docs/协议要点.md`** (Chinese): the protocol-level pitfalls that used to live in the
+  README now live in a dedicated developer document; entry numbers are unchanged so existing
+  code comments still match.
+
+### Changed
+
+- **README rewritten for users** (Chinese / English kept in sync): what it is, features,
+  screenshots, installation (Arch, Debian/Ubuntu, tarball, from source), signing in, the
+  long-running daemon, multiple NAS devices, mounting and dehydration, common commands,
+  upgrading, known limitations, security & privacy, contributing. Maintainer-facing
+  architecture notes, implementation details and the acceptance matrix moved to `docs/` and
+  `CONTRIBUTING.md`.
+- **Release pipeline**: 7 release assets instead of 6 (the shared `.deb` is new). Two new
+  steps after the Arch package check: build the `.deb`, then install it in a five-distro
+  clean-container matrix; the `.deb` is also listed in `SHA256SUMS`.
+
+### Notes
+
+- **No sync-logic changes in this release**: `git diff v0.6.4..v0.6.5 -- crates/` is empty;
+  0.6.5 changes no data formats, configuration keys or CLI options. Upgrading from 0.6.4 is
+  optional.
+
 ## [0.6.4] - 2026-10-18
 
 ### Fixed

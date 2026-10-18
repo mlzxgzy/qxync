@@ -5,6 +5,36 @@
 
 [English](CHANGELOG.en.md) · [README](README.md) · [验收记录](docs/验收记录.md)
 
+## [0.6.5] - 2026-10-18
+
+### 新增
+
+- **Debian / Ubuntu 安装包**：Release 新增 `qxync_<版本>-1_amd64.deb`，**一个包同时适用**
+  Debian 12 / 13 与 Ubuntu 22.04 / 24.04 / 26.04（amd64）。三个二进制与本 Release 的
+  tar.gz **逐字节同源**（从 tar.gz 重打包、不重新编译）；`Depends` 由 `dpkg-shlibdeps`
+  对三个二进制实测后得出、再手工补 `fuse3`（共 11 项，全是官方仓库里的标准包）。
+  发布流水线在干净容器矩阵里把 Debian 12 / 13、Ubuntu 22.04 / 24.04 / 26.04
+  逐个 `apt install` 实装、跑通断言才发布。
+- **打包脚本**：`xtask/release/package-deb.sh`（在 `ubuntu:22.04` / `debian:12` 基线容器里
+  从 Release tar.gz 打 `.deb`）、`xtask/release/apt-mirror.sh`（容器内 apt 源切国内镜像，
+  默认清华）。维护者说明见 `packaging/debian/README.md`。
+- **`docs/协议要点.md`**：把原本堆在 README 里的协议级「踩过的坑」集中成开发文档，
+  条目编号保持不变，代码注释里的引用仍然对得上。
+
+### 变化
+
+- **README 重写为面向用户的说明**（中文 / English 同步）：是什么、功能、截图、安装
+  （Arch、Debian/Ubuntu、tar.gz、源码构建）、登录、常驻 daemon、多 NAS、挂载与脱水、
+  常用命令、升级、已知限制、安全隐私、贡献。维护者向的架构说明、实现要点、验收矩阵等
+  从 README 移到 `docs/` 与 `CONTRIBUTING.md`。
+- **发版流水线**：Release 资产 6 → 7 个（新增通用 `.deb`）；Arch 包校验之后新增
+  「打 `.deb`」与「五发行版干净容器实装校验」两步，`.deb` 同时进 `SHA256SUMS`。
+
+### 说明
+
+- **本版没有同步逻辑变更**：`git diff v0.6.4..v0.6.5 -- crates/` 为空，0.6.4 → 0.6.5
+  不涉及数据格式、配置项或 CLI 参数变化。已在 0.6.4 上的用户升级是可选的。
+
 ## [0.6.4] - 2026-10-18
 
 ### 修复
