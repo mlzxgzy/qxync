@@ -275,12 +275,14 @@ impl Client {
     }
 
     /// 会话保活：`qbox_get_max_log` 能用就说明 sid 还有效。
+    ///
+    /// 三种结果由 [`alive_from_max_log`] 分类，**不能**把「服务端未就绪」判成会话失效：
+    /// status=8（`Qsync Central is initializing…`）是 NAS 还在启动/迁移，
+    /// 重登没有任何用（见 [`qxync_core::error::Error::is_server_busy`] 与
+    /// `status.rs` 的说明）；以前这里对**所有** `Error::Status` 都回 `Ok(false)`，
+    /// daemon 的会话保活会据此每轮重登一次，日志里还会写「sid 已失效」（诊断是错的）。
     pub async fn check_alive(&self) -> Result<bool> {
-        match self.max_log().await {
-            Ok(_) => Ok(true),
-            Err(Error::Status { .. }) | Err(Error::Auth(_)) => Ok(false),
-            Err(e) => Err(e),
-        }
+        alive_from_max_log(self.max_log().await)
     }
 
     // ---------------------------------------------------------- M2c 变更发现
@@ -577,6 +579,11 @@ impl Client {
     }
 
     /// 区间下载（M2 的 128 KiB 水合就靠它）。`end` 含端点，返回 200/206 的原始字节。
+    ///
+    /// 两个边界都在发请求前/后显式挡住：
+    /// * `start > end` 是**非法区间**（`Range: bytes=100-50` 会被服务端忽略，
+    ///   回**整个文件**，调用方按「区间字节」用就会把整文件写进缓存）；
+    /// * 200 + 服务端 JSON 错误信封要当错误（见 [`download_json_error`]）。
     pub async fn download_range(
         &self,
         dir: &str,
@@ -584,6 +591,7 @@ impl Client {
         start: u64,
         end: u64,
     ) -> Result<Vec<u8>> {
+        checked_range(start, end)?;
         let sid = self.require_sid()?.to_string();
         let url = self.url(
             "cgi-bin/filemanager/utilRequest.cgi",
@@ -607,11 +615,18 @@ impl Client {
                 String::from_utf8_lossy(&body[..body.len().min(160)])
             )));
         }
+        // 服务端忽略 Range 时会回 200 + **整个文件**。长度不等于请求长度就说明拿到的
+        // 不是那一段 —— 绝不能当区间字节返回（FUSE 会把整文件写进区间缓存）。
+        if range_was_ignored(code, start, end, body.len()) {
+            return Err(Error::Transport(format!(
+                "download {dir}/{name}: 服务端忽略了 Range（请求 bytes={start}-{end}，\
+                 实际回 {} 字节，看起来是整文件）",
+                body.len()
+            )));
+        }
         // 服务端出错时会用 200 + JSON 错误体，这里按内容再兜一层。
-        if body.starts_with(b"{") && body.windows(9).any(|w| w == b"\"status\"") {
-            if let Ok(l) = parse_listing(&body) {
-                l.ensure_ok(format!("download {dir}/{name}"))?;
-            }
+        if let Some(e) = download_json_error(&body, &format!("download {dir}/{name}")) {
+            return Err(e);
         }
         Ok(body.to_vec())
     }
@@ -778,28 +793,14 @@ impl Client {
         // 通用 `R: AsyncRead` → `Stream<Item = Result<Vec<u8>, io::Error>>` 的适配。
         // `Body::wrap_stream` 要的是 `TryStream`（`Bytes: From<Item>`，`Vec<u8>` 满足），
         // 而 `tokio::fs::File` 只实现 `AsyncRead` —— tokio 的 `File` **不**实现
-        // `Stream`，所以这里用 `unfold` 手动泵：每次 poll 读一块（`UPLOAD_CHUNK`），
-        // 读满即产出一块，内存占用因此是 O(块大小) 而非 O(文件大小)。
+        // `Stream`，所以用 [`read_chunk_stream`] 手动泵：每次 poll 读一块
+        // （`UPLOAD_CHUNK`），读满即产出一块，内存占用因此是 O(块大小) 而非 O(文件大小)。
         //
         // `sent` 累加**真正读走**的字节数：上传期间用户可能还在改同一个文件，
         // 调用方（`UploadQueue`）要用这个数把 baseline 推到准确签名，
         // 所以不能用 `expected_len` 代替。
         let sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let stream = futures_util::stream::unfold(
-            (reader, vec![0u8; UPLOAD_CHUNK], sent.clone()),
-            |(mut reader, mut buf, sent)| async move {
-                use tokio::io::AsyncReadExt;
-                let n = reader.read(&mut buf).await.ok()?;
-                if n == 0 {
-                    return None;
-                }
-                sent.fetch_add(n as u64, Ordering::Relaxed);
-                Some((
-                    Ok::<_, std::io::Error>(buf[..n].to_vec()),
-                    (reader, buf, sent),
-                ))
-            },
-        );
+        let stream = read_chunk_stream(reader, sent.clone());
         // ★ 必须是 `stream_with_length`：QNAP 的 upload.php 对 chunked（无
         // Content-Length）直接回 `411 Length Required`。见 upload_file 的注释。
         let part = reqwest::multipart::Part::stream_with_length(
@@ -854,6 +855,147 @@ impl Client {
         parse_listing(&body)?.ensure_ok(format!("stat&settime {dir}/{name}"))?;
         Ok(())
     }
+}
+
+// ------------------------------------------------- 会话保活判定
+
+/// 把 `qbox_get_max_log` 的探测结果分成三类（[`Client::check_alive`] 的判定核心）：
+///
+/// * `Ok(true)`  —— 探测成功，sid 有效；
+/// * `Ok(false)` —— **会话确定失效**（[`Error::is_auth`]：登录失败 / status 4 / 5），该重登；
+/// * `Err(e)`    —— 探测本身失败（断网 / 解析失败 / 服务端未就绪），调用方应稍后再试，
+///   **不要**重登。
+///
+/// status=8（`Qsync Central is initializing…`）属于第三类：那是 NAS 正在安装/迁移/
+/// 还原，`authLogin.cgi` 可能照样能过，但 Qsync 侧一直回未就绪 —— 重登只会每轮白跑
+/// 一次，还会在日志里写出「sid 已失效」这种**错误诊断**。码值与 `msg` 文本两种
+/// 判据都认（见 `qxync_core::error::Error::is_server_busy`，它按 msg 判；这里补一个
+/// 按 `ServerStatus` 码值判的兜底，防止服务端某次没带 msg）。
+fn alive_from_max_log(probe: Result<MaxLog>) -> Result<bool> {
+    match probe {
+        Ok(_) => Ok(true),
+        Err(e) if e.is_auth() => Ok(false),
+        Err(e) if e.is_server_busy() => Err(e),
+        Err(Error::Status { status, .. }) if status.is_server_busy() => Err(Error::status(
+            status.0,
+            "qbox_get_max_log（服务端未就绪：Qsync Central is initializing）",
+        )),
+        // 其它业务 status：无法确认存活，但也不是「确定失效」→ 不触发重登。
+        Err(Error::Status { .. }) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+// ------------------------------------------------- 上传流泵 / 下载正文的错误体判定
+
+/// 把任意 [`tokio::io::AsyncRead`] 泵成 `Stream<Item = io::Result<Vec<u8>>>`，
+/// 同时累计**真正读走**的字节数（`sent`）。
+///
+/// 这是 [`Client::upload_stream_sized`] 的数据来源：内存 O(块大小)，与文件大小无关。
+///
+/// ★ 读错误必须**传出去**，不能当作 EOF：早期实现是 `reader.read(...).await.ok()?`
+/// —— 一次本地 IO 错误（磁盘掉线 / 读 EIO）被 `ok()` 吞成「流正常结束」，
+/// 于是 reqwest 按已声明的 `Content-Length` 发了一个**短 body**，调用方最后只看到
+/// 一个泛泛的网络/服务端错误（根因丢失）；若服务端宽松接受短 body，更会静默落盘
+/// 一个截断文件。这里用 `Some(Err(e))` 让 `Body::wrap_stream` 把它当传输错误抛出，
+/// 并在产出错误后终止流（下一次 poll 返回 `None`）。
+fn read_chunk_stream<R>(
+    reader: R,
+    sent: Arc<std::sync::atomic::AtomicU64>,
+) -> impl futures_util::Stream<Item = std::io::Result<Vec<u8>>>
+where
+    R: tokio::io::AsyncRead + Send + Unpin + 'static,
+{
+    futures_util::stream::unfold(
+        (Some(reader), vec![0u8; UPLOAD_CHUNK], sent),
+        |(mut reader, mut buf, sent)| async move {
+            use tokio::io::AsyncReadExt as _;
+            // `None` = 上一块读失败后已终止（reqwest 通常不会再 poll，这里兜底）。
+            let mut r = reader.take()?;
+            match r.read(&mut buf).await {
+                Ok(0) => None,
+                Ok(n) => {
+                    sent.fetch_add(n as u64, Ordering::Relaxed);
+                    Some((Ok(buf[..n].to_vec()), (Some(r), buf, sent)))
+                }
+                Err(e) => Some((Err(e), (None, buf, sent))),
+            }
+        },
+    )
+}
+
+// ------------------------------------------------- 下载正文的错误体判定 / 区间校验
+
+/// 校验 [`Client::download_range`] 的闭区间。
+///
+/// `start > end` 必须报错而不是把 `Range: bytes=100-50` 发出去：那是非法 Range，
+/// 服务端会**忽略 Range 直接回整个文件**（200），调用方拿到的就不再是请求的那一段
+/// —— FUSE 的区间水合会把它当区间内容写进缓存（铁则 1：绝不短读/错位）。
+fn checked_range(start: u64, end: u64) -> Result<()> {
+    if start > end {
+        return Err(Error::Parse(format!(
+            "download_range 非法区间: start={start} > end={end}"
+        )));
+    }
+    Ok(())
+}
+
+/// 服务端是否**忽略了 Range**（对「从中间取」的请求回了 200 + 整个文件）。
+///
+/// 判据刻意宽松：`start == 0` 时 200 与 206 本来就难分（整个文件可能就是这段），
+/// 长度恰好等于请求长度的 200 也放过（有些实现会直接回切片 + 200）；
+/// 只有「200 + 从中间取 + 长度不等于请求长度」才是确定的整文件 —— 这种绝不能
+/// 当区间字节返回。
+fn range_was_ignored(code: u16, start: u64, end: u64, body_len: usize) -> bool {
+    code == 200 && start > 0 && body_len as u64 != end - start + 1
+}
+
+/// 「HTTP 200 但 body 其实是服务端 JSON 错误信封」的判定（命中 → 返回可读错误）。
+///
+/// 真机记录（`xtask/probe/probe-out/webui/chain4/dl_missing.http`）：
+///
+/// ```text
+/// 200 ... Content-Type: application/json
+/// { "version": "", "build": "20260723", "status": 20, "success": "true" }
+/// ```
+///
+/// ★ 早期实现写的是 `body.windows(9).any(|w| w == b"\"status\"")` ——
+/// `b"\"status\""` 只有 **8** 字节，任何 9 字节窗口都不可能等于它，条件**恒为 false**，
+/// 于是这道保险从来没生效过：服务端错误体被当成文件内容静默返回。
+///
+/// 但也不能简单改成 `windows(8)`：用户同步的 **JSON 文件**同样可能以 `{` 开头、
+/// 带一个非 0/1 的 `status` 字段，那样会把真文件误判成服务端错误（读它必然 EIO）。
+/// 所以除了 `status` 非成功，还要求它**像服务端信封** —— `version` / `build` /
+/// `success` / `msg` 里至少出现两个，且没有列表响应才有的 `datas` 键。
+fn download_json_error(body: &[u8], context: &str) -> Option<Error> {
+    if !body.starts_with(b"{") {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let obj = v.as_object()?;
+    // 列表响应（正常 get_list）不是「单个文件的错误体」。
+    if obj.contains_key("datas") {
+        return None;
+    }
+    let status = match v.get("status")? {
+        serde_json::Value::Number(n) => n.as_i64()?,
+        serde_json::Value::String(s) => s.parse().ok()?,
+        _ => return None,
+    };
+    if ServerStatus(status).is_success() {
+        return None;
+    }
+    let envelope_markers = ["version", "build", "success", "msg"]
+        .iter()
+        .filter(|k| obj.contains_key(**k))
+        .count();
+    if envelope_markers < 2 {
+        return None;
+    }
+    Some(match v.get("msg").and_then(|m| m.as_str()) {
+        Some(msg) if !msg.trim().is_empty() => Error::status_msg(status, context, msg),
+        _ => Error::status(status, context),
+    })
 }
 
 impl Client {
@@ -1651,6 +1793,170 @@ pub fn debug_query(pairs: &[(&str, &str)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------ 区间下载的边界 / 错误体判定
+
+    /// ★ 回归：旧实现 `body.windows(9).any(|w| w == b"\"status\"")` 恒为 false
+    /// （`"status"` 带引号只有 8 字节），所以「200 + 服务端 JSON 错误体」从来没被拦住。
+    #[test]
+    fn download_error_envelope_is_detected_but_real_json_files_are_not() {
+        // 真机记录：200 + JSON 错误信封（xtask/probe/probe-out/webui/chain4/dl_missing.http）
+        let real = br#"{ "version": "", "build": "20260723", "status": 20, "success": "true" }"#;
+        let e = download_json_error(real, "download /home/nope.txt").expect("必须识别成错误");
+        assert!(matches!(e, Error::Status { .. }), "{e:?}");
+        assert!(e.to_string().contains("status=20"), "{e}");
+
+        // 成功信封不是错误
+        let ok = br#"{ "version": "", "build": "20260723", "status": 1, "success": "true" }"#;
+        assert!(download_json_error(ok, "x").is_none());
+
+        // 用户同步的 JSON 文件：有非 0/1 的 status，但不是服务端信封 → 不能误伤
+        // （误判会让这个文件的每次读都 EIO）
+        assert!(
+            download_json_error(br#"{"status": 500, "message": "boom"}"#, "x").is_none(),
+            "普通 JSON 文件不能被当成服务端错误"
+        );
+        assert!(
+            download_json_error(br#"{"version": "1.0.0", "status": 4, "items": []}"#, "x")
+                .is_none()
+        );
+
+        // 带 datas 的列表响应不是「单个文件的错误体」
+        assert!(download_json_error(
+            br#"{"status": 4, "version": "x", "build": "1", "datas": []}"#,
+            "x"
+        )
+        .is_none());
+
+        // 二进制 / 空 body / 非 JSON
+        assert!(download_json_error(&[0u8, 1, 2, 3], "x").is_none());
+        assert!(download_json_error(b"", "x").is_none());
+        assert!(download_json_error(b"not json", "x").is_none());
+
+        // 旧判据的窗口长度（`"status"` = 8 字节）—— 写死在这里防再次写错
+        assert_eq!(b"\"status\"".len(), 8);
+    }
+
+    #[test]
+    fn download_range_rejects_inverted_interval() {
+        assert!(checked_range(0, 0).is_ok(), "1 字节区间必须合法");
+        assert!(checked_range(0, 1023).is_ok());
+        let e = checked_range(50, 10).expect_err("start > end 必须报错");
+        assert!(e.to_string().contains("非法区间"), "{e}");
+    }
+
+    /// 服务端忽略 Range 的判定：只拦「200 + 从中间取 + 长度不对」这一种确定的整文件回包。
+    #[test]
+    fn download_range_detects_ignored_range() {
+        // 206 = 服务端确实按 Range 回了那一段
+        assert!(!range_was_ignored(206, 10, 19, 10));
+        // 200 + start=0：整文件可能就是请求的那段，不拦
+        assert!(!range_was_ignored(200, 0, 99, 100));
+        // 200 + 长度恰好等于请求长度：宽松放过
+        assert!(!range_was_ignored(200, 10, 19, 10));
+        // 200 + 从中间取 + 回的长度不对 = 整文件，必须拦
+        assert!(range_was_ignored(200, 10, 19, 100));
+        assert!(range_was_ignored(200, 10, 19, 5000));
+    }
+
+    // ------------------------------------------------ 上传流泵：读错误不能被吞
+
+    /// 读一块成功后立刻报 IO 错的数据源（模拟上传中途磁盘掉线 / EIO）。
+    struct FailAfterFirstChunk {
+        served: bool,
+    }
+
+    impl tokio::io::AsyncRead for FailAfterFirstChunk {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if !self.served {
+                self.served = true;
+                buf.put_slice(b"abc");
+                std::task::Poll::Ready(Ok(()))
+            } else {
+                std::task::Poll::Ready(Err(std::io::Error::other("磁盘读失败")))
+            }
+        }
+    }
+
+    /// ★ 回归：旧实现 `reader.read(...).await.ok()?` 把读错误吞成 EOF，
+    /// 上传会变成一次「短 body」，根因丢失。
+    #[tokio::test]
+    async fn upload_stream_propagates_read_error_instead_of_eof() {
+        use futures_util::StreamExt as _;
+        let sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let s = read_chunk_stream(FailAfterFirstChunk { served: false }, sent.clone());
+        futures_util::pin_mut!(s);
+        let first = s.next().await.expect("第一块必须有").expect("第一块应成功");
+        assert_eq!(first.as_slice(), b"abc");
+        let second = s.next().await.expect("第二个元素必须是错误");
+        assert!(second.is_err(), "读错误不能变成 EOF：{second:?}");
+        assert!(second.unwrap_err().to_string().contains("磁盘读失败"));
+        assert!(s.next().await.is_none(), "出错后流必须终止（不能继续读）");
+        assert_eq!(sent.load(Ordering::Relaxed), 3, "sent 只累计真正读走的字节");
+    }
+
+    #[tokio::test]
+    async fn upload_stream_pumps_to_eof_and_counts_bytes() {
+        use futures_util::StreamExt as _;
+        let sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let s = read_chunk_stream(&b"hello world"[..], sent.clone());
+        futures_util::pin_mut!(s);
+        let mut all = Vec::new();
+        while let Some(item) = s.next().await {
+            all.extend(item.expect("读 &[u8] 不会失败"));
+        }
+        assert_eq!(all.as_slice(), b"hello world");
+        assert_eq!(sent.load(Ordering::Relaxed), 11);
+    }
+
+    // ------------------------------------------------ 会话保活：未就绪 ≠ 会话失效
+
+    #[test]
+    fn alive_probe_does_not_treat_server_busy_as_dead_session() {
+        // 探测成功 = 活着
+        let ok = parse_max_log(b"{}").expect("空对象可解析");
+        assert!(matches!(alive_from_max_log(Ok(ok)), Ok(true)));
+
+        // 确定失效 → Ok(false)（调用方据此重登）
+        assert!(matches!(
+            alive_from_max_log(Err(Error::Auth("口令不对".into()))),
+            Ok(false)
+        ));
+        assert!(matches!(
+            alive_from_max_log(Err(Error::status(4, "qbox_get_max_log"))),
+            Ok(false)
+        ));
+
+        // 服务端未就绪（status=8 + 真机 msg）→ 探测失败，**不是**会话失效
+        let busy = Error::status_msg(
+            8,
+            "qbox_get_max_log",
+            "Qsync Central is initializing. Please wait a few minutes and try again.",
+        );
+        assert!(
+            matches!(alive_from_max_log(Err(busy)), Err(_)),
+            "status=8 不能进重登路径（重登无用，日志还会写「sid 已失效」）"
+        );
+        // 码值兜底：即便服务端这次没带 msg，8 也按未就绪处理
+        assert!(matches!(
+            alive_from_max_log(Err(Error::status(8, "qbox_get_max_log"))),
+            Err(_)
+        ));
+
+        // 网络/解析错误 → 探测失败
+        assert!(matches!(
+            alive_from_max_log(Err(Error::Transport("连接超时".into()))),
+            Err(_)
+        ));
+        assert!(matches!(
+            alive_from_max_log(Err(Error::Parse("坏 JSON".into()))),
+            Err(_)
+        ));
+    }
 
     #[test]
     fn xml_extraction_handles_cdata_and_plain() {

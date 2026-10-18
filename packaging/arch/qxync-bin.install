@@ -15,6 +15,17 @@ post_install() {
     没有连接配置时它也能起来（空转待命，不做事但一直活着），配好连接后会自动开始同步。
     装了本单元之后请用 systemctl 管它，别再 `qxync daemon start/stop`（两边会打架）。
 
+    多 NAS：上面装的是 default 连接的单元。额外连接用模板单元（<link_id> 是连接名，
+    对应 ~/.config/qxync/links/<link_id>.json，例如 nas2）：
+
+        systemctl --user enable --now qxyncd@<link_id>
+        systemctl --user status qxyncd@<link_id>
+        journalctl --user -u qxyncd@<link_id> -f
+
+    default 仍用 qxyncd.service，别和 qxyncd@default 同时启用（同一条连接会被拉起两个进程）。
+    每条连接一个独立 daemon（独立 socket / pid / 日志），停掉一条不影响其它连接。
+    图形界面里也能启动 / 停止每个连接：「设置 → 连接」的连接列表。
+
     图形界面：应用菜单里搜 qxync；首次使用在「设置 → 连接」里填 NAS 地址 / 用户 / 口令，
     点「保存并登录」。
 EOF

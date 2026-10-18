@@ -107,6 +107,13 @@ fn default_direction() -> String {
 pub struct Task {
     /// 任务 id，同时是文件名（`tasks/<id>.json`）。只允许 `[A-Za-z0-9._-]`。
     pub id: String,
+    /// ★ M16：这条任务属于哪个 NAS 连接（`links/<id>.json` 的 id）。
+    ///
+    /// `None` = 旧格式（多连接出现之前写的任务）：按
+    /// [`crate::config::LinkConfig::legacy_owner`] 归 `default` 或字典序最小的连接。
+    /// daemon 保存时一律写成显式的 `Some(link.id)`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_id: Option<String>,
     /// 展示名（缺省用 id）。
     #[serde(default)]
     pub name: String,
@@ -174,6 +181,7 @@ impl Default for Task {
     fn default() -> Self {
         Self {
             id: "default".into(),
+            link_id: None,
             name: String::new(),
             enabled: false,
             mountpoint: PathBuf::new(),
@@ -216,6 +224,9 @@ impl Task {
         Self {
             name: id.clone(),
             id,
+            // ★ M16：from_mount 不知道调用方正在用哪个 link；daemon 会在落盘前
+            // 显式补上（见 daemon 的 tasks_cmd/mount 分支）。
+            link_id: None,
             enabled: true,
             mountpoint,
             cache_dir: None,
@@ -286,6 +297,15 @@ impl Task {
         }
         if self.name.trim().is_empty() {
             self.name = self.id.clone();
+        }
+        // ★ M16：显式 link_id 必须能安全地当文件名（任务 JSON 可能是手工编辑的）。
+        if let Some(id) = &self.link_id {
+            if !crate::config::LinkConfig::is_valid_id(id) {
+                return Err(Error::Io(format!(
+                    "任务「{}」的 link_id 不合法：{id:?}（只允许 A-Za-z0-9 . _ -）",
+                    self.id
+                )));
+            }
         }
         if let Some(c) = &self.cache_dir {
             if !c.is_absolute() {
@@ -359,6 +379,50 @@ impl Task {
     /// 不碰文件系统 —— 挂载点可能还不存在，`canonicalize` 会失败。
     pub fn local_key(&self) -> PathBuf {
         normalize_local(&self.mountpoint)
+    }
+
+    /// ★ M16：这条任务实际归属的连接 id。
+    ///
+    /// 显式写了 `link_id` 就用它（哪怕对应连接文件暂时不在，也不能被别的 daemon 抢走）；
+    /// 旧任务没有字段 → 按 [`crate::config::LinkConfig::legacy_owner`] 归 `default`
+    /// 或字典序最小的连接。
+    pub fn effective_link_id(&self, all_ids: &[String]) -> Option<String> {
+        self.link_id
+            .clone()
+            .or_else(|| crate::config::LinkConfig::legacy_owner(all_ids))
+    }
+
+    /// ★ M16：这条任务是不是当前 daemon（`link_id`）该管的。
+    pub fn belongs_to(&self, link_id: &str, all_ids: &[String]) -> bool {
+        self.effective_link_id(all_ids)
+            .is_some_and(|id| id == link_id)
+    }
+
+    /// ★ M16：链式设置归属（daemon 落盘前用）。
+    pub fn with_link_id(mut self, link_id: impl Into<String>) -> Self {
+        self.link_id = Some(link_id.into());
+        self
+    }
+
+    /// ★ M16：只列出属于某个连接的任务。
+    pub fn list_for_link(
+        paths: &ConfigPaths,
+        link_id: &str,
+        all_ids: &[String],
+    ) -> (Vec<Task>, Vec<(PathBuf, String)>) {
+        let (list, bad) = Self::list(paths);
+        (
+            list.into_iter()
+                .filter(|t| t.belongs_to(link_id, all_ids))
+                .collect(),
+            bad,
+        )
+    }
+
+    /// ★ M16：任务目录里有没有**属于这个连接**的任务（界面空态判据）。
+    pub fn has_any_task_for_link(paths: &ConfigPaths, link_id: &str, all_ids: &[String]) -> bool {
+        let (list, _bad) = Self::list(paths);
+        list.iter().any(|t| t.belongs_to(link_id, all_ids))
     }
 
     /// ★ 提交前的「目的地冲突」检查（**会拦保存**）：本地这一侧撞车。
@@ -509,6 +573,7 @@ impl Task {
     pub fn legacy_from_link(link: &crate::config::LinkConfig) -> Self {
         Self {
             id: link.id.clone(),
+            link_id: Some(link.id.clone()),
             name: format!("{}（从连接配置推导）", link.id),
             enabled: false,
             mountpoint: PathBuf::new(),
@@ -1046,5 +1111,97 @@ mod tests {
         );
         t.save(&p).unwrap();
         assert!(has_any_task(&p));
+    }
+
+    // ------------------------------------------------------------ ★ M16 多连接归属
+
+    fn mk_task(id: &str, mp: &str) -> Task {
+        Task::from_mount(
+            Some(id.into()),
+            PathBuf::from(mp),
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn m16_task_link_id_is_optional_and_backward_compatible() {
+        // 旧 JSON 没有 link_id
+        let raw = br#"{"id":"t1","mountpoint":"/tmp/m","root":"/home"}"#;
+        let mut old: Task = serde_json::from_slice(raw).unwrap();
+        old.normalize().unwrap();
+        assert_eq!(old.link_id, None);
+
+        // 新 JSON 能往返；None 时**不写**这个键（老版本读新任务也不会看到陌生字段）
+        let mut t = mk_task("t1", "/tmp/m");
+        t.link_id = Some("nas2".into());
+        let body = serde_json::to_vec(&t).unwrap();
+        assert!(String::from_utf8(body)
+            .unwrap()
+            .contains("\"link_id\":\"nas2\""));
+        let back: Task = serde_json::from_slice(&serde_json::to_vec(&t).unwrap()).unwrap();
+        assert_eq!(back.link_id.as_deref(), Some("nas2"));
+        let none = serde_json::to_vec(&mk_task("t2", "/tmp/m")).unwrap();
+        assert!(!String::from_utf8(none).unwrap().contains("link_id"));
+    }
+
+    #[test]
+    fn m16_legacy_task_belongs_to_default_then_smallest_id() {
+        let t = mk_task("t1", "/tmp/m");
+        assert_eq!(
+            t.effective_link_id(&["default".into(), "nas2".into()]),
+            Some("default".into())
+        );
+        assert_eq!(
+            t.effective_link_id(&["nas3".into(), "nas2".into()]),
+            Some("nas2".into())
+        );
+        assert!(t.belongs_to("default", &["default".into(), "nas2".into()]));
+        assert!(!t.belongs_to("nas2", &["default".into(), "nas2".into()]));
+
+        // 显式归属优先：即使 default 存在，也只听自己的 link
+        let t = t.with_link_id("nas2");
+        assert!(t.belongs_to("nas2", &["default".into(), "nas2".into()]));
+        assert!(!t.belongs_to("default", &["default".into(), "nas2".into()]));
+    }
+
+    #[test]
+    fn m16_list_for_link_only_returns_its_tasks() {
+        let p = tmp_paths("m16-list");
+        let mut a = mk_task("a", "/tmp/a");
+        a.link_id = Some("default".into());
+        a.save(&p).unwrap();
+        let mut b = mk_task("b", "/tmp/b");
+        b.link_id = Some("nas2".into());
+        b.save(&p).unwrap();
+        let mut c = mk_task("c", "/tmp/c"); // 旧任务 → default
+        c.save(&p).unwrap();
+
+        let ids = vec!["default".to_string(), "nas2".to_string()];
+        let (d, bad) = Task::list_for_link(&p, "default", &ids);
+        assert!(bad.is_empty());
+        assert_eq!(
+            d.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "c"]
+        );
+        let (n, _) = Task::list_for_link(&p, "nas2", &ids);
+        assert_eq!(
+            n.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec!["b"]
+        );
+        assert!(Task::has_any_task_for_link(&p, "nas2", &ids));
+        assert!(!Task::has_any_task_for_link(&p, "nas9", &ids));
+    }
+
+    #[test]
+    fn m16_invalid_link_id_is_rejected_by_normalize() {
+        let mut t = mk_task("t1", "/tmp/m");
+        t.link_id = Some("../evil".into());
+        assert!(t.normalize().is_err());
     }
 }

@@ -131,6 +131,52 @@ baseline = **上次同步成功时远端的样子**（`path → {exists,is_dir,s
 `ui_spec`（`cargo test -p qxync-gui`）会校验新增 i18n 键都在 ZH 表里 —— 改这类
 「提示 + 按钮」时最容易漏的就是文案键。
 
+### 5.2 引擎侧：熔断告警只报「变化」+ 恢复后要能消失（2026-10-18 补充）
+
+真机现场（用户机器，v0.5.1）：
+
+```text
+每 30s 一条：WARN 删除保护熔断（526 项）：一次对账要删除 526 项，超过上限 50
+qxync status：删除被挡 692742          ← 13 小时 × 每 30s × 526 项 = 累计值
+journal：3046 条里 3023 条是同一句话  ← 1 万条上限几天就被冲掉
+GUI：三处「有删除被熔断挡住」告警一直亮着（问题恢复/放行后也不会消失）
+```
+
+根因不在熔断本身（它挡住删除是对的），而在**呈现层三件事**：
+
+1. **每轮都当成新告警**：`reconcile_view` 每轮 WARN + `journal_record_sync` 每轮记一条
+   blocked。现在 `SyncReport` 带「数量 + 原因」签名，`absorb_round()` 只在**签名变化**时
+   置 `delete_block_changed`；WARN/journal 只认这个标志，重复轮次降为 debug。
+   熔断解除的那一轮补记一条「删除保护熔断已解除」，否则更新中心最后一条永远停在熔断上。
+2. **「最近错误 / 熔断告警」只写不清**：`last_error`、`last_note`、`delete_block_reason`
+   以前只在「有」的时候写。现在统一由 `absorb_round(stats, report, completed)` 结算：
+   **完整跑完**的轮次（`completed=true`）零错误才清 `last_error`、`deletes_blocked==0`
+   才清熔断告警；在 `max_log` 阶段提前返回的轮次只更新当前错误、不清历史告警
+   （没检查过 ≠ 检查通过）。`--force-deletes` 手动放行时同时清 reason 与签名，
+   下次再熔断能重新告警。
+3. **累计值被当成「当前」显示**：`deletes_blocked` 是 `fetch_add` 的累计计数（只增不清），
+   CLI/GUI 标签改为「删除被挡（累计）」；「当前是否熔断」只看 `delete_block_reason`。
+   「引擎活着」的 scan journal 条目也从每 30s 一条降到 600s 一条。
+
+同批修的两个**数据安全**问题（都属于「远端缺失」判定的前提）：
+
+* **列举失败不能当远端删除**：旧实现里目录 `client.list()` 网络失败只记一条 error，
+  `remote_map` 因此缺项 → 这些路径被判 `DeleteLocal` → 本地节点与缓存被删。
+  现在 `reconcile_view` 统计非 404 的列举失败，>0 时**暂缓本视图删除判定**并在 note 里
+  说明；下一轮列全后恢复。（`status 4/5/6` 是确定的「不存在」，不算列举失败。）
+  这就是上面 §5 那条「网络错误绝不当成删除」的显式实现。
+* **baseline 的删除/改名永远落不了盘**（pre-existing）：`persist()` 只按 mtime 取较新
+  签名做增量合并，从**本轮快照**里删掉的条目会被内存里旧 `g.baseline` 复活 → 下一轮
+  又写回库。于是「规则排除清理」「回收站清理」「已执行删除的 baseline」「改名迁移的
+  旧路径」全部每轮重复出现。现在改为「本轮没有并发 hook 写 → **整份替换**（删除/改名
+  真正落盘）；有 hook 并发写 → 退回逐条合并」，并用重开库的测试钉住落盘。
+* **回收站不进 baseline/对账**：真机 baseline 1991 条里 1425 条在 `/home/@Recycle` 下、
+  13 条在 `.Trash-1000` 下（还有 FDO `.trashinfo` 被反向同步到 NAS）。
+  `@Recycle` / `.Trash` / `.Trash-<uid>` 现在从对账、baseline、改名配对、事件处理里
+  全部排除（判定在 `qxync-core::trash`，与 FUSE `deny_trash` 同一套段级语义）；
+  baseline 里已有的回收站条目做一次性清理（**只清状态，不动文件**）。
+  QTS 清理自己的回收站时，不会再在本端产生成批「远端删除」候选。
+
 ---
 
 ## 6. 远端变更如何作用到 FUSE

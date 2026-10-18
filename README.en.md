@@ -28,7 +28,7 @@ A **Qsync client that runs on Linux**, made up of three binaries:
 | Binary | Role |
 |---|---|
 | `qxync` | Command line (login / list / upload & download / mount / sync / dehydrate / tasks / settings / logs / LAN peering) |
-| `qxyncd` | Long-running daemon: the **only** process holding the FUSE mount and the NAS session, exposing a local unix-socket JSON IPC |
+| `qxyncd` | Long-running daemon (**one per NAS connection**): holds that connection's FUSE mount and NAS session, exposing a local unix-socket JSON IPC |
 | `qxync-gui` | Tauri 2 desktop app (dependency-free static frontend, everything goes through the daemon's IPC) |
 
 **What it is**: an **interoperability implementation** of the behaviour exhibited by QNAP's
@@ -55,12 +55,14 @@ against a real NAS.
 | **Deleting** | `unlink`/`rmdir` **return immediately**; the remote delete is pushed by a background queue that **coalesces same-directory items into one request** (the official Smart Delete shape); survives crashes; bulk accidental deletes are still stopped by the **circuit breaker** | [CHANGELOG](CHANGELOG.en.md) |
 | **No trash bin on the mount point** | when the desktop (KDE Dolphin's `trash:` protocol) tries to create `.Trash-$UID` inside the mount, it is rejected — deleting a file really deletes it | [CHANGELOG](CHANGELOG.en.md) |
 | **Change discovery** | three-cursor polling + three-way baseline reconciliation; conflicts produce a **conflicted copy**, and bulk remote deletes are guarded by a **circuit breaker** | [M2c](docs/M2c-变更发现.md) |
+| **Conflict decisions** | under the "ask me for every file" policy, pending conflicts land in a queue where you can **compare local vs NAS** (line-level diff with correct direction), **keep local / keep NAS / keep both / ignore this one / clear**; stale rows are swept automatically (queue rows only, never files); **recycle-bin subtrees (`@Recycle` / `.Trash-*`) are never synced** | [M8 §⑤](docs/M8-向Qsync-Client-6靠拢.md) · [M4 §4.1.2](docs/M4-GUI.md) |
 | **Dehydration (free up space)** | the full safety-check chain (pin / unuploaded changes / open fd / mmap'd / currently hydrating / recently accessed) must pass before local content is dropped | [M3](docs/M3-脱水.md) |
 | **Local state store** | SQLite carries cursors / baseline / pin / upload queue, persisted in **one and the same transaction**; librsync-compatible delta codec + capability gating | [M5](docs/M5-SQLite与delta.md) |
 | **Shared folders** | NAS folders are paired **one-to-one** onto local folders; writability is decided by the NAS (folders registered as Qsync sync folders are writable) | [M6](docs/M6-多根与共享文件夹.md) · [CHANGELOG](CHANGELOG.en.md) |
 | **Selective sync** | gitignore-flavoured `exclude` rules (anchoring / `**` / negation / subtree pruning) + built-in temporary-file filtering | [M7](docs/M7-选择性同步与LAN直连.md) |
 | **LAN direct** | qxync↔qxync peer protocol: device pairing, event fast path, direct local range transfer (any failure silently falls back to the NAS) | [M7](docs/M7-选择性同步与LAN直连.md) |
 | **Sync tasks** | mount registrations persisted in `tasks/<id>.json`, pause/resume per task, restorable after a restart with `--restore-tasks` | [M8](docs/M8-向Qsync-Client-6靠拢.md) |
+| **Multiple NAS connections** | **one `qxyncd` process per connection** (its own socket / pid / log / state store / cache / upload queue); `default` keeps the legacy paths; many tasks per connection; CLI `qxync links` / `daemon … --all`, GUI connection list and "current connection" switcher | [M16](docs/M16-多NAS连接.md) |
 | **Sync log** | the `journal` table of `sync.db` plus background batched writes and rotation, driving the GUI's "File Update Center / error list" | [M8](docs/M8-向Qsync-Client-6靠拢.md) |
 | **Desktop GUI** | Home / Tasks / Files / Updates / Errors / Settings / Diagnostics; tray + notifications + autostart + file picker + **"Open folder"** on task cards (opens the local mount point with the desktop's default directory tool) | [M4](docs/M4-GUI.md) · [M8](docs/M8-向Qsync-Client-6靠拢.md) |
 | **Settings center** | three proxy modes (Auto-detect / No proxy / Manual), automatic space freeing, five conflict policies, three file states | [M8](docs/M8-向Qsync-Client-6靠拢.md) |
@@ -222,6 +224,22 @@ sudo loginctl enable-linger "$USER"      # only if you want it up without an act
 > `qxync daemon stop` — that path is for systems without systemd, and using both at once only
 > makes them fight (`qxync daemon stop` exits via IPC, so systemd sees its main process vanish).
 
+**Several NAS boxes**: the unit above is for the `default` connection. For additional
+connections use the **template unit** `qxyncd@<link_id>` (`<link_id>` corresponds to
+`~/.config/qxync/links/<id>.json`, e.g. `nas2`):
+
+```bash
+systemctl --user enable --now qxyncd@nas2    # start / enable the nas2 connection
+systemctl --user status qxyncd@nas2
+journalctl --user -u qxyncd@nas2 -f          # that connection's log (same content as qxyncd-nas2.log)
+```
+
+`default` keeps using `qxyncd.service`; do **not** enable `qxyncd@default` as well (it would
+start two processes for the same connection), and do not let the GUI and systemd manage the
+same connection at the same time. Each connection gets its own daemon (own socket / pid / log /
+state store), stopping one leaves the others alone, and the GUI's "Settings → Connections" can
+start / stop each connection too. See [`docs/M16-多NAS连接.md`](docs/M16-多NAS连接.md).
+
 ### 5. GUI
 
 ```bash
@@ -365,6 +383,11 @@ Qsync protocol (it is not a config field).
   two-way `ui_spec` self-check in `qxync-gui --self-test`, and **no i18n framework is introduced**.
 * **In direct mode (`--direct`), editing `settings.json` only writes the file**: a running daemon must
   be restarted before it reads the new settings.
+* **Two boundaries of multiple NAS connections (M16)**: (1) do **not** bidirectionally sync the same
+  remote directory through two connections to the same NAS at the same time (each connection has its
+  own baseline, so the two would read each other's writes as local changes); (2) non-default
+  connections **do not exist in older versions** — rolling back makes them unavailable (`default` is
+  unaffected). See [`M16-多NAS连接.md`](docs/M16-多NAS连接.md).
 * **Capability gating rather than capability assumptions**: when the NAS has no historical versions,
   delta goes through the gate and the real path is still a whole-file transfer
   (see [`M5-SQLite与delta.md`](docs/M5-SQLite与delta.md)).
@@ -573,6 +596,7 @@ cargo test -p qxync-daemon -- --ignored --test-threads=1 --nocapture     # M2c e
 | [`docs/M6-多根与共享文件夹.md`](docs/M6-多根与共享文件夹.md) | **Historical**: multi-root layout (removed), read-only rules, real-NAS shared-folder probing |
 | [`docs/M7-选择性同步与LAN直连.md`](docs/M7-选择性同步与LAN直连.md) | exclude rule engine, peer protocol wire format, event fast path, direct transfer |
 | [`docs/M8-向Qsync-Client-6靠拢.md`](docs/M8-向Qsync-Client-6靠拢.md) | GUI rework research + M8.1–M8.6 execution plan and decision log |
+| [`docs/M16-多NAS连接.md`](docs/M16-多NAS连接.md) | Multiple NAS connections: one daemon per connection, namespacing and storage layout, legacy migration, CLI/GUI entry points, safety boundaries and acceptance |
 | [`docs/验收记录.md`](docs/验收记录.md) | Milestone-level acceptance conclusions (what was run, what the result was) |
 | [`docs/发布清单-v0.1.0.md`](docs/发布清单-v0.1.0.md) | Pre-release checklist (for maintainers) |
 | [`CHANGELOG.md`](CHANGELOG.md) | Changelog |

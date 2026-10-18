@@ -4,13 +4,20 @@
 
 | 文件 | 作用 |
 |---|---|
-| `PKGBUILD` | AUR 包定义：直接取 GitHub Release 上的预编译 `qxync-<版本>-x86_64-unknown-linux-gnu.tar.gz`，把 `qxync` / `qxyncd` / `qxync-gui` 装进 `/usr/bin`，桌面项 / 图标装进 `/usr/share`，systemd **user** 单元装进 `/usr/lib/systemd/user/` |
-| `qxync-bin.install` | 装完打印的提示（`post_install`）：怎么 `systemctl --user enable --now qxyncd`、怎么看日志、以及「开了单元就别再用 `qxync daemon start/stop`」 |
+| `PKGBUILD` | AUR 包定义：直接取 GitHub Release 上的预编译 `qxync-<版本>-x86_64-unknown-linux-gnu.tar.gz`，把 `qxync` / `qxyncd` / `qxync-gui` 装进 `/usr/bin`，桌面项 / 图标装进 `/usr/share`，systemd **user** 单元装进 `/usr/lib/systemd/user/`（`qxyncd.service` + 多连接模板 `qxyncd@.service`） |
+| `qxync-bin.install` | 装完打印的提示（`post_install`）：怎么 `systemctl --user enable --now qxyncd`、怎么看日志、多 NAS 怎么用 `qxyncd@<link_id>`，以及「开了单元就别再用 `qxync daemon start/stop`」 |
 | `.SRCINFO` | AUR 要求的元数据，由 `makepkg --printsrcinfo > .SRCINFO` 生成，**不要手写** |
 
 > ⚠️ **不会**自动启用 `qxyncd.service`：它是 user 单元，得在**每个用户自己的会话**里
 > `systemctl --user enable --now qxyncd`（包不能替某个用户做这件事）。想「不登录也常驻」
 > 再加 `sudo loginctl enable-linger "$USER"`。
+
+> ⚠️ **多 NAS（M16）**：包里另外装了模板单元 `/usr/lib/systemd/user/qxyncd@.service`，
+> **只给非 default 连接用**。额外连接用 `systemctl --user enable --now qxyncd@<link_id>`
+> （`<link_id>` 对应 `~/.config/qxync/links/<link_id>.json`）；default 仍用
+> `qxyncd.service`，**别**和 `qxyncd@default` 同时启用（同一条连接会被拉起两个进程）。
+> 每条连接一个独立 daemon（独立 socket / pid / 日志），停掉一条不影响其它连接；
+> GUI「设置 → 连接」里也能启动 / 停止每个连接。
 
 > ⚠️ `sha256sums` 在仓库里是**占位值**（一串 `0`）：Release 产物由 CI 在 ubuntu-22.04 上构建，
 > 提交代码时算不出来。发版之后**必须**更新（见下面「发新版本」），否则用户装的时候

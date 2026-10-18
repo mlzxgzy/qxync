@@ -313,7 +313,14 @@ impl DirContent {
             }
         }
         let (root, dir) = best?;
-        let rel = remote.trim_start_matches(root).trim_start_matches('/');
+        // ★ 必须 `strip_prefix` 一次，**不能** `trim_start_matches(root)`：
+        //   `trim_start_matches` 会**反复**剥同一前缀，`/home/home/x` 配 root `/home`
+        //   会被剥成 `x` → 取到 `<dir>/x` 而不是 `<dir>/home/x`（读错文件）。
+        //   走到这里时已确认 `remote == root` 或 `remote.starts_with("{root}/")`。
+        let rel = remote
+            .strip_prefix(root)
+            .unwrap_or("")
+            .trim_start_matches('/');
         Some(dir.join(rel))
     }
 }
@@ -484,6 +491,11 @@ impl PeerServer {
     }
 
     /// 路径必须落在某个 root 之内（拒绝 `..` 与空路径）。
+    ///
+    /// **没声明任何 root = 什么路径都不放行**（fail-closed）：这个服务端在 LAN 上
+    /// 收明文请求，`roots` 空时若 fail-open，任何自定义 [`ContentSource`] 只要没在
+    /// `read_at` 里自己校验路径，就变成「任意路径读取」。daemon 的内容源恒定声明
+    /// `/home`，所以真机上不会走到空 roots 分支；这条只影响自定义/测试内容源。
     fn path_allowed(&self, path: &str) -> bool {
         if path.is_empty() || !path.starts_with('/') {
             return false;
@@ -493,7 +505,7 @@ impl PeerServer {
         }
         let roots = &self.identity.roots;
         if roots.is_empty() {
-            return true;
+            return false;
         }
         roots.iter().any(|r| {
             let r = r.trim_end_matches('/');
@@ -1279,6 +1291,57 @@ mod tests {
         assert!(!srv.path_allowed("/home/a/../b"));
         assert!(!srv.path_allowed("home/a"));
         assert!(!srv.path_allowed(""));
+    }
+
+    /// ★ 没声明 root（`roots` 为空）时必须 **fail-closed**。
+    ///
+    /// 这个服务端在 LAN 上收明文请求：空 roots 若 fail-open，任何自定义
+    /// [`ContentSource`] 只要没在 `read_at` 里自己校验路径 = 任意路径读取。
+    #[test]
+    fn path_guard_fails_closed_when_no_roots_declared() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (reg_tx, _rr) = tokio::sync::mpsc::unbounded_channel();
+        let srv = PeerServer::new(
+            "s",
+            "v",
+            None,
+            Vec::new(),
+            Arc::new(DirContent::default()),
+            tx,
+            reg_tx,
+        );
+        assert!(srv.identity.roots.is_empty());
+        assert!(
+            !srv.path_allowed("/home/a"),
+            "没声明 roots 就不能放行任何路径"
+        );
+        assert!(!srv.path_allowed("/"));
+    }
+
+    /// ★ 回归：`DirContent::local_of` 曾用 `trim_start_matches(root)`，它会**反复**
+    /// 剥同一前缀 —— root `/home` 时 `/home/home/x` 被剥成 `x`，于是读到的是
+    /// `<dir>/x` 而不是 `<dir>/home/x`（把别的文件内容当成本路径返回）。
+    #[test]
+    fn dir_content_keeps_repeated_root_prefix() {
+        let d = tmpdir("repeated-root");
+        std::fs::create_dir_all(d.join("home")).unwrap();
+        // 两个同名文件、内容不同：剥多一层就会拿到错的那个
+        std::fs::write(d.join("home/same.txt"), b"nested-inside-home").unwrap();
+        std::fs::write(d.join("same.txt"), b"at-map-root").unwrap();
+        let src = DirContent::new(vec![("/home".into(), d.clone())]);
+
+        let head = src.head("/home/home/same.txt").expect("路径在 root 内");
+        assert_eq!(head.size, b"nested-inside-home".len() as u64);
+        let data = src.read_at("/home/home/same.txt", 0, 16).unwrap();
+        assert_eq!(&data[..16], b"nested-inside-ho");
+        assert_eq!(
+            src.read_at("/home/same.txt", 0, 11).unwrap(),
+            b"at-map-root",
+            "单层前缀不能剥错"
+        );
+        // 根自身（root == remote）映射到目录，head 只对文件返回 Some
+        assert!(src.head("/home").is_none());
+        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]

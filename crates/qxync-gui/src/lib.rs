@@ -46,6 +46,11 @@ pub fn run() {
             commands::credential_present,
             commands::daemon_start,
             commands::daemon_stop,
+            commands::daemon_start_all,
+            commands::daemon_stop_all,
+            commands::links_status,
+            commands::tasks_config,
+            commands::link_delete,
             commands::login_flow,
             // ★ M8.4：托盘 / 通知 / 选择器 / opener / 窗口控制
             commands::m84_info,
@@ -213,7 +218,7 @@ async fn self_test_login_inner() -> Value {
     }
 
     // 1) 停掉（可能本来就没跑）
-    let stopped = commands::daemon_stop().await.unwrap_or(Value::Null);
+    let stopped = commands::daemon_stop(None).await.unwrap_or(Value::Null);
     let stop_ok = stopped["stopped"].as_bool().unwrap_or(false)
         || stopped["already"].as_bool().unwrap_or(false);
 
@@ -233,7 +238,7 @@ async fn self_test_login_inner() -> Value {
     let login_ok = login["ok"].as_bool().unwrap_or(false);
 
     // 3) 复核
-    let st = commands::daemon_status().await.ok();
+    let st = commands::daemon_status(None).await.ok();
     let st_json = st
         .and_then(|s| serde_json::to_value(s).ok())
         .unwrap_or(Value::Null);
@@ -253,6 +258,216 @@ async fn self_test_login_inner() -> Value {
         "daemon_running": running,
         "logged_in": logged_in,
         "session": st_json["status"]["session"],
+    })
+}
+
+/// ★ M16 多连接自检（`qxync-gui --self-test-multi`）：无窗口、无真 NAS。
+///
+/// 用隔离的 XDG 目录 + 两个假连接（`127.0.0.1:1`）证明：
+/// 1. `links_status` 能列出两个连接；
+/// 2. `daemon_start_all` 能起两个独立 daemon（两个 socket）；
+/// 3. 任务保存按连接隔离，且同 id 跨连接覆盖会被拒；
+/// 4. `daemon_stop_all` 能把它们收干净。
+pub fn self_test_multi() -> bool {
+    // 先把日志目录也指到临时 XDG 里：沙箱/CI 的 ~/.local/state 可能不可写，
+    // 而 init_logging 会真的去建滚动日志文件。进程跑完就退出，改 env 无副作用。
+    let root = std::env::temp_dir().join(format!("qxync-gui-multi-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(root.join("state"));
+    std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
+    std::env::set_var("XDG_DATA_HOME", root.join("data"));
+    std::env::set_var("XDG_STATE_HOME", root.join("state"));
+    std::env::set_var("XDG_RUNTIME_DIR", root.join("run"));
+    std::env::remove_var("QXNYC_SOCKET");
+    init_logging();
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            println!(
+                "{}",
+                json!({"ok": false, "error": format!("建 tokio 运行时失败: {e}")})
+            );
+            return false;
+        }
+    };
+    let out = rt.block_on(self_test_multi_inner());
+    let ok = out["ok"].as_bool().unwrap_or(false);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".into())
+    );
+    ok
+}
+
+async fn self_test_multi_inner() -> Value {
+    let root = std::env::temp_dir().join(format!("qxync-gui-multi-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let (cfg, run, state) = (root.join("config"), root.join("run"), root.join("state"));
+    for d in [cfg.join("qxync/links"), run.clone(), state.clone()] {
+        if let Err(e) = std::fs::create_dir_all(&d) {
+            return json!({"ok": false, "error": format!("建临时目录失败 {}: {e}", d.display())});
+        }
+    }
+    // 两条假连接：端口 1 一定连不上，但 daemon 会正常起来（同步失败不影响 IPC）。
+    for (id, host) in [("default", "127.0.0.1"), ("nas2", "127.0.0.1")] {
+        let link = json!({
+            "id": id, "host": host, "port": 1u16, "https": false, "insecure": true,
+            "user": "u", "ipv4_only": true,
+        });
+        if let Err(e) = std::fs::write(
+            cfg.join(format!("qxync/links/{id}.json")),
+            serde_json::to_vec_pretty(&link).unwrap(),
+        ) {
+            return json!({"ok": false, "error": format!("写连接 {id} 失败: {e}")});
+        }
+    }
+    // 隔离环境；清掉外部可能设置的固定 socket（否则两个连接会抢同一个路径）。
+    std::env::set_var("XDG_CONFIG_HOME", &cfg);
+    std::env::set_var("XDG_DATA_HOME", &root.join("data"));
+    std::env::set_var("XDG_STATE_HOME", &state);
+    std::env::set_var("XDG_RUNTIME_DIR", &run);
+    std::env::set_var("QXNYC_TASK_RESTORE", "0");
+    std::env::remove_var("QXNYC_SOCKET");
+
+    let before = commands::links_status().await.unwrap_or(Value::Null);
+    let n_before = before["links"].as_array().map(Vec::len).unwrap_or(0);
+    let start = commands::daemon_start_all().await.unwrap_or(Value::Null);
+
+    // 等两个 daemon 都就绪（start_daemon 自己会等，这里只是复核）
+    let mut running = 0usize;
+    let mut sockets = Vec::new();
+    for _ in 0..40 {
+        let st = commands::links_status().await.unwrap_or(Value::Null);
+        running = 0;
+        sockets.clear();
+        if let Some(ls) = st["links"].as_array() {
+            for l in ls {
+                if l["daemon"]["running"].as_bool() == Some(true) {
+                    running += 1;
+                    sockets.push(l["socket"].as_str().unwrap_or("").to_string());
+                }
+            }
+        }
+        if running == 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    sockets.sort();
+    sockets.dedup();
+
+    let mp = root.join("mnt");
+    let _ = std::fs::create_dir_all(&mp);
+    let task = json!({
+        "id": "t1", "mountpoint": mp.display().to_string(), "root": "/home",
+        "enabled": true, "read_write": false,
+    });
+    let save_default = commands::ipc_call(
+        Some("default".into()),
+        json!({"v":1,"method":"tasks","action":"save","task":task}),
+    )
+    .await;
+    let list_default = commands::ipc_call(
+        Some("default".into()),
+        json!({"v":1,"method":"tasks","action":"list"}),
+    )
+    .await;
+    let list_nas2 = commands::ipc_call(
+        Some("nas2".into()),
+        json!({"v":1,"method":"tasks","action":"list"}),
+    )
+    .await;
+    // 同 id 从另一连接覆盖必须被拒
+    let overwrite = commands::ipc_call(
+        Some("nas2".into()),
+        json!({"v":1,"method":"tasks","action":"save","task":{
+            "id":"t1","mountpoint": root.join("mnt2").display().to_string(), "root":"/home"
+        }}),
+    )
+    .await;
+
+    // ★ M16：daemon 停掉后，任务登记仍然要从磁盘读得到（主页不能把任务藏起来）
+    let mp2 = root.join("mnt-nas2");
+    let _ = std::fs::create_dir_all(&mp2);
+    let save_nas2 = commands::ipc_call(
+        Some("nas2".into()),
+        json!({"v":1,"method":"tasks","action":"save","task":{
+            "id":"t2","mountpoint": mp2.display().to_string(), "root":"/home"
+        }}),
+    )
+    .await;
+    let stop_nas2 = commands::daemon_stop(Some("nas2".into()))
+        .await
+        .unwrap_or(Value::Null);
+    let offline_nas2 = commands::tasks_config("nas2".into())
+        .await
+        .unwrap_or(Value::Null);
+    let offline_has = offline_nas2["tasks"]
+        .as_array()
+        .is_some_and(|a| a.iter().any(|t| t["task"]["id"] == "t2"));
+
+    // 移除连接：先探测（有任务时只回 needs_confirm、不删），确认后才真删。
+    let del_probe = commands::link_delete("nas2".into(), None)
+        .await
+        .unwrap_or(Value::Null);
+    let probe_needs_confirm = del_probe["needs_confirm"].as_bool() == Some(true)
+        && del_probe["deleted"].as_bool() == Some(false);
+    let still_there = commands::tasks_config("nas2".into())
+        .await
+        .unwrap_or(Value::Null)["tasks"]
+        .as_array()
+        .is_some_and(|a| a.iter().any(|t| t["task"]["id"] == "t2"));
+    let del_done = commands::link_delete("nas2".into(), Some(true))
+        .await
+        .unwrap_or(Value::Null);
+    let delete_ok = del_done["deleted"].as_bool() == Some(true)
+        && del_done["tasks_deleted"].as_u64() == Some(1);
+
+    let stopped = commands::daemon_stop_all().await.unwrap_or(Value::Null);
+    let _ = std::fs::remove_dir_all(&root);
+
+    let default_has = list_default["data"]["tasks"]
+        .as_array()
+        .is_some_and(|a| a.iter().any(|t| t["task"]["id"] == "t1"));
+    let nas2_has = list_nas2["data"]["tasks"]
+        .as_array()
+        .is_some_and(|a| a.iter().any(|t| t["task"]["id"] == "t1"));
+    let overwrite_rejected = overwrite["ok"].as_bool() == Some(false);
+    let stopped_ok = stopped["ok"].as_bool() == Some(true);
+
+    json!({
+        "ok": n_before == 2
+            && start["ok"].as_bool() == Some(true)
+            && running == 2
+            && sockets.len() == 2
+            && save_default["ok"].as_bool() == Some(true)
+            && default_has
+            && !nas2_has
+            && overwrite_rejected
+            && save_nas2["ok"].as_bool() == Some(true)
+            && stop_nas2["stopped"].as_bool() == Some(true)
+            && offline_has
+            && probe_needs_confirm
+            && still_there
+            && delete_ok
+            && stopped_ok,
+        "links_before": n_before,
+        "start": start,
+        "running": running,
+        "unique_sockets": sockets.len(),
+        "sockets": sockets,
+        "save_default_ok": save_default["ok"],
+        "default_has_task": default_has,
+        "nas2_has_task": nas2_has,
+        "cross_link_overwrite_rejected": overwrite_rejected,
+        "offline_tasks_visible": offline_has,
+        "link_delete_probe_needs_confirm": probe_needs_confirm,
+        "link_delete_kept_link_until_confirm": still_there,
+        "link_delete_ok": delete_ok,
+        "stop_all_ok": stopped_ok,
+        "note": "假连接 127.0.0.1:1：只验证多 daemon/任务隔离，不验证 NAS 同步",
     })
 }
 

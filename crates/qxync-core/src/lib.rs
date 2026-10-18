@@ -17,6 +17,7 @@
 //!   `versioning_stat_delta` 恒 `exist:0` → **增量链路服务端不可用**（M5 实测，见 `M5-SQLite与delta.md`）。
 
 pub mod config;
+pub mod decisions;
 pub mod dehydrate;
 pub mod delta;
 pub mod encode;
@@ -33,8 +34,13 @@ pub mod status;
 pub mod store;
 pub mod sync;
 pub mod tasks;
+pub mod trash;
 
 pub use config::{ConfigPaths, Credentials, LinkConfig, PeerConfig, PeerRegistry};
+pub use decisions::{
+    looks_binary, prepare_bytes, sweep_batch, sweep_decision, text_diff, DecisionFacts, DiffLine,
+    DiffOutcome, DiffResult, DiffSkip, SweepVerdict, DIFF_MAX_BYTES,
+};
 pub use dehydrate::{Block, CacheLimit, Candidate, Policy};
 pub use delta::Signature;
 pub use encode::{build_query, encode_query_value};
@@ -53,6 +59,7 @@ pub use sync::{
     SyncLogBatch,
 };
 pub use tasks::{Task, DIR_2WAY, DIR_DOWN, DIR_UP};
+pub use trash::{is_trash_path, is_trash_segment};
 
 /// 普通用户的 Qsync 家目录根（不是 `/home/<user>`）。
 pub const HOME_ROOT: &str = "/home";

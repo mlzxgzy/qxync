@@ -8,17 +8,17 @@ use qxync_client::{Client, Session};
 use qxync_core::dehydrate::{Block, CacheLimit, Policy};
 use qxync_core::ipc::{
     decode_line, encode_line, mask_sid, mask_token, CacheInfo, CursorInfo, DaemonInfo,
-    DecisionInfo, DecisionsData, DehydrateData, ErrorKind, FileStateInfo, FileStatesData, GetData,
-    HydroStats, IpcError, JournalData, LinkInfo, LoginData, LsData, MountInfo, PeerData, PingData,
-    PutData, Request, RequestEnvelope, Response, RootsData, RulesData, ServerInfo, SessionInfo,
-    SettingsData, ShutdownData, SpaceData, StatusData, StoreData, SyncCursors, SyncInfo, TaskInfo,
-    TasksData, IPC_VERSION,
+    DecisionInfo, DecisionsData, DehydrateData, DiffData, ErrorKind, FileStateInfo, FileStatesData,
+    GetData, HydroStats, IpcError, JournalData, LinkInfo, LoginData, LsData, MountInfo, PeerData,
+    PingData, PutData, Request, RequestEnvelope, Response, RootsData, RulesData, ServerInfo,
+    SessionInfo, SettingsData, ShutdownData, SpaceData, StatusData, StoreData, SyncCursors,
+    SyncInfo, TaskInfo, TasksData, IPC_VERSION,
 };
 use qxync_core::mounts::{MountRecord, MountsFile};
 use qxync_core::rules::Rules;
 use qxync_core::settings::{ProxySpec, Settings};
 use qxync_core::store::JournalEntry;
-use qxync_core::tasks::{conflict_label, has_any_task, Task, CONFLICT_RENAME_LOCAL};
+use qxync_core::tasks::{conflict_label, Task, CONFLICT_RENAME_LOCAL};
 use qxync_core::{ConfigPaths, Credentials, Error as CoreError, LinkConfig, PeerConfig};
 use qxync_fuse::delete::DeleteQueue;
 use qxync_fuse::upload::UploadQueue;
@@ -262,6 +262,15 @@ pub(crate) struct State {
     sync_cfg: StdMutex<SyncConfig>,
     /// 后台轮询间隔秒数（0 = 暂停）。
     sync_interval: StdMutex<u64>,
+    /// ★ **整轮同步互斥锁**（tokio 异步锁，`run_sync_once` 全程持有）。
+    ///
+    /// 为什么必须有：`sync::persist` 在本轮**没有 hook 并发写**时会把 baseline
+    /// **整份替换**（这是删除 / 改名迁移真正落盘的前提）。这个写语义假设
+    /// 「同一时刻只有一轮同步在跑」—— 而后台 poller 与 IPC `sync --once`
+    /// （GUI「立即同步」/ 托盘 / CLI）本来可以并发：后结束的一轮会拿**开轮询时的
+    /// 旧快照**整份盖回去，抹掉 hook 刚推进的签名、复活上一轮已删的条目、
+    /// 甚至让游标回退。这里把一整轮串行化，让「快照 → 对账 → 落盘」不可分割。
+    sync_run: Mutex<()>,
     /// ★ M3：脱水配置 + 计数。
     dehydrate_cfg: StdMutex<DehydrateCfg>,
     dehydrate_stats: Arc<DehydrateStats>,
@@ -323,13 +332,266 @@ async fn bind_socket(opts: &Options) -> Result<(UnixListener, PathBuf)> {
     let listener = UnixListener::bind(&opts.socket)
         .with_context(|| format!("绑定 socket 失败: {}", opts.socket.display()))?;
     qxync_core::config::restrict_perms(&opts.socket, 0o600)?;
-    let pid_path = qxync_core::ipc::default_pid_path();
+    let pid_path = qxync_core::ipc::pid_path_for(&opts.link_id);
     std::fs::write(
         &pid_path,
         format!("{}\n{}\n", std::process::id(), opts.socket.display()),
     )
     .ok();
     Ok((listener, pid_path))
+}
+
+/// ★ M16：当前配置里的全部连接 id（按 id 排序）。
+///
+/// 任务归属、legacy 数据迁移都要用。`current` 一定在列表里（本 daemon 已经成功
+/// load 了它）；坏文件只 WARN，不阻塞启动。
+fn all_link_ids(paths: &ConfigPaths, current: &str) -> Vec<String> {
+    let (links, bad) = LinkConfig::list(paths);
+    for (p, e) in &bad {
+        tracing::warn!("连接配置解析失败，已跳过 {}: {e}", p.display());
+    }
+    let mut ids: Vec<String> = links.into_iter().map(|l| l.id).collect();
+    if !ids.iter().any(|id| id == current) {
+        ids.push(current.to_string());
+    }
+    ids.sort();
+    ids
+}
+
+/// ★ M16：把旧版「全局/按 host」的数据迁到多连接命名空间。
+///
+/// 规则：
+/// * `default` 只迁 **upload-queue**（旧全局队列 → `upload-queue/<host>/`）；
+///   它的 socket/pid/日志/凭据/mounts/sync/cache 全部保持旧路径。
+/// * 非 `default` 只有在它是 **legacy owner**（没有 default 时字典序最小）时迁移
+///   sync / cache / queue / mounts / credentials。sync 与 queue 迁移失败要拒绝启动：
+///   空 baseline 重新对账可能误删、丢未上传改动；cache 失败只告警（可重新下载）。
+fn migrate_legacy_data(paths: &ConfigPaths, link: &LinkConfig, all_ids: &[String]) -> Result<()> {
+    let owner = LinkConfig::legacy_owner(all_ids);
+    let is_owner = owner.as_deref() == Some(link.id.as_str());
+    if link.id == "default" || is_owner {
+        migrate_legacy_queue(paths, link)?;
+    }
+    if link.id != "default" && is_owner {
+        migrate_legacy_sync(paths, link)?;
+        migrate_legacy_cache(paths, link);
+        migrate_legacy_mounts(paths, link);
+        migrate_legacy_credentials(paths, link);
+    }
+    Ok(())
+}
+
+/// 旧全局 `data/upload-queue/{queue.db,*.dirty}` → `data/upload-queue/<ns>/`。
+fn migrate_legacy_queue(paths: &ConfigPaths, link: &LinkConfig) -> Result<()> {
+    let legacy = paths.legacy_queue_dir();
+    let target = paths.queue_dir_for(link);
+    if target.join("queue.db").exists() {
+        return Ok(());
+    }
+    let has_work = std::fs::read_dir(&legacy)
+        .map(|rd| {
+            rd.flatten().any(|e| {
+                let n = e.file_name();
+                let n = n.to_string_lossy();
+                n == "queue.db"
+                    || n == "queue.db-wal"
+                    || n == "queue.db-shm"
+                    || n.ends_with(".dirty")
+            })
+        })
+        .unwrap_or(false);
+    if !has_work {
+        return Ok(());
+    }
+    std::fs::create_dir_all(&target)
+        .with_context(|| format!("创建队列目录失败: {}", target.display()))?;
+    let mut moved = 0usize;
+    for name in ["queue.db", "queue.db-wal", "queue.db-shm"] {
+        let src = legacy.join(name);
+        if src.exists() {
+            std::fs::rename(&src, target.join(name)).with_context(|| {
+                format!(
+                    "迁移上传队列 {} → {} 失败（为避免丢未上传改动，daemon 拒绝启动）",
+                    src.display(),
+                    target.join(name).display()
+                )
+            })?;
+            moved += 1;
+        }
+    }
+    if let Ok(rd) = std::fs::read_dir(&legacy) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_file()
+                && p.file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|n| n.ends_with(".dirty"))
+            {
+                let dst = target.join(p.file_name().unwrap());
+                std::fs::rename(&p, &dst).with_context(|| {
+                    format!(
+                        "迁移上传标记 {} → {} 失败（为避免丢未上传改动，daemon 拒绝启动）",
+                        p.display(),
+                        dst.display()
+                    )
+                })?;
+                moved += 1;
+            }
+        }
+    }
+    if moved > 0 {
+        tracing::info!(
+            "M16：旧上传队列已迁移到 {}（{moved} 个文件）",
+            target.display()
+        );
+    }
+    Ok(())
+}
+
+/// 旧 `data/sync/<host>/` → 非 default 的 `data/sync/<ns>/`。
+fn migrate_legacy_sync(paths: &ConfigPaths, link: &LinkConfig) -> Result<()> {
+    let legacy = paths
+        .data_dir
+        .join("sync")
+        .join(qxync_core::config::sanitize_component(&link.host));
+    let target = paths.sync_dir_for(link);
+    if target == legacy || !legacy.is_dir() || target.exists() {
+        if target != legacy && target.exists() && legacy.is_dir() {
+            tracing::warn!(
+                "M16：{} 与旧目录 {} 同时存在，按新目录继续（旧目录保留）",
+                target.display(),
+                legacy.display()
+            );
+        }
+        return Ok(());
+    }
+    move_dir(&legacy, &target).with_context(|| {
+        format!(
+            "迁移同步状态 {} → {} 失败（为避免空 baseline 重新对账误删，daemon 拒绝启动）",
+            legacy.display(),
+            target.display()
+        )
+    })?;
+    tracing::info!(
+        "M16：同步状态已迁移 {} → {}",
+        legacy.display(),
+        target.display()
+    );
+    Ok(())
+}
+
+/// 旧 `data/cache/<host>/` → 非 default 的 `data/cache/<ns>/`（失败只告警）。
+fn migrate_legacy_cache(paths: &ConfigPaths, link: &LinkConfig) {
+    let legacy = paths
+        .data_dir
+        .join("cache")
+        .join(qxync_core::config::sanitize_component(&link.host));
+    let target = paths.cache_dir_for(link);
+    if target == legacy || !legacy.is_dir() || target.exists() {
+        return;
+    }
+    match move_dir(&legacy, &target) {
+        Ok(()) => tracing::info!(
+            "M16：水合缓存已迁移 {} → {}",
+            legacy.display(),
+            target.display()
+        ),
+        Err(e) => tracing::warn!(
+            "M16：水合缓存迁移失败（不影响正确性，最坏重新下载）{} → {}: {e}",
+            legacy.display(),
+            target.display()
+        ),
+    }
+}
+
+/// 旧 `state/qxync/mounts.json` → 非 default 的 per-link 文件（复制，旧文件保留）。
+fn migrate_legacy_mounts(paths: &ConfigPaths, link: &LinkConfig) {
+    let target = MountsFile::file_for(paths, link);
+    if target.exists() {
+        return;
+    }
+    let (legacy, warns) = MountsFile::load(paths);
+    for w in warns {
+        tracing::warn!("M16 迁移挂载记录：{w}");
+    }
+    let Some(f) = legacy else { return };
+    if f.mounts.is_empty() {
+        return;
+    }
+    match f.save_for(paths, link) {
+        Ok(p) => {
+            tracing::info!(
+                "M16：旧挂载记录已复制到 {}（{} 项）",
+                p.display(),
+                f.mounts.len()
+            );
+            // 非 default 迁移完后把旧文件改名归档：否则以后新建一个 default 连接时，
+            // 它会读到这份属于别的连接的「现场」，凭空恢复一堆不相干的挂载点。
+            if link.id != "default" {
+                let legacy_path = MountsFile::file(paths);
+                let archived = legacy_path.with_extension(format!(
+                    "json.migrated-{}",
+                    qxync_core::config::sanitize_component(&link.id)
+                ));
+                if let Err(e) = std::fs::rename(&legacy_path, &archived) {
+                    tracing::warn!(
+                        "M16：旧 mounts.json 归档失败（保留原文件，可能被将来的 default 连接误读）: {e}"
+                    );
+                }
+            }
+        }
+        Err(e) => tracing::warn!("M16：复制旧挂载记录失败（跳过）: {e}"),
+    }
+}
+
+/// 旧全局 `credentials.json` → 非 default 的 `links/<id>.credentials.json`。
+fn migrate_legacy_credentials(paths: &ConfigPaths, link: &LinkConfig) {
+    let target = paths.link_credentials_file(&link.id);
+    if target.exists() {
+        return;
+    }
+    match Credentials::load_for(paths, link) {
+        Ok(c) => match c.save_for(paths, link) {
+            Ok(p) => tracing::info!(
+                "M16：旧凭据已复制到 {}（host/user 与连接匹配）",
+                p.display()
+            ),
+            Err(e) => tracing::warn!("M16：复制旧凭据失败（跳过）: {e}"),
+        },
+        Err(_) => {
+            // 没有凭据 / 不匹配都正常：用户会在「保存并登录」时写新凭据。
+        }
+    }
+}
+
+/// 目录移动：同分区 rename；跨分区退回复制 + 删源。
+fn move_dir(from: &Path, to: &Path) -> Result<()> {
+    if let Some(dir) = to.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    match std::fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            copy_dir_recursive(from, to)?;
+            std::fs::remove_dir_all(from)?;
+            Ok(())
+        }
+    }
+}
+
+fn copy_dir_recursive(from: &Path, to: &Path) -> Result<()> {
+    std::fs::create_dir_all(to)?;
+    for e in std::fs::read_dir(from)? {
+        let e = e?;
+        let src = e.path();
+        let dst = to.join(e.file_name());
+        if e.file_type()?.is_dir() {
+            copy_dir_recursive(&src, &dst)?;
+        } else {
+            std::fs::copy(&src, &dst)?;
+        }
+    }
+    Ok(())
 }
 
 /// ★ 空转待命：**没有任何连接配置时，daemon 也要一直活着**。
@@ -547,6 +809,12 @@ fn idle_status(socket: &Path, started: Instant) -> StatusData {
 }
 
 pub async fn run(opts: Options) -> Result<()> {
+    if !LinkConfig::is_valid_id(&opts.link_id) {
+        bail!(
+            "连接 id 不合法：{:?}（只允许 A-Za-z0-9 . _ -，且不能是 . / ..）",
+            opts.link_id
+        );
+    }
     let paths = ConfigPaths::discover()?;
     paths
         .ensure_dirs()
@@ -570,6 +838,12 @@ pub async fn run(opts: Options) -> Result<()> {
     let link = LinkConfig::load(&paths, &opts.link_id)
         .with_context(|| format!("读取连接配置失败（先 `qxync --host ... login`）"))?;
     let (listener, pid_path) = bind_socket(&opts).await?;
+
+    // ★ M16：多连接的数据迁移。必须在 bind 成功之后做 —— 旧 daemon 还占着 socket
+    // 时本进程已经先退出了，绝不会去动它正在写的队列/状态。
+    let all_ids = all_link_ids(&paths, &link.id);
+    migrate_legacy_data(&paths, &link, &all_ids)
+        .with_context(|| format!("迁移连接「{}」的旧数据失败", link.id))?;
 
     // ★ M8.4：全局设置（代理 / 自动释放空间 / 通知）。
     //   读不到就全默认（= M8.3 行为）：**设置文件坏了也不该让 daemon 起不来**。
@@ -599,8 +873,8 @@ pub async fn run(opts: Options) -> Result<()> {
     };
     // ★ M8.4：所有 HTTP 客户端都按设置里的代理构造
     let client = Client::new_with_proxy(&link, Some(&settings.proxy))?;
-    // ★ M2c：游标 + baseline 落在 <data>/sync/<host>/（不同 NAS 互不污染）
-    let sync_dir = qxync_core::sync::sync_state_dir(&paths.data_dir, &link.host);
+    // ★ M2c/M16：游标 + baseline 落在 <data>/sync/<ns>/（不同 NAS、不同连接互不污染）
+    let sync_dir = qxync_core::sync::sync_state_dir_for_link(&paths.data_dir, &link);
     let sync_store = SyncState::load(&sync_dir)
         .with_context(|| format!("读取同步状态失败: {}", sync_dir.display()))?;
     tracing::info!(
@@ -657,6 +931,7 @@ pub async fn run(opts: Options) -> Result<()> {
         sync_stats: Arc::new(SyncStats::default()),
         sync_cfg: StdMutex::new(SyncConfig::default()),
         sync_interval: StdMutex::new(sync_interval),
+        sync_run: Mutex::new(()),
         dehydrate_cfg: StdMutex::new(DehydrateCfg::from_env()),
         dehydrate_stats: Arc::new(DehydrateStats::default()),
         rules: Arc::new(parsed_rules.rules),
@@ -719,7 +994,7 @@ pub async fn run(opts: Options) -> Result<()> {
     //   `kill -9` / OOM 之后挂载点留在 `/proc/self/mounts` 里但已 ENOTCONN，
     //   不先清掉，恢复会一直撞「路径已挂载」而失败。
     if opts.restore_tasks {
-        cleanup_zombie_mounts();
+        cleanup_zombie_mounts(&state.link);
     }
 
     // ★ M8.2 / ★ M15/T5：恢复挂载（**默认开启**，见 Options::restore_tasks 的说明）
@@ -934,7 +1209,7 @@ async fn hold_mounts(
     stop_sync_engine(state, engine).await;
     // 2) 挂载记录写盘。语义是「上一次实际挂了什么」—— 挂载还挂着，记录就该留着；
     //    ★ 这里绝不能去动 mounts.json 的内容，T5 的自动重挂全靠它。
-    mounts_persist(&state.mounts);
+    mounts_persist(state);
     let n = state.mounts.lock().unwrap().len();
     if n == 0 {
         tracing::info!("SIGTERM：挂载表本来就是空的，无需挂载守护");
@@ -1098,10 +1373,40 @@ async fn dispatch(state: &Arc<State>, req: Request, shutdown: &mpsc::Sender<()>)
             //   默认不登记 → qxync CLI / 验收矩阵的行为与 M7 **一字不变**。
             let want_task = save_task.unwrap_or(false) || task.is_some();
             let reg = if want_task {
+                // ★ M16：不显式给 id 时，非 default 连接用连接 id 当任务 id，
+                // 避免所有连接都去抢 `default.json`。
+                let task_id = task
+                    .clone()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| {
+                        if state.link.id == "default" {
+                            "default".into()
+                        } else {
+                            state.link.id.clone()
+                        }
+                    });
+                // 跨连接覆盖检查：同 id 的任务属于别的连接时拒绝（还没挂载，直接退）。
+                if let Ok(paths) = ConfigPaths::discover() {
+                    let ids = all_link_ids(&paths, &state.link.id);
+                    if let Ok(existing) = Task::load(&paths, &task_id) {
+                        if !existing.belongs_to(&state.link.id, &ids) {
+                            let owner = existing
+                                .effective_link_id(&ids)
+                                .unwrap_or_else(|| "（未分配）".into());
+                            return Response::err(
+                                ErrorKind::BadRequest,
+                                format!(
+                                    "任务 id「{task_id}」已经属于连接「{owner}」，不能从连接「{}」覆盖；换个 id",
+                                    state.link.id
+                                ),
+                            );
+                        }
+                    }
+                }
                 // ★ 缓存目录也要落进任务登记，否则「任务方式挂载」改不了缓存位置
                 Some(
                     Task::from_mount(
-                        task.clone(),
+                        Some(task_id),
                         mountpoint.clone(),
                         remote
                             .clone()
@@ -1116,7 +1421,9 @@ async fn dispatch(state: &Arc<State>, req: Request, shutdown: &mpsc::Sender<()>)
                     )
                     .with_cache_dir(cache_dir.clone())
                     // ★ M8.4：登记任务时把冲突策略一起落盘
-                    .with_conflict(conflict.clone()),
+                    .with_conflict(conflict.clone())
+                    // ★ M16：归属本连接
+                    .with_link_id(state.link.id.clone()),
                 )
             } else {
                 None
@@ -1154,7 +1461,7 @@ async fn dispatch(state: &Arc<State>, req: Request, shutdown: &mpsc::Sender<()>)
             let out = umount(state, mountpoint).await;
             // 卸载成功 → 把对应任务标成停用（**只改登记，不动数据**）
             if out.is_ok() {
-                if let Err(e) = disable_task_by_mountpoint(&mp) {
+                if let Err(e) = disable_task_by_mountpoint(state, &mp) {
                     tracing::warn!("更新任务登记失败（卸载已完成）：{e}");
                 }
             }
@@ -1180,7 +1487,7 @@ async fn dispatch(state: &Arc<State>, req: Request, shutdown: &mpsc::Sender<()>)
             action,
             id,
             resolution,
-        } => decisions_cmd(state, &action, id, resolution),
+        } => decisions_cmd(state, &action, id, resolution).await,
         Request::FileStates { path } => file_states_cmd(state, path).await,
         Request::Space { now } => space_cmd(state, now.unwrap_or(false)).await,
         Request::Peer {
@@ -1311,7 +1618,7 @@ async fn login_internal(
     password: Option<String>,
 ) -> Result<Session, IpcError> {
     let paths = ConfigPaths::discover().map_err(|e| IpcError::new(ErrorKind::Io, e.to_string()))?;
-    let creds = Credentials::load(&paths).ok();
+    let creds = Credentials::load_for(&paths, &state.link).ok();
     let user = user
         .or_else(|| creds.as_ref().map(|c| c.user.clone()))
         .unwrap_or_else(|| state.link.user.clone());
@@ -1341,7 +1648,7 @@ async fn login_internal(
         user: user.clone(),
         password,
     }
-    .save(&paths);
+    .save_for(&paths, &state.link);
     tracing::info!(
         "登录成功 user={} sid={}",
         session.username,
@@ -1604,6 +1911,8 @@ async fn status(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
             host: state.link.host.clone(),
             port: state.link.port,
             https: state.link.https,
+            // ★ GUI 的 `same_link` 用它判断「跳过 TLS 校验」改了要不要重启 daemon
+            insecure: state.link.insecure,
             user: state.link.user.clone(),
             ipv4_only: state.link.ipv4_only,
         }),
@@ -2011,26 +2320,12 @@ async fn mount(
     //   服务端拒绝（实测 `status:20`）。以前这里按「是不是 home_root」一刀切成只读，
     //   那是错的判据（家目录之外登记过的目录照样能写）：用户勾了「读写」就按读写挂，
     //   真被服务端拒了由上传队列 / 错误列表如实报出来，而不是在本地替 NAS 做决定。
-    // 缓存按「主机」隔离：不同 NAS 上的同名路径不能共用缓存文件
-    let host_ns: String = state
-        .link
-        .host
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
+    // 缓存按「连接」隔离：不同 NAS / 同一 NAS 的不同账号上的同名路径不能共用缓存文件
+    let paths = ConfigPaths::discover().map_err(|e| IpcError::new(ErrorKind::Io, e.to_string()))?;
+    let ns = qxync_core::config::link_namespace(&state.link);
     let cache = cache_dir
-        .unwrap_or_else(|| {
-            ConfigPaths::discover()
-                .map(|p| p.data_dir.join("cache"))
-                .unwrap_or_else(|_| PathBuf::from("/tmp/qxync/cache"))
-        })
-        .join(host_ns);
+        .map(|parent| parent.join(&ns))
+        .unwrap_or_else(|| paths.cache_dir_for(&state.link));
 
     // 给 FUSE 一个独立 Client（只带 sid），避免和 daemon 主体抢同一把锁
     // ★ M8.4：FUSE 的客户端也要走设置里的代理（否则挂载后水合直连、绕开代理）
@@ -2074,9 +2369,8 @@ async fn mount(
     let mut upload_queue = None;
     let mut delete_queue = None;
     if read_write {
-        let marker_dir = ConfigPaths::discover()
-            .map(|p| p.data_dir.join("upload-queue"))
-            .unwrap_or_else(|_| cache.join("upload-queue"));
+        // ★ M16：上传/删除队列按连接隔离（键是远端路径，不同 NAS 会撞车）
+        let marker_dir = paths.queue_dir_for(&state.link);
         let q = UploadQueue::new(
             fuse_client.clone(),
             tokio::runtime::Handle::current(),
@@ -2233,7 +2527,7 @@ async fn mount(
     );
     // ★ M15/T5：挂载成功才写盘。写失败只 WARN —— 记录文件是为了下次重启省一步，
     // 不能因为它把「已经挂上了」这件事变成失败（用户会以为没挂成功去重试）。
-    mounts_persist(&state.mounts);
+    mounts_persist(state);
     to_value(info)
 }
 
@@ -2248,7 +2542,7 @@ async fn mount(
 ///
 /// 失败只 WARN：这份文件的作用是「下次重启省一步」，写不进去最坏结果是
 /// 下次要手工重挂，**不该让 `mount` / `umount` 因此失败**。
-fn mounts_persist(mounts: &StdMutex<HashMap<PathBuf, MountEntry>>) {
+fn mounts_persist(state: &Arc<State>) {
     let paths = match ConfigPaths::discover() {
         Ok(p) => p,
         Err(e) => {
@@ -2258,7 +2552,8 @@ fn mounts_persist(mounts: &StdMutex<HashMap<PathBuf, MountEntry>>) {
     };
     // 按挂载点排序：挂载表是 HashMap（顺序不定），不排序的话每次写盘的字节序
     // 都不一样，diff 一片噪音、也没法人工核对。
-    let mut recs: Vec<MountRecord> = mounts
+    let mut recs: Vec<MountRecord> = state
+        .mounts
         .lock()
         .unwrap()
         .values()
@@ -2270,7 +2565,7 @@ fn mounts_persist(mounts: &StdMutex<HashMap<PathBuf, MountEntry>>) {
     //   挂载表里，纯「从挂载表全量重建」会把它们从记录里抹掉 —— 那个进程一旦
     //   结束，挂载点就再也回不来了（T5/T6 的语义都断掉）。
     //   判据与 T7 一样保守：内核挂载表里有 **且** subtype 是 qxync 才算。
-    for rec in externally_held_records(&paths, &recs) {
+    for rec in externally_held_records(&paths, &state.link, &recs) {
         tracing::info!(
             "挂载记录：{} 由其他 qxyncd 进程托管，保留记录不覆盖",
             rec.mountpoint.display()
@@ -2282,7 +2577,7 @@ fn mounts_persist(mounts: &StdMutex<HashMap<PathBuf, MountEntry>>) {
         version: qxync_core::mounts::MOUNTS_VERSION,
         mounts: recs,
     };
-    if let Err(e) = f.save(&paths) {
+    if let Err(e) = f.save_for(&paths, &state.link) {
         tracing::warn!("挂载记录：写盘失败（本次挂载/卸载改动不会被记下）: {e}");
     }
 }
@@ -2301,8 +2596,12 @@ fn mounts_persist(mounts: &StdMutex<HashMap<PathBuf, MountEntry>>) {
 ///
 /// 读 `mounts.json` 失败就返回空 —— 那时写盘会退化成「纯挂载表重建」，
 /// 与 T5 现有的降级行为一致（不报错，不阻塞）。
-fn externally_held_records(paths: &ConfigPaths, mine: &[MountRecord]) -> Vec<MountRecord> {
-    let (recorded, _) = MountsFile::load(paths);
+fn externally_held_records(
+    paths: &ConfigPaths,
+    link: &LinkConfig,
+    mine: &[MountRecord],
+) -> Vec<MountRecord> {
+    let (recorded, _) = MountsFile::load_for(paths, link);
     let Some(f) = recorded else {
         return Vec::new();
     };
@@ -2397,7 +2696,7 @@ async fn umount_inner(
     // ★ M15/T5：真正卸掉了才从 `mounts.json` 里去掉。放在这一步之后 ——
     // 上面的失败分支会把挂载表条目放回去，那时就**不该**动记录文件。
     if persist_record {
-        mounts_persist(&state.mounts);
+        mounts_persist(state);
     }
     to_value(serde_json::json!({}))
 }
@@ -2577,7 +2876,7 @@ const QXYNC_FSTYPE: &str = "fuse.qxync";
 ///   的挂载点」，与意图正好相反。
 ///
 /// 失败只 WARN，绝不阻塞 daemon 启动。
-fn cleanup_zombie_mounts() {
+fn cleanup_zombie_mounts(link: &LinkConfig) {
     let paths = match ConfigPaths::discover() {
         Ok(p) => p,
         Err(e) => {
@@ -2585,7 +2884,7 @@ fn cleanup_zombie_mounts() {
             return;
         }
     };
-    let (recorded, warns) = MountsFile::load(&paths);
+    let (recorded, warns) = MountsFile::load_for(&paths, link);
     for w in warns {
         tracing::warn!("{w}");
     }
@@ -2827,16 +3126,28 @@ fn build_views(state: &Arc<State>) -> Vec<MountView> {
 
 /// 跑一轮同步（拉事件 + baseline 对账）。
 async fn run_sync_once(state: &Arc<State>) -> Result<sync::SyncReport, IpcError> {
+    // ★ 串行化「一整轮」：见 [`State::sync_run`] 的字段注释。
+    //
+    //   `persist` 在「本轮没有 hook 并发写」时会整份替换 baseline，这个写语义要求
+    //   **同一时刻只有一轮在跑**。后台 poller 与 IPC `sync --once`（GUI「立即同步」/
+    //   托盘 / CLI）可以并发：两轮的快照一旧一新，后落盘的那轮会把另一轮（以及
+    //   hook）的进展用旧快照盖回去。在锁内跑完 = 快照、对账、落盘、journal 是原子的。
+    //
+    //   ⚠️ 这把锁是 tokio 异步锁，**等待时不阻塞 runtime 线程**；`sync --once`
+    //   在轮询进行中会排队等这一轮结束再跑（用户看到的是「稍慢」，不是数据错乱）。
+    let _run = state.sync_run.lock().await;
     let client = engine_client(state).await?;
     let views = build_views(state);
     let cfg = state.sync_cfg.lock().unwrap().clone();
     let user = state.link.user.clone();
+    let link_id = state.link.id.clone();
     let report = sync::poll_once(
         &client,
         &views,
         &state.sync_store,
         &cfg,
         &state.sync_stats,
+        &link_id,
         &user,
     )
     .await;
@@ -2884,6 +3195,8 @@ async fn sync_cmd(
             g.reset();
         }
         state.sync_stats.delete_block_reason.lock().unwrap().take();
+        // 签名也一起清：解除之后再出现熔断要能重新 WARN / 记 journal。
+        state.sync_stats.delete_block_sig.lock().unwrap().take();
         tracing::warn!("删除保护已解除（--force-deletes，仅放行一轮）");
     }
     if once {
@@ -2957,7 +3270,25 @@ fn spawn_poller(state: Arc<State>, mut gen: EngineGen) -> tokio::task::JoinHandl
             last_run = Instant::now();
             match run_sync_once(&state).await {
                 Ok(r) => {
-                    if r.conflicts > 0 || r.deletes_blocked > 0 || !r.errors.is_empty() {
+                    // ★ 会话失效自愈：`poll_once` 把错误塞进 report.errors 后仍返回 Ok，
+                    //   所以下面 Err 分支的 `is_auth` 重登永远等不到。真机实测：
+                    //   sid 过期后每 30s 一条 `qbox_get_max_log 失败: status=3`，
+                    //   直到 120s 会话保活重登才恢复 —— 这里看到标志就立刻重登一次。
+                    if r.auth_failed {
+                        tracing::warn!(
+                            "轮询遇会话失效（本轮已记录），立即重登后下一轮继续: {:?}",
+                            r.errors
+                        );
+                        if let Err(e2) = login_internal(&state, None, None).await {
+                            tracing::warn!("轮询重登失败: {}", e2.message);
+                        }
+                    }
+                    // ★ 熔断告警只在**签名变化**的那一轮打 WARN（重复轮次在
+                    //   absorb_round 里已降为 debug），否则真机每 30s 刷一条。
+                    if r.conflicts > 0
+                        || (r.deletes_blocked > 0 && r.delete_block_changed)
+                        || !r.errors.is_empty()
+                    {
                         tracing::warn!(
                             "轮询有异常: conflicts={} blocked={} errors={:?}",
                             r.conflicts,
@@ -3114,7 +3445,7 @@ fn first_cache_dir(state: &Arc<State>) -> PathBuf {
         .or_else(|| {
             ConfigPaths::discover()
                 .ok()
-                .map(|p| p.data_dir.join("cache"))
+                .map(|p| p.cache_dir_for(&state.link))
         })
         .unwrap_or_else(|| PathBuf::from("/tmp/qxync/cache"))
 }
@@ -3231,6 +3562,8 @@ async fn run_dehydrate_with_recent(
         dry_run: opts.dry_run,
         ..Default::default()
     };
+    // 本轮有没有真正的脱水失败（决定跑完之后要不要清掉「最近错误」）。
+    let mut had_failure = false;
     let manual_path = opts.path.clone();
     for (mp, remote_root, handle, notifier, _mode) in &targets {
         if let Some(p) = &manual_path {
@@ -3284,12 +3617,16 @@ async fn run_dehydrate_with_recent(
                 }
                 qxync_fuse::DehydrateOutcome::Failed(e) => {
                     out.blocked.push((c.remote.clone(), format!("失败: {e}")));
+                    had_failure = true;
                     *state.dehydrate_stats.last_error.lock().unwrap() = Some(e);
                 }
             }
         }
     }
     out.used_bytes = cache_info(state).used_bytes;
+    // ★ 完整跑完且本轮没有失败 → 清掉上次的「最近错误」，否则 status/GUI 的红字常驻
+    //   （这与同步引擎 last_error 的修法是同一条原则，见 sync::absorb_round）。
+    settle_dehydrate_error(&state.dehydrate_stats, had_failure, opts.dry_run);
     // 累计统计（手动与后台共用；dry-run 不计数）
     let st = &state.dehydrate_stats;
     st.runs.fetch_add(1, Ordering::Relaxed);
@@ -3299,6 +3636,20 @@ async fn run_dehydrate_with_recent(
         st.freed.fetch_add(out.freed_bytes, Ordering::Relaxed);
     }
     out
+}
+
+/// 一次脱水跑完后的「最近错误」结算。
+///
+/// 与同步引擎的 `absorb_round` 同一条原则：**完整跑完且本轮没有失败 → 清掉上次的
+/// 失败**。这些字段原先是「只写不清」，于是失败恢复之后 `qxync status` / GUI 的
+/// 「最近错误」永远红着（真机症状：08:30 就恢复了，下午还显示那条错误）。
+///
+/// * 提前返回的轮次（参数无效）不经过这里 —— 没跑过就别动历史结论；
+/// * `dry_run` 也不清：dry-run 根本没尝试脱水，不能据此断言「现在没失败了」。
+fn settle_dehydrate_error(stats: &DehydrateStats, had_failure: bool, dry_run: bool) {
+    if !had_failure && !dry_run {
+        *stats.last_error.lock().unwrap() = None;
+    }
 }
 
 fn record_block(stats: &Arc<DehydrateStats>, b: Block) {
@@ -3440,9 +3791,10 @@ fn task_info_join(state: &Arc<State>, task: Task) -> TaskInfo {
 }
 
 /// 卸载成功后把对应的任务标成停用（**只改登记，不动挂载点里的数据**）。
-fn disable_task_by_mountpoint(mp: &Path) -> Result<(), String> {
+fn disable_task_by_mountpoint(state: &Arc<State>, mp: &Path) -> Result<(), String> {
     let paths = ConfigPaths::discover().map_err(|e| e.to_string())?;
-    let (list, _) = Task::list(&paths);
+    let ids = all_link_ids(&paths, &state.link.id);
+    let (list, _) = Task::list_for_link(&paths, &state.link.id, &ids);
     let want = std::fs::canonicalize(mp).unwrap_or_else(|_| mp.to_path_buf());
     for mut t in list {
         let cand = std::fs::canonicalize(&t.mountpoint).unwrap_or_else(|_| t.mountpoint.clone());
@@ -3453,6 +3805,29 @@ fn disable_task_by_mountpoint(mp: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// ★ M16：按 id 读任务，并确认它属于**本连接**。
+///
+/// 不这么做的话，`qxync --link nas2 task rm t1` 会删掉 default 的任务 —— 任务
+/// 文件是全局共享的，daemon 必须自己守住边界。
+fn load_task_for_link(
+    paths: &ConfigPaths,
+    state: &Arc<State>,
+    ids: &[String],
+    id: &str,
+) -> Result<Task, IpcError> {
+    let t = Task::load(paths, id).map_err(core_err)?;
+    if !t.belongs_to(&state.link.id, ids) {
+        let owner = t
+            .effective_link_id(ids)
+            .unwrap_or_else(|| "（未分配）".into());
+        return Err(bad_req(format!(
+            "任务「{id}」属于连接「{owner}」，不是当前连接「{}」的",
+            state.link.id
+        )));
+    }
+    Ok(t)
 }
 
 /// 按任务登记的参数挂载（**复用既有 `mount()` 路径，不改 FUSE**）。
@@ -3489,11 +3864,13 @@ async fn tasks_cmd(
     task: Option<Task>,
 ) -> Result<serde_json::Value, IpcError> {
     let paths = ConfigPaths::discover().map_err(core_err)?;
+    // ★ M16：任务文件是全局共享的，但每个 daemon 只该管自己连接的任务。
+    let ids = all_link_ids(&paths, &state.link.id);
     match action {
         "list" => {
-            let (list, bad) = Task::list(&paths);
+            let (list, bad) = Task::list_for_link(&paths, &state.link.id, &ids);
+            let empty = list.is_empty();
             let infos: Vec<TaskInfo> = list.into_iter().map(|t| task_info_join(state, t)).collect();
-            let empty = !has_any_task(&paths);
             let data = TasksData {
                 tasks: infos,
                 bad_files: bad
@@ -3512,22 +3889,44 @@ async fn tasks_cmd(
         }
         "get" => {
             let id = id.ok_or_else(|| bad_req("get 需要 id"))?;
-            let t = Task::load(&paths, &id).map_err(core_err)?;
+            let t = load_task_for_link(&paths, state, &ids, &id)?;
             to_value(task_info_join(state, t))
         }
         "save" => {
             let mut t = task.ok_or_else(|| bad_req("save 需要 task"))?;
+            // ★ M16：归属由 daemon 说了算，客户端传什么都覆盖掉。
+            t.link_id = Some(state.link.id.clone());
             t.normalize().map_err(core_err)?;
+            // 同 id 的任务如果属于别的连接，**拒绝覆盖**：两个 NAS 都用 t1 是
+            // 很自然的误操作，静默覆盖会直接换掉另一条任务的远端根。
+            if let Ok(existing) = Task::load(&paths, &t.id) {
+                if !existing.belongs_to(&state.link.id, &ids) {
+                    let owner = existing
+                        .effective_link_id(&ids)
+                        .unwrap_or_else(|| "（未分配）".into());
+                    return Err(bad_req(format!(
+                        "任务 id「{}」已经属于连接「{owner}」，不能从连接「{}」覆盖；换个 id",
+                        t.id, state.link.id
+                    )));
+                }
+            }
             // ★ 提交前的「目的地冲突」检查：本地文件夹重复 / 嵌套 → 直接拒；
             //   NAS 文件夹重复 → 只作为 warnings 回给界面（只读挂同一个是合法用法）。
             let (others, _bad) = Task::list(&paths);
-            let (errors, warnings) = t.conflict_report(&others);
+            let (errors, _) = t.conflict_report(&others);
             if !errors.is_empty() {
                 return Err(IpcError::new(
                     ErrorKind::BadRequest,
                     format!("目的地冲突：{}", errors.join("；")),
                 ));
             }
+            // NAS 根重叠只在同一连接内有意义：不同 NAS 上的 /home 不是同一个目录。
+            let same_link: Vec<Task> = others
+                .iter()
+                .filter(|o| o.belongs_to(&state.link.id, &ids))
+                .cloned()
+                .collect();
+            let (_, warnings) = t.conflict_report(&same_link);
             let p = t.save(&paths).map_err(core_err)?;
             to_value(serde_json::json!({
                 "saved": true,
@@ -3538,6 +3937,7 @@ async fn tasks_cmd(
         }
         "delete" => {
             let id = id.ok_or_else(|| bad_req("delete 需要 id"))?;
+            let _ = load_task_for_link(&paths, state, &ids, &id)?;
             let existed = Task::delete(&paths, &id).map_err(core_err)?;
             // ⚠️ 只删登记；挂载点里的文件、缓存、baseline 一律不动
             to_value(serde_json::json!({
@@ -3548,7 +3948,8 @@ async fn tasks_cmd(
         }
         "pause" => {
             let id = id.ok_or_else(|| bad_req("pause 需要 id"))?;
-            let mut t = Task::load(&paths, &id).map_err(core_err)?;
+            let mut t = load_task_for_link(&paths, state, &ids, &id)?;
+            t.link_id = Some(state.link.id.clone());
             t.enabled = false;
             t.save(&paths).map_err(core_err)?;
             // 语义（见 docs/M8 §M8.2）：暂停 = 停用登记 + **卸载该挂载点**。
@@ -3571,7 +3972,8 @@ async fn tasks_cmd(
         }
         "resume" => {
             let id = id.ok_or_else(|| bad_req("resume 需要 id"))?;
-            let mut t = Task::load(&paths, &id).map_err(core_err)?;
+            let mut t = load_task_for_link(&paths, state, &ids, &id)?;
+            t.link_id = Some(state.link.id.clone());
             t.enabled = true;
             t.save(&paths).map_err(core_err)?;
             let mounted = state.mounts.lock().unwrap().contains_key(
@@ -3587,7 +3989,7 @@ async fn tasks_cmd(
         }
         "mount" => {
             let id = id.ok_or_else(|| bad_req("mount 需要 id"))?;
-            let t = Task::load(&paths, &id).map_err(core_err)?;
+            let t = load_task_for_link(&paths, state, &ids, &id)?;
             let m = mount_task(state, &t).await?;
             to_value(serde_json::json!({ "id": id, "mount": m }))
         }
@@ -3622,8 +4024,8 @@ pub(crate) async fn restore_mounts_on_start(state: &Arc<State>, link_id: &str) {
             return;
         }
     };
-    // 现场：上一次实际挂了什么
-    let (recorded, warns) = MountsFile::load(&paths);
+    // 现场：上一次实际挂了什么（★ M16：只读本连接自己的记录文件）
+    let (recorded, warns) = MountsFile::load_for(&paths, &state.link);
     for w in warns {
         tracing::warn!("{w}");
     }
@@ -3745,7 +4147,8 @@ pub(crate) async fn restore_tasks_on_start(state: &Arc<State>, link_id: &str) {
             return;
         }
     };
-    let (list, bad) = Task::list(&paths);
+    let ids = all_link_ids(&paths, &state.link.id);
+    let (list, bad) = Task::list_for_link(&paths, &state.link.id, &ids);
     for (p, e) in &bad {
         tracing::warn!("任务文件解析失败，已跳过 {}: {e}", p.display());
     }
@@ -3848,7 +4251,29 @@ fn journal_record_sync(state: &Arc<State>, r: &sync::SyncReport) {
             JournalEntry::ok(
                 "conflict",
                 "",
-                format!("双方都改 → 生成 {} 个冲突副本", r.conflicts),
+                // 措辞要覆盖所有策略：rename_* 会生成冲突副本，ask 只是入待裁决队列
+                // （以前这里写「生成 N 个冲突副本」，ask 下一页副本都没有，是谎报）。
+                format!(
+                    "双方都改 → 处理冲突 {} 项（冲突副本 / 待裁决队列，见冲突中心）",
+                    r.conflicts
+                ),
+            ),
+        );
+        n += 1;
+    }
+    // ★ 巡检自动清掉的待裁决条目：队列里「自己失效」的行（远端已删 / 任务已删 /
+    //   策略不再是 ask）会被 sweep 出队。**必须让用户看见**「少了 N 条、为什么」——
+    //   静默消失会让人以为自己的裁决被吞了；这里同时声明没动任何文件。
+    if r.decisions_swept > 0 {
+        journal_log(
+            state,
+            JournalEntry::ok(
+                "conflict",
+                "",
+                format!(
+                    "待裁决队列自动清理 {} 条失效条目（远端已删 / 任务已删 / 策略已改，未动任何文件）",
+                    r.decisions_swept
+                ),
             ),
         );
         n += 1;
@@ -3864,7 +4289,10 @@ fn journal_record_sync(state: &Arc<State>, r: &sync::SyncReport) {
         );
         n += 1;
     }
-    if r.deletes_blocked > 0 {
+    // ★ 熔断：只在**签名变化**（数量/原因变了）的那一轮记一条，重复轮次不再刷屏。
+    //   真机实测：同一批 526 项每 30s 一条 → journal 3046 条里 3023 条是同一句话，
+    //   1 万条上限几天就被冲掉，真实历史反而没了。
+    if r.deletes_blocked > 0 && r.delete_block_changed {
         journal_log(
             state,
             JournalEntry::blocked(
@@ -3877,13 +4305,27 @@ fn journal_record_sync(state: &Arc<State>, r: &sync::SyncReport) {
             ),
         );
         n += 1;
+    } else if r.deletes_blocked == 0 && r.delete_block_changed {
+        // 上一轮还在熔断、这一轮删除检查通过了 → 记一条「已解除」，
+        // 否则「更新中心」里最后一条永远停在熔断上（用户以为还没好）。
+        journal_log(
+            state,
+            JournalEntry::ok(
+                "delete",
+                "",
+                "删除保护熔断已解除：本轮删除检查通过".to_string(),
+            ),
+        );
+        n += 1;
     }
     for e in &r.errors {
         journal_log(state, JournalEntry::error("sync", "", e.clone()));
         n += 1;
     }
-    if n == 0 && r.dirs_scanned > 0 {
-        // 扫过但没变化：记一条很轻的，方便「更新中心」看出引擎活着
+    // 「引擎活着」的轻量条目：扫过但**没有任何值得记的事**时才写，且限频
+    // （默认 30s 一轮 = 一天 2880 条，照样会把 1 万条上限几天冲掉）。
+    // 熔断持续中的轮次不算「无变化」—— 那种轮次本来就不是安静轮次。
+    if n == 0 && r.dirs_scanned > 0 && r.deletes_blocked == 0 && scan_journal_due() {
         journal_log(
             state,
             JournalEntry::ok(
@@ -3893,6 +4335,38 @@ fn journal_record_sync(state: &Arc<State>, r: &sync::SyncReport) {
             ),
         );
     }
+}
+
+/// 「引擎活着」这条 journal 的最小间隔（秒）。
+///
+/// journal 是「文件更新中心 / 错误列表」的数据来源，有 1 万条上限；30s 一轮的
+/// 「无变化」记录会把上限冲掉。10 分钟一条足够看出引擎活着，一天只有 144 条。
+const SCAN_JOURNAL_MIN_INTERVAL_SECS: u64 = 600;
+
+/// 进程级的「上次写 scan journal 的时间」。单 daemon 单引擎，用静态量即可。
+static LAST_SCAN_JOURNAL_UNIX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `now` 这一刻该不该写 scan journal（纯逻辑，便于单测）。
+///
+/// `last == 0`（进程启动后还没写过）→ 写；否则至少间隔
+/// [`SCAN_JOURNAL_MIN_INTERVAL_SECS`]。时钟回拨（`now < last`）也写，宁多一条。
+fn scan_journal_due_at(last: u64, now: u64) -> bool {
+    if last == 0 {
+        return true;
+    }
+    now < last || now.saturating_sub(last) >= SCAN_JOURNAL_MIN_INTERVAL_SECS
+}
+
+/// 带进程状态的封装：判定该写就**顺手推进**时间戳（返回 true）。
+fn scan_journal_due() -> bool {
+    use std::sync::atomic::Ordering;
+    let now = now_secs();
+    let last = LAST_SCAN_JOURNAL_UNIX.load(Ordering::Relaxed);
+    if !scan_journal_due_at(last, now) {
+        return false;
+    }
+    LAST_SCAN_JOURNAL_UNIX.store(now, Ordering::Relaxed);
+    true
 }
 
 /// 后台批量落库 + 轮转。
@@ -4170,13 +4644,20 @@ fn default_gui_exe() -> Option<PathBuf> {
 }
 
 /// `Request::Decisions`：冲突待裁决队列。
-fn decisions_cmd(
+async fn decisions_cmd(
     state: &Arc<State>,
     action: &str,
     id: Option<String>,
     resolution: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
+    // ★ diff 要拉 NAS 内容 + 读本地缓存 → 单独走异步分支，不进下面的同步块
+    if action == "diff" {
+        let id = id.ok_or_else(|| bad_req("diff 需要 id"))?;
+        return decision_diff_cmd(state, &id).await;
+    }
+
     let mut removed = 0usize;
+    let mut removed_one: Option<DecisionInfo> = None;
     {
         let g = state.sync_store.lock().unwrap();
         match action {
@@ -4208,6 +4689,29 @@ fn decisions_cmd(
                     ),
                 );
             }
+            // ★ 删单条：给用户一个「这条我不想管」的出口。
+            //   只删队列行，**不动任何文件** —— 与 clear 同语义。
+            "forget" => {
+                let id = id.ok_or_else(|| bad_req("forget 需要 id"))?;
+                let row = g.store.decision_by_id(&id).map_err(core_err)?;
+                if !g.store.decision_delete(&id).map_err(core_err)? {
+                    return Err(IpcError::new(
+                        ErrorKind::BadRequest,
+                        format!("没有这条待裁决：{id}"),
+                    ));
+                }
+                if let Some(r) = row {
+                    removed_one = Some(decision_info_of(&r));
+                    journal_log(
+                        state,
+                        JournalEntry::ok(
+                            "conflict",
+                            &r.path,
+                            format!("用户忽略待裁决条目（未动文件）：{}", r.path),
+                        ),
+                    );
+                }
+            }
             "clear" => {
                 removed = g.store.decisions_clear().map_err(core_err)?;
                 journal_log(
@@ -4224,21 +4728,7 @@ fn decisions_cmd(
     }
     let g = state.sync_store.lock().unwrap();
     let rows = g.store.decisions().map_err(core_err)?;
-    let decisions: Vec<DecisionInfo> = rows
-        .iter()
-        .map(|r| DecisionInfo {
-            id: r.id.clone(),
-            path: r.path.clone(),
-            task_id: r.task_id.clone(),
-            local_size: r.local_size,
-            local_mtime: r.local_mtime,
-            remote_size: r.remote_size,
-            remote_mtime: r.remote_mtime,
-            is_dir: r.is_dir,
-            created_unix: r.created_unix,
-            resolution: r.resolution.clone(),
-        })
-        .collect();
+    let decisions: Vec<DecisionInfo> = rows.iter().map(decision_info_of).collect();
     let pending = decisions.iter().filter(|d| d.resolution.is_none()).count();
     let resolved = decisions.len() - pending;
     to_value(DecisionsData {
@@ -4247,10 +4737,232 @@ fn decisions_cmd(
         pending,
         resolved,
         removed,
+        removed_one,
         note: Some(
             "「每个文件都问我」的冲突会停在这里：文件两边都不动，裁决后由下一轮同步执行".into(),
         ),
     })
+}
+
+/// `DecisionRow` → 对外的 [`DecisionInfo`]。
+fn decision_info_of(r: &qxync_core::store::DecisionRow) -> DecisionInfo {
+    DecisionInfo {
+        id: r.id.clone(),
+        path: r.path.clone(),
+        task_id: r.task_id.clone(),
+        local_size: r.local_size,
+        local_mtime: r.local_mtime,
+        remote_size: r.remote_size,
+        remote_mtime: r.remote_mtime,
+        is_dir: r.is_dir,
+        created_unix: r.created_unix,
+        resolution: r.resolution.clone(),
+    }
+}
+
+/// ★ `action="diff"`：本地 vs NAS 的文本对比。
+///
+/// ## 三条硬约束
+///
+/// 1. **要么给 diff，要么明说为什么没给**（`DiffSkip`）。返回空 diff 而不解释，
+///    用户会以为「两边一样」—— 那是危险的假象。
+/// 2. **只读，不改任何东西**。远端用区间下载（`download_range`）而不是整文件落盘；
+///    本地只读 FUSE 已缓存的内容（[`qxync_fuse::FsHandle::read_cached`]），
+///    **不触发认领 / 不触发水合** —— 这是「看一眼本地存稿」，不是读路径。
+/// 3. **每一步失败都归到 `Skipped`**，不抛 IPC 错误。用户点「对比」不该看到
+///    一个报错弹窗，而是看到「这个文件没法逐行比：原因」。
+async fn decision_diff_cmd(state: &Arc<State>, id: &str) -> Result<serde_json::Value, IpcError> {
+    use qxync_core::decisions as dz;
+
+    // 1. 找到这条队列行
+    let row = {
+        let g = state.sync_store.lock().unwrap();
+        g.store.decision_by_id(id).map_err(core_err)?
+    };
+    let Some(row) = row else {
+        return Err(IpcError::new(
+            ErrorKind::BadRequest,
+            format!("没有这条待裁决：{id}"),
+        ));
+    };
+
+    // ★ `detail` 的约定：**只写原因，不带「本地/NAS 内容读不到：」这类 side 前缀**。
+    //   那层前缀由前端按 `which` 统一拼（GUI 模板 `{side}内容读不到：{detail}`、
+    //   CLI 也一样），damon 再带一层就会显示成
+    //   「本地内容读不到：本地内容读不到：…」。同文件所有分支都遵守这一条。
+    let skip = |s: dz::DiffSkip| -> Result<serde_json::Value, IpcError> {
+        to_value(DiffData {
+            path: row.path.clone(),
+            local_size: row.local_size,
+            remote_size: row.remote_size,
+            outcome: dz::DiffOutcome::Skipped(s),
+        })
+    };
+
+    if row.is_dir {
+        return skip(dz::DiffSkip::IsDir);
+    }
+
+    // 2. 定位挂载视图（要它的 FsHandle 读缓存）
+    let views = build_views(state);
+    let view = views.iter().find(|v| {
+        let root = v.remote_root.trim_end_matches('/');
+        row.path == root || row.path.starts_with(&format!("{root}/"))
+    });
+    let Some(view) = view else {
+        return skip(dz::DiffSkip::NoContent {
+            which: "local".into(),
+            detail: "没有已挂载的任务覆盖这个路径".into(),
+        });
+    };
+    // FsHandle 的 `read_cached` 只有真挂载点有；`Arc<dyn LocalView>` 上没有这个方法，
+    // 所以拿具体句柄。视图是 build_views 现建的，句柄从 mounts 里取。
+    let handle = {
+        let g = state.mounts.lock().unwrap();
+        g.get(&view.mountpoint).map(|m| m.handle.clone())
+    };
+    let Some(handle) = handle else {
+        return skip(dz::DiffSkip::NoContent {
+            which: "local".into(),
+            detail: "挂载点句柄不可用".into(),
+        });
+    };
+
+    // 3. 先 stat 远端拿**真实大小**（别盲目 range，也别拿它的 "0" 当空文件）
+    let client = engine_client(state).await?;
+    let (rdir, rname) = match row.path.rsplit_once('/') {
+        Some(("", name)) => ("/".to_string(), name.to_string()),
+        Some((d, name)) => (d.to_string(), name.to_string()),
+        None => ("/".to_string(), row.path.clone()),
+    };
+    let entry = match client.stat(&rdir, &rname).await {
+        Ok(Some(e)) => e,
+        Ok(None) => {
+            return skip(dz::DiffSkip::NoContent {
+                which: "remote".into(),
+                detail: "文件已不存在（可能已被删除）".into(),
+            });
+        }
+        Err(e) => {
+            return skip(dz::DiffSkip::NoContent {
+                which: "remote".into(),
+                detail: format!("读取元信息失败：{e}"),
+            });
+        }
+    };
+    if entry.isfolder {
+        return skip(dz::DiffSkip::IsDir);
+    }
+    let remote_size = entry.filesize;
+
+    // 4. 大小上限：**必须用真实大小判**，不能拿「读了多少」当大小。
+    //
+    //    `read_cached` 最多读 `cap+1` 字节；一个 100MB 的本地文件只会返回 512K+1，
+    //    把 `local.len()` 当 `local_size` 报出去就是「524289 B」这种假数字。
+    //    本地真实大小优先取 FUSE 节点元数据（脏文件写入时同步维护）。
+    let cap = dz::DIFF_MAX_BYTES;
+    let local_hint = view.view.node(&row.path).map(|n| n.size);
+    if let Some(size) = diff_too_large(local_hint, None, remote_size, cap) {
+        return to_value(DiffData {
+            path: row.path.clone(),
+            local_size: local_hint.unwrap_or(row.local_size),
+            remote_size,
+            outcome: dz::DiffOutcome::Skipped(dz::DiffSkip::TooLarge { size, limit: cap }),
+        });
+    }
+
+    // 5. 读本地缓存（最多上限+1 字节，多一个字节用来判断「恰好超限」）
+    let local = match handle.read_cached(&row.path, cap + 1) {
+        Ok(b) => b,
+        Err(e) => {
+            // 两种「NotFound」都不是「两边一样」，要说清楚：
+            //  ① `FsHandle::read_cached` 先按 by_remote 找节点 —— daemon 重启后节点表是空的，
+            //    用户没在挂载点里访问过的路径根本没物化（见报告「未修」：需要 FUSE 侧 API）；
+            //  ② 节点在但没有本地缓存（未水合 / 缓存被清理）。
+            let detail = if e.to_string().contains("没有本地缓存") {
+                e.to_string()
+            } else if e.kind() == std::io::ErrorKind::NotFound {
+                "本进程还没物化这个文件（daemon 重启后需先在挂载点里访问一次该路径）".to_string()
+            } else {
+                e.to_string()
+            };
+            return skip(dz::DiffSkip::NoContent {
+                which: "local".into(),
+                detail,
+            });
+        }
+    };
+    // 读到 `cap+1` = 本地内容确实超过上限（节点元数据可能滞后于缓存文件，再核一次）。
+    if let Some(size) = diff_too_large(local_hint, Some(local.len() as u64), remote_size, cap) {
+        return to_value(DiffData {
+            path: row.path.clone(),
+            local_size: local_hint.unwrap_or(local.len() as u64),
+            remote_size,
+            outcome: dz::DiffOutcome::Skipped(dz::DiffSkip::TooLarge { size, limit: cap }),
+        });
+    }
+    // 空文件（0 字节）不发 Range 请求：`bytes=0--1` 这种区间语义可疑
+    // （可能 416、也可能被服务端理解成"读到最后"），而且本来就没内容可拉。
+    let remote = match remote_download_range(remote_size) {
+        None => Vec::new(),
+        Some((start, end)) => match client.download_range(&rdir, &rname, start, end).await {
+            Ok(b) => b,
+            Err(e) => {
+                return skip(dz::DiffSkip::NoContent {
+                    which: "remote".into(),
+                    detail: format!("下载内容失败：{e}"),
+                });
+            }
+        },
+    };
+
+    // 6. 判二进制 / 解码 → 行级 diff
+    let outcome = match dz::prepare_bytes(&local, &remote) {
+        Err(s) => dz::DiffOutcome::Skipped(s),
+        Ok((l, r)) => dz::DiffOutcome::Diff(dz::text_diff(&l, &r)),
+    };
+    to_value(DiffData {
+        path: row.path.clone(),
+        // 有节点元数据就用真实大小；拿不到才退回实际读取长度（并在注释里说明）。
+        local_size: local_hint.unwrap_or(local.len() as u64),
+        remote_size,
+        outcome,
+    })
+}
+
+/// 远程整文件下载的字节区间；**空文件返回 `None`**（不发 Range 请求）。
+///
+/// `bytes=0--1`（`filesize-1` 下溢后的区间）语义可疑：可能回 416，也可能被服务端
+/// 理解成「读到结尾」。空文件本来就没有内容可拉，直接跳过最稳。
+fn remote_download_range(filesize: u64) -> Option<(u64, u64)> {
+    (filesize > 0).then(|| (0, filesize - 1))
+}
+
+/// 判断「两侧真实大小」是否超出对比上限；超出时返回**应报告的真实最大大小**。
+///
+/// * `local_hint` = 本地真实大小（FUSE 节点元数据；拿不到是 `None`）；
+/// * `local_read` = 实际读到的字节数，**只为 `local_hint` 缺失时兜底**。
+///   它**不是**真实大小（被 `read_cached` 的 cap+1 截断），绝不能单独当结果报出去；
+///   两者都有时取 `max`（保守：宁可报大，不可报小）。
+/// * `remote` = NAS 上的真实大小（stat 得到）。
+///
+/// 返回 `Some(size)` 时调用方必须走 `Skipped(TooLarge{size, limit})`，
+/// 其中 `size` 就是这里给的真实大小（不是读了多少）。
+fn diff_too_large(
+    local_hint: Option<u64>,
+    local_read: Option<u64>,
+    remote: u64,
+    limit: u64,
+) -> Option<u64> {
+    let local = match (local_hint, local_read) {
+        (Some(h), Some(r)) => h.max(r),
+        (Some(h), None) => h,
+        (None, Some(r)) => r,
+        // 两侧都不知道 → 现在无法判定（调用方会先读一次再来问）。
+        (None, None) => return None,
+    };
+    let biggest = local.max(remote);
+    (biggest > limit).then_some(biggest)
 }
 
 /// ★ T8：把 `decisions` 表的行压成「路径 → 待裁决冲突数」。
@@ -4892,7 +5604,7 @@ mod tests {
         f.save(&p).unwrap();
 
         let mine = vec![mount_rec("/home/tester/other")];
-        let held = externally_held_records(&p, &mine);
+        let held = externally_held_records(&p, &test_link(), &mine);
         assert!(
             held.is_empty(),
             "没挂着的记录不算「被托管」，不该被带进写盘（那会让已卸载的挂载点复活）；\
@@ -4905,7 +5617,7 @@ mod tests {
     fn t6_externally_held_records_does_not_duplicate_own_records() {
         let p = tmp_paths("t6-dup");
         let mine = vec![mount_rec("/home/tester/qxync")];
-        let held = externally_held_records(&p, &mine);
+        let held = externally_held_records(&p, &test_link(), &mine);
         for h in &held {
             assert!(
                 !mine.iter().any(|m| m.mountpoint == h.mountpoint),
@@ -4969,6 +5681,83 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------- ★ diff 边界
+
+    /// ★ 空文件不发 Range 请求：`bytes=0--1` 语义可疑（416 / 读到结尾都可能），
+    /// 而且 0 字节本来就没有内容可拉。
+    #[test]
+    fn empty_remote_file_is_not_downloaded_with_a_bogus_range() {
+        assert_eq!(remote_download_range(0), None, "空文件不该发 Range 请求");
+        assert_eq!(remote_download_range(1), Some((0, 0)), "1 字节 = bytes=0-0");
+        assert_eq!(remote_download_range(100), Some((0, 99)));
+    }
+
+    /// ★ 超限判定必须报**真实大小**：本地 100MB 但只能读到 cap+1 字节时，
+    /// 不能把「读到多少」当成文件大小报给用户。
+    #[test]
+    fn too_large_reports_true_size_not_truncated_read() {
+        const CAP: u64 = 512 * 1024;
+        // 本地节点元数据知道真实大小 → 报 100MB，而不是 cap+1
+        assert_eq!(
+            diff_too_large(Some(100 * 1024 * 1024), Some(CAP + 1), 100, CAP),
+            Some(100 * 1024 * 1024),
+            "本地 100MB 必须报真实大小，不能报截断后的 512K+1"
+        );
+        // 远端大：报远端真实大小
+        assert_eq!(
+            diff_too_large(Some(10), None, 5 * 1024 * 1024, CAP),
+            Some(5 * 1024 * 1024)
+        );
+        // 节点元数据拿不到 → 用实际读取长度兜底（至少 > 上限，不会漏报）
+        assert_eq!(diff_too_large(None, Some(CAP + 1), 10, CAP), Some(CAP + 1));
+        // 两侧都没超限 → 不报（交给 diff）
+        assert_eq!(diff_too_large(Some(100), Some(200), 300, CAP), None);
+        // 两侧都还没读到 → 现在判不了，不误报
+        assert_eq!(diff_too_large(None, None, 300, CAP), None);
+        // 恰好等于上限不算超（与 prepare_bytes 的 `>` 语义一致）
+        assert_eq!(diff_too_large(Some(CAP), None, CAP, CAP), None);
+    }
+
+    /// ★ 脱水失败也是「只写不清」：干净完整的一轮跑完必须清掉上次的失败，
+    /// 否则 status / GUI 的「最近错误」常驻红字（与同步引擎 last_error 同一症状）。
+    #[test]
+    fn dehydrate_error_does_not_outlive_a_clean_round() {
+        let stats = DehydrateStats::default();
+        *stats.last_error.lock().unwrap() = Some("磁盘写满".into());
+        // 本轮仍有失败 → 保留（由失败分支写入新的错误，这里不清）
+        settle_dehydrate_error(&stats, true, false);
+        assert!(stats.last_error.lock().unwrap().is_some(), "有失败不能清");
+        // dry-run 没尝试脱水 → 不清
+        settle_dehydrate_error(&stats, false, true);
+        assert!(
+            stats.last_error.lock().unwrap().is_some(),
+            "dry-run 没真正跑脱水，不能据此清错误"
+        );
+        // 完整跑完且没有失败 → 清
+        settle_dehydrate_error(&stats, false, false);
+        assert_eq!(
+            *stats.last_error.lock().unwrap(),
+            None,
+            "★ 修复前这里永远不清 → 「最近错误」常驻"
+        );
+    }
+
+    /// ★ journal「引擎活着」条目限频：10 分钟内不重复写，避免把 1 万条上限冲掉。
+    #[test]
+    fn scan_journal_is_rate_limited() {
+        assert!(scan_journal_due_at(0, 1_000), "进程启动后第一条要写");
+        assert!(
+            !scan_journal_due_at(1_000, 1_000 + SCAN_JOURNAL_MIN_INTERVAL_SECS - 1),
+            "间隔不到就不写"
+        );
+        assert!(scan_journal_due_at(
+            1_000,
+            1_000 + SCAN_JOURNAL_MIN_INTERVAL_SECS
+        ));
+        // 时钟回拨（now < last）也写一条：宁可多一条，也别让引擎看起来死了
+        assert!(scan_journal_due_at(10_000, 9_000));
+    }
+
     // ------------------------------------------------------------ 测试脚手架
 
     /// 造一份 `ConfigPaths`（每个用例一个独立目录；`/tmp` 只有 10M tmpfs）。
@@ -4997,6 +5786,67 @@ mod tests {
             hydrate_timeout_secs: 60,
             delete_limit: None,
             auto_unmount: true,
+        }
+    }
+
+    /// ★ M16：旧全局上传队列迁到 per-link 目录（default 用 host 命名空间）。
+    #[test]
+    fn m16_migrates_legacy_queue_to_per_link_dir() {
+        let p = tmp_paths("m16-queue");
+        let legacy = p.legacy_queue_dir();
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("queue.db"), b"db").unwrap();
+        std::fs::write(legacy.join("job1.dirty"), b"{}").unwrap();
+        let link = test_link();
+        migrate_legacy_queue(&p, &link).unwrap();
+        let target = p.queue_dir_for(&link);
+        assert_eq!(std::fs::read(target.join("queue.db")).unwrap(), b"db");
+        assert!(target.join("job1.dirty").exists());
+        assert!(!legacy.join("queue.db").exists(), "迁移后旧队列不该留着");
+        // 幂等：目标已有 queue.db 时不再动旧文件
+        std::fs::write(legacy.join("queue.db"), b"old").unwrap();
+        migrate_legacy_queue(&p, &link).unwrap();
+        assert_eq!(
+            std::fs::read(target.join("queue.db")).unwrap(),
+            b"db",
+            "目标已存在时不能被旧文件覆盖"
+        );
+    }
+
+    /// ★ M16：非 default 的 legacy 迁移走 `#id@host` 命名空间。
+    #[test]
+    fn m16_migrates_legacy_sync_state_for_non_default_owner() {
+        let p = tmp_paths("m16-sync");
+        let link = LinkConfig {
+            id: "nas2".into(),
+            ..test_link()
+        };
+        let legacy = p
+            .data_dir
+            .join("sync")
+            .join(qxync_core::config::sanitize_component(&link.host));
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("baseline.json"), b"{}").unwrap();
+        migrate_legacy_sync(&p, &link).unwrap();
+        let target = p.sync_dir_for(&link);
+        assert!(target.join("baseline.json").exists());
+        assert!(!legacy.exists(), "legacy 状态目录应整体移走");
+        assert!(target.ends_with("#nas2@nas.test"));
+    }
+
+    fn test_link() -> LinkConfig {
+        LinkConfig {
+            id: "default".into(),
+            host: "nas.test".into(),
+            port: 9834,
+            https: true,
+            insecure: false,
+            user: "u".into(),
+            ipv4_only: false,
+            exclude: Vec::new(),
+            filter_temp: true,
+            peer_listen: None,
+            peer_name: None,
         }
     }
 }

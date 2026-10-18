@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use qxync_client::Client;
 use qxync_core::ipc::{
-    default_socket_path, CacheInfo, CursorInfo, DecisionsData, DehydrateData, ErrorKind,
+    socket_path_for, CacheInfo, CursorInfo, DecisionsData, DehydrateData, ErrorKind,
     FileStatesData, GetData, LsData, MountInfo, PeerData, PingData, PutData, Request, RootsData,
     RulesData, SettingsData, SpaceData, StatusData, StoreData, SyncInfo, TasksData,
 };
@@ -271,13 +271,24 @@ enum Cmd {
     },
 
     /// ★ M8.4：冲突待裁决队列（策略 = 每个文件都问我）
+    ///
+    /// 一次只能做一件事：`--resolve` / `--forget` / `--diff` / `--clear` 互斥。
+    /// 早期版本让它们同时出现时「按代码顺序静默取一个」—— 用户敲了
+    /// `--diff X --forget Y` 却只看到 diff，会以为 forget 也执行了。现在由 clap
+    /// 直接报参数矛盾（退出码 2），宁可报错也不静默。
     Conflicts {
         /// 裁决某一条：`--resolve <id> --as keep_local|keep_remote|keep_both`
-        #[arg(long, value_name = "ID")]
+        #[arg(long, value_name = "ID", conflicts_with_all = ["forget", "diff", "clear"])]
         resolve: Option<String>,
-        /// 裁决方式：保留本地 / 保留 NAS 上的 / 两份都留
-        #[arg(long = "as", value_name = "RESOLUTION")]
+        /// 裁决方式：保留本地 / 保留 NAS 上的 / 两份都留（**必须**和 `--resolve` 一起给）
+        #[arg(long = "as", value_name = "RESOLUTION", requires = "resolve")]
         resolution: Option<String>,
+        /// 删掉单条（**只删队列行，不动文件**）——「这条我不想管」的出口
+        #[arg(long, value_name = "ID", conflicts_with_all = ["diff", "clear"])]
+        forget: Option<String>,
+        /// 打印某一条的本地/NAS 文本对比（超 512 KiB 或二进制只给原因）
+        #[arg(long, value_name = "ID", conflicts_with = "clear")]
+        diff: Option<String>,
         /// 清空队列（**只清队列，不动文件**）
         #[arg(long)]
         clear: bool,
@@ -324,6 +335,13 @@ enum Cmd {
         /// 把坏区间退回「按需水合」（不下载，下次读时自然修复）
         #[arg(long)]
         repair: bool,
+        /// 直接输出 JSON（脚本/验收用）
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// ★ M16：列出所有 NAS 连接（含各自 daemon / 登录 / 凭据状态）
+    Links {
         /// 直接输出 JSON（脚本/验收用）
         #[arg(long)]
         json: bool,
@@ -451,17 +469,29 @@ enum PeerAction {
 
 #[derive(Subcommand, Debug)]
 enum DaemonAction {
-    /// 拉起 qxyncd（已在运行则直接报成功）
-    Start,
-    /// 请求 qxyncd 干净退出（★ M15/T6：会**真正卸载**全部 FUSE 挂载点）
-    Stop,
-    /// ping + 状态快照
-    Status,
-    /// ★ M15/T6：重载同步引擎（SIGHUP）—— **挂载点一秒都不中断**
+    /// 拉起 qxyncd（已在运行则直接报成功）；`--all` = 所有连接
+    Start {
+        #[arg(long)]
+        all: bool,
+    },
+    /// 请求 qxyncd 干净退出（★ M15/T6：会**真正卸载**全部 FUSE 挂载点）；`--all` = 所有连接
+    Stop {
+        #[arg(long)]
+        all: bool,
+    },
+    /// ping + 状态快照；`--all` = 所有连接
+    Status {
+        #[arg(long)]
+        all: bool,
+    },
+    /// ★ M15/T6：重载同步引擎（SIGHUP）—— **挂载点一秒都不中断**；`--all` = 所有连接
     ///
     /// 等价于 `systemctl --user reload qxyncd`。这是「让同步重新跑起来」的
     /// 推荐做法：restart 会短暂断开挂载点（systemd 语义限制，见 docs/M15 T6）。
-    Reload,
+    Reload {
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 fn paths() -> Result<ConfigPaths> {
@@ -517,10 +547,8 @@ fn resolve_password(cli: &Cli, link: &LinkConfig) -> Result<String> {
         return Ok(p.clone());
     }
     let p = paths()?;
-    if let Ok(c) = Credentials::load(&p) {
-        if c.host == link.host && c.user == link.user {
-            return Ok(c.password);
-        }
+    if let Ok(c) = Credentials::load_for(&p, link) {
+        return Ok(c.password);
     }
     bail!("没有口令：用 --password / QXNYC_PASSWORD，或先跑 `qxync login --password` 写凭据")
 }
@@ -582,11 +610,18 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
-    let socket = cli.socket.clone().unwrap_or_else(default_socket_path);
+    let socket = cli
+        .socket
+        .clone()
+        .unwrap_or_else(|| socket_path_for(&cli.link));
 
     // ---- daemon 生命周期命令（不参与自动路由）----
     if let Cmd::Daemon { action } = &cli.cmd {
         return daemon_cmd(&cli, &socket, action).await;
+    }
+    // ★ M16：连接列表是纯本地 + 逐个 ping，不走 socket 路由。
+    if let Cmd::Links { json } = &cli.cmd {
+        return links_cmd(*json).await;
     }
 
     // ---- 路由：显式指定 > 自动探测（socket 可连就走 daemon）----
@@ -630,7 +665,7 @@ async fn main() -> Result<()> {
                 user: link.user.clone(),
                 password: pw,
             }
-            .save(&paths()?)?;
+            .save_for(&paths()?, &link)?;
             println!("✅ 登录成功");
             println!("   sid        : {}", session.sid);
             println!("   user       : {}", session.username);
@@ -810,6 +845,7 @@ async fn main() -> Result<()> {
             println!("✅ 已删除 {dir}/{name}");
         }
         Cmd::Daemon { .. } => unreachable!("daemon 命令在路由前已处理"),
+        Cmd::Links { .. } => unreachable!("links 命令在路由前已处理"),
         Cmd::Mount {
             mountpoint,
             remote,
@@ -830,11 +866,13 @@ async fn main() -> Result<()> {
                 remote.clone()
             };
             let (client, link) = connect(&cli, true).await?;
-            let cache = cache_dir.clone().unwrap_or_else(|| {
-                paths()
-                    .map(|p| p.data_dir.join("cache"))
-                    .unwrap_or_else(|_| PathBuf::from("/tmp/qxync-cache"))
-            });
+            // ★ M16：与 daemon 同一套命名空间（default 仍然落在 cache/<host>）
+            let p = paths()?;
+            let ns = qxync_core::config::link_namespace(&link);
+            let cache = cache_dir
+                .clone()
+                .unwrap_or_else(|| p.data_dir.join("cache"))
+                .join(&ns);
             let client = Arc::new(client);
             let mut fs = QxyncFs::new(client.clone(), remote.clone(), cache.clone())
                 .context("初始化 FUSE 文件系统失败")?
@@ -850,9 +888,19 @@ async fn main() -> Result<()> {
             let mut queue = None;
             if *rw {
                 // 写路径：上传队列（worker 线程把本地改动推回 NAS）
-                let marker_dir = paths()
-                    .map(|p| p.data_dir.join("upload-queue"))
-                    .unwrap_or_else(|_| cache.join("upload-queue"));
+                // ★ M16：队列按连接隔离，避免不同 NAS 的同名远端路径互相污染
+                let marker_dir = p.queue_dir_for(&link);
+                // 旧版全局队列的迁移只由 daemon 启动时做（它先抢 socket，能确认
+                // 旧 daemon 已退出）；直连模式发现了就提示，不在这里冒险搬。
+                if !marker_dir.join("queue.db").exists()
+                    && p.legacy_queue_dir().join("queue.db").exists()
+                {
+                    eprintln!(
+                        "⚠️ 检测到旧版全局上传队列 {}；先启动一次 qxyncd（`qxync daemon start`）                         让它迁移到 {}，否则这里的直连上传不会接着旧队列继续",
+                        p.legacy_queue_dir().display(),
+                        marker_dir.display()
+                    );
+                }
                 let q = qxync_fuse::upload::UploadQueue::new(
                     client.clone(),
                     tokio::runtime::Handle::current(),
@@ -1055,19 +1103,32 @@ fn to_request(cli: &Cli) -> Option<Request> {
         Cmd::Conflicts {
             resolve,
             resolution,
+            forget,
+            diff,
             clear,
             ..
-        } => Request::Decisions {
-            action: if *clear {
-                "clear".to_string()
-            } else if resolve.is_some() {
-                "resolve".to_string()
-            } else {
-                "list".to_string()
-            },
-            id: resolve.clone(),
-            resolution: resolution.clone(),
-        },
+        } => {
+            // 四种模式**互斥**由 clap 保证（见 `Cmd::Conflicts` 的 conflicts_with），
+            // 所以这里的 if 链不存在「同时给两个、静默取一个」的情况；顺序只是兜底。
+            Request::Decisions {
+                action: if *clear {
+                    "clear".to_string()
+                } else if diff.is_some() {
+                    "diff".to_string()
+                } else if forget.is_some() {
+                    "forget".to_string()
+                } else if resolve.is_some() {
+                    "resolve".to_string()
+                } else {
+                    "list".to_string()
+                },
+                id: diff
+                    .clone()
+                    .or_else(|| forget.clone())
+                    .or_else(|| resolve.clone()),
+                resolution: resolution.clone(),
+            }
+        }
         Cmd::FileStates { path, .. } => Request::FileStates { path: path.clone() },
         Cmd::Journal {
             limit,
@@ -1228,7 +1289,9 @@ fn to_request(cli: &Cli) -> Option<Request> {
             mountpoint: mount.clone(),
         },
         // verify / state / daemon 都不走 IPC
-        Cmd::Verify { .. } | Cmd::State { .. } | Cmd::Daemon { .. } => return None,
+        Cmd::Verify { .. } | Cmd::State { .. } | Cmd::Daemon { .. } | Cmd::Links { .. } => {
+            return None
+        }
     })
 }
 
@@ -1494,17 +1557,32 @@ async fn route_via_daemon(
                 print_space(&d, *now);
             }
         }
-        Cmd::Conflicts { json, .. } => {
-            let d: qxync_core::ipc::DecisionsData = ipc_client::call(&socket, req).await?;
-            if *json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&d).map_err(
-                        |e| qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string())
-                    )?
-                );
+        Cmd::Conflicts { json, diff, .. } => {
+            // diff 返回的是另一种结构，别按 DecisionsData 解
+            if diff.is_some() {
+                let d: qxync_core::ipc::DiffData = ipc_client::call(&socket, req).await?;
+                if *json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&d).map_err(|e| {
+                            qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string())
+                        })?
+                    );
+                } else {
+                    print_diff(&d);
+                }
             } else {
-                print_decisions(&d);
+                let d: qxync_core::ipc::DecisionsData = ipc_client::call(&socket, req).await?;
+                if *json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&d).map_err(|e| {
+                            qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string())
+                        })?
+                    );
+                } else {
+                    print_decisions(&d);
+                }
             }
         }
         Cmd::FileStates { json, .. } => {
@@ -1634,7 +1712,7 @@ async fn route_via_daemon(
                 );
             }
         }
-        Cmd::State { .. } | Cmd::Daemon { .. } => unreachable!(),
+        Cmd::State { .. } | Cmd::Daemon { .. } | Cmd::Links { .. } => unreachable!(),
     }
     Ok(())
 }
@@ -1858,6 +1936,9 @@ fn print_decisions(d: &DecisionsData) {
     if d.removed > 0 {
         println!("本次清空  : {} 条", d.removed);
     }
+    if let Some(x) = &d.removed_one {
+        println!("已忽略    : {}（未动文件）", x.path);
+    }
     if d.decisions.is_empty() {
         println!("（队列为空 —— 只有冲突策略为「每个文件都问我」时才会攒条目）");
     }
@@ -1873,6 +1954,106 @@ fn print_decisions(d: &DecisionsData) {
     }
     if let Some(n) = &d.note {
         println!("说明      : {n}");
+    }
+}
+
+/// 「本地独有 / NAS 独有」统计行。
+///
+/// ★ **别按字段名猜方向** —— 真实语义（见 `qxync_core::decisions::text_diff`）是：
+///
+/// * `-` 行 / `removed` = **只有本地有**（这一行取的是本地那一侧的内容，NAS 没有）；
+/// * `+` 行 / `added`   = **只有 NAS 有**（这一行取的是 NAS 那一侧的内容，本地没有）。
+///
+/// 写反的后果不是「显示难看」：用户看着「本地多 N 行」去点「保留 NAS 上的」，
+/// 方向整个反过来，内容被覆盖且撤销不了。
+fn diff_counts_line(added: usize, removed: usize) -> String {
+    format!("本地独有 {removed} 行 / NAS 独有 {added} 行")
+}
+
+/// diff 单行渲染：`本地行号  NAS行号  标记 内容`。
+///
+/// 行号 0 表示「这一侧没有对应行」 → 打 `-`（打 0 会被读成「第 0 行」）。
+fn diff_row_line(l: &qxync_core::decisions::DiffLine) -> String {
+    let num = |n: u32| {
+        if n == 0 {
+            "-".to_string()
+        } else {
+            n.to_string()
+        }
+    };
+    format!(
+        "{:>6} {:>6} {}{}",
+        num(l.local_no),
+        num(l.remote_no),
+        l.kind,
+        l.text
+    )
+}
+
+/// diff 图例。方向与 [`diff_counts_line`] 一致：`-` 本地独有、`+` NAS 独有。
+const DIFF_LEGEND: &str = "红/－ = 只有本地有（保留本地会把这份内容推到 NAS）  \
+                           绿/＋ = 只有 NAS 上有（保留 NAS 上的会覆盖本地）";
+
+/// 「为什么没对比」的一句话（`Skipped` 必须打印原因 —— 静默返回空 diff 会让人
+/// 以为「两边一样」）。
+fn diff_skip_reason(s: &qxync_core::decisions::DiffSkip) -> String {
+    use qxync_core::decisions::DiffSkip;
+    match s {
+        DiffSkip::TooLarge { size, limit } => format!(
+            "文件 {} 超出 {} 的文本对比上限，不做逐行对比（可继续用「保留本地 / 保留 NAS 上的」裁决）",
+            human_size(*size),
+            human_size(*limit)
+        ),
+        DiffSkip::Binary => "这是二进制文件（含 NUL 字节），不做逐行对比".to_string(),
+        DiffSkip::IsDir => "这是目录，不做逐行对比".to_string(),
+        DiffSkip::NoContent { which, detail } => {
+            // `which` 只可能是 local / remote（daemon 侧赋值）；`unknown` 是
+            // `DiffData` 的默认值，理论上到不了这里，但到了也不能瞎猜成 NAS。
+            let (side, sep) = match which.as_str() {
+                "local" => ("本地", ""),
+                "remote" => ("NAS", " "), // 中英混排留一个空格，别印成「NAS内容…」
+                _ => ("两侧之一", ""),
+            };
+            // daemon 有一条 detail 已经自成一句（「本地内容读不到：…」），再套前缀
+            // 会变成「本地内容读不到：本地内容读不到：…」。先剥一层再统一加。
+            let prefix = format!("{side}{sep}内容读不到：");
+            let detail = detail.strip_prefix(&prefix).unwrap_or(detail);
+            format!("{prefix}{detail}")
+        }
+    }
+}
+
+/// 本地 vs NAS 的文本对比。
+///
+/// **`Skipped` 必须打印原因** —— 静默返回空 diff 会让人以为「两边一样」。
+fn print_diff(d: &qxync_core::ipc::DiffData) {
+    use qxync_core::decisions::DiffOutcome;
+    println!("# {}", d.path);
+    println!(
+        "大小      : 本地 {} / NAS {}",
+        human_size(d.local_size),
+        human_size(d.remote_size)
+    );
+    match &d.outcome {
+        DiffOutcome::Diff(r) => {
+            println!("差异      : {}", diff_counts_line(r.added, r.removed));
+            if r.added == 0 && r.removed == 0 {
+                println!("（内容逐行相同）");
+            }
+            if r.truncated {
+                println!("（行数过多，只显示前 {} 行）", r.lines.len());
+            }
+            println!();
+            println!("  本地   NAS   内容");
+            for l in &r.lines {
+                println!("{}", diff_row_line(l));
+            }
+            println!();
+            println!("{DIFF_LEGEND}");
+        }
+        DiffOutcome::Skipped(s) => {
+            println!("未对比    : {}", diff_skip_reason(s));
+        }
     }
 }
 
@@ -2154,9 +2335,15 @@ fn print_cache(c: &CacheInfo) {
         human_size(c.freed_total_bytes)
     );
     if c.last_sweep_age_secs > 0 {
+        println!("            上次扫描 {}s 前", c.last_sweep_age_secs);
+    }
+    // ★ 这几个 `blocked_*` 是 daemon 每次脱水 `fetch_add` 的**累计值**（只增不清），
+    //   不是「最近一次扫描被挡了多少」—— 混在一起印会让人以为现在正被挡这么多。
+    let blocked =
+        c.blocked_dirty + c.blocked_pinned + c.blocked_open + c.blocked_mapped + c.blocked_inflight;
+    if blocked > 0 {
         println!(
-            "            上次扫描 {}s 前｜被挡：dirty={} pinned={} open={} mmap={} 在途={}",
-            c.last_sweep_age_secs,
+            "            累计被挡：dirty={} pinned={} open={} mmap={} 在途={}（自 daemon 启动，只增不清）",
             c.blocked_dirty,
             c.blocked_pinned,
             c.blocked_open,
@@ -2215,8 +2402,13 @@ fn print_sync(s: &SyncInfo) {
         s.cursors.max_log_seen,
         s.cursors.log_missing_count
     );
+    // ★ `SyncStats` 里的计数器是 daemon 生命周期内的**累计值**（fetch_add，只增不清）：
+    //   13 小时 × 每 30s 一轮 × 每轮 526 项被挡 = 69 万 —— 它绝不是「这一轮被挡了多少」。
+    //   不写「累计」会让人以为现在真有几十万条在等，白查一圈。
+    //   下面那行 `delete_block_reason` 才是「最近一次**完整**轮询有没有被挡」（daemon
+    //   在干净轮次会清空它），所以那里的「本轮有 N 项…」措辞是可信的。
     println!(
-        "  baseline: {} 项｜事件 {}｜远端刷新 {}｜入队上传 {}｜冲突 {}｜删除 {}｜删除被挡 {}",
+        "  baseline: {} 项｜自 daemon 启动累计：事件 {}｜远端刷新 {}｜入队上传 {}｜冲突 {}｜删除 {}｜删除被挡 {}（累计）",
         s.baseline_entries,
         s.events,
         s.refreshed,
@@ -2304,8 +2496,10 @@ fn print_status(st: &StatusData) {
         print_cache(c);
     }
     if let Some(u) = &st.uploads {
+        // ★ `done` / `failed` / `retries` / `bytes` 是队列生命周期内的累计值（只增不清）；
+        //   `pending` / `active` 才是「此刻」。
         println!(
-            "上传队列  : 待上传 {}｜上传中 {}｜完成 {}｜失败 {}｜重试 {}｜{} 字节",
+            "上传队列  : 待上传 {}｜上传中 {}｜完成 {}（累计）｜失败 {}（累计）｜重试 {}（累计）｜{} 字节（累计）",
             u.pending,
             if u.active { "yes" } else { "no" },
             u.done,
@@ -2317,8 +2511,9 @@ fn print_status(st: &StatusData) {
     // ★ M11：删除队列。`pending>0` = 有删除还没推给 NAS（正常只会持续几百毫秒）；
     // `failed>0` = 有删除重试超限被放弃了 —— 这时 NAS 上会残留文件，需要人工处理。
     if let Some(d) = &st.deletes {
+        // ★ 同上传队列：只有 `pending` / `active` 是此刻，其余都是累计值。
         println!(
-            "删除队列  : 待删 {}｜推送中 {}｜已删 {}｜失败 {}｜重试 {}｜批次 {}",
+            "删除队列  : 待删 {}｜推送中 {}｜已删 {}（累计）｜失败 {}（累计）｜重试 {}（累计）｜批次 {}（累计）",
             d.pending,
             if d.active { "yes" } else { "no" },
             d.deleted,
@@ -2331,7 +2526,7 @@ fn print_status(st: &StatusData) {
         print_sync(s);
     }
     println!(
-        "水合统计  : {} 次 / {} 字节",
+        "水合统计  : {} 次 / {} 字节（累计，自 daemon 启动）",
         st.hydro.count, st.hydro.bytes
     );
     if st.mounts.is_empty() {
@@ -2358,12 +2553,13 @@ fn print_status(st: &StatusData) {
 /// 为什么需要它：`qxyncd` 默认 daemon 化，fork 之后 fd 0/1/2 都指向 `/dev/null`，
 /// 所以它的启动失败**不会**出现在调用方的终端上 —— 唯一的线索就在日志文件里。
 /// 读不到就如实说读不到，不要假装没有线索。
-fn daemon_log_tail() -> String {
+fn daemon_log_tail(link_id: &str) -> String {
     let dir = qxync_core::ipc::default_log_dir();
+    let prefix = qxync_core::ipc::log_prefix_for(link_id);
     let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
     if let Ok(rd) = std::fs::read_dir(&dir) {
         for e in rd.flatten() {
-            if !e.file_name().to_string_lossy().starts_with("qxyncd.log") {
+            if !e.file_name().to_string_lossy().starts_with(&prefix) {
                 continue;
             }
             if let Ok(t) = e.metadata().and_then(|m| m.modified()) {
@@ -2374,7 +2570,11 @@ fn daemon_log_tail() -> String {
         }
     }
     let Some((_, path)) = newest else {
-        return format!("（读不到 daemon 日志目录 {}）", dir.display());
+        return format!(
+            "（读不到 daemon 日志目录 {}，前缀 {}）",
+            dir.display(),
+            prefix
+        );
     };
     let text = std::fs::read_to_string(&path).unwrap_or_default();
     let tail: Vec<&str> = text.lines().rev().take(8).collect();
@@ -2390,10 +2590,51 @@ fn daemon_log_tail() -> String {
 }
 
 async fn daemon_cmd(cli: &Cli, socket: &std::path::Path, action: &DaemonAction) -> Result<()> {
+    let all = matches!(
+        action,
+        DaemonAction::Start { all: true }
+            | DaemonAction::Stop { all: true }
+            | DaemonAction::Status { all: true }
+            | DaemonAction::Reload { all: true }
+    );
+    if !all {
+        return daemon_action_one(&cli.link, socket, action).await;
+    }
+    if cli.socket.is_some() {
+        bail!("`daemon --all` 不能和显式 `--socket` 一起用（每个连接有自己的 socket）");
+    }
+    let p = paths()?;
+    let (links, bad) = LinkConfig::list(&p);
+    for (bp, be) in &bad {
+        eprintln!("⚠️ 连接配置解析失败，已跳过 {}: {be}", bp.display());
+    }
+    if links.is_empty() {
+        println!("没有连接配置（{}）", p.config_dir.join("links").display());
+        return Ok(());
+    }
+    let mut failed = 0usize;
+    for link in &links {
+        let s = socket_path_for(&link.id);
+        if let Err(e) = daemon_action_one(&link.id, &s, action).await {
+            eprintln!("❌ [{}] {e:#}", link.id);
+            failed += 1;
+        }
+    }
+    if failed > 0 {
+        bail!("{failed}/{} 个连接失败", links.len());
+    }
+    Ok(())
+}
+
+async fn daemon_action_one(
+    link_id: &str,
+    socket: &std::path::Path,
+    action: &DaemonAction,
+) -> Result<()> {
     match action {
-        DaemonAction::Start => {
+        DaemonAction::Start { .. } => {
             if ipc_client::available(socket).await {
-                println!("✅ qxyncd 已在运行（{}）", socket.display());
+                println!("✅ qxyncd 已在运行（{}，link={link_id}）", socket.display());
                 return Ok(());
             }
             // ★ **不检查 link 配置**：daemon 的职责是常驻后台，没配 NAS 时它空转待命
@@ -2401,7 +2642,7 @@ async fn daemon_cmd(cli: &Cli, socket: &std::path::Path, action: &DaemonAction) 
             //   所以「还没有连接配置」不是启动失败的理由。
             let exe = daemon_binary()?;
             let mut cmd = std::process::Command::new(&exe);
-            cmd.arg("--link").arg(&cli.link).arg("--socket").arg(socket);
+            cmd.arg("--link").arg(link_id).arg("--socket").arg(socket);
             let status = cmd.status().context("启动 qxyncd 失败")?;
             if !status.success() {
                 bail!("qxyncd 启动失败（退出码 {:?}）", status.code());
@@ -2419,29 +2660,28 @@ async fn daemon_cmd(cli: &Cli, socket: &std::path::Path, action: &DaemonAction) 
                 bail!(
                     "qxyncd 已派生但 socket 未就绪：{}\n{}",
                     socket.display(),
-                    daemon_log_tail()
+                    daemon_log_tail(link_id)
                 );
             }
             let p: PingData = ipc_client::call(socket, Request::Ping)
                 .await
                 .map_err(ipc_err)?;
             println!(
-                "✅ qxyncd 已启动 pid={} version={} socket={}",
+                "✅ qxyncd 已启动 link={link_id} pid={} version={} socket={}",
                 p.pid,
                 p.daemon_version,
                 socket.display()
             );
-            if LinkConfig::load(&ConfigPaths::discover()?, &cli.link).is_err() {
+            if LinkConfig::load(&ConfigPaths::discover()?, link_id).is_err() {
                 println!(
-                    "   空转待命：还没有配置 NAS 连接「{}」—— 先 `qxync login`，\
-                     或在 GUI「设置 → 连接」里保存；配好后它会自动开始同步（不用重启）",
-                    cli.link
+                    "   空转待命：还没有配置 NAS 连接「{link_id}」—— 先 `qxync --link {link_id} login`，\
+                     或在 GUI「设置 → 连接」里保存；配好后它会自动开始同步（不用重启）"
                 );
             }
         }
-        DaemonAction::Stop => {
+        DaemonAction::Stop { .. } => {
             if !ipc_client::available(socket).await {
-                println!("qxyncd 未在运行");
+                println!("qxyncd（link={link_id}）未在运行");
                 return Ok(());
             }
             ipc_client::call_ok(socket, Request::Shutdown)
@@ -2453,11 +2693,14 @@ async fn daemon_cmd(cli: &Cli, socket: &std::path::Path, action: &DaemonAction) 
                 }
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
-            println!("✅ qxyncd 已停止");
+            println!("✅ qxyncd 已停止（link={link_id}）");
         }
-        DaemonAction::Status => {
+        DaemonAction::Status { .. } => {
             if !ipc_client::available(socket).await {
-                bail!("qxyncd 未在运行（socket {}）", socket.display());
+                bail!(
+                    "qxyncd（link={link_id}）未在运行（socket {}）",
+                    socket.display()
+                );
             }
             let p: PingData = ipc_client::call(socket, Request::Ping)
                 .await
@@ -2465,13 +2708,14 @@ async fn daemon_cmd(cli: &Cli, socket: &std::path::Path, action: &DaemonAction) 
             let st: StatusData = ipc_client::call(socket, Request::Status)
                 .await
                 .map_err(ipc_err)?;
+            println!("link      : {} (socket {})", link_id, socket.display());
             println!(
                 "pong      : {} v{} pid={} uptime={}s",
                 p.pong, p.daemon_version, p.pid, p.uptime_secs
             );
             print_status(&st);
         }
-        DaemonAction::Reload => {
+        DaemonAction::Reload { .. } => {
             // ★ M15/T6：SIGHUP = 重载同步引擎但**不碰 FUSE 会话**。
             //   走信号而不是新增 IPC 方法，与 `systemctl reload` 完全同一条路径 ——
             //   用户在两种部署下得到同样的行为。
@@ -2494,11 +2738,101 @@ async fn daemon_cmd(cli: &Cli, socket: &std::path::Path, action: &DaemonAction) 
             // 不 sleep 轮询 —— 同步引擎重载包含「等旧任务做完当前一轮」，
             // 短则几秒长则几十秒，CLI 不该在这里卡住。
             println!(
-                "✅ 已给 qxyncd(pid={}) 发 SIGHUP：同步引擎将重载（轮询 / 脱水 / 队列 / journal）",
+                "✅ 已给 qxyncd(pid={}, link={link_id}) 发 SIGHUP：同步引擎将重载（轮询 / 脱水 / 队列 / journal）",
                 p.pid
             );
             println!("   FUSE 挂载点**不中断** —— 这正是用 reload 而不是 restart 的原因");
         }
+    }
+    Ok(())
+}
+
+/// ★ M16：`qxync links [--json]` —— 所有连接 + 各自 daemon/凭据状态。
+async fn links_cmd(json: bool) -> Result<()> {
+    let p = paths()?;
+    let (links, bad) = LinkConfig::list(&p);
+    let mut rows = Vec::new();
+    for link in &links {
+        let socket = socket_path_for(&link.id);
+        let running = ipc_client::available(&socket).await;
+        let mut logged_in = false;
+        let mut pid: Option<u32> = None;
+        let mut error: Option<String> = None;
+        if running {
+            match ipc_client::call::<PingData>(&socket, Request::Ping).await {
+                Ok(ping) => pid = Some(ping.pid),
+                Err(e) => error = Some(e.message),
+            }
+            match ipc_client::call::<StatusData>(&socket, Request::Status).await {
+                Ok(st) => logged_in = st.logged_in,
+                Err(e) => {
+                    if error.is_none() {
+                        error = Some(e.message);
+                    }
+                }
+            }
+        }
+        let cred = Credentials::present_for(&p, link);
+        rows.push(serde_json::json!({
+            "id": link.id,
+            "host": link.host,
+            "port": link.port,
+            "https": link.https,
+            "insecure": link.insecure,
+            "user": link.user,
+            "socket": socket.display().to_string(),
+            "credential_present": cred.is_some(),
+            "daemon": {
+                "running": running,
+                "pid": pid,
+                "logged_in": logged_in,
+                "error": error,
+            },
+        }));
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "links": rows,
+                "bad": bad.iter().map(|(p, e)| serde_json::json!({
+                    "path": p.display().to_string(), "error": e,
+                })).collect::<Vec<_>>(),
+            }))?
+        );
+        return Ok(());
+    }
+    if rows.is_empty() {
+        println!(
+            "还没有 NAS 连接。用 `qxync --host <NAS> --user <用户> --password <口令> login`，\
+             或在 GUI「设置 → 连接」里添加。"
+        );
+    }
+    for r in &rows {
+        let id = r["id"].as_str().unwrap_or("?");
+        let host = r["host"].as_str().unwrap_or("?");
+        let port = r["port"].as_u64().unwrap_or(0);
+        let user = r["user"].as_str().unwrap_or("?");
+        let running = r["daemon"]["running"].as_bool().unwrap_or(false);
+        let logged = r["daemon"]["logged_in"].as_bool().unwrap_or(false);
+        let cred = r["credential_present"].as_bool().unwrap_or(false);
+        println!(
+            "- {id:<10} {user}@{host}:{port}  daemon={}  login={}  credential={}{}",
+            if running { "运行" } else { "停止" },
+            if logged { "已登录" } else { "未登录" },
+            if cred { "有" } else { "无" },
+            if running {
+                format!("  socket={}", r["socket"].as_str().unwrap_or("?"))
+            } else {
+                String::new()
+            }
+        );
+        if let Some(err) = r["daemon"]["error"].as_str() {
+            println!("  ⚠️ {err}");
+        }
+    }
+    for (bp, be) in &bad {
+        eprintln!("⚠️ 连接配置解析失败，已跳过 {}: {be}", bp.display());
     }
     Ok(())
 }
@@ -2772,5 +3106,170 @@ fn print_journal(d: &qxync_core::ipc::JournalData) {
     }
     if let Some(n) = &d.note {
         println!("说明：{n}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cli_from(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("qxync").chain(args.iter().copied()))
+    }
+
+    fn decisions_req(args: &[&str]) -> (String, Option<String>, Option<String>) {
+        let cli = cli_from(args).unwrap_or_else(|e| panic!("{args:?} 应能解析: {e}"));
+        match to_request(&cli).expect("conflicts 有 IPC 形态") {
+            Request::Decisions {
+                action,
+                id,
+                resolution,
+            } => (action, id, resolution),
+            other => panic!("{args:?} 解成了 {other:?}"),
+        }
+    }
+
+    /// ★ 参数矛盾必须**报错**，不能按代码顺序静默取一个。
+    ///
+    /// 修复前：`--clear --diff X` 静默执行 clear；`--diff X --forget Y` 静默只 diff。
+    /// 用户会以为两件事都做了（尤其 forget 是「忽略这条」，静默丢裁决意图很危险）。
+    #[test]
+    fn conflicts_modes_are_mutually_exclusive() {
+        for args in [
+            &["conflicts", "--clear", "--diff", "a"][..],
+            &["conflicts", "--clear", "--forget", "a"],
+            &[
+                "conflicts",
+                "--clear",
+                "--resolve",
+                "a",
+                "--as",
+                "keep_local",
+            ],
+            &["conflicts", "--diff", "a", "--forget", "b"],
+            &[
+                "conflicts",
+                "--diff",
+                "a",
+                "--resolve",
+                "b",
+                "--as",
+                "keep_local",
+            ],
+            &[
+                "conflicts",
+                "--forget",
+                "a",
+                "--resolve",
+                "b",
+                "--as",
+                "keep_local",
+            ],
+        ] {
+            let e = cli_from(args).expect_err(&format!("{args:?} 必须报参数冲突"));
+            assert_eq!(
+                e.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{args:?} 的错误类型不对: {e}"
+            );
+        }
+        // `--as` 单独给 = resolution 会被静默忽略 → 必须报错（requires=resolve）
+        assert!(
+            cli_from(&["conflicts", "--as", "keep_local"]).is_err(),
+            "--as 没有 --resolve 时必须报错，不能静默忽略"
+        );
+        // 互斥只针对这四个模式：`--json` 可以和任意一个共存
+        assert!(cli_from(&["conflicts", "--diff", "a", "--json"]).is_ok());
+    }
+
+    /// 每种模式各映射成什么请求（一次只有一种，不允许歧义）。
+    #[test]
+    fn conflicts_modes_map_to_exactly_one_request() {
+        assert_eq!(decisions_req(&["conflicts"]), ("list".into(), None, None));
+        assert_eq!(
+            decisions_req(&["conflicts", "--clear"]),
+            ("clear".into(), None, None)
+        );
+        assert_eq!(
+            decisions_req(&["conflicts", "--diff", "a"]),
+            ("diff".into(), Some("a".into()), None)
+        );
+        assert_eq!(
+            decisions_req(&["conflicts", "--forget", "a"]),
+            ("forget".into(), Some("a".into()), None)
+        );
+        assert_eq!(
+            decisions_req(&["conflicts", "--resolve", "a", "--as", "keep_local"]),
+            (
+                "resolve".into(),
+                Some("a".into()),
+                Some("keep_local".into())
+            )
+        );
+    }
+
+    /// ★ 方向回归：`removed` = 本地独有行、`added` = NAS 独有行。
+    ///
+    /// 早期 `print_diff` 写成「本地多 {added} / NAS 多 {removed}」+ 图例反向，
+    /// 用户会照着反的结论选「保留哪边」。这里用**真实数据源**（`text_diff`）造
+    /// diff，再把 CLI 的三处文字（统计行 / 行号列 / 图例）全部钉住方向。
+    #[test]
+    fn diff_text_direction_matches_text_diff_semantics() {
+        use qxync_core::decisions::text_diff;
+        let r = text_diff("a\nlocal-only\nc\n", "a\nnas-only\nc\n");
+        assert_eq!((r.added, r.removed), (1, 1));
+
+        // `text_diff` 的真语义：'-' 行 = 本地独有（取本地文本，NAS 行号 0）
+        let minus = r.lines.iter().find(|l| l.kind == '-').unwrap();
+        assert_eq!(minus.text, "local-only");
+        assert_eq!((minus.local_no, minus.remote_no), (2, 0));
+        // '+' 行 = NAS 独有（取 NAS 文本，本地行号 0）
+        let plus = r.lines.iter().find(|l| l.kind == '+').unwrap();
+        assert_eq!(plus.text, "nas-only");
+        assert_eq!((plus.local_no, plus.remote_no), (0, 2));
+
+        // 统计行方向（不是 1:1，才能看出有没有写反）
+        assert_eq!(diff_counts_line(3, 2), "本地独有 2 行 / NAS 独有 3 行");
+        // 行号列：没有对应行的一侧打 '-'（打 0 会被读成「第 0 行」）
+        assert_eq!(diff_row_line(plus), "     -      2 +nas-only");
+        assert_eq!(diff_row_line(minus), "     2      - -local-only");
+        // 图例方向必须和统计行一致
+        assert!(DIFF_LEGEND.contains("－ = 只有本地有"), "{DIFF_LEGEND}");
+        assert!(DIFF_LEGEND.contains("＋ = 只有 NAS 上有"), "{DIFF_LEGEND}");
+    }
+
+    /// `Skipped` 的原因必须**原样可读、不重复前缀**（daemon 有一条 detail 自带
+    /// 「本地内容读不到：」前缀，再套一层会变成双重前缀）。
+    #[test]
+    fn diff_skip_reason_is_readable_and_not_double_prefixed() {
+        use qxync_core::decisions::DiffSkip;
+        // 本地：daemon 已自带前缀的那条 → 剥掉再统一加，不能重复
+        let s = diff_skip_reason(&DiffSkip::NoContent {
+            which: "local".into(),
+            detail: "本地内容读不到：文件只水合了一部分".into(),
+        });
+        assert_eq!(s, "本地内容读不到：文件只水合了一部分");
+        // 本地：自带无前缀的（例如「没有已挂载的任务覆盖这个路径」）→ 加上
+        let s = diff_skip_reason(&DiffSkip::NoContent {
+            which: "local".into(),
+            detail: "没有已挂载的任务覆盖这个路径".into(),
+        });
+        assert_eq!(s, "本地内容读不到：没有已挂载的任务覆盖这个路径");
+        // remote：一侧是 NAS，不能错标成本地
+        let s = diff_skip_reason(&DiffSkip::NoContent {
+            which: "remote".into(),
+            detail: "从 NAS 下载内容失败：timeout".into(),
+        });
+        assert_eq!(s, "NAS 内容读不到：从 NAS 下载内容失败：timeout");
+        // 未知 which（DiffData 默认值）不能瞎猜成 NAS
+        let s = diff_skip_reason(&DiffSkip::NoContent {
+            which: "unknown".into(),
+            detail: "尚未对比".into(),
+        });
+        assert_eq!(s, "两侧之一内容读不到：尚未对比");
+        // 其它跳过原因都要说明「为什么没比」
+        assert!(diff_skip_reason(&DiffSkip::IsDir).contains("目录"));
+        assert!(diff_skip_reason(&DiffSkip::Binary).contains("二进制"));
+        assert!(diff_skip_reason(&DiffSkip::TooLarge { size: 5, limit: 4 }).contains("上限"));
     }
 }

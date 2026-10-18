@@ -11,7 +11,7 @@
 #   没更新就推上去，用户装的时候会直接 checksum 失败（不会静默装错东西）。
 
 pkgname=qxync-bin
-pkgver=0.5.1
+pkgver=0.6.0
 pkgrel=1
 pkgdesc='QNAP Qsync client for Linux: FUSE on-demand sync + qxyncd daemon + Tauri GUI (prebuilt)'
 arch=('x86_64')
@@ -69,6 +69,9 @@ package() {
   # FUSE 挂载点也属于该用户），所以装 /usr/lib/systemd/user/，由用户自己
   # `systemctl --user enable --now qxyncd` —— 包**不能**替某个用户启用它。
   install -Dm644 "$srcdir/$stem/qxyncd.service" "$pkgdir/usr/lib/systemd/user/qxyncd.service"
+  # ★ M16：多连接模板单元（`systemctl --user enable --now qxyncd@<link_id>`）。
+  #   default 连接仍用上面的 qxyncd.service；本模板只给非 default 连接用。
+  install -Dm644 "$srcdir/$stem/qxyncd@.service" "$pkgdir/usr/lib/systemd/user/qxyncd@.service"
 
   install -Dm644 "$srcdir/$stem/LICENSE-MIT" "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
   install -Dm644 "$srcdir/$stem/LICENSE-APACHE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"

@@ -25,13 +25,16 @@ pub const TEMP_PATTERNS: &[&str] = &[
     "*.qxync-tmp",
 ];
 
-/// 为什么一个路径在挂载点里不可见。
+/// 为什么一个路径在挂载点里不可见 / 不参与同步。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HideReason {
     /// `exclude` 规则命中（选择性同步：根本不管）。
     Excluded,
     /// 临时文件规则命中（写到一半的下载/Office 锁文件…）。
     Temp,
+    /// 回收站目录（`.Trash` / `.Trash-<uid>` / `@Recycle`）—— **不是**用户规则，
+    /// 而是硬约束：同步引擎与 FUSE 层都不管回收站（判定见 [`crate::trash`]）。
+    Trash,
 }
 
 impl HideReason {
@@ -39,6 +42,7 @@ impl HideReason {
         match self {
             HideReason::Excluded => "excluded",
             HideReason::Temp => "temp",
+            HideReason::Trash => "trash",
         }
     }
 }

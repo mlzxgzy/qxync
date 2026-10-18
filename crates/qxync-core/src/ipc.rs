@@ -10,6 +10,19 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// 协议版本：请求/响应都带，用于向前兼容。
+///
+/// ## 什么时候才该 bump（关系到能不能混跑新旧版本）
+///
+/// daemon 对 `v` 是**严格相等**校验（不等于就回 `BadVersion` 拒绝整个请求），所以
+/// bump = 新旧 CLI/GUI/daemon **完全不能混跑**。因此：
+///
+/// * **只加字段 / 只加 action 取值** → **不 bump**。响应结构体都带
+///   `#[serde(default)]`：老客户端解新 payload 会忽略未知字段，新客户端解老 payload
+///   会拿到默认值；新增 action 在旧 daemon 上会得到明确的 `未知 action "xxx"` 错误
+///   （不是静默当成 list）。
+/// * **改帧格式 / 改已有字段含义 / 删字段** → 必须 bump。
+///
+/// 本文件新增的 `DecisionsData.removed_one` 与 `DiffData` 属于第一类，故仍是 1。
 pub const IPC_VERSION: u32 = 1;
 
 // ---------------------------------------------------------------- 路径规则
@@ -40,6 +53,53 @@ pub fn default_log_dir() -> PathBuf {
     match ConfigPaths::discover() {
         Ok(p) => p.log_dir(),
         Err(_) => PathBuf::from("/tmp/qxync/log"),
+    }
+}
+
+/// ★ M16：某个连接的 IPC socket 路径。
+///
+/// * `default` → 旧的 `qxyncd.sock`（`QXNYC_SOCKET` 仍可精确覆盖，测试/多实例兼容）；
+/// * 其它 → 与 default 同一个目录下的 `qxyncd-<id>.sock`。**不看 `QXNYC_SOCKET` 的
+///   文件名，只看它的目录**：这样隔离环境里设一个 socket 路径，多连接的 socket
+///   仍然落在同一个运行目录，不会互相踩。
+pub fn socket_path_for(link_id: &str) -> PathBuf {
+    let default = default_socket_path();
+    if link_id == "default" {
+        return default;
+    }
+    let dir = default
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    dir.join(format!(
+        "qxyncd-{}.sock",
+        crate::config::sanitize_component(link_id)
+    ))
+}
+
+/// ★ M16：某个连接的 pid 文件。
+pub fn pid_path_for(link_id: &str) -> PathBuf {
+    if link_id == "default" {
+        return default_pid_path();
+    }
+    let dir = default_pid_path()
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("/tmp/qxync"));
+    dir.join(format!(
+        "qxyncd-{}.pid",
+        crate::config::sanitize_component(link_id)
+    ))
+}
+
+/// ★ M16：某个连接的滚动日志文件前缀（`tracing_appender::rolling::daily` 用）。
+///
+/// default 保持 `qxyncd.log`，其余 `qxyncd-<id>.log`。
+pub fn log_prefix_for(link_id: &str) -> String {
+    if link_id == "default" {
+        "qxyncd.log".into()
+    } else {
+        format!("qxyncd-{}.log", crate::config::sanitize_component(link_id))
     }
 }
 
@@ -264,6 +324,9 @@ pub enum Request {
     ///
     /// * `action="list"`     → 全部待裁决（`resolution` 为空的 + 已裁决未执行的）；
     /// * `action="resolve"`  → 给 `id` 定夺：`keep_local` / `keep_remote` / `keep_both`；
+    /// * `action="forget"`   → **删掉单条**（只删队列行，不动文件）。给用户一个
+    ///   「这条我不想管」的出口 —— 否则已裁决的条目只能干等下一轮同步，看着像卡住；
+    /// * `action="diff"`     → 本地 vs NAS 的**文本对比**（见 [`DiffOutcome`]）；
     /// * `action="clear"`    → 清空队列（**只清队列，不动文件**）。
     Decisions {
         action: String,
@@ -340,6 +403,12 @@ impl Request {
             // ★ M8.2：list/get/save/delete 很快，只有 mount/resume/pause 会真的挂载
             Request::Tasks { action, .. }
                 if matches!(action.as_str(), "mount" | "resume" | "pause")
+        ) || matches!(
+            self,
+            // ★ 冲突文本对比要 stat + 读本地缓存 + 从 NAS 拉最多 `DIFF_MAX_BYTES`
+            //   （512 KiB）再跑 LCS；list/resolve/forget/clear 都是轻操作。
+            //   CLI 与 GUI 共用这张表，30s 超时会把慢链路上的正常对比判成超时。
+            Request::Decisions { action, .. } if action.as_str() == "diff"
         )
     }
 }
@@ -473,6 +542,16 @@ pub struct LinkInfo {
     pub host: String,
     pub port: u16,
     pub https: bool,
+    /// GUI 的「跳过 TLS 校验」（对应 `LinkConfig.insecure`）。
+    ///
+    /// GUI 的 `same_link` 靠它判断「重存连接后要不要重启 daemon 才生效」：
+    /// 没这个字段时，用户勾/去勾该选项再保存，daemon 仍按旧值跑（改了没生效）。
+    ///
+    /// `#[serde(default)]` 是双向兼容的关键：老 daemon 的 payload 没有这个键 →
+    /// 按 `false` 解析（最坏情况是新 GUI + 老 daemon 多重启一次 daemon，
+    /// 不会把「配置不一致」误判成一致）。
+    #[serde(default)]
+    pub insecure: bool,
     pub user: String,
     pub ipv4_only: bool,
 }
@@ -503,11 +582,17 @@ pub struct CursorInfo {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HydroStats {
+    /// **累计**水合次数（自 daemon 启动，只增不清）—— 不是「此刻在传的水合数」。
     pub count: u64,
+    /// **累计**水合字节数（同上）。
     pub bytes: u64,
 }
 
 /// 上传队列快照（M2b）。
+///
+/// ★ 只有 `pending` / `active` 是「此刻」；`done` / `failed` / `retries` / `bytes`
+/// 是队列生命周期内的**累计值**（只增不清）—— 展示时必须标明「累计」，否则
+/// 「失败 3」会被读成「现在有 3 个失败作业」。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UploadInfo {
     pub pending: u64,
@@ -521,6 +606,9 @@ pub struct UploadInfo {
 }
 
 /// ★ M11：删除队列快照（`unlink`/`rmdir` 异步入队，后台同目录攒批推送）。
+///
+/// ★ 同 [`UploadInfo`]：`pending` / `active` 是此刻，其余是**累计值**。
+/// `done` 与 `deleted` 都只增不清（成功一批两个各加「这批条目数」，数值相同）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DeleteInfo {
     /// 排队中（还没发出）的删除条目数。
@@ -558,17 +646,29 @@ pub struct SyncCursors {
 }
 
 /// 变更发现状态（`status` / `sync` 共用）。
+///
+/// ★ **哪些是累计、哪些是此刻**（展示时别混）：
+///
+/// * 累计（`SyncStats` 的 `AtomicU64`，自 daemon 启动只增不清）：`polls`、
+///   `events`、`refreshed`、`uploaded`、`conflicts`、`deleted`、`deletes_blocked`；
+/// * 此刻：`enabled` / `interval_secs` / `last_poll_age_secs` / `baseline_entries` /
+///   `cursors`。`delete_block_reason` / `last_error` 是「最近一次**完整**轮询」的结论
+///   （daemon 在干净轮次会清空它们，见 `sync::absorb_round`），既不累计也非实时。
+///
+/// `refreshed` 等曾被误写成「最近一次轮询的统计」—— 实际 daemon 每轮 `fetch_add`，
+/// 用户会看到「冲突 5000」以为现在积了 5000 条冲突。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SyncInfo {
     /// 轮询是否在跑。
     pub enabled: bool,
     pub interval_secs: u64,
+    /// **累计**轮询次数（自 daemon 启动）。
     pub polls: u64,
     /// 距离上次轮询的秒数（没跑过 = 0）。
     pub last_poll_age_secs: u64,
     pub cursors: SyncCursors,
     pub baseline_entries: u64,
-    /// 最近一次轮询的统计。
+    /// **累计**远端刷新次数（自 daemon 启动，只增不清）。
     pub refreshed: u64,
     pub conflicts: u64,
     pub uploaded: u64,
@@ -602,7 +702,8 @@ pub struct CacheInfo {
     pub freed_total_bytes: u64,
     /// 上次扫描距今秒数（没扫过 = 0）。
     pub last_sweep_age_secs: u64,
-    /// 被安全检查挡下的分类计数（最近一次扫描）。
+    /// 被安全检查挡下的分类计数 —— **累计值**（daemon 每次脱水 `fetch_add`，只增不清），
+    /// 不是「最近一次扫描」的数。展示时必须标明累计，否则会被读成「现在有这么多被挡」。
     pub blocked_dirty: u64,
     pub blocked_pinned: u64,
     pub blocked_open: u64,
@@ -948,7 +1049,7 @@ pub struct SettingsData {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DecisionInfo {
-    /// 稳定 id（路径 + 首次发现时间）。
+    /// 稳定 id（**路径派生**：同一路径只有一条，可读、可 diff；不含时间）。
     pub id: String,
     /// 远端绝对路径（冲突的那个文件）。
     pub path: String,
@@ -1123,7 +1224,24 @@ pub struct DecisionsData {
     pub resolved: usize,
     /// `clear` 删掉了多少条。
     pub removed: usize,
+    /// `forget` 删掉的那一条（`clear` 时为 `None`）。
+    pub removed_one: Option<DecisionInfo>,
     pub note: Option<String>,
+}
+
+/// ★ `action="diff"` 的返回：本地 vs NAS 的文本对比。
+///
+/// **要么给出 diff，要么明说为什么没给**（`status="skipped"` + 原因）——
+/// 静默返回空 diff 会让用户以为「两边一样」，那是危险的假象。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DiffData {
+    /// 被对比的远端路径。
+    pub path: String,
+    pub local_size: u64,
+    pub remote_size: u64,
+    /// [`crate::decisions::DiffOutcome`]：`{status:"diff",...}` 或 `{status:"skipped",...}`。
+    pub outcome: crate::decisions::DiffOutcome,
 }
 
 /// sid 掩码（诊断用，绝不回传完整值）。
@@ -1150,6 +1268,38 @@ pub fn decode_line<T: serde::de::DeserializeOwned>(line: &[u8]) -> Result<T, ser
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------ ★ M16 多连接路径
+
+    #[test]
+    fn m16_default_endpoint_paths_are_unchanged() {
+        assert_eq!(socket_path_for("default"), default_socket_path());
+        assert_eq!(pid_path_for("default"), default_pid_path());
+        assert_eq!(log_prefix_for("default"), "qxyncd.log");
+    }
+
+    #[test]
+    fn m16_non_default_endpoints_are_siblings_and_unique() {
+        let d = socket_path_for("default");
+        let s2 = socket_path_for("nas2");
+        let s3 = socket_path_for("nas3");
+        assert_eq!(s2.parent(), d.parent(), "必须落在同一个运行目录");
+        assert_eq!(
+            s2.file_name().and_then(|x| x.to_str()),
+            Some("qxyncd-nas2.sock")
+        );
+        assert_ne!(s2, s3, "不同连接不能共用一个 socket");
+        assert_eq!(
+            pid_path_for("nas2").file_name().and_then(|x| x.to_str()),
+            Some("qxyncd-nas2.pid")
+        );
+        assert_eq!(log_prefix_for("nas2"), "qxyncd-nas2.log");
+        // 非法字符被 sanitize 成安全文件名（防路径穿越）
+        assert!(socket_path_for("../x")
+            .file_name()
+            .and_then(|x| x.to_str())
+            .is_some_and(|n| n.contains("qxyncd-") && !n.contains('/')));
+    }
 
     #[test]
     fn request_round_trip_is_flat() {
@@ -1289,6 +1439,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(li.id, "default");
+        // ★ `insecure` 是后加的字段：老 payload 没有这个键 → 默认 false，不许解析失败
+        assert!(
+            !li.insecure,
+            "老 daemon 的 LinkInfo 没有 insecure → 默认 false"
+        );
+        // 新 payload 带 insecure:true 必须能解析出来（GUI 的 same_link 靠它）
+        let li_new: LinkInfo = serde_json::from_str(
+            r#"{"id":"default","host":"nas","port":9834,"https":true,"insecure":true,
+                "user":"u","ipv4_only":false}"#,
+        )
+        .unwrap();
+        assert!(li_new.insecure);
+        // 序列化必须带上这个键（daemon → GUI 的契约；字段名定死）
+        let v = serde_json::to_value(&li_new).unwrap();
+        assert_eq!(v["insecure"], serde_json::json!(true), "{v}");
     }
 
     #[test]
@@ -1414,6 +1579,33 @@ mod tests {
         }
         .is_long_running());
         assert!(!Request::Ls { path: "/".into() }.is_long_running());
+    }
+
+    /// ★ `decisions diff` 要 stat + 读本地缓存 + 从 NAS 拉最多 512 KiB 再跑 LCS，
+    /// 比其它 action 慢：只有它给 600s 超时。
+    ///
+    /// CLI 与 GUI 的超时都取这张表（`qxync-cli/src/ipc_client.rs` 与
+    /// `qxync-gui/src/ipc.rs` 都调 `is_long_running`），所以判据只该在这里定义一次。
+    #[test]
+    fn decisions_diff_is_long_running_other_actions_are_not() {
+        let diff = Request::Decisions {
+            action: "diff".into(),
+            id: Some("home_a.txt".into()),
+            resolution: None,
+        };
+        assert!(diff.is_long_running(), "diff 要拉 NAS 内容，属于长任务");
+        for action in ["list", "resolve", "forget", "clear"] {
+            let req = Request::Decisions {
+                action: action.into(),
+                id: None,
+                resolution: None,
+            };
+            assert_eq!(req.method(), "decisions");
+            assert!(
+                !req.is_long_running(),
+                "{action} 是轻操作，不该给 600s 超时"
+            );
+        }
     }
 
     #[test]
@@ -1581,6 +1773,207 @@ mod tests {
             "total_bytes",
         ] {
             assert!(tv.get(k).is_some(), "transfers 缺字段 {k}");
+        }
+    }
+
+    // ------------------------------------------------ ★ 未提交改动：diff / forget 的 IPC 契约
+
+    /// `DecisionsData.removed_one` 是新增字段：老 daemon 的 payload（没这个键）必须能解析。
+    #[test]
+    fn decisions_data_removed_one_is_backward_compatible() {
+        let old = r#"{
+            "action":"list",
+            "decisions":[{"id":"home_a.txt","path":"/home/a.txt","task_id":"",
+                          "local_size":1,"local_mtime":2,"remote_size":3,"remote_mtime":4,
+                          "is_dir":false,"created_unix":5,"resolution":null}],
+            "pending":1,"resolved":0,"removed":0,"note":null
+        }"#;
+        let d: DecisionsData = serde_json::from_str(old).expect("老 payload 必须能解析");
+        assert!(
+            d.removed_one.is_none(),
+            "没走 forget 时是 None，不是解析失败"
+        );
+        assert_eq!(d.decisions.len(), 1);
+        assert_eq!(d.decisions[0].path, "/home/a.txt");
+
+        // forget 的返回：removed_one 要能经信封往返（CLI 靠它显示「已忽略 <路径>」）
+        let forgot = DecisionsData {
+            action: "forget".into(),
+            decisions: vec![],
+            pending: 0,
+            resolved: 0,
+            removed: 0,
+            removed_one: Some(DecisionInfo {
+                id: "home_a.txt".into(),
+                path: "/home/a.txt".into(),
+                task_id: String::new(),
+                local_size: 1,
+                local_mtime: 2,
+                remote_size: 3,
+                remote_mtime: 4,
+                is_dir: false,
+                created_unix: 5,
+                resolution: None,
+            }),
+            note: None,
+        };
+        let v = serde_json::to_value(&forgot).unwrap();
+        assert_eq!(v["removed_one"]["path"], "/home/a.txt");
+        let wire = encode_line(&Response::ok(forgot)).unwrap();
+        let back: DecisionsData = decode_line::<Response>(&wire)
+            .unwrap()
+            .into_result()
+            .unwrap();
+        assert_eq!(
+            back.removed_one.expect("removed_one 丢了").path,
+            "/home/a.txt"
+        );
+    }
+
+    /// `DiffData` 必须能经 IPC 信封往返（daemon `to_value` → CLI 解包）。
+    /// 两种 outcome 的 JSON 形状一起钉住 —— 这个形状同时是 GUI 的契约。
+    #[test]
+    fn diff_data_round_trips_through_ipc_envelope() {
+        let d = DiffData {
+            path: "/home/a.txt".into(),
+            local_size: 3,
+            remote_size: 3,
+            outcome: crate::decisions::DiffOutcome::Diff(crate::decisions::text_diff(
+                "a\nb\n", "a\nx\n",
+            )),
+        };
+        let v = serde_json::to_value(&d).unwrap();
+        assert_eq!(v["path"], "/home/a.txt");
+        let out = &v["outcome"];
+        assert_eq!(out["status"], "diff");
+        assert_eq!(out["added"], 1);
+        assert_eq!(out["removed"], 1);
+        // 行字段名/类型是 CLI/GUI 的契约（kind 必须是单字符字符串）
+        let line = out["lines"].as_array().unwrap().first().unwrap();
+        for k in ["kind", "local_no", "remote_no", "text"] {
+            assert!(line.get(k).is_some(), "diff 行缺字段 {k}");
+        }
+        assert_eq!(line["kind"].as_str().map(str::len), Some(1));
+        // daemon → Response 信封 → CLI
+        let wire = encode_line(&Response::ok(d)).unwrap();
+        let got: DiffData = decode_line::<Response>(&wire)
+            .unwrap()
+            .into_result()
+            .unwrap();
+        assert_eq!(got.path, "/home/a.txt");
+        match got.outcome {
+            crate::decisions::DiffOutcome::Diff(r) => assert_eq!((r.added, r.removed), (1, 1)),
+            other => panic!("应解成 Diff，实际 {other:?}"),
+        }
+
+        // 跳过分支：必须带 status=skipped + reason（界面要显示「为什么没比」）
+        let skipped = DiffData {
+            path: "/home/big.bin".into(),
+            local_size: 0,
+            remote_size: u64::MAX,
+            outcome: crate::decisions::DiffOutcome::Skipped(crate::decisions::DiffSkip::TooLarge {
+                size: 5,
+                limit: 4,
+            }),
+        };
+        let v = serde_json::to_value(&skipped).unwrap();
+        assert_eq!(v["outcome"]["status"], "skipped");
+        assert_eq!(v["outcome"]["reason"], "too_large");
+        assert_eq!(v["outcome"]["size"], 5);
+        assert_eq!(v["outcome"]["limit"], 4);
+        let wire = encode_line(&Response::ok(skipped)).unwrap();
+        let got: DiffData = decode_line::<Response>(&wire)
+            .unwrap()
+            .into_result()
+            .unwrap();
+        assert!(matches!(
+            got.outcome,
+            crate::decisions::DiffOutcome::Skipped(crate::decisions::DiffSkip::TooLarge { .. })
+        ));
+
+        // 其余跳过原因的形状（GUI 按 `reason` 分支渲染，名字写错就会落到「未知原因」）
+        for (skip, reason) in [
+            (crate::decisions::DiffSkip::Binary, "binary"),
+            (crate::decisions::DiffSkip::IsDir, "is_dir"),
+            (
+                crate::decisions::DiffSkip::NoContent {
+                    which: "local".into(),
+                    detail: "没有缓存".into(),
+                },
+                "no_content",
+            ),
+        ] {
+            let v = serde_json::to_value(DiffData {
+                path: "/home/x".into(),
+                local_size: 1,
+                remote_size: 2,
+                outcome: crate::decisions::DiffOutcome::Skipped(skip),
+            })
+            .unwrap();
+            assert_eq!(v["outcome"]["status"], "skipped");
+            assert_eq!(v["outcome"]["reason"], reason);
+        }
+        // `no_content` 的 side 用哪个字段名也是契约（GUI 读 which/detail）
+        let v = serde_json::to_value(DiffData {
+            path: "/home/x".into(),
+            local_size: 1,
+            remote_size: 2,
+            outcome: crate::decisions::DiffOutcome::Skipped(
+                crate::decisions::DiffSkip::NoContent {
+                    which: "remote".into(),
+                    detail: "NAS 上的文件已不存在".into(),
+                },
+            ),
+        })
+        .unwrap();
+        assert_eq!(v["outcome"]["which"], "remote");
+        assert_eq!(v["outcome"]["detail"], "NAS 上的文件已不存在");
+    }
+
+    /// `DiffData` 缺字段时**不能默认成「零差异」**：默认必须落在 skipped 一侧，
+    /// 否则界面会显示「两边一样」，而真相是根本没比。
+    #[test]
+    fn diff_data_default_is_skipped_not_empty_diff() {
+        let d: DiffData = serde_json::from_str("{}").expect("空 payload 也要能解析");
+        assert!(d.path.is_empty() && d.local_size == 0 && d.remote_size == 0);
+        match d.outcome {
+            crate::decisions::DiffOutcome::Skipped(crate::decisions::DiffSkip::NoContent {
+                which,
+                ..
+            }) => assert_eq!(which, "unknown"),
+            other => panic!("默认必须是「跳过且原因未知」，实际 {other:?}"),
+        }
+        let v = serde_json::to_value(DiffData::default()).unwrap();
+        assert_eq!(v["outcome"]["status"], "skipped");
+    }
+
+    /// `Decisions` 请求的每种 action 都能经信封往返（新增 diff/forget **不用** bump 版本）。
+    #[test]
+    fn decisions_request_actions_round_trip() {
+        for (action, id) in [
+            ("list", None),
+            ("clear", None),
+            ("diff", Some("home_a.txt")),
+            ("forget", Some("home_a.txt")),
+            ("resolve", Some("home_a.txt")),
+        ] {
+            let e = RequestEnvelope::new(Request::Decisions {
+                action: action.into(),
+                id: id.map(str::to_string),
+                resolution: None,
+            });
+            assert_eq!(e.req.method(), "decisions");
+            assert_eq!(e.v, IPC_VERSION);
+            let back: RequestEnvelope = decode_line(&encode_line(&e).unwrap()).unwrap();
+            match back.req {
+                Request::Decisions {
+                    action: a, id: i, ..
+                } => {
+                    assert_eq!(a, action);
+                    assert_eq!(i.as_deref(), id);
+                }
+                other => panic!("解成了 {other:?}"),
+            }
         }
     }
 }

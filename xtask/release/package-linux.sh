@@ -12,8 +12,8 @@
 #
 # 产物（out-dir 下）：
 #   qxync-<version>-<triple>.tar.gz   解包后是 <stem>/{三个二进制, qxync.desktop,
-#                                     qxyncd.service, icons/, README*, LICENSE-*,
-#                                     DISCLAIMER.md}
+#                                     qxyncd.service, qxyncd@.service, icons/,
+#                                     README*, LICENSE-*, DISCLAIMER.md}
 #                                     —— 发行版打包（packaging/arch/）直接从这里取
 #   qxync / qxyncd / qxync-gui        三个裸二进制（供直接下载）
 #
@@ -85,6 +85,9 @@ install -m 0644 "$root/packaging/qxync.desktop" "$dest/qxync.desktop"
 # systemd user 单元：发行版装到 /usr/lib/systemd/user/，本机手动解包的用户可以自己拷到
 # ~/.config/systemd/user/。放 tarball 里是为了让 PKGBUILD 只有一个来源，不另抄一份。
 install -m 0644 "$root/packaging/systemd/qxyncd.service" "$dest/qxyncd.service"
+# ★ M16：多连接用的模板单元（`qxyncd@<link_id>`，ExecStart 带 `--link %i`）。
+#   default 连接仍用上面的 qxyncd.service；本模板只给非 default 连接用。
+install -m 0644 "$root/packaging/systemd/qxyncd@.service" "$dest/qxyncd@.service"
 mkdir -p "$dest/icons"
 for i in 32x32 128x128 128x128@2x icon; do
   install -m 0644 "$root/crates/qxync-gui/icons/$i.png" "$dest/icons/$i.png"

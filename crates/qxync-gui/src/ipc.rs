@@ -4,8 +4,7 @@
 //! 这里只做「请求 → 响应信封」的搬运，契约类型全部复用 `qxync-core::ipc`。
 
 use qxync_core::ipc::{
-    decode_line, default_socket_path, encode_line, ErrorKind, IpcError, Request, RequestEnvelope,
-    Response,
+    decode_line, encode_line, ErrorKind, IpcError, Request, RequestEnvelope, Response,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -14,12 +13,14 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-/// socket 路径：`QXNYC_SOCKET` 优先（测试/多实例），否则 `$XDG_RUNTIME_DIR/qxync/qxyncd.sock`。
+/// 默认连接的 socket 路径（兼容旧调用）。
 pub fn socket_path() -> PathBuf {
-    std::env::var_os("QXNYC_SOCKET")
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(default_socket_path)
+    socket_path_for("default")
+}
+
+/// ★ M16：某个连接的 socket 路径（default 保持旧行为，其它连接同目录派生）。
+pub fn socket_path_for(link_id: &str) -> PathBuf {
+    qxync_core::ipc::socket_path_for(link_id)
 }
 
 /// 超时：普通请求 30s；长任务（mount/get/put/sync/dehydrate）600s（与 CLI 一致）。

@@ -12,9 +12,9 @@ mod daemon;
 mod peer_host;
 mod sync;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
-use qxync_core::ipc::{default_pid_path, default_socket_path};
+use qxync_core::ipc::{log_prefix_for, pid_path_for, socket_path_for};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -84,21 +84,31 @@ fn main() -> Result<()> {
     // 同 CLI：别让 EPIPE 变成 panic
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let args = Args::parse();
+    if !qxync_core::LinkConfig::is_valid_id(&args.link) {
+        bail!(
+            "连接 id 不合法：{:?}（只允许 A-Za-z0-9 . _ -，且不能是 . / ..）",
+            args.link
+        );
+    }
 
     // ★ 顺序很重要：fork 必须发生在建 tokio 运行时之前（多线程运行时 fork 不安全）
     if !args.foreground && !args.print_config {
         daemonize().context("daemon 化失败")?;
     }
-    let _log_guard = init_logging(&args.log_level).context("初始化日志失败")?;
+    let _log_guard = init_logging(&args.log_level, &args.link).context("初始化日志失败")?;
 
-    let socket = args.socket.clone().unwrap_or_else(default_socket_path);
+    let socket = args
+        .socket
+        .clone()
+        .unwrap_or_else(|| socket_path_for(&args.link));
     if args.print_config {
         println!(
             "{}",
             serde_json::json!({
                 "link": args.link,
                 "socket": socket,
-                "pid_file": default_pid_path(),
+                "pid_file": pid_path_for(&args.link),
+                "log_prefix": log_prefix_for(&args.link),
                 "foreground": args.foreground,
                 "auto_login": args.auto_login,
                 "log_level": args.log_level,
@@ -168,8 +178,12 @@ fn daemonize() -> Result<()> {
     Ok(())
 }
 
-/// `RUST_LOG`/`--log-level` → stderr（前台）+ 按天滚动文件 `<state>/log/qxyncd.log`。
-fn init_logging(level: &str) -> Result<Option<tracing_appender::non_blocking::WorkerGuard>> {
+/// `RUST_LOG`/`--log-level` → stderr（前台）+ 按天滚动文件
+/// `<state>/log/qxyncd.log`（default）/ `qxyncd-<id>.log`（其它连接）。
+fn init_logging(
+    level: &str,
+    link_id: &str,
+) -> Result<Option<tracing_appender::non_blocking::WorkerGuard>> {
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
 
@@ -180,7 +194,7 @@ fn init_logging(level: &str) -> Result<Option<tracing_appender::non_blocking::Wo
     let log_dir = qxync_core::ipc::default_log_dir();
     match std::fs::create_dir_all(&log_dir) {
         Ok(()) => {
-            let appender = tracing_appender::rolling::daily(&log_dir, "qxyncd.log");
+            let appender = tracing_appender::rolling::daily(&log_dir, log_prefix_for(link_id));
             let (nb, guard) = tracing_appender::non_blocking(appender);
             let file_layer = tracing_subscriber::fmt::layer()
                 .with_ansi(false)

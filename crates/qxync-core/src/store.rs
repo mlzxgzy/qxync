@@ -822,6 +822,38 @@ impl Store {
         }
     }
 
+    /// 按 id 取一条（`forget` 要在删之前把内容取出来给 journal 记路径）。
+    pub fn decision_by_id(&self, id: &str) -> Result<Option<DecisionRow>> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, path, task_id, is_dir, local_size, local_mtime,
+                        remote_size, remote_mtime, created_unix, resolution
+                   FROM decisions WHERE id = ?1",
+            )
+            .map_err(Error::from)?;
+        let mut rows = stmt
+            .query_map(params![id], |r| {
+                Ok(DecisionRow {
+                    id: r.get(0)?,
+                    path: r.get(1)?,
+                    task_id: r.get(2)?,
+                    is_dir: r.get::<_, i64>(3)? != 0,
+                    local_size: r.get::<_, i64>(4)? as u64,
+                    local_mtime: r.get(5)?,
+                    remote_size: r.get::<_, i64>(6)? as u64,
+                    remote_mtime: r.get(7)?,
+                    created_unix: r.get(8)?,
+                    resolution: r.get(9)?,
+                })
+            })
+            .map_err(Error::from)?;
+        match rows.next() {
+            Some(r) => Ok(Some(r.map_err(Error::from)?)),
+            None => Ok(None),
+        }
+    }
+
     /// 裁决一条；返回是否命中（`resolution` 为 `None` = 退回未裁决）。
     pub fn decision_resolve(&self, id: &str, resolution: Option<&str>) -> Result<bool> {
         let n = self
@@ -849,6 +881,28 @@ impl Store {
             .conn()
             .execute("DELETE FROM decisions", [])
             .map_err(Error::from)?;
+        Ok(n)
+    }
+
+    /// 批量删行（巡检出队用）。
+    ///
+    /// **一个事务**：巡检一次可能删几十行，逐条 `decision_delete` 会开几十个事务。
+    /// 传空列表直接返回 0，不开事务（`DELETE … WHERE id IN ()` 是语法错误）。
+    ///
+    /// 只删行，**不碰任何文件、pin、journal** —— 与 `decisions_clear` 语义一致。
+    pub fn decisions_delete_many(&self, ids: &[String]) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(Error::from)?;
+        let mut n = 0usize;
+        for id in ids {
+            n += tx
+                .execute("DELETE FROM decisions WHERE id = ?1", params![id])
+                .map_err(Error::from)?;
+        }
+        tx.commit().map_err(Error::from)?;
         Ok(n)
     }
 
@@ -1867,6 +1921,93 @@ mod tests {
         // 隔离：pin 与 journal 一行没动
         assert_eq!(s.pin("/home/keep.bin").unwrap().as_deref(), Some("pinned"));
         assert_eq!(s.journal_count().unwrap(), 1);
+    }
+
+    /// ★ 巡检出队用的批量删除：空列表不报错、只删指定行、幂等。
+    #[test]
+    fn decisions_delete_many_is_batched_and_idempotent() {
+        let s = Store::open_in_memory().unwrap();
+        let mk = |path: &str| DecisionRow {
+            id: DecisionRow::id_for(path),
+            path: path.to_string(),
+            task_id: "t1".into(),
+            is_dir: false,
+            local_size: 10,
+            local_mtime: 100,
+            remote_size: 20,
+            remote_mtime: 200,
+            created_unix: 1_700_000_000,
+            resolution: None,
+        };
+        for p in ["/home/a.txt", "/home/b.txt", "/home/c.txt"] {
+            s.decision_upsert(&mk(p)).unwrap();
+        }
+
+        // 空列表：不报错、不开事务、删 0 条
+        assert_eq!(s.decisions_delete_many(&[]).unwrap(), 0);
+        assert_eq!(s.decisions().unwrap().len(), 3);
+
+        // 删两条，留一条
+        let ids: Vec<String> = ["/home/a.txt", "/home/b.txt"]
+            .iter()
+            .map(|p| DecisionRow::id_for(p))
+            .collect();
+        assert_eq!(s.decisions_delete_many(&ids).unwrap(), 2);
+        let left = s.decisions().unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].path, "/home/c.txt");
+
+        // 重复删：0 条（幂等，不报错）
+        assert_eq!(s.decisions_delete_many(&ids).unwrap(), 0);
+        assert_eq!(s.decisions().unwrap().len(), 1);
+
+        // 不存在的 id 混在里面也不能删掉别的行
+        let mixed = vec![
+            DecisionRow::id_for("/home/c.txt"),
+            "根本没有这个".to_string(),
+        ];
+        assert_eq!(s.decisions_delete_many(&mixed).unwrap(), 1);
+        assert!(s.decisions().unwrap().is_empty());
+    }
+
+    /// `decision_by_id` 是 `forget` 的读取路径：只取那一条、字段完整、不存在给 None。
+    ///
+    /// daemon 的 `forget` 顺序是「先用 by_id 取内容 → 再删行 → journal 记下路径」，
+    /// 取错/取空会让日志把「忽略」记到别的路径上（删行本身只认 id）。
+    #[test]
+    fn decision_by_id_returns_exactly_that_row() {
+        let s = Store::open_in_memory().unwrap();
+        let mk = |path: &str, ls: u64, res: Option<&str>| DecisionRow {
+            id: DecisionRow::id_for(path),
+            path: path.to_string(),
+            task_id: "t9".into(),
+            is_dir: false,
+            local_size: ls,
+            local_mtime: 100 + ls as i64,
+            remote_size: ls + 1,
+            remote_mtime: 200 + ls as i64,
+            created_unix: 1_700_000_000 + ls as i64,
+            resolution: res.map(str::to_string),
+        };
+        let a = mk("/home/a.txt", 10, None);
+        let b = mk("/home/b.txt", 20, Some("keep_local"));
+        s.decision_upsert(&a).unwrap();
+        s.decision_upsert(&b).unwrap();
+
+        assert_eq!(
+            s.decision_by_id(&a.id).unwrap().expect("a 应在库里"),
+            a,
+            "取回的行必须逐字段一致"
+        );
+        assert_eq!(s.decision_by_id(&b.id).unwrap().expect("b 应在库里"), b);
+
+        // 不存在的 id → None（不是错误，也不是随便返回一条）
+        assert!(s.decision_by_id("没有这个 id").unwrap().is_none());
+
+        // 删掉之后 → None（「先读后删」不会读到幽灵行）
+        assert!(s.decision_delete(&a.id).unwrap());
+        assert!(s.decision_by_id(&a.id).unwrap().is_none());
+        assert_eq!(s.decisions().unwrap().len(), 1);
     }
 
     /// ★ M8.4：v2 老库打开后自动补 decisions 表（不写迁移代码），旧数据原样保留。

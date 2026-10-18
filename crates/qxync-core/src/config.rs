@@ -168,6 +168,57 @@ impl ConfigPaths {
     pub fn credentials_file(&self) -> PathBuf {
         self.config_dir.join("credentials.json")
     }
+
+    /// ★ M16：某个连接的凭据文件。
+    ///
+    /// `default` 继续用旧的全局 `credentials.json`（升级零迁移）；其它连接用
+    /// `links/<id>.credentials.json`，避免 A 的密码被拿去登 B。
+    pub fn link_credentials_file(&self, link_id: &str) -> PathBuf {
+        if link_id == "default" {
+            self.credentials_file()
+        } else {
+            self.config_dir
+                .join("links")
+                .join(format!("{link_id}.credentials.json"))
+        }
+    }
+
+    /// ★ M16：某个连接的挂载现场记录。
+    ///
+    /// `default` 继续用旧的 `state/qxync/mounts.json`；其它连接一瓶一个文件，
+    /// 多 daemon 各写各的，不再有「全量重写把别人的记录抹掉」的竞态。
+    pub fn mounts_file_for(&self, link: &LinkConfig) -> PathBuf {
+        if link.id == "default" {
+            self.state_dir.join("qxync").join("mounts.json")
+        } else {
+            self.state_dir
+                .join("qxync")
+                .join("mounts")
+                .join(format!("{}.json", link_namespace(link)))
+        }
+    }
+
+    /// ★ M16：某个连接的同步状态目录（游标 / baseline / sync.db / journal）。
+    pub fn sync_dir_for(&self, link: &LinkConfig) -> PathBuf {
+        self.data_dir.join("sync").join(link_namespace(link))
+    }
+
+    /// ★ M16：某个连接的水合缓存目录（实际缓存文件还会再拼一层 `conflicts/` 之类）。
+    pub fn cache_dir_for(&self, link: &LinkConfig) -> PathBuf {
+        self.data_dir.join("cache").join(link_namespace(link))
+    }
+
+    /// ★ M16：某个连接的上传/删除队列目录。
+    pub fn queue_dir_for(&self, link: &LinkConfig) -> PathBuf {
+        self.data_dir
+            .join("upload-queue")
+            .join(link_namespace(link))
+    }
+
+    /// ★ M16：旧版全局队列目录（`data/upload-queue`）—— **只给迁移用**。
+    pub fn legacy_queue_dir(&self) -> PathBuf {
+        self.data_dir.join("upload-queue")
+    }
     /// ★ M7：LAN 对等设备（含 token，0600）—— 与 link 分开存，避免把密钥混进可分享的 link JSON。
     pub fn peers_file(&self, link_id: &str) -> PathBuf {
         self.config_dir
@@ -206,6 +257,45 @@ pub fn restrict_perms(path: &Path, mode: u32) -> Result<()> {
 #[cfg(not(unix))]
 pub fn restrict_perms(_path: &Path, _mode: u32) -> Result<()> {
     Ok(())
+}
+
+/// ★ M16：把任意字符串变成**安全的单层路径组件**。
+///
+/// 只保留 `A-Z a-z 0-9 . _ -`，其余全换成 `_`。注意：这个函数**永远不会**
+/// 产出 `#` 或 `@` —— 多连接的命名空间就靠这两个字符与「旧 host 命名空间」区分开。
+pub fn sanitize_component(s: &str) -> String {
+    let out: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if out.is_empty() {
+        "_".into()
+    } else if out == "." || out == ".." {
+        format!("_{out}")
+    } else {
+        out
+    }
+}
+
+/// ★ M16：一个连接的数据命名空间。
+///
+/// * `default` → `sanitize(host)`（= 旧版 `sync/<host>` / `cache/<host>` 的目录名，
+///   升级后路径一字不变）；
+/// * 其它 → `#<id>@<sanitize(host)>`。`#` / `@` 不可能出现在 [`sanitize_component`]
+///   的输出里，所以同一台 NAS 上的多个账号也不会互相踩缓存/队列/状态库。
+pub fn link_namespace(link: &LinkConfig) -> String {
+    let host = sanitize_component(&link.host);
+    if link.id == "default" {
+        host
+    } else {
+        format!("#{}@{}", sanitize_component(&link.id), host)
+    }
 }
 
 /// 一个 NAS 连接。
@@ -255,17 +345,129 @@ impl LinkConfig {
         crate::rules::Rules::parse(&self.exclude, self.filter_temp)
     }
 
+    /// ★ M16：连接 id 必须能安全地当文件名 / socket 名（防路径穿越）。
+    pub fn is_valid_id(id: &str) -> bool {
+        !id.is_empty()
+            && id.len() <= 64
+            && id != "."
+            && id != ".."
+            && id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    }
+
+    fn validate_id(&self) -> Result<()> {
+        if !Self::is_valid_id(&self.id) {
+            return Err(Error::Io(format!(
+                "连接 id 不合法：{:?}（只允许 A-Za-z0-9 . _ -，且不能是 . / ..）",
+                self.id
+            )));
+        }
+        Ok(())
+    }
+
     pub fn load(paths: &ConfigPaths, link_id: &str) -> Result<Self> {
+        if !Self::is_valid_id(link_id) {
+            return Err(Error::Io(format!("连接 id 不合法：{link_id:?}")));
+        }
         let p = paths.link_file(link_id);
         let raw = std::fs::read(&p).map_err(|e| Error::Io(format!("读取 {}: {e}", p.display())))?;
-        serde_json::from_slice(&raw).map_err(|e| Error::Parse(format!("解析 {}: {e}", p.display())))
+        let link: Self = serde_json::from_slice(&raw)
+            .map_err(|e| Error::Parse(format!("解析 {}: {e}", p.display())))?;
+        // 文件名与文件里的 id 必须一致：否则 save() 会写到另一个文件，
+        // 用户会看到「改了一个连接，另一个连接变了」这种极难排查的现象。
+        if link.id != link_id {
+            return Err(Error::Parse(format!(
+                "{} 里的 id 是 {:?}，与文件名 {:?} 不一致",
+                p.display(),
+                link.id,
+                link_id
+            )));
+        }
+        Ok(link)
     }
 
     pub fn save(&self, paths: &ConfigPaths) -> Result<PathBuf> {
+        self.validate_id()?;
+        paths.ensure_dirs()?;
         let p = paths.link_file(&self.id);
+        let tmp = p.with_extension("json.tmp");
         let body = serde_json::to_vec_pretty(self)?;
-        std::fs::write(&p, body)?;
+        std::fs::write(&tmp, body)?;
+        std::fs::rename(&tmp, &p)?;
         Ok(p)
+    }
+
+    /// ★ M16：列出全部连接（按 id 排序）。
+    ///
+    /// 与 [`crate::tasks::Task::list`] 同风格：单个文件坏掉**不整体失败**，
+    /// 坏文件进第二个返回值，让 GUI/CLI 能如实报出来。
+    pub fn list(paths: &ConfigPaths) -> (Vec<Self>, Vec<(PathBuf, String)>) {
+        let dir = paths.config_dir.join("links");
+        let mut out = Vec::new();
+        let mut bad = Vec::new();
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(_) => return (out, bad),
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            let Some(name) = p.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            // peers / 凭据 / 临时文件都不是连接配置
+            if name.ends_with(".peers.json")
+                || name.ends_with(".credentials.json")
+                || name.ends_with(".json.tmp")
+            {
+                continue;
+            }
+            if p.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(id) = p.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            match Self::load(paths, id) {
+                Ok(l) => out.push(l),
+                Err(err) => bad.push((p.clone(), err.to_string())),
+            }
+        }
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        (out, bad)
+    }
+
+    /// ★ M16：删除连接配置（link / 凭据 / peers）。**不删任务、不删缓存/状态**。
+    ///
+    /// 任务与缓存由 GUI 的「移除连接」按用户确认结果处理；core 只做最保守的
+    /// 配置清理，避免一个底层函数悄悄删掉用户数据。
+    pub fn delete(paths: &ConfigPaths, link_id: &str) -> Result<bool> {
+        if !Self::is_valid_id(link_id) {
+            return Err(Error::Io(format!("连接 id 不合法：{link_id:?}")));
+        }
+        let link = paths.link_file(link_id);
+        let existed = link.exists();
+        for p in [
+            link,
+            paths.link_credentials_file(link_id),
+            paths.peers_file(link_id),
+        ] {
+            if p.exists() {
+                std::fs::remove_file(&p)?;
+            }
+        }
+        Ok(existed)
+    }
+
+    /// ★ M16：旧数据（没有 link_id 的任务、旧 `mounts.json`、旧全局 queue）归谁。
+    ///
+    /// `default` 优先；没有 `default` 时归字典序最小的连接。这个规则必须**确定**：
+    /// 两个 daemon 同时启动时，不能让它们都认为旧数据归自己。
+    pub fn legacy_owner(ids: &[String]) -> Option<String> {
+        if ids.iter().any(|id| id == "default") {
+            return Some("default".into());
+        }
+        ids.iter().min().cloned()
     }
 }
 
@@ -349,10 +551,96 @@ impl Credentials {
         serde_json::from_slice(&raw).map_err(|e| Error::Parse(format!("解析 {}: {e}", p.display())))
     }
 
+    /// ★ M16：按连接读凭据。
+    ///
+    /// 优先 `links/<id>.credentials.json`（`default` 是旧的 `credentials.json`）。
+    /// 旧版只有一个全局凭据文件：非 default 连接首次读取时会回落到它，但必须
+    /// **host + user 都对上**才认 —— 否则就会出现「拿 A 的密码去登 B」。
+    pub fn load_for(paths: &ConfigPaths, link: &LinkConfig) -> Result<Self> {
+        let target = paths.link_credentials_file(&link.id);
+        let read = |p: &Path| -> Result<Self> {
+            let raw =
+                std::fs::read(p).map_err(|e| Error::Io(format!("读取 {}: {e}", p.display())))?;
+            serde_json::from_slice(&raw)
+                .map_err(|e| Error::Parse(format!("解析 {}: {e}", p.display())))
+        };
+        let mut c = match std::fs::read(&target) {
+            Ok(_) => read(&target)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // 回落旧全局凭据（只认 host/user 完全匹配的那一份）
+                let legacy = paths.credentials_file();
+                let c = read(&legacy)?;
+                if !same_account(&c, link) {
+                    return Err(Error::Io(format!(
+                        "{} 里的凭据是 {}@{}，与连接「{}」的 {}@{} 不匹配",
+                        legacy.display(),
+                        c.user,
+                        c.host,
+                        link.id,
+                        link.user,
+                        link.host
+                    )));
+                }
+                c
+            }
+            Err(e) => return Err(Error::Io(format!("读取 {}: {e}", target.display()))),
+        };
+        if !same_account(&c, link) {
+            return Err(Error::Io(format!(
+                "{} 里的凭据是 {}@{}，与连接「{}」的 {}@{} 不匹配",
+                target.display(),
+                c.user,
+                c.host,
+                link.id,
+                link.user,
+                link.host
+            )));
+        }
+        // 统一成连接上的写法，免得大小写差异把后续比较搞乱
+        c.host = link.host.clone();
+        c.user = link.user.clone();
+        Ok(c)
+    }
+
+    /// ★ M16：按连接写凭据（0600）。`default` 继续写旧的 `credentials.json`。
+    pub fn save_for(&self, paths: &ConfigPaths, link: &LinkConfig) -> Result<PathBuf> {
+        let mut c = self.clone();
+        c.host = link.host.clone();
+        c.user = link.user.clone();
+        c.save_to(paths, &paths.link_credentials_file(&link.id))
+    }
+
+    /// ★ M16：凭据是否存在（GUI 用；**绝不回传口令**）。
+    pub fn present_for(
+        paths: &ConfigPaths,
+        link: &LinkConfig,
+    ) -> Option<(String, String, PathBuf)> {
+        match Self::load_for(paths, link) {
+            Ok(c) => {
+                // load_for 可能回落到旧文件；这里如实报「实际可用的那份」
+                let target = paths.link_credentials_file(&link.id);
+                let p = if target.exists() {
+                    target
+                } else {
+                    paths.credentials_file()
+                };
+                Some((c.host, c.user, p))
+            }
+            Err(_) => None,
+        }
+    }
+
     /// 写 0600：先 build 到临时文件再 rename，避免出现半截的凭据文件。
     pub fn save(&self, paths: &ConfigPaths) -> Result<PathBuf> {
-        paths.ensure_dirs()?;
         let target = paths.credentials_file();
+        self.save_to(paths, &target)
+    }
+
+    fn save_to(&self, paths: &ConfigPaths, target: &Path) -> Result<PathBuf> {
+        paths.ensure_dirs()?;
+        if let Some(dir) = target.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
         let tmp = target.with_extension("json.tmp");
         let body = serde_json::to_vec_pretty(self)?;
         {
@@ -362,9 +650,14 @@ impl Credentials {
             f.write_all(&body)?;
             f.sync_all()?;
         }
-        std::fs::rename(&tmp, &target)?;
-        Ok(target)
+        std::fs::rename(&tmp, target)?;
+        Ok(target.to_path_buf())
     }
+}
+
+/// 凭据是不是这个连接账号的（host 大小写不敏感，user 精确）。
+fn same_account(c: &Credentials, link: &LinkConfig) -> bool {
+    c.host.eq_ignore_ascii_case(&link.host) && c.user == link.user
 }
 
 #[cfg(test)]
@@ -516,5 +809,182 @@ mod tests {
         }
         assert_eq!(PeerRegistry::load(&paths, "default").unwrap(), reg);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ------------------------------------------------------------ ★ M16 多连接
+
+    fn m16_paths(tag: &str) -> ConfigPaths {
+        let dir = std::env::temp_dir().join(format!(
+            "qxync-m16-cfg-{}-{}-{}",
+            process_marker(),
+            tag,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let p = ConfigPaths {
+            config_dir: dir.join("config"),
+            data_dir: dir.join("data"),
+            state_dir: dir.join("state"),
+        };
+        p.ensure_dirs().unwrap();
+        p
+    }
+
+    fn process_marker() -> u32 {
+        std::process::id()
+    }
+
+    fn mk_link(id: &str, host: &str, user: &str) -> LinkConfig {
+        LinkConfig {
+            id: id.into(),
+            host: host.into(),
+            port: 9834,
+            https: true,
+            insecure: false,
+            user: user.into(),
+            ipv4_only: false,
+            exclude: Vec::new(),
+            filter_temp: true,
+            peer_listen: None,
+            peer_name: None,
+        }
+    }
+
+    #[test]
+    fn m16_default_namespace_is_exactly_the_legacy_host_path() {
+        let paths = m16_paths("ns-default");
+        let link = mk_link("default", "nas.local", "u");
+        assert_eq!(link_namespace(&link), "nas.local");
+        assert_eq!(
+            paths.sync_dir_for(&link),
+            paths.data_dir.join("sync/nas.local")
+        );
+        assert_eq!(
+            paths.cache_dir_for(&link),
+            paths.data_dir.join("cache/nas.local")
+        );
+        assert_eq!(
+            paths.queue_dir_for(&link),
+            paths.data_dir.join("upload-queue/nas.local")
+        );
+        assert_eq!(
+            paths.mounts_file_for(&link),
+            paths.state_dir.join("qxync/mounts.json")
+        );
+        // host 里的非法字符仍走旧的 `_` 替换
+        assert_eq!(
+            link_namespace(&mk_link("default", "nas:9834", "u")),
+            "nas_9834"
+        );
+        std::fs::remove_dir_all(paths.data_dir.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn m16_non_default_namespace_cannot_collide_with_host_namespace() {
+        let paths = m16_paths("ns-other");
+        let link = mk_link("nas2", "nas.local", "u");
+        assert_eq!(link_namespace(&link), "#nas2@nas.local");
+        assert!(paths.sync_dir_for(&link).ends_with("#nas2@nas.local"));
+        assert!(paths.cache_dir_for(&link).ends_with("#nas2@nas.local"));
+        assert!(paths.queue_dir_for(&link).ends_with("#nas2@nas.local"));
+        assert!(paths
+            .mounts_file_for(&link)
+            .ends_with("mounts/#nas2@nas.local.json"));
+        // 同一台 NAS 的另一个账号 → 不同命名空间
+        assert_ne!(
+            link_namespace(&link),
+            link_namespace(&mk_link("nas3", "nas.local", "u"))
+        );
+        std::fs::remove_dir_all(paths.data_dir.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn m16_link_id_validation_and_list() {
+        assert!(LinkConfig::is_valid_id("default"));
+        assert!(LinkConfig::is_valid_id("nas-2.local_1"));
+        for bad in ["", ".", "..", "a/b", "../x", "a b", "a#b"] {
+            assert!(!LinkConfig::is_valid_id(bad), "{bad:?} 不该合法");
+        }
+        let paths = m16_paths("list");
+        let a = mk_link("default", "a.local", "u");
+        let b = mk_link("nas2", "b.local", "u");
+        a.save(&paths).unwrap();
+        b.save(&paths).unwrap();
+        // 辅助文件不能出现在连接列表里
+        std::fs::write(
+            paths.link_file("default").with_extension("peers.json"),
+            b"{}",
+        )
+        .unwrap();
+        std::fs::write(
+            paths
+                .link_file("default")
+                .with_extension("credentials.json"),
+            b"{}",
+        )
+        .unwrap();
+        let (list, bad) = LinkConfig::list(&paths);
+        assert!(bad.is_empty(), "{bad:?}");
+        assert_eq!(
+            list.iter().map(|l| l.id.as_str()).collect::<Vec<_>>(),
+            vec!["default", "nas2"]
+        );
+        std::fs::remove_dir_all(paths.data_dir.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn m16_legacy_owner_is_default_then_lexicographically_smallest() {
+        assert_eq!(
+            LinkConfig::legacy_owner(&["nas2".into(), "default".into()]),
+            Some("default".into())
+        );
+        assert_eq!(
+            LinkConfig::legacy_owner(&["nas3".into(), "nas2".into()]),
+            Some("nas2".into())
+        );
+        assert_eq!(LinkConfig::legacy_owner(&[]), None);
+    }
+
+    #[test]
+    fn m16_credentials_are_per_link_and_default_stays_legacy() {
+        let paths = m16_paths("cred");
+        let d = mk_link("default", "a.local", "u1");
+        let n = mk_link("nas2", "b.local", "u2");
+
+        let cd = Credentials {
+            host: "a.local".into(),
+            user: "u1".into(),
+            password: "pw-default".into(),
+        };
+        let p = cd.save_for(&paths, &d).unwrap();
+        assert_eq!(p, paths.credentials_file(), "default 必须继续用旧文件");
+        assert_eq!(
+            Credentials::load_for(&paths, &d).unwrap().password,
+            "pw-default"
+        );
+
+        let cn = Credentials {
+            host: "b.local".into(),
+            user: "u2".into(),
+            password: "pw-nas2".into(),
+        };
+        let pn = cn.save_for(&paths, &n).unwrap();
+        assert_eq!(pn, paths.link_credentials_file("nas2"));
+        assert_eq!(
+            Credentials::load_for(&paths, &n).unwrap().password,
+            "pw-nas2"
+        );
+        // 非 default 的文件存在时**绝不**回落全局凭据
+        assert_eq!(
+            Credentials::load_for(&paths, &d).unwrap().password,
+            "pw-default"
+        );
+
+        // host/user 不匹配 → 明确报错，不能拿 A 的密码去登 B
+        let wrong = mk_link("nas2", "other.local", "u2");
+        assert!(Credentials::load_for(&paths, &wrong).is_err());
+        std::fs::remove_dir_all(paths.data_dir.parent().unwrap()).ok();
     }
 }

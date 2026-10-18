@@ -1,0 +1,59 @@
+# qxync 的多连接常驻同步守护（qxyncd）—— **user 单元模板**，不是 system 单元。
+#
+# ★ M16：一条 NAS 连接 = 一个 qxyncd 进程 = 一个模板实例。
+#   本文件里的 `%i` 是连接 id（对应 ~/.config/qxync/links/<id>.json）。
+#
+# 用法（普通用户即可，**不需要 root**）：
+#     systemctl --user enable --now qxyncd@nas2     # 启动名为 nas2 的那条连接
+#     systemctl --user status qxyncd@nas2
+#     journalctl --user -u qxyncd@nas2 -f           # 跟日志（stderr 进 journald）
+#     systemctl --user reload qxyncd@nas2           # ★ 重载同步引擎，挂载点不中断
+#     systemctl --user stop qxyncd@nas2             # 停（真卸载该连接 FUSE 挂载 + 删 socket/pid）
+#
+# 连接 id 的合法字符：A-Z a-z 0-9 . _ -（不超过 64 字符，不能是 . / ..）。
+# 因为 id 会进文件名 / socket 名 / 数据目录名，非法 id 在 daemon 启动时就会被拒。
+#
+# ⚠ **default 连接仍然用 `qxyncd.service`**（旧单元，`--link default` 是缺省值，
+#   所以两个单元**不要同时启用 default**：那会让同一条连接被拉起两个进程，
+#   第二个会发现 socket 已被占用然后退出（日志里会看到反复重启）。
+#   本模板只给**非 default** 的连接用。
+#
+# ⚠ **不要和 GUI 同时管同一条连接**：GUI 的「启动 / 停止」走 IPC/socket，
+#   systemd 走它自己拉起的进程；两边同时管会互相打架。
+#   要么全交给 systemd，要么全交给 GUI，别混着来。
+#
+# ⚠ 没有连接配置时 qxyncd 会「空转待命」（不做事但一直活着），所以这里**不需要**
+#   等网络、也不需要等登录 —— 配好连接之后它会自己转入同步，不用重启本服务。
+
+[Unit]
+Description=qxync 常驻同步守护（qxyncd，连接 %i）
+Documentation=https://github.com/mlzxgzy/qxync
+# 没配连接也能起来（空转待命），所以只依赖最基础的目标
+After=default.target
+
+[Service]
+# 前台运行 + 指定连接：进程由 systemd 管，**不要**让 daemon 自己 fork。
+# socket / pid / 日志全部由 `--link %i` 派生（qxyncd-<id>.sock / .pid / .log）。
+ExecStart=/usr/bin/qxyncd --foreground --link %i
+# 崩溃/被 OOM 杀掉才拉起；`systemctl stop` 是干净退出（exit 0）→ 不重启
+Restart=on-failure
+RestartSec=3
+
+# ★ M15/T6：reload = SIGHUP = **重载同步引擎（poller / 脱水 / 队列 / journal /
+#   会话保活），完全不碰 FUSE 会话**。reload 不终止进程，所以挂载点一秒都不中断。
+ExecReload=/bin/kill -HUP $MAINPID
+
+# ★ M15/T6：`systemctl stop/restart` 发的是 SIGTERM，qxyncd 收到后**不再卸载 FUSE
+#   挂载点**，而是「停同步、保留挂载」并留在挂载守护模式里继续应答内核。
+#   ⚠ 但 restart 仍会短暂断开挂载点：restart = 「stop 旧进程 → 等退出 → start」，
+#   而守护进程按设计不会在 SIGTERM 后立刻退出，于是 stop 阶段会等到下面的
+#   TimeoutStopSec，然后被 SIGKILL —— 挂载点照样断（强杀，不是正常卸载）。
+#   断掉之后由「启动自动重挂」恢复（mounts.json 记着现场）。
+#
+#   TimeoutStopSec 给到 30s：留出「停同步 + 写盘 + 把没发完的上传/删除排空」的余量。
+TimeoutStopSec=30
+# SIGTERM 只发给主进程，超时后 cgroup 里剩下的才 SIGKILL
+KillMode=mixed
+
+[Install]
+WantedBy=default.target

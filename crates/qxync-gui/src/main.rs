@@ -17,6 +17,10 @@ fn main() {
     if args.iter().any(|a| a == "--self-test-login") {
         std::process::exit(if qxync_gui::self_test_login() { 0 } else { 1 });
     }
+    // ★ M16：多连接/多 daemon 无窗口自检（假连接，不需要 NAS）
+    if args.iter().any(|a| a == "--self-test-multi") {
+        std::process::exit(if qxync_gui::self_test_multi() { 0 } else { 1 });
+    }
     // ★ M8.4：通知链路的无窗口自检（真发一条，供 dbus-monitor 抓 Notify 调用）。
     if args.iter().any(|a| a == "--self-test-notify") {
         std::process::exit(if qxync_gui::self_test_notify() { 0 } else { 1 });

@@ -18,6 +18,10 @@
 #   那条路是给「没有 systemd 单元」的用法准备的。`qxync daemon stop` 走 IPC 让进程自己退出，
 #   systemd 会看到主进程消失 —— 两边同时用只会互相打架（日志里会出现反复重启）。
 #
+# ★ M16：本单元只负责 **default** 连接。多 NAS 的其它连接用模板单元
+#   `qxyncd@<link_id>`（`systemctl --user enable --now qxyncd@nas2`，见同目录
+#   `qxyncd@.service`）；**不要**再启用 `qxyncd@default`，那会和本单元抢同一个 socket。
+#
 # ⚠ 没有连接配置时 qxyncd 会「空转待命」（不做事但一直活着），所以这里**不需要**等网络、
 #   也不需要等登录 —— 配好连接之后它会自己转入同步，不用重启本服务。
 

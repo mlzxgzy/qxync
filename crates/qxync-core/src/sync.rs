@@ -811,6 +811,16 @@ pub fn sync_state_dir(data_dir: &Path, host: &str) -> PathBuf {
     data_dir.join("sync").join(host_ns)
 }
 
+/// ★ M16：按连接取状态目录。
+///
+/// `default` 必须与 [`sync_state_dir`] **逐字相同**（升级零迁移）；非 default 用
+/// `#<id>@<host>` 命名空间，同一台 NAS 的多个账号各有各的 baseline/游标/sync.db。
+pub fn sync_state_dir_for_link(data_dir: &Path, link: &crate::config::LinkConfig) -> PathBuf {
+    data_dir
+        .join("sync")
+        .join(crate::config::link_namespace(link))
+}
+
 // ---------------------------------------------------------------- 测试
 
 #[cfg(test)]
@@ -1092,6 +1102,39 @@ mod tests {
     fn sync_state_dir_is_host_scoped_and_safe() {
         let p = sync_state_dir(Path::new("/data"), "nas.example:9834");
         assert_eq!(p, PathBuf::from("/data/sync/nas.example_9834"));
+    }
+
+    /// ★ M16：default 必须与旧路径逐字一致；非 default 用 `#id@host` 隔离。
+    #[test]
+    fn m16_sync_state_dir_for_link_keeps_default_and_isolates_others() {
+        let mk = |id: &str, host: &str| crate::config::LinkConfig {
+            id: id.into(),
+            host: host.into(),
+            port: 9834,
+            https: true,
+            insecure: false,
+            user: "u".into(),
+            ipv4_only: false,
+            exclude: Vec::new(),
+            filter_temp: true,
+            peer_listen: None,
+            peer_name: None,
+        };
+        let d = mk("default", "nas.example:9834");
+        assert_eq!(
+            sync_state_dir_for_link(Path::new("/data"), &d),
+            sync_state_dir(Path::new("/data"), "nas.example:9834"),
+            "default 的状态目录必须和旧版完全相同（升级零迁移）"
+        );
+        let n = mk("nas2", "nas.example:9834");
+        assert_eq!(
+            sync_state_dir_for_link(Path::new("/data"), &n),
+            PathBuf::from("/data/sync/#nas2@nas.example_9834")
+        );
+        assert_ne!(
+            sync_state_dir_for_link(Path::new("/data"), &n),
+            sync_state_dir_for_link(Path::new("/data"), &d)
+        );
     }
 
     // ------------------------------------------------ ★ M15/T9 改名配对

@@ -67,10 +67,21 @@ async fn wait_ready(socket: &std::path::Path) -> bool {
     false
 }
 
+/// `start_daemon` 的返回值算不算「daemon 已经在跑」。
+///
+/// `already=true` 同样是成功：`start_daemon` 在 socket 已可连时返回
+/// `{started:false, already:true}`。这不是边角情况 —— 「保存并登录」的重启路径
+/// 刚把旧 daemon 停掉后的 **10s 窗口**里，可能有别的进程抢先把它拉起来了
+/// （第二个 GUI 实例、用户手工 `qxync daemon start`、systemd 自动拉起），
+/// 这时只看 `started` 会误判「没能起来」并且**跳过登录**。
+fn start_ok(v: &Value) -> bool {
+    v["started"].as_bool().unwrap_or(false) || v["already"].as_bool().unwrap_or(false)
+}
+
 /// 拉起 `qxyncd --link <id> --socket <socket>`（daemon 自己 fork+setsid）。
 /// 返回 `(already_running, ping_json_or_null)`。
 async fn start_daemon(link_id: &str) -> Value {
-    let socket = ipc::socket_path();
+    let socket = ipc::socket_path_for(link_id);
     if ipc::available(&socket).await {
         let ping = ipc::call(&socket, Request::Ping).await;
         return json!({"started": false, "already": true, "socket": socket.display().to_string(), "ping": ping["data"]});
@@ -116,10 +127,15 @@ async fn start_daemon(link_id: &str) -> Value {
 }
 
 /// 连接参数是否与 daemon 当前持有的 link 一致（不一致要重启 daemon 才生效）。
+///
+/// `insecure`（GUI 的「跳过 TLS 校验」）也在比较里：它决定 daemon 的 HTTP 客户端
+/// 是否接受无效证书，改完不重启 daemon 就还是旧行为（用户勾/去勾后「看起来保存了
+/// 但没生效」）。
 fn same_link(a: &qxync_core::ipc::LinkInfo, b: &LinkConfig) -> bool {
     a.host == b.host
         && a.port == b.port
         && a.https == b.https
+        && a.insecure == b.insecure
         && a.user == b.user
         && a.ipv4_only == b.ipv4_only
 }
@@ -183,8 +199,15 @@ impl LinkInput {
 
     /// 保存前把 GUI 不编辑的 M7 字段（exclude / filter_temp / peer_*）从已有配置里带过来，
     /// 避免「GUI 保存一次就把规则清空」。
+    #[allow(dead_code)]
     fn link_with_existing(&self, paths: &ConfigPaths) -> LinkConfig {
+        self.link_with_existing_and_id(paths, self.link().id)
+    }
+
+    /// ★ M16：用指定 id 保存（新建时由后端生成 id）。
+    fn link_with_existing_and_id(&self, paths: &ConfigPaths, id: String) -> LinkConfig {
         let mut link = self.link();
+        link.id = id;
         if let Ok(old) = LinkConfig::load(paths, &link.id) {
             if self.exclude.is_empty() {
                 link.exclude = old.exclude;
@@ -203,6 +226,56 @@ impl LinkInput {
     }
 }
 
+/// ★ M16：新连接的 id。没有任何连接时用 `default`（沿用旧路径），否则 `nas2`/`nas3`…
+fn next_link_id(p: &ConfigPaths) -> String {
+    let (links, _) = LinkConfig::list(p);
+    if links.is_empty() {
+        return "default".into();
+    }
+    for n in 2.. {
+        let id = format!("nas{n}");
+        if !links.iter().any(|l| l.id == id) {
+            return id;
+        }
+    }
+    unreachable!()
+}
+
+/// ★ M16：同 `(host, port, user)` 的连接已经存在时拒绝新建/改成重复。
+fn duplicate_link(p: &ConfigPaths, link: &LinkConfig) -> Option<String> {
+    let (links, _) = LinkConfig::list(p);
+    links
+        .into_iter()
+        .find(|o| {
+            o.id != link.id
+                && o.port == link.port
+                && o.user == link.user
+                && o.host.eq_ignore_ascii_case(&link.host)
+        })
+        .map(|o| o.id)
+}
+
+/// 前端给了 id 就用（编辑/高级用户），没给或非法就自动生成。
+fn resolve_link_id(
+    p: &ConfigPaths,
+    requested: Option<&str>,
+    create: bool,
+) -> Result<String, String> {
+    if let Some(id) = requested.filter(|s| !s.trim().is_empty()) {
+        if !LinkConfig::is_valid_id(id) {
+            return Err(format!(
+                "连接 id 不合法：{id:?}（只允许 A-Za-z0-9 . _ -，且不能是 . / ..）"
+            ));
+        }
+        return Ok(id.to_string());
+    }
+    if create {
+        Ok(next_link_id(p))
+    } else {
+        Ok("default".into())
+    }
+}
+
 // ---------------------------------------------------------------- 命令
 
 /// 应用/环境概览：版本、socket、配置目录、daemon 二进制、前端资源。
@@ -210,6 +283,21 @@ impl LinkInput {
 pub async fn app_info() -> Result<Value, String> {
     let p = paths()?;
     let socket = ipc::socket_path();
+    let (links, bad) = LinkConfig::list(&p);
+    let links_json: Vec<Value> = links
+        .iter()
+        .map(|l| {
+            json!({
+                "id": l.id,
+                "host": l.host,
+                "port": l.port,
+                "https": l.https,
+                "insecure": l.insecure,
+                "user": l.user,
+                "socket": ipc::socket_path_for(&l.id).display().to_string(),
+            })
+        })
+        .collect();
     Ok(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "home": std::env::var("HOME").unwrap_or_default(),
@@ -219,34 +307,49 @@ pub async fn app_info() -> Result<Value, String> {
         "state_dir": p.state_dir.display().to_string(),
         "daemon_bin": daemon_binary().ok().map(|b| b.display().to_string()),
         "daemon_running": ipc::available(&socket).await,
+        "links": links_json,
+        "links_bad": bad.iter().map(|(bp, be)| json!({"path": bp.display().to_string(), "error": be})).collect::<Vec<_>>(),
         "ui_assets": crate::ui_assets(),
         // 调试/验收用：`QXNYC_GUI_TAB=<status|connect|mounts|files|sync>` 指定初始 tab
         "initial_tab": std::env::var("QXNYC_GUI_TAB").ok(),
     }))
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DaemonStatus {
-    running: bool,
-    socket: String,
-    ping: Option<PingData>,
-    status: Option<StatusData>,
-    error: Option<String>,
+    /// ★ M16：这份状态属于哪个连接。
+    pub link_id: String,
+    pub running: bool,
+    pub socket: String,
+    pub ping: Option<PingData>,
+    pub status: Option<StatusData>,
+    pub error: Option<String>,
 }
 
 /// daemon 存活 + 完整状态快照（前端每 2s 轮询一次）。
+///
+/// ★ M16：必须按连接查 —— 每个连接的 daemon 有独立 socket。
 #[tauri::command]
-pub async fn daemon_status() -> Result<DaemonStatus, String> {
-    let socket = ipc::socket_path();
+pub async fn daemon_status(link_id: Option<String>) -> Result<DaemonStatus, String> {
+    let id = link_id
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "default".into());
+    Ok(daemon_status_for(&id).await)
+}
+
+/// 单连接状态（内部用；不 panic、不 Err：连不上就是 `running=false`）。
+pub async fn daemon_status_for(link_id: &str) -> DaemonStatus {
+    let socket = ipc::socket_path_for(link_id);
     let sock_str = socket.display().to_string();
     if !ipc::available(&socket).await {
-        return Ok(DaemonStatus {
+        return DaemonStatus {
+            link_id: link_id.to_string(),
             running: false,
             socket: sock_str,
             ping: None,
             status: None,
             error: None,
-        });
+        };
     }
     let ping = ipc::call_typed::<PingData>(&socket, Request::Ping).await;
     let status = ipc::call_typed::<StatusData>(&socket, Request::Status).await;
@@ -255,19 +358,23 @@ pub async fn daemon_status() -> Result<DaemonStatus, String> {
         (_, Err(e)) => Some(e.message.clone()),
         _ => None,
     };
-    Ok(DaemonStatus {
+    DaemonStatus {
+        link_id: link_id.to_string(),
         running: true,
         socket: sock_str,
         ping: ping.ok(),
         status: status.ok(),
         error,
-    })
+    }
 }
 
 /// 通用 IPC：入参就是 `{"v":1,"method":"ls","path":"/home"}`，回响应信封。
 #[tauri::command]
-pub async fn ipc_call(req: Value) -> Value {
-    let socket = ipc::socket_path();
+pub async fn ipc_call(link_id: Option<String>, req: Value) -> Value {
+    let id = link_id
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "default".into());
+    let socket = ipc::socket_path_for(&id);
     match serde_json::from_value::<RequestEnvelope>(req) {
         Ok(env) if env.v == IPC_VERSION => ipc::call(&socket, env.req).await,
         Ok(env) => ipc::err_response(
@@ -297,6 +404,12 @@ pub async fn link_read(link_id: Option<String>) -> Result<Value, String> {
 }
 
 /// 写连接配置 `~/.config/qxync/links/<id>.json`。
+///
+/// ★ 必须走 `link_with_existing`：前端「连接」表单与「筛选器」表单都只提交**自己那部分**
+/// 字段（`LinkInput` 里 `exclude`/`filter_temp`/`peer_listen`/`peer_name` 可省），
+/// 用 `li.link()` 直接落盘会把 GUI 不编辑的 M7 字段清成默认值 —— 用户只是在
+/// 「连接」页重存一次 host，选择性同步规则和 LAN 对等配置就被静默抹掉了。
+/// 前端也明确按「空数组 = 保留旧值」在调它（见 `ui/app.js` 的 `doFiltersSave`）。
 #[tauri::command]
 pub async fn link_save(input: Value) -> Result<Value, String> {
     let li: LinkInput = serde_json::from_value(input).map_err(|e| format!("参数错误: {e}"))?;
@@ -305,12 +418,19 @@ pub async fn link_save(input: Value) -> Result<Value, String> {
     }
     let p = paths()?;
     p.ensure_dirs().map_err(|e| e.to_string())?;
-    let link = li.link();
+    let id = resolve_link_id(&p, li.id.as_deref(), true)?;
+    let link = li.link_with_existing_and_id(&p, id);
+    if let Some(other) = duplicate_link(&p, &link) {
+        return Err(format!(
+            "{}@{}:{} 已经有连接「{other}」；同一 NAS + 账号只保留一个连接",
+            link.user, link.host, link.port
+        ));
+    }
     let path = link.save(&p).map_err(|e| e.to_string())?;
     Ok(json!({"ok": true, "path": path.display().to_string(), "link": link}))
 }
 
-/// 写凭据 `~/.config/qxync/credentials.json`（0600，先临时文件再 rename）。
+/// ★ M16：写某个连接的凭据（`credentials.json` 或 `links/<id>.credentials.json`，0600）。
 #[tauri::command]
 pub async fn credential_save(input: Value) -> Result<Value, String> {
     let li: LinkInput = serde_json::from_value(input).map_err(|e| format!("参数错误: {e}"))?;
@@ -319,24 +439,52 @@ pub async fn credential_save(input: Value) -> Result<Value, String> {
         .clone()
         .ok_or_else(|| "缺少 password".to_string())?;
     let p = paths()?;
+    let id = resolve_link_id(&p, li.id.as_deref(), false)?;
+    let link = match LinkConfig::load(&p, &id) {
+        Ok(existing) => existing,
+        Err(_) => li.link_with_existing_and_id(&p, id),
+    };
     let cred = Credentials {
-        host: li.host.trim().to_string(),
-        user: li.user.trim().to_string(),
+        host: link.host.clone(),
+        user: link.user.clone(),
         password,
     };
-    let path = cred.save(&p).map_err(|e| e.to_string())?;
-    Ok(json!({"ok": true, "path": path.display().to_string()}))
+    let path = cred.save_for(&p, &link).map_err(|e| e.to_string())?;
+    Ok(json!({"ok": true, "path": path.display().to_string(), "id": link.id}))
 }
 
 /// 凭据是否存在（只回 host/user，绝不回口令）。
 #[tauri::command]
-pub async fn credential_present() -> Result<Value, String> {
+pub async fn credential_present(link_id: Option<String>) -> Result<Value, String> {
     let p = paths()?;
-    match Credentials::load(&p) {
-        Ok(c) => Ok(
-            json!({"present": true, "host": c.host, "user": c.user, "path": p.credentials_file().display().to_string()}),
-        ),
-        Err(_) => Ok(json!({"present": false, "path": p.credentials_file().display().to_string()})),
+    let id = link_id
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "default".into());
+    let target = p.link_credentials_file(&id);
+    let link = match LinkConfig::load(&p, &id) {
+        Ok(l) => l,
+        Err(_) => {
+            return Ok(json!({
+                "present": false,
+                "path": target.display().to_string(),
+                "id": id,
+                "link_missing": true,
+            }))
+        }
+    };
+    match Credentials::present_for(&p, &link) {
+        Some((host, user, path)) => Ok(json!({
+            "present": true,
+            "host": host,
+            "user": user,
+            "path": path.display().to_string(),
+            "id": id,
+        })),
+        None => Ok(json!({
+            "present": false,
+            "path": target.display().to_string(),
+            "id": id,
+        })),
     }
 }
 
@@ -352,18 +500,54 @@ pub async fn daemon_start(link_id: Option<String>) -> Result<Value, String> {
     Ok(start_daemon(&id).await)
 }
 
-/// 干净退出 daemon（卸载全部挂载 + 删 socket/pid）。
+/// 干净退出某个连接的 daemon（卸载全部挂载 + 删 socket/pid）。
 #[tauri::command]
-pub async fn daemon_stop() -> Result<Value, String> {
-    let socket = ipc::socket_path();
+pub async fn daemon_stop(link_id: Option<String>) -> Result<Value, String> {
+    let id = link_id
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "default".into());
+    let socket = ipc::socket_path_for(&id);
     if !ipc::available(&socket).await {
-        return Ok(json!({"stopped": false, "already": true, "message": "qxyncd 未在运行"}));
+        return Ok(
+            json!({"stopped": false, "already": true, "id": id, "message": "qxyncd 未在运行"}),
+        );
     }
     let resp = ipc::call(&socket, Request::Shutdown).await;
     let gone = wait_gone(&socket).await;
-    Ok(
-        json!({"stopped": gone, "already": false, "socket": socket.display().to_string(), "response": resp}),
-    )
+    Ok(json!({
+        "stopped": gone, "already": false, "id": id,
+        "socket": socket.display().to_string(), "response": resp
+    }))
+}
+
+/// ★ M16：启动所有配置里的连接（已在跑的跳过）。
+#[tauri::command]
+pub async fn daemon_start_all() -> Result<Value, String> {
+    let p = paths()?;
+    let (links, bad) = LinkConfig::list(&p);
+    let mut out = Vec::new();
+    for l in &links {
+        let v = start_daemon(&l.id).await;
+        out.push(json!({"id": l.id, "result": v}));
+    }
+    Ok(json!({
+        "ok": out.iter().all(|v| v["result"]["error"].is_null()),
+        "links": out,
+        "bad": bad.iter().map(|(bp, be)| json!({"path": bp.display().to_string(), "error": be})).collect::<Vec<_>>(),
+    }))
+}
+
+/// ★ M16：停止所有配置里的连接。
+#[tauri::command]
+pub async fn daemon_stop_all() -> Result<Value, String> {
+    let p = paths()?;
+    let (links, _bad) = LinkConfig::list(&p);
+    let mut ids = Vec::new();
+    for l in &links {
+        let v = daemon_stop(Some(l.id.clone())).await?;
+        ids.push(json!({"id": l.id, "result": v}));
+    }
+    Ok(json!({"ok": true, "links": ids}))
 }
 
 /// 「保存连接 + 登录」一条龙：
@@ -379,18 +563,26 @@ pub async fn login_flow(input: Value) -> Result<Value, String> {
         .clone()
         .ok_or_else(|| "缺少 password".to_string())?;
     let p = paths()?;
-    let link = li.link_with_existing(&p);
     p.ensure_dirs().map_err(|e| e.to_string())?;
+    let id = resolve_link_id(&p, li.id.as_deref(), true)?;
+    let link = li.link_with_existing_and_id(&p, id);
+    if let Some(other) = duplicate_link(&p, &link) {
+        return Ok(json!({
+            "ok": false,
+            "error": format!("{}@{}:{} 已经有连接「{other}」；同一 NAS + 账号只保留一个连接",
+                link.user, link.host, link.port),
+        }));
+    }
     let link_path = link.save(&p).map_err(|e| e.to_string())?;
     let cred_path = Credentials {
         host: link.host.clone(),
         user: link.user.clone(),
         password: password.clone(),
     }
-    .save(&p)
+    .save_for(&p, &link)
     .map_err(|e| e.to_string())?;
 
-    let socket = ipc::socket_path();
+    let socket = ipc::socket_path_for(&link.id);
     let mut restarted = false;
     if ipc::available(&socket).await {
         let current = ipc::call_typed::<StatusData>(&socket, Request::Status)
@@ -412,7 +604,9 @@ pub async fn login_flow(input: Value) -> Result<Value, String> {
                 }));
             }
             let started = start_daemon(&link.id).await;
-            restarted = started["started"].as_bool().unwrap_or(false);
+            // ★ `already` 也算起来了（见 [`start_ok`]）：刚停机后的窗口里可能有别的
+            //   进程抢先拉起。以前这里只看 `started`，会报「新 daemon 没能起来」并跳过登录。
+            restarted = start_ok(&started);
             if !restarted {
                 return Ok(json!({
                     "ok": false, "link_path": link_path.display().to_string(),
@@ -424,9 +618,7 @@ pub async fn login_flow(input: Value) -> Result<Value, String> {
         }
     } else {
         let started = start_daemon(&link.id).await;
-        if !started["started"].as_bool().unwrap_or(false)
-            && !started["already"].as_bool().unwrap_or(false)
-        {
+        if !start_ok(&started) {
             return Ok(json!({
                 "ok": false, "link_path": link_path.display().to_string(),
                 "credential_path": cred_path.display().to_string(), "restarted": false,
@@ -450,6 +642,167 @@ pub async fn login_flow(input: Value) -> Result<Value, String> {
         "credential_path": cred_path.display().to_string(),
         "restarted": restarted,
         "login": login,
+    }))
+}
+
+/// ★ M16：所有连接 + 各自 daemon / 凭据状态（GUI 每 2s 轮询的主入口）。
+///
+/// 返回 `{links:[...], bad:[...]}`。`links` 里除配置里的连接外，还包含
+/// 「没有 link 文件、但 default socket 在跑」的空转 daemon（`link_exists=false`），
+/// 让用户至少能把它停掉。
+#[tauri::command]
+pub async fn links_status() -> Result<Value, String> {
+    let p = paths()?;
+    let (links, bad) = LinkConfig::list(&p);
+    // 并行查：连不上的连接每个要等 500ms 探测，串行会让 2s 轮询被拖慢。
+    let out: Vec<Value> =
+        futures_util::future::join_all(links.iter().map(|l| link_status_one(&p, l))).await;
+    let mut out = out;
+    if !links.iter().any(|l| l.id == "default") {
+        let st = daemon_status_for("default").await;
+        if st.running {
+            out.push(json!({
+                "id": "default",
+                "host": "",
+                "port": 0,
+                "https": true,
+                "insecure": false,
+                "user": "",
+                "link_exists": false,
+                "credential_present": false,
+                "socket": st.socket,
+                "daemon": st,
+            }));
+        }
+    }
+    Ok(json!({
+        "links": out,
+        "bad": bad.iter().map(|(bp, be)| json!({
+            "path": bp.display().to_string(), "error": be,
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+async fn link_status_one(p: &ConfigPaths, link: &LinkConfig) -> Value {
+    let daemon = daemon_status_for(&link.id).await;
+    let cred = Credentials::present_for(p, link);
+    json!({
+        "id": link.id,
+        "host": link.host,
+        "port": link.port,
+        "https": link.https,
+        "insecure": link.insecure,
+        "user": link.user,
+        "link_exists": true,
+        "credential_present": cred.is_some(),
+        "socket": daemon.socket,
+        "daemon": daemon,
+    })
+}
+
+/// ★ M16：**不经过 daemon** 读某个连接的任务登记。
+///
+/// 用途：该连接的 daemon 没在跑时，主页/任务页仍然应该显示「这里有哪些任务」，
+/// 只是标注「当前不会同步」。daemon 的 `tasks list` 读不到时用这个兜底。
+#[tauri::command]
+pub async fn tasks_config(link_id: String) -> Result<Value, String> {
+    if !LinkConfig::is_valid_id(&link_id) {
+        return Err(format!("连接 id 不合法：{link_id:?}"));
+    }
+    let p = paths()?;
+    let link = LinkConfig::load(&p, &link_id).map_err(|e| e.to_string())?;
+    let (all_links, _bad) = LinkConfig::list(&p);
+    let mut ids: Vec<String> = all_links.into_iter().map(|l| l.id).collect();
+    if !ids.iter().any(|id| id == &link_id) {
+        ids.push(link_id.clone());
+    }
+    ids.sort();
+    let (tasks, bad) = qxync_core::tasks::Task::list_for_link(&p, &link_id, &ids);
+    let empty = tasks.is_empty();
+    let infos: Vec<qxync_core::ipc::TaskInfo> = tasks
+        .into_iter()
+        .map(|task| qxync_core::ipc::TaskInfo {
+            task,
+            mounted: false,
+            last_error: Some(format!(
+                "连接「{}」的 daemon 未运行：这是磁盘上的任务登记，当前不会同步",
+                link.id
+            )),
+        })
+        .collect();
+    let data = qxync_core::ipc::TasksData {
+        tasks: infos,
+        bad_files: bad
+            .into_iter()
+            .map(|(bp, be)| (bp.display().to_string(), be))
+            .collect(),
+        empty,
+        note: Some("daemon 未运行：以下任务来自磁盘登记，启动该连接的 daemon 后才会同步".into()),
+    };
+    serde_json::to_value(data).map_err(|e| e.to_string())
+}
+
+/// ★ M16：移除一个连接。
+///
+/// 安全边界：
+/// * 有本连接的任务时，**必须** `delete_tasks=true` 才继续（先返回 `needs_confirm`，
+///   此阶段**不停 daemon、不删任何东西**，用户取消后连接仍在运行）；
+/// * 确认后才停 daemon（会真正卸载该连接的挂载点）；
+/// * 只删任务登记 / link / 凭据 / peers；**不删本地文件、不删 NAS 数据、不动 cache/state**。
+#[tauri::command]
+pub async fn link_delete(link_id: String, delete_tasks: Option<bool>) -> Result<Value, String> {
+    if !LinkConfig::is_valid_id(&link_id) {
+        return Err(format!("连接 id 不合法：{link_id:?}"));
+    }
+    let p = paths()?;
+    let link = LinkConfig::load(&p, &link_id).map_err(|e| e.to_string())?;
+
+    // 任务归属要在删 link 之前算：删掉之后 legacy owner 可能就变了。
+    let (all_links, _bad) = LinkConfig::list(&p);
+    let mut ids: Vec<String> = all_links.into_iter().map(|l| l.id).collect();
+    if !ids.iter().any(|id| id == &link_id) {
+        ids.push(link_id.clone());
+    }
+    ids.sort();
+    let (tasks, bad_tasks) = qxync_core::tasks::Task::list_for_link(&p, &link_id, &ids);
+    // 坏任务文件也算「有东西可能属于这条连接」：解析不出归属时不能静默删连接，
+    // 否则那些文件会变成永远没人管的孤儿。
+    if (!tasks.is_empty() || !bad_tasks.is_empty()) && !delete_tasks.unwrap_or(false) {
+        return Ok(json!({
+            "deleted": false,
+            "needs_confirm": true,
+            "id": link_id,
+            "task_count": tasks.len(),
+            "tasks": tasks.iter().map(|t| json!({
+                "id": t.id,
+                "mountpoint": t.mountpoint.display().to_string(),
+                "root": t.effective_root(),
+            })).collect::<Vec<_>>(),
+            "bad_task_files": bad_tasks.iter().map(|(bp, be)| json!({
+                "path": bp.display().to_string(), "error": be,
+            })).collect::<Vec<_>>(),
+            "stopped": Value::Null,
+            "note": "移除连接会停止 daemon、卸载挂载点并删除这些任务登记；不会删除本地文件或 NAS 数据",
+        }));
+    }
+    // 用户还没确认任务怎么处理时先不动 daemon：取消移除不该把正在同步的连接停掉。
+    let stop = daemon_stop(Some(link_id.clone())).await?;
+    let mut deleted_tasks = 0usize;
+    for t in &tasks {
+        if qxync_core::tasks::Task::delete(&p, &t.id).map_err(|e| e.to_string())? {
+            deleted_tasks += 1;
+        }
+    }
+    let existed = LinkConfig::delete(&p, &link_id).map_err(|e| e.to_string())?;
+    Ok(json!({
+        "deleted": existed,
+        "needs_confirm": false,
+        "id": link_id,
+        "host": link.host,
+        "user": link.user,
+        "tasks_deleted": deleted_tasks,
+        "stopped": stop,
+        "note": "已删除连接与任务登记；本地文件 / NAS 数据 / cache / 状态库均未删除",
     }))
 }
 
@@ -1086,6 +1439,7 @@ mod tests {
             host: "nas.local".into(),
             port: 9834,
             https: true,
+            insecure: true,
             user: "test1".into(),
             ipv4_only: false,
         };
@@ -1108,6 +1462,194 @@ mod tests {
         // 改回来 → 一致（不再有「家目录变了」这条：它已经不是配置项）
         link.user = "test1".into();
         assert!(same_link(&info, &link));
+        // ★ insecure 翻转必须报「不一致」：login_flow 才会重启 daemon 让新 TLS
+        //   校验行为生效（以前这个字段不在 LinkInfo 里，改了永远不重启）。
+        link.insecure = false;
+        assert!(
+            !same_link(&info, &link),
+            "跳过 TLS 校验改了必须重启 daemon 才生效"
+        );
+        link.insecure = true;
+        assert!(same_link(&info, &link));
+    }
+
+    #[test]
+    fn start_ok_accepts_already_running() {
+        assert!(start_ok(&json!({"started": true, "already": false})));
+        assert!(
+            start_ok(&json!({"started": false, "already": true})),
+            "别的进程抢先拉起（socket 已就绪）也算「daemon 在跑」"
+        );
+        assert!(!start_ok(
+            &json!({"started": false, "already": false, "error": "x"})
+        ));
+        assert!(!start_ok(&json!({})), "缺字段按没起来处理");
+    }
+
+    /// ★ 回归：`link_save` 必须保留 GUI 不编辑的 M7 字段。
+    ///
+    /// 前端「连接」表单只提交 host/port/https/insecure/user/ipv4_only；后端若用
+    /// `li.link()` 直接落盘，会把已有的 `exclude` / `filter_temp` / `peer_*` 静默
+    /// 清成默认值 —— 用户只是在连接页重存一次 host，选择性同步规则和 LAN 对等配置
+    /// 就没了。前端 `doFiltersSave` 的注释也明确按「空数组 = 保留旧值」在调它。
+    #[test]
+    fn link_save_preserves_fields_gui_does_not_edit() {
+        let d = std::env::temp_dir().join(format!(
+            "qxync-gui-linksave-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|t| t.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        let paths = ConfigPaths {
+            config_dir: d.join("config"),
+            data_dir: d.join("data"),
+            state_dir: d.join("state"),
+        };
+        std::fs::create_dir_all(paths.config_dir.join("links")).unwrap();
+        LinkConfig {
+            id: "default".into(),
+            host: "old.nas".into(),
+            port: 9834,
+            https: true,
+            insecure: true,
+            user: "test1".into(),
+            ipv4_only: false,
+            exclude: vec!["*.tmp".into(), "# 已清空（GUI）".into()],
+            filter_temp: false,
+            peer_listen: Some("0.0.0.0:9840".into()),
+            peer_name: Some("box".into()),
+        }
+        .save(&paths)
+        .unwrap();
+
+        // 「连接」页的 input：完全没有 exclude/filter_temp/peer_* 字段
+        let li: LinkInput = serde_json::from_value(json!({
+            "host": "new.nas", "user": "test2", "https": false
+        }))
+        .unwrap();
+        let link = li.link_with_existing(&paths);
+        assert_eq!(link.host, "new.nas", "表单里的字段必须生效");
+        assert_eq!(link.user, "test2");
+        assert!(!link.https);
+        assert_eq!(
+            link.exclude,
+            vec!["*.tmp".to_string(), "# 已清空（GUI）".to_string()],
+            "exclude 不能被清空"
+        );
+        assert!(!link.filter_temp, "filter_temp 不能被重置成默认值");
+        assert_eq!(link.peer_listen.as_deref(), Some("0.0.0.0:9840"));
+        assert_eq!(link.peer_name.as_deref(), Some("box"));
+
+        // 落盘后再读回来仍然保留（link_save 实际走的就是 save）
+        link.save(&paths).unwrap();
+        let back = LinkConfig::load(&paths, "default").unwrap();
+        assert_eq!(back.exclude, link.exclude);
+        assert_eq!(back.peer_listen, link.peer_listen);
+
+        // 反向：显式提交了 exclude / filter_temp 时必须**采用新值**（筛选器页
+        // 就是用非空 exclude + filter_temp 表达「清空规则 / 开关临时文件过滤」）
+        let li2: LinkInput = serde_json::from_value(json!({
+            "host": "new.nas", "user": "test2",
+            "exclude": ["# 已清空（GUI）"], "filter_temp": true
+        }))
+        .unwrap();
+        let link2 = li2.link_with_existing(&paths);
+        assert_eq!(link2.exclude, vec!["# 已清空（GUI）".to_string()]);
+        assert!(link2.filter_temp, "显式给的值必须覆盖旧值");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// ★ M16：新连接 id 生成规则（没有连接 → default；否则 nas2/nas3…）。
+    #[test]
+    fn m16_next_link_id_avoids_existing() {
+        let d = std::env::temp_dir().join(format!(
+            "qxync-gui-nextid-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|t| t.as_nanos())
+                .unwrap_or(0)
+        ));
+        let paths = ConfigPaths {
+            config_dir: d.join("config"),
+            data_dir: d.join("data"),
+            state_dir: d.join("state"),
+        };
+        std::fs::create_dir_all(paths.config_dir.join("links")).unwrap();
+        assert_eq!(
+            next_link_id(&paths),
+            "default",
+            "全新安装第一个连接用 default"
+        );
+        for id in ["default", "nas2", "nas4"] {
+            LinkConfig {
+                id: id.into(),
+                host: format!("{id}.local"),
+                port: 9834,
+                https: true,
+                insecure: false,
+                user: "u".into(),
+                ipv4_only: false,
+                exclude: Vec::new(),
+                filter_temp: true,
+                peer_listen: None,
+                peer_name: None,
+            }
+            .save(&paths)
+            .unwrap();
+        }
+        assert_eq!(next_link_id(&paths), "nas3", "跳过已占用的 nas2/nas4");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// ★ M16：同 host+port+user 的重复连接必须能被发现。
+    #[test]
+    fn m16_duplicate_link_detection_ignores_host_case_and_self() {
+        let d = std::env::temp_dir().join(format!(
+            "qxync-gui-duplink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|t| t.as_nanos())
+                .unwrap_or(0)
+        ));
+        let paths = ConfigPaths {
+            config_dir: d.join("config"),
+            data_dir: d.join("data"),
+            state_dir: d.join("state"),
+        };
+        std::fs::create_dir_all(paths.config_dir.join("links")).unwrap();
+        let mk = |id: &str, host: &str, user: &str| LinkConfig {
+            id: id.into(),
+            host: host.into(),
+            port: 9834,
+            https: true,
+            insecure: false,
+            user: user.into(),
+            ipv4_only: false,
+            exclude: Vec::new(),
+            filter_temp: true,
+            peer_listen: None,
+            peer_name: None,
+        };
+        mk("default", "NAS.local", "u").save(&paths).unwrap();
+        assert_eq!(
+            duplicate_link(&paths, &mk("nas2", "nas.local", "u")).as_deref(),
+            Some("default"),
+            "host 大小写不同也算同一台 NAS"
+        );
+        assert!(
+            duplicate_link(&paths, &mk("nas2", "nas.local", "other")).is_none(),
+            "同 NAS 不同账号允许"
+        );
+        assert!(
+            duplicate_link(&paths, &mk("default", "nas.local", "u")).is_none(),
+            "编辑自己不算重复"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

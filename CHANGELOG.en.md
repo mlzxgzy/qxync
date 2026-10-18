@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-18
+
+### Added
+
+- **Multiple NAS connections (M16)**: one `qxyncd` process per connection, so several NAS
+  boxes can be connected at the same time and each connection can host several tasks
+  (one local folder ⇄ one NAS folder). Highlights:
+  - each connection gets its **own** socket / pid / log / state store / cache / upload queue;
+    **stopping one connection leaves the others untouched**; the `default` connection keeps
+    the legacy paths and **upgrades with zero migration**;
+  - data is namespaced per connection: `default` uses `<host>` (the legacy directory names),
+    every other connection uses `#<id>@<host>` (same rule for `sync/`, `cache/`,
+    `upload-queue/` and `mounts/`); non-default credentials live in
+    `links/<id>.credentials.json`;
+  - tasks carry an optional `link_id`; ownership of legacy tasks is **deterministic**
+    (`default` first, otherwise the lexicographically smallest connection); reusing a task id
+    across connections is **refused**; local mount-point conflicts are **refused across
+    connections**, NAS-root overlaps only warn within the same connection;
+  - migration: `default` only moves the upload queue; for non-default connections the legacy
+    owner moves sync / cache / queue / mounts / credentials (sync / queue failures **refuse to
+    start**, cache failures degrade with a warning);
+  - CLI: `qxync links [--json]` (all connections plus each daemon / credential state), a global
+    `--link` routing flag, and `qxync daemon start|stop|status|reload --all`;
+  - GUI: connection list (add / edit / remove), a "current connection" switcher, aggregated
+    tasks, the files page following the current connection, settings broadcast to all
+    connections, and tray "start all / stop all";
+  - removing a connection **only deletes registrations** (link / credentials / peers / task
+    records) — **never** local files, NAS data, cache or the state store; a duplicate
+    `(host, port, user)` is refused;
+  - new `qxync-gui --self-test-multi` self-check (two fake connections, two independent
+    sockets, task isolation, cross-connection overwrite refused, everything stopped cleanly,
+    all exit codes 0); see [M16-多NAS连接.md](docs/M16-多NAS连接.md).
+- **The conflict decision queue is now something you can actually inspect and act on.**
+  Under the "ask me for every file" policy the queue only had three resolve buttons
+  (keep local / keep NAS / keep both): you could not *see* what differed, and there was no
+  way to say "I don't care about this one".
+  - **Compare local vs NAS** in the GUI and the CLI: a line-level text diff
+    (`-` = exists only locally, `+` = exists only on the NAS). Oversized (512 KiB) files,
+    binaries, directories and unreadable sides now show an explicit reason — the UI never
+    silently claims "no differences".
+  - **Ignore this one** (queue row only; no file is touched), plus **Clear all** in the GUI
+    and `--clear` in the CLI.
+  - **Queue sweep in the engine**: rows whose remote file is gone, whose task is gone,
+    whose policy is no longer `ask`, or whose conflict resolved itself are dropped
+    automatically with a human-readable reason (queue rows only).
+- **The sync engine no longer manages recycle-bin subtrees**: `@Recycle`, `.Trash` and
+  `.Trash-<uid>` are excluded from reconciliation, baseline, rename pairing, event
+  handling, the decision queue and the upload queue (shared segment rules live in
+  `qxync-core::trash`, matching FUSE's existing `deny_trash`). Real-device evidence:
+  1425 of 1991 baseline entries were under `/home/@Recycle` and 13 under `.Trash-1000`
+  (FDO trashinfo had even been synced back to the NAS); QTS purging its recycle bin
+  produced mass phantom deletions.
+
 ### Fixed
 
 - **The GUI said "some deletes are blocked by the circuit breaker" but gave you no way to
@@ -33,6 +86,140 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
      删除 812 项，超过上限 50" carries far more information than "确认放行？"), plus a
      warning not to release if the remote was emptied by accident. Deletion is
      irreversible; this step cannot be skipped.
+- **The conflict diff panel always showed "local +0 / -0 / identical"** (a dangerous
+  illusion): serde flattens `DiffOutcome` fields next to `status` on the wire, but the
+  frontend read a nested `o.diff`, and its `{}` fallback hid the mistake — "never compared"
+  and "zero differences" looked exactly the same. Now it reads the flat shape, validates
+  every line, and shows an error instead of ever claiming "identical".
+- **Diff direction was inverted** (GUI legend and CLI): in the real `text_diff`, `-` = local
+  only (`removed`) and `+` = NAS only (`added`). An inverted legend makes users pick the
+  wrong "keep" side, which cannot be undone. Core docs, the wire-contract fixture, the GUI
+  legend and the CLI output are now aligned (pinned by tests using the production function).
+- **"Discovered at" always showed the current time**: `clock()` dropped numeric timestamps
+  and fell back to `new Date()`; the same bug affected "last trigger" and LAN event times.
+- **Busy/disabled state for dynamic buttons never worked**: `withBusy` looked buttons up by
+  `id`, but card buttons are created dynamically without ids, so repeated clicks sent
+  duplicate resolve/forget/compare requests. It now accepts element references; the diff
+  toggle is disabled while a request is in flight.
+- **Diagnostics displayed cumulative counters as "current"**: `deletes_blocked` is
+  cumulative (692 742 on the real device); it is now labelled "(cumulative)" and no longer
+  styled as an error. "Currently tripped" is driven only by `delete_block_reason`.
+- **Saving the connection page silently wiped selective-sync / LAN-peer settings**:
+  `link_save` persisted `LinkInfo::link()` directly while the form only submits
+  host/port/https/insecure/user/ipv4, resetting `exclude` / `filter_temp` / `peer_*`.
+  It now uses `link_with_existing()`, like `login_flow` already did.
+- **`login_flow` ignored `already` on the restart path**: when another process had already
+  started the daemon (`{started:false, already:true}`), it reported failure and skipped login.
+- **`LinkInfo` lacked `insecure`**: the GUI could not tell that "skip TLS verification" had
+  changed, so the daemon kept the old setting. The field is added and compared in
+  `same_link`.
+- **The same 526 blocked deletions produced a WARN + journal entry every 30 s for 13 hours**
+  (3023 of 3046 journal rows were the same sentence; the 10 000-row cap was being flushed
+  within days): blocked rounds are now de-duplicated by a "count + reason" signature
+  (unchanged signature drops to debug); `ask` conflicts are counted/logged only on first
+  enqueue (it used to claim "generated N conflict copies" every round while generating
+  none); the "engine alive" scan entry is rate-limited to 600 s.
+- **Stale `last_error` / breaker alerts never cleared after recovery**: live evidence — the
+  `status=3` error had recovered at 08:30 but was still red on the home page in the
+  afternoon. A single `absorb_round()` now clears `last_error` on a *completed* round with
+  zero errors and clears the breaker alert when `deletes_blocked == 0`; rounds that return
+  early (session expired / server busy) only update the current error and never clear
+  historical alarms. Dehydration errors got the same treatment.
+- **Expired sessions waited up to 120 s for the keepalive**: `poll_once` returned `Ok` with
+  the `qbox_get_max_log` failure only in `errors`, so the poller's `is_auth` re-login branch
+  was unreachable. `SyncReport::auth_failed` (status 3 is recognised on the max_log endpoint
+  only, with real-device evidence) makes the poller re-login immediately.
+- **The decision queue was silently wiped when no mount view existed**: right after daemon
+  start / while unmounted / when restore failed, `views` is empty and the old sweep treated
+  every row as "task deleted + remote gone", destroying the user's decisions. Added
+  `DecisionFacts::observed` (never judge from placeholder signatures) plus an on-disk task
+  check to tell "task deleted" from "temporarily unmounted"; unreadable config is kept.
+  A red-team review found the other half: `observed` only proves the **remote** side was
+  stat'ed; after a daemon restart the local node table is still empty (`local_sig` returns a
+  placeholder `MISSING`), so "already resolved, waiting for execution" rows would be judged
+  "conflict resolved itself" and dropped. Added `DecisionFacts::local_observed`; rule 4 now
+  only concludes "resolved" when both sides were really observed.
+- **A failed directory listing was treated as "remote deleted" and could delete local
+  nodes/cache** (data safety): with an incomplete `remote_map`, the old logic picked
+  `DeleteLocal`. Any non-404 listing failure now defers deletion for that view with an
+  explanation; a complete listing on the next round resumes it. The same class of escape
+  found in review is covered too: when the directory count exceeds `max_dirs_per_poll`
+  (default 200) only the first 200 are scanned and the rest were treated as remotely
+  deleted — **no error, no failure counter, the easiest one to miss**. "Directory scan was
+  truncated" now counts as an incomplete remote view and defers deletion as well.
+- **Baseline deletions and renames never reached disk** (pre-existing; the root cause of
+  "recycle-bin purge comes back next round"): `persist()` only merged newer signatures, so
+  deletions were resurrected from the in-memory snapshot. Now a round without concurrent
+  hook writes replaces the whole baseline (deletions/renames really land); otherwise it
+  falls back to per-entry merging. This also affected rule-exclusion purges, executed
+  deletions and rename migrations. Since "replace the whole baseline" requires one round at
+  a time (the old pure-merge write was naturally concurrency-safe), `run_sync_once` is now
+  serialised with a `State`-level async mutex: a manual `sync --once` / GUI "Sync now"
+  queues behind the background round instead of overwriting its persisted result.
+- **Text diff could OOM / hang**: the LCS DP table was quadratic in line count — 512 KiB of
+  one-character lines is 260k x 260k x 4 B ≈ 275 GB worst case. A bounded fallback now
+  diffs the first 2000 lines of each side (worst case 16 MiB, `truncated=true`, and it never
+  falsely reports "identical").
+- **Diff edge cases**: empty remote files no longer send a suspicious `bytes=0--1` range;
+  oversize reports the *real* size (FUSE node metadata first, not the truncated read length).
+- **`download_range`'s "HTTP 200 + JSON error body" guard was dead code**: it searched for
+  the 8-byte `"status"` with a 9-byte window, so the condition was always false and the
+  protection never worked. It now recognises the server error envelope precisely without
+  misclassifying user JSON files.
+- **`download_range` range edges**: `start > end` makes the server ignore Range and return
+  the whole file (which FUSE would write into one chunk cache); an ignored Range was not
+  detected either. Both are explicit errors now.
+- **Upload streaming swallowed read errors as EOF**: `reader.read(...).await.ok()?` turned a
+  local IO error into end-of-stream, sending a short body for the declared Content-Length —
+  at best losing the root cause, at worst leaving a truncated file on the server.
+- **Session keepalive treated "server not ready" as "session dead"**: `status=8` (Qsync
+  Central is initializing) should simply wait; the old code re-logged in every round and
+  printed the wrong diagnosis.
+- **Two real LAN-peer bugs**: `local_of` used `trim_start_matches` and stripped the prefix
+  repeatedly (`/home/home/x` → `x`), so a peer could read a *different* file; `path_allowed`
+  failed open when roots were empty. Now single `strip_prefix` and fail-closed.
+- **`read_cached` could treat the zero bytes of a partially hydrated file as local content**
+  (fake diff, potentially a wrong resolve): it now verifies that every required chunk is
+  hydrated (in-memory bitmap / read-only `.qxstate` with size/mtime/file_id checks) and
+  returns an explicit reason instead of fabricated data.
+- **CLI `conflicts` silently preferred one flag**: `--clear`/`--diff`/`--forget`/`--resolve`
+  given together silently picked one (users assumed all ran). Now clap rejects conflicting
+  combinations (exit 2) and `--as` requires `--resolve`.
+- **CLI cumulative counters are labelled**: "deletes blocked", upload/delete queue
+  done/failed/retries, hydration stats now say "(cumulative, since daemon start)"; the
+  duplicated "content unreadable:" prefix is fixed.
+
+### Changed
+
+- With the `ask` conflict policy, `conflicts` now counts **files waiting for a decision**
+  (first enqueue only) instead of accumulating per round; `deletes_blocked` remains
+  cumulative (now labelled).
+- Recycle-bin exclusion is a **hard rule**: even a user `!@Recycle` re-include rule cannot
+  bring them back into sync (consistent with FUSE's `deny_trash`).
+
+### Known limitations (not fixed in this batch)
+
+- Diff depends on FUSE nodes: after a daemon restart, comparing a path the user has not
+  touched in the mount yet yields "this process has not materialised the file" (needs a
+  FUSE-side materialisation API).
+- When the differing region exceeds 2000 lines per side the bounded fallback kicks in: the
+  footer explicitly says "result truncated", but the `added/removed` counts only cover the
+  compared prefix (the numbers are understated for extremely large diffs).
+- The FUSE mount still lists recycle-bin directories (the engine no longer manages them;
+  whether to hide them is a product decision).
+- `.Trash-<uid>` only matches the local uid; a different NAS-side uid would not be excluded
+  (they match on the real device today).
+- Continuously repeating sync errors still produce one WARN per round (long outages still
+  grow the log; blocked rounds are de-duplicated).
+- GUI: the delete queue (`StatusData.deletes`) is not displayed; file-state/LAN query
+  failures degrade silently; no single-instance guard; `pick_with` has no timeout;
+  `link_read` / `credential_present` swallow errors.
+- Protocol: `download_to_file` does not yet reuse the "200 + JSON error body" guard;
+  HTTP 401/403 are classified as Transport (no re-login; the real device uses 200+status 4/5);
+  no upload cancellation; LAN pairing rate limiting is global and peers may register any
+  addr (low risk).
+- `status=3` is only recognised as a session loss on `qbox_get_max_log` (insufficient
+  evidence elsewhere).
 
 ## [0.5.1] - 2026-10-04
 
@@ -865,6 +1052,7 @@ Verified on **QNAP TS-464C / QTS 5.2.9 / Qsync QPKG 5.0.0.7 (build 20260723)**.
 - Acceptance results were split out of the README into [`docs/验收记录.md`](docs/验收记录.md).
 - Dual-licensed under **MIT OR Apache-2.0** (`LICENSE-MIT` / `LICENSE-APACHE`).
 
+[0.6.0]: https://github.com/mlzxgzy/qxync/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/mlzxgzy/qxync/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/mlzxgzy/qxync/compare/v0.4.3...v0.5.0
 [0.4.3]: https://github.com/mlzxgzy/qxync/compare/v0.4.2...v0.4.3

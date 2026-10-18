@@ -7,6 +7,46 @@
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-18
+
+### 新增
+
+- **多 NAS 连接（M16）**：一条连接一个 `qxyncd` 进程，可以同时连多台 NAS，
+  每条连接下再建多个任务（本地文件夹 ⇄ NAS 文件夹）。要点：
+  - 每个连接**独立** socket / pid / 日志 / 状态库 / 缓存 / 上传队列；**停掉一条连接
+    不影响其它连接**；`default` 连接保持旧路径、**升级零迁移**；
+  - 数据按连接命名空间隔离：`default` 用 `<host>`（旧目录名），其它连接用
+    `#<id>@<host>`（`sync/`、`cache/`、`upload-queue/`、`mounts/` 同一个规则）；
+    非 default 凭据在 `links/<id>.credentials.json`；
+  - 任务新增可选 `link_id`；旧任务归属**确定**（`default` 优先，否则字典序最小的连接）；
+    同 id 任务跨连接**拒绝覆盖**；本地挂载点冲突**跨连接直接拒**，NAS 根重叠只同连接告警；
+  - 旧数据迁移：`default` 只迁上传队列；非 default 的 legacy owner 迁
+    sync / cache / queue / mounts / credentials（sync / queue 失败**拒绝启动**，
+    cache 失败降级只告警）；
+  - CLI：`qxync links [--json]`（所有连接 + 各自 daemon / 凭据状态）、全局 `--link`
+    路由、`qxync daemon start|stop|status|reload --all`；
+  - GUI：连接列表（新增 / 编辑 / 移除）、「当前连接」选择器、任务聚合、文件页跟随
+    当前连接、设置广播到所有连接、托盘「启动全部 / 停止全部」；
+  - 移除连接**只删登记**（link / 凭据 / peers / 任务登记），**不删**本地文件、NAS 数据、
+    cache 与状态库；同一 `(host, port, user)` 拒绝重复添加；
+  - 新增 `qxync-gui --self-test-multi` 自检（两个假连接、两个独立 socket、任务隔离、
+    跨连接覆盖被拒、收干净全部退出码 0），文档见
+    [M16-多NAS连接.md](docs/M16-多NAS连接.md)。
+- **冲突待裁决队列现在「能看清、能处置」**：「每个文件都问我」策略攒下的队列，以前只有
+  三个裁决按钮（保留本地 / 保留 NAS / 两份都留），用户**看不到差在哪**、**也没有
+  「这条我不想管」的出口**。本批完成：
+  - GUI / CLI 新增「**对比本地/NAS**」：行级文本 diff（`-` = 只有本地有、`+` = 只有 NAS 有），
+    超 512 KiB / 二进制 / 目录 / 一边内容读不到时**明确显示原因**，绝不静默显示「无差异」；
+  - GUI / CLI 新增「**忽略这条**」：只删队列行、不动任何文件；
+  - GUI 新增「**清空全部**」，CLI 补 `--clear`；
+  - 引擎新增**队列巡检**：远端已删 / 任务已删 / 策略不再是 `ask` / 冲突自行消解的条目
+    自动出队（只删队列行、不动文件），并说明原因。
+- **同步引擎不再管理回收站子树**：`@Recycle`、`.Trash`、`.Trash-<uid>` 从对账、baseline、
+  改名配对、事件处理、待裁决队列、上传队列里全部排除（判定收进
+  `qxync-core::trash`，与 FUSE 既有的 `deny_trash` 同一套段级语义）。真机取证：
+  baseline 1991 条里 **1425 条在 `/home/@Recycle` 下**、13 条在 `.Trash-1000` 下
+  （FDO trashinfo 还曾被反向同步到 NAS）——回收站被 QTS 清理时会产生成批「幽灵删除」。
+
 ### 修复
 
 - **GUI 提示「有删除被熔断挡住」，却没地方处理**（用户反馈）。这是一条**只有出口提示、
@@ -25,6 +65,122 @@
   5. 三个入口的放行动作收敛到同一个 `doForceDeletes()`：二次确认，且**确认框里摆出
      daemon 给的原始原因**（「一次对账要删除 812 项，超过上限 50」比「确认放行？」
      有信息量得多），并提示「如果是误清空就别放行」。删除不可逆，这一步不能省。
+
+#### GUI
+
+- **冲突对比面板恒显「本地多 +0 / -0 / 两边内容逐行相同」**（危险假象）：`DiffOutcome`
+  是 serde newtype 变体，wire 上字段与 `status` **平级**，前端却多读了一层 `o.diff`，
+  而兜底 `{}` 不报错 → 没比过和比出零差异长得一模一样。改为读平级 + 校验每行形状，
+  形状不对显示错误说明（**绝不落成「逐行相同」**）。
+- **diff 语义方向反了**（GUI 图例 / CLI 输出）：真实 `text_diff` 里 `-` = 只有本地有
+  （`removed`）、`+` = 只有 NAS 有（`added`），UI 与 CLI 都按反方向标注。方向看反会
+  直接导致选错「保留哪边」且不可撤销，已把 core 注释、契约夹具、GUI 图例、CLI 输出
+  四处统一（并用生产函数写测试钉死）。
+- **冲突卡片「发现于」永远显示当前时刻**：`clock()` 把数字时间戳当成非对象丢弃、
+  退化成 `new Date()`。同类问题还影响「上次触发 / LAN 事件时间」。
+- **动态按钮的「忙 / 禁用」完全没生效**：`withBusy` 用 `document.getElementById(btn.id)`
+  找按钮，而卡片按钮是动态建的无 id → 连点会重复发裁决/忽略/对比请求。改为同时支持
+  元素引用；diff 展开还加了飞行中禁用与去重，避免同一张卡挂出两个对比面板。
+- **诊断页把累计值当「当前」**：`deletes_blocked` 是累计计数（真机 69 万），
+  标签改为「删除被挡（累计）」且不再标红；「当前是否熔断」只看 `delete_block_reason`。
+- **连接页保存会静默抹掉选择性同步 / LAN 对等配置**：`link_save` 用 `LinkInfo::link()`
+  直接落盘，前端只提交 host/port/https/insecure/user/ipv4；`exclude` / `filter_temp` /
+  `peer_listen` / `peer_name` 被默认值覆盖。改走 `link_with_existing()`（`login_flow`
+  本来就这么做）。
+- **`login_flow` 重启路径忽略 `already`**：另一个进程抢先拉起 daemon 时
+  （`{started:false, already:true}`）被判成「新 daemon 没能起来」并**跳过登录**。
+- **`LinkInfo` 缺 `insecure` 字段**：GUI 感知不到「跳过 TLS 校验」被改过，
+  重存连接后 daemon 仍用旧配置。补字段并纳入 `same_link` 比较。
+
+#### 同步引擎 / daemon
+
+- **同一批 526 项删除被熔断挡住，每 30s 刷一条 WARN + 一条 journal，连续 13 小时**
+  （真机 journal 3046 条里 3023 条是同一句话，1 万条上限几天就被冲掉）：改为按
+  「数量 + 原因」签名去重，签名不变降为 debug；`ask` 策略的冲突也只在**首次入队**时
+  计数/记日志（以前每轮都写「生成 N 个冲突副本」，实际一个副本都没有）；「引擎活着」
+  的 scan 条目 600s 限频。
+- **「最近错误 / 熔断告警」只写不清，问题恢复后界面永远红着**：真机上 08:30 就恢复
+  的 `status=3` 错误下午还显示在首页。统一到 `absorb_round()`：**完整跑完**的轮次
+  零错误才清 `last_error`，`deletes_blocked==0` 才清熔断告警；提前返回的轮次
+  （会话失效 / 服务端未就绪）只更新当前错误、不清历史告警。脱水路径同款修复。
+- **会话过期后要等 120s 保活才自愈**：`poll_once` 把 `qbox_get_max_log` 失败塞进
+  `errors` 后仍返回 `Ok`，轮询循环的 `is_auth` 重登分支永远不触发。新增
+  `SyncReport::auth_failed`（`status=3` 只在 max_log 端点识别，附真机证据）→
+  轮询循环立即重登一次。
+- **待裁决队列在「没有挂载视图」时被整队静默删光**（真机风险）：daemon 刚启动 /
+  用户卸载 / 恢复失败时 `views` 为空，旧巡检验把每行都当成「任务已删 + 远端已不存在」
+  → 用户裁决意图直接丢失。新增 `DecisionFacts::observed` 禁止用占位签名判定，并用
+  磁盘任务配置区分「任务被删」与「只是没挂载」；配置读不全时保守保留。
+  ★ 复核又补上一半：`observed` 只保证**远端** stat 到了；daemon 重启后本地节点表还是空
+  的（`local_sig` 返回占位 `MISSING`），「已裁决待执行」的行会被 rule 4 误判「冲突已
+  自行消解」清掉。新增 `DecisionFacts::local_observed`（本地节点真的存在才为真），
+  rule 4 只在这两个观察都成立时才敢判「消解」。
+- **对账列举失败被当成「远端已删」→ 可能真删本地节点/缓存**（数据安全）：
+  网络超时/权限错误时 `remote_map` 不完整，旧逻辑据此判 `DeleteLocal`。现在本轮只要有
+  非 404 列举失败就**暂缓该视图的删除判定**并说明原因，下一轮列全再删。
+  ★ 同类漏网也补上：目录数超过 `max_dirs_per_poll`（默认 200）时只扫前 200 个，
+  第 201 个之后的 baseline 条目同样会被判「远端已删」——**没有报错、没有失败计数，最
+  容易漏判**，现在「目录被截断」与「列举失败」一样算远端视图不完整、同样暂缓删除判定。
+- **baseline 的删除与改名永远落不了盘**（pre-existing，回收站清理「下一轮又回来」的
+  根因）：`persist()` 只做「取较新签名」的增量合并，**删除方向被内存里旧快照复活**。
+  改为「本轮无并发 hook 写 → 整份替换（删除/改名真正落盘）；有则逐条合并」。
+  该 bug 同样影响规则排除清理、已执行删除的 baseline 与改名迁移。
+  「整份替换」要求同一时刻只有一轮在跑（HEAD 的纯合并写对并发天然免疫），所以
+  `run_sync_once` 加了 `State` 级异步 Mutex 串行化：后台轮询与 GUI「立即同步」/
+  `qxync sync --once` 并发时，后者排队等本轮结束，不会用旧快照覆盖已落盘结果。
+- **文本对比可能 OOM / 卡死**：LCS 的 DP 表按行数平方分配，512 KiB 的短行文本最坏
+  26 万×26 万×4B ≈ 275 GB。加有界回退（差异区各截前 2000 行做精确 LCS，最坏 16 MiB，
+  `truncated=true` 且绝不误报「逐行相同」）。
+- **diff 边界**：空远端文件不再发可疑的 `bytes=0--1`；超限时报告**真实大小**
+  （优先取 FUSE 节点元数据，而不是被截断的读取长度）。
+
+#### 协议层 / CLI
+
+- **`download_range` 的「200 + JSON 错误体」防护是死代码**：`body.windows(9)` 去匹配
+  8 字节的 `"status"`，条件恒为 false，这道保险从上线起从未生效 → 服务端错误体被当
+  文件内容静默返回。改为精确识别「服务端错误信封」（不误伤用户同步的 JSON 文件）。
+- **`download_range` 区间边界**：`start > end` 会让服务端忽略 Range 回整个文件
+  （FUSE 会把整文件写进区间缓存）；服务端忽略 Range 时也没有检测。两处都显式报错。
+- **上传流把读错误吞成 EOF**：`reader.read(...).await.ok()?` 让本地 IO 错误变成
+  「流正常结束」，按其声明长度发短 body —— 轻则错误根因丢失，重则服务端落盘截断文件。
+- **会话保活把「服务端未就绪」判成「会话失效」**：`status=8`（Qsync Central is
+  initializing）本该等待，旧逻辑每轮无意义重登并打出错误诊断「sid 已失效」。
+- **LAN 对端两个真 bug**：`local_of` 用 `trim_start_matches` 会**反复**剥前缀
+  （`/home/home/x` → `x`）→ 对端读到的可能是**另一个文件**；`path_allowed` 在 roots
+  为空时 fail-open → 任意路径可被对端读取。改为单次 `strip_prefix` 与 fail-closed。
+- **`read_cached` 会拿「半水合文件的 0 字节」当本地内容**做 diff（假差异，可能让用户
+  选错裁决）：改为先校验所需区间都已就绪（内存位图 / 纯读 `.qxstate` 且核对
+  size/mtime/file_id），未就绪返回明确原因而不是假数据。
+- **CLI `conflicts` 参数静默优先**：`--clear`/`--diff`/`--forget`/`--resolve` 同时给时
+  按代码顺序静默取一个（用户以为都执行了）。改为 clap 互斥报错（exit 2），
+  `--as` 必须配 `--resolve`。
+- **CLI 累计计数器标注**：「删除被挡 N」、上传/删除队列的完成/失败/重试、水合统计等
+  补「（累计，自 daemon 启动）」；「最近错误」双重前缀修复。
+
+### 变更
+
+- 冲突策略为 `ask` 时，`conflicts` 计数现在是「**待裁决的文件数**」（首次入队才 +1），
+  不再按轮次累计；`deletes_blocked` 仍是累计值（已标注）。
+- 回收站排除是**硬约束**：即使用户写了 `!@Recycle` 之类反向规则也不会把它们放回同步
+  （与 FUSE `deny_trash` 的硬约束一致）。
+
+### 已知问题（本轮未修）
+
+- diff 依赖 FUSE 节点：daemon 重启后、用户还没在挂载点里访问过该路径时点「对比」会得到
+  「本进程还没物化这个文件」的说明（需要 FUSE 侧新增按路径物化节点的 API）。
+- 差异区超过 2000 行/侧时走有界回退：界面脚注会明确说「结果已截断」，但 `added/removed`
+  统计只覆盖**已对比的前缀**（差异极大时数字偏小）。
+- FUSE 挂载点里**仍能看到**回收站目录（引擎已不管理；是否隐藏属产品决定）。
+- `.Trash-<uid>` 只认本机 uid；若 NAS 侧 uid 不同则不会排除（真机当前一致）。
+- 持续重复的同步 errors 仍每轮 WARN 一次（长时间断网时日志仍会增长；blocked 已去重）。
+- GUI：删除队列（`StatusData.deletes`）尚未展示；文件页三态/LAN 面板查询失败仍静默
+  降级；无单实例保护；`pick_with` 无超时；`link_read` / `credential_present` 吞错；
+  `ui_spec` 的自检存在三处「声称比实际多」（screens 统计把定义算进去、states 只验
+  数量、i18n 只扫单引号 `T('`）。
+- 协议层：`download_to_file` 尚未复用「200 + JSON 错误体」防护；HTTP 401/403 归为
+  Transport 不触发重登（真机鉴权失败走 200+status 4/5，风险低）；上传无取消接口；
+  LAN 配对限流是全局的、对端可登记任意 addr（低危）。
+- `status=3` 目前只在 `qbox_get_max_log` 端点识别为会话失效（其它端点证据不足）。
 
 ## [0.5.1] - 2026-10-04
 
@@ -709,6 +865,7 @@ NAS 设置名 `QSYNC_FOLDERPAIR_USE_SPACE_SAVING`、Windows 客户端注册表�
 - 验收结论从 README 抽出为 [`docs/验收记录.md`](docs/验收记录.md)。
 - 采用 **MIT OR Apache-2.0** 双许可（`LICENSE-MIT` / `LICENSE-APACHE`）。
 
+[0.6.0]: https://github.com/mlzxgzy/qxync/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/mlzxgzy/qxync/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/mlzxgzy/qxync/compare/v0.4.3...v0.5.0
 [0.4.3]: https://github.com/mlzxgzy/qxync/compare/v0.4.2...v0.4.3

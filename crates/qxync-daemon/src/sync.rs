@@ -50,15 +50,38 @@ pub struct MountView {
 }
 
 impl MountView {
-    /// ★ M7：该路径是否被规则隐藏（对账/事件都要跳过）。
+    /// 该路径是否**不该被同步引擎管理**（对账/事件都要跳过）。
+    ///
+    /// 两层判据，都在这里收口（调用点只认 `is_some()`）：
+    ///
+    /// 1. ★ M11+：**回收站子树**（`.Trash` / `.Trash-<uid>` / `@Recycle`）——
+    ///    段级精确匹配，与 FUSE 的 `deny_trash` 同一套语义（判定在
+    ///    [`qxync_core::trash`]，这里有同样的单测）。不管的后果是真机上
+    ///    baseline 71% 被 `@Recycle` 占满、QTS 清回收站时制造批量幽灵删除、
+    ///    FDO 的 `.trashinfo` 被反向同步上 NAS。
+    /// 2. ★ M7：用户规则（选择性同步排除 / 临时文件）。
     pub fn hidden(&self, remote: &str, is_dir: bool) -> Option<HideReason> {
-        // 卷的根目录本身是挂载视图，不参与规则判定（与 FUSE 层一致）。
+        // 卷的根目录本身是挂载视图，不参与判定（与 FUSE 层一致）。
         if remote == self.remote_root {
             return None;
+        }
+        // ★ 回收站：硬约束，优先于用户规则（用户写 `!@Recycle` 也不能把它放回来）。
+        if qxync_core::trash::is_trash_path(remote, local_uid()) {
+            return Some(HideReason::Trash);
         }
         let roots = self.view.remote_roots();
         self.rules.hides_in_roots(&roots, remote, is_dir)
     }
+}
+
+/// 本进程的 uid（与 FUSE 侧 `deny_trash` 的 `trash_uid` 同口径）。
+///
+/// 回收站目录名里带的是「创建者 uid」（`.Trash-1000`）。FUSE 层用的是
+/// `libc::getuid()`；同步引擎必须用同一个数，否则会出现
+/// 「FUSE 拒绝操作、引擎却还在同步」的语义分叉。这里**不把它做成配置项**：
+/// 它不是策略，只是同一个进程的既定事实。
+fn local_uid() -> u32 {
+    unsafe { libc::getuid() }
 }
 
 /// 引擎参数。
@@ -100,8 +123,27 @@ pub struct SyncReport {
     pub content_updating: u64,
     pub uploaded: u64,
     pub conflicts: u64,
+    /// ★ 待裁决队列巡检清掉的失效条目数（远端已删 / 挂载没了 / 策略已不是 ask）。
+    pub decisions_swept: u64,
     pub deleted: u64,
     pub deletes_blocked: u64,
+    /// 本轮触发删除熔断的**人话原因**（`deletes_blocked > 0` 时才有值）。
+    ///
+    /// 与 `deletes_blocked` 一起构成「熔断签名」：数量或原因变了才算「新告警」，
+    /// 否则重复轮次只降级成 debug —— 真机实测每 30s 一轮、连续 13 小时刷屏。
+    pub delete_block_reason: Option<String>,
+    /// ★ 本轮熔断签名是否与上一轮**不同**（新出现 / 数量或原因变了 / 已解除）。
+    ///
+    /// 只有它为真时才写 WARN 与 journal（避免把日志和历史记录冲掉）；
+    /// 解除时也置真，用来记一条「熔断已解除」。
+    pub delete_block_changed: bool,
+    /// ★ 本轮是否识别到**会话失效**（sid 过期）。
+    ///
+    /// `poll_once` 把错误塞进 `errors` 后仍返回 `Ok`，所以轮询循环的
+    /// `Err(e) if e.is_auth()` 分支永远不触发 —— 真机实测过：sid 过期后每 30s
+    /// 报一次 `qbox_get_max_log 失败: status=3`，直到 120s 会话保活重登才恢复。
+    /// 有了这个标志，轮询循环看到 `Ok(report)` 也能**立即重登一次**。
+    pub auth_failed: bool,
     /// ★ M15/T9：按 `file_id` 认出并迁移成功的远端改名次数。
     pub renamed: u64,
     pub baseline_entries: usize,
@@ -140,6 +182,9 @@ pub struct SyncStats {
     pub last_poll_unix: AtomicU64,
     pub last_error: Mutex<Option<String>>,
     pub delete_block_reason: Mutex<Option<String>>,
+    /// 上一轮的**熔断签名**（`数量|原因`）。只有签名变化才重新 WARN / 记 journal，
+    /// 否则真机每 30s 一条的重复告警会把 1 万条的 journal 上限几天内冲掉。
+    pub delete_block_sig: Mutex<Option<String>>,
     pub last_note: Mutex<Option<String>>,
     pub devices: Mutex<BTreeMap<String, u64>>,
 }
@@ -200,6 +245,12 @@ pub struct SyncState {
     pub store: Store,
     pub cursors: Cursors,
     pub baseline: Baseline,
+    /// 本轮轮询开始后，上传 success hook 有没有改过 baseline。
+    ///
+    /// 用途见 [`persist`]：没有并发写入时 baseline 可以**整份替换**（删除/改名迁移
+    /// 才能真正落盘）；有并发写入时退回逐条合并（宁可删除晚一轮落盘，也不能把
+    /// hook 刚推进的新签名抹掉）。
+    pub hook_touched: bool,
 }
 
 impl SyncState {
@@ -229,6 +280,7 @@ impl SyncState {
             store,
             cursors,
             baseline,
+            hook_touched: false,
         })
     }
 
@@ -262,6 +314,9 @@ impl SyncState {
             return Ok(());
         }
         self.baseline.put(path, sig);
+        // ★ 告诉正在跑的那一轮「baseline 有并发写入」：它会退回落盘合并，
+        //   不把我们刚写的签名覆盖回旧快照（见 [`persist`]）。
+        self.hook_touched = true;
         self.save_all()
     }
 }
@@ -275,11 +330,17 @@ pub async fn poll_once(
     store: &Mutex<SyncState>,
     cfg: &SyncConfig,
     stats: &SyncStats,
+    link_id: &str,
     user: &str,
 ) -> SyncReport {
+    // ★ 克隆快照的同时复位「hook 改过 baseline」标记（同一把锁，没有竞态窗口）：
+    //   本轮期间 hook 若再写，标记会重新置起，persist 就退回逐条合并。
+    //   本轮之前残留的标记直接忽略 —— hook 那些写入已经包含在这份快照里了。
     let (mut cursors, mut baseline) = {
-        let g = store.lock().unwrap();
-        (g.cursors, g.baseline.clone())
+        let mut g = store.lock().unwrap();
+        let snapshot = (g.cursors, g.baseline.clone());
+        g.hook_touched = false;
+        snapshot
     };
     let mut report = SyncReport {
         baseline_entries: baseline.len(),
@@ -298,8 +359,14 @@ pub async fn poll_once(
                 report.note(format!("服务端未就绪，稍后重试：{e}"));
                 return report;
             }
+            // ★ 会话失效：以前只记一条 error 就 Ok 返回，轮询循环收不到 Err，
+            //   于是永远不重登 —— 真机实测每 30s 报一次，直到 120s 保活才恢复。
+            if max_log_failure_is_session_loss(&e) {
+                report.auth_failed = true;
+            }
             report.error(format!("qbox_get_max_log 失败: {e}"));
-            *stats.last_error.lock().unwrap() = report.errors.last().cloned();
+            // 本轮没跑到对账 → completed=false：只更新「当前错误」，不清任何陈旧告警。
+            absorb_round(stats, &mut report, false);
             return report;
         }
     };
@@ -400,6 +467,9 @@ pub async fn poll_once(
                 break;
             }
             Err(e) => {
+                if e.is_auth() {
+                    report.auth_failed = true;
+                }
                 report.error(format!("qbox_get_sync_log lower={lower} 失败: {e}"));
                 break;
             }
@@ -421,7 +491,12 @@ pub async fn poll_once(
                 cursors.config = max.max_log as i64;
             }
             Err(e) if is_log_missing(&e) => cursors.config = max.max_log as i64,
-            Err(e) => report.error(format!("qbox_get_device_config_list 失败: {e}")),
+            Err(e) => {
+                if e.is_auth() {
+                    report.auth_failed = true;
+                }
+                report.error(format!("qbox_get_device_config_list 失败: {e}"));
+            }
         }
     }
     if max.global_notify > cursors.global_notify.max(0) as u64 {
@@ -438,7 +513,12 @@ pub async fn poll_once(
                 cursors.global_notify = max.global_notify as i64;
             }
             Err(e) if is_log_missing(&e) => cursors.global_notify = max.global_notify as i64,
-            Err(e) => report.error(format!("qbox_query_notify 失败: {e}")),
+            Err(e) => {
+                if e.is_auth() {
+                    report.auth_failed = true;
+                }
+                report.error(format!("qbox_query_notify 失败: {e}"));
+            }
         }
     }
 
@@ -446,6 +526,9 @@ pub async fn poll_once(
     for view in views {
         reconcile_view(client, view, cfg, &mut baseline, &mut report, store).await;
     }
+
+    // ---- ④' 冲突待裁决队列巡检（把已经不该留着的行清掉）
+    sweep_decision_queue(client, views, &baseline, store, &mut report, link_id).await;
 
     report.baseline_entries = baseline.len();
     persist(store, &cursors, &baseline);
@@ -462,21 +545,10 @@ pub async fn poll_once(
     stats
         .deletes_blocked
         .fetch_add(report.deletes_blocked, Ordering::Relaxed);
-    if let Some(e) = report.errors.last() {
-        *stats.last_error.lock().unwrap() = Some(e.clone());
-    }
-    if !report.notes.is_empty() {
-        *stats.last_note.lock().unwrap() = Some(report.notes.join("；"));
-    }
-    {
-        let mut g = stats.delete_block_reason.lock().unwrap();
-        if report.deletes_blocked > 0 {
-            *g = Some(format!(
-                "本轮有 {} 项删除被保护挡住",
-                report.deletes_blocked
-            ));
-        }
-    }
+    // ★ 唯一一处把「一轮的结论」并入长期状态：last_error / last_note / 熔断告警。
+    //   这里走到 = 本轮**完整跑完**（拉事件 + 对账 + 巡检），所以陈旧值可以清；
+    //   提前 return 的轮次不会经过这里（除 max_log 失败那一支自己调 completed=false）。
+    absorb_round(stats, &mut report, true);
     tracing::info!(
         "同步轮询: max_log={} events={} refreshed={} uploaded={} conflicts={} deleted={} blocked={} baseline={} dirs={}",
         report.max_log,
@@ -492,32 +564,155 @@ pub async fn poll_once(
     report
 }
 
+/// ★ 把一轮的结论并入长期状态（`status` / GUI 告警 / journal 都读这里）。
+///
+/// ## 为什么必须集中在一处（真机事故）
+///
+/// 这些字段以前都是「只写不清」：`last_error` 只在有错时写、`delete_block_reason`
+/// 只在熔断时写、`last_note` 只在有 note 时写。于是**问题修好之后界面永远显示红字**：
+/// 用户机器上 `qxync status` 连续 13 小时显示「删除被挡 692742」，
+/// 而实际每轮被挡的一直是同一批 526 项；错误也早就在 08:30 恢复了，
+/// 「最近错误」却常驻首页/诊断。
+///
+/// ## `completed` 的语义（决定敢不敢清）
+///
+/// * `true` = 本轮真的跑完了全部对账/巡检 → 本轮没发现的问题就是**已经不在了**，
+///   陈旧值可以清（`deletes_blocked==0` 时清熔断告警；零错误时清 last_error）。
+/// * `false` = 这轮在 max_log 阶段就提前返回（会话失效 / 服务端未就绪），
+///   **什么检查都没做** → 只更新「当前错误」，不清任何陈旧告警。
+///   没检查过 ≠ 检查通过。
+///
+/// ## 熔断告警去重（真机事故 2）
+///
+/// 同一个熔断（数量 + 原因都不变）每 30s 重复一轮，以前每轮一条 WARN + 一条 journal
+/// → 实测 journal 3046 条里 3023 条是同一句「526 项删除被熔断挡住」，1 万条上限几天
+/// 就被冲掉、真实历史反而没了。现在只有**签名变化**才置
+/// [`SyncReport::delete_block_changed`]（WARN / journal 据此只记一次），重复轮次降为 debug。
+pub fn absorb_round(stats: &SyncStats, report: &mut SyncReport, completed: bool) {
+    // 错误：本轮有错就更新（提前返回的轮次也一样 —— 用户要立刻看到最新的错）。
+    if let Some(e) = report.errors.last() {
+        *stats.last_error.lock().unwrap() = Some(e.clone());
+    } else if completed {
+        // 完整跑完且零错误 → 之前那条错误已经过时了。
+        *stats.last_error.lock().unwrap() = None;
+    }
+
+    if !completed {
+        return;
+    }
+
+    // note：完整轮次**整体替换**（本轮没有 note 就清空），否则上一轮的提示会常驻。
+    *stats.last_note.lock().unwrap() = (!report.notes.is_empty()).then(|| report.notes.join("；"));
+
+    // 删除熔断告警：按签名（数量+原因）去重；本轮检查通过就清掉旧告警。
+    let mut slot = stats.delete_block_reason.lock().unwrap();
+    if report.deletes_blocked > 0 {
+        let reason = report.delete_block_reason.clone().unwrap_or_default();
+        let sig = format!("{}|{}", report.deletes_blocked, reason);
+        let changed = {
+            let mut last = stats.delete_block_sig.lock().unwrap();
+            if last.as_deref() == Some(sig.as_str()) {
+                false
+            } else {
+                *last = Some(sig);
+                true
+            }
+        };
+        report.delete_block_changed = changed;
+        *slot = Some(format!(
+            "本轮有 {} 项删除被保护挡住",
+            report.deletes_blocked
+        ));
+        if changed {
+            tracing::warn!("删除保护熔断（{} 项）：{}", report.deletes_blocked, reason);
+        } else {
+            // 同一批删除还在被挡：降为 debug，不再每 30s 刷一条 WARN / journal。
+            tracing::debug!(
+                "删除保护熔断持续中（{} 项）：{}",
+                report.deletes_blocked,
+                reason
+            );
+        }
+    } else {
+        let had_reason = slot.take().is_some();
+        let had_sig = stats.delete_block_sig.lock().unwrap().take().is_some();
+        report.delete_block_changed = had_reason || had_sig;
+        if report.delete_block_changed {
+            tracing::info!("删除保护熔断已解除：本轮删除检查通过");
+        }
+    }
+}
+
+/// ★ 判「`qbox_get_max_log` 这次失败 = 会话没了」。
+///
+/// `Error::is_auth()` 只认 `Auth` 与 status 4/5；但**真机证据**（`docs/M10-会话热更新.md`
+/// §1 现场日志）显示 sid 过期后 `qbox_get_max_log` 会回 `status=3`：
+///
+/// ```text
+/// 变更轮询每一轮都报错（`qbox_get_max_log 失败: status=3`），也不会重登。
+/// ```
+///
+/// status=3 没有码表、也**只在这一个端点上**观测到，所以这里做两件保守的事：
+/// 1. 判据只给 `qbox_get_max_log` 用（其他端点不推广 status=3）；
+/// 2. 误判的代价只是「多登一次」，漏判的代价是真机实测过的「每 30s 报错，
+///    直到 120s 保活才恢复」。
+///
+/// ⚠️ 关于「多登一次」到底多贵：`login_internal` 自己**不做去重**；唯一的 3s
+/// 去重在 `spawn_session_broker` 里（`SESSION_REFRESH_DEDUP`），而那把去重**只服务
+/// FUSE 挂载点的重登请求**。轮询循环看到 `auth_failed` 后是直接调 `login_internal`
+/// （见 `spawn_poller`）—— 频率上限是「每轮一次」，轮询默认 30s 一轮，量级可接受；
+/// 但如果凭据本身失效，就会每轮一次失败登录（长期可能撞上 NAS 的暴力破解封锁）。
+/// 所以这里**不要**再把「有 3s 去重」当成放宽判据的理由。
+fn max_log_failure_is_session_loss(e: &CoreError) -> bool {
+    if e.is_auth() {
+        return true;
+    }
+    matches!(
+        e,
+        CoreError::Status { status, context, .. }
+            if status.0 == 3 && context == "qbox_get_max_log"
+    )
+}
+
 /// 把内存状态写回 store（**游标 + baseline 同一个事务**；失败只记录不 panic）。
 fn persist(store: &Mutex<SyncState>, cursors: &Cursors, baseline: &Baseline) {
     let mut g = store.lock().unwrap();
     g.cursors = *cursors;
-    // ★ baseline 要**合并**，不能整份盖回去。
-    //
-    //   一轮轮询是「先克隆一份快照 → 跑很久的网络 IO → 最后落盘」。在这期间，
-    //   上传成功的 success hook 也会改 baseline（`note_uploaded`）—— 那是比轮询
-    //   **更新**的事实。若整份盖回这份开轮询时的旧快照，刚推上去的签名就被抹掉，
-    //   下一轮又变成「本地干净 / 远端变了 / 本地 ≠ baseline」→ 又判成冲突，
-    //   正好把本次修复撤销掉。
-    //
-    //   只接受**比内存里新**的条目（mtime 更大者为新）。mtime 相等时**保留内存里
-    //   那份**：epoch 秒粒度下同秒连改两次很常见，凭什么认定快照更权威？
-    //
-    //   删除方向不用管：`remove_baseline_tree` 只在**轮询自己那份**快照上调用，
-    //   hook 从不删条目。也就是说内存里不会出现「快照里没有」的条目，无需回补。
+    let hook_touched = g.hook_touched;
+    merge_round_baseline(&mut g, baseline, hook_touched);
+    if let Err(e) = g.save_all() {
+        tracing::warn!("状态落盘失败（游标 + baseline 同一事务）: {e}");
+    }
+}
+
+/// 把一轮结束时的 baseline 快照并入状态库。
+///
+/// ## 两种模式（`hook_touched` 决定）
+///
+/// * **本轮没有 hook 并发写入** → **整份替换**。这是默认路径，也是唯一能让
+///   **删除/改名迁移落盘**的路径：旧实现只做增量合并，`remove_baseline_tree`
+///   从快照里删掉的条目会在下一次克隆时从内存 `g.baseline` 复活，
+///   于是「清理回收站 baseline」「删除已确认的基线条目」永远清不掉。
+/// * **本轮有 hook 并发写入**（上传成功的 `note_uploaded` 写入了比快照更新的签名）
+///   → 逐条合并，只接受 mtime 更新的条目：宁可删除晚一轮落盘，也不能把 hook
+///   刚推进的签名覆盖回旧快照（那会让连续两次保存凭空变成冲突副本）。
+///
+/// mtime 相等时保留内存里那份：epoch 秒粒度下同秒连改两次很常见，快照没有
+/// 更权威的理由。合并完成后清掉标记，让下一次 persist 回到整份替换。
+fn merge_round_baseline(g: &mut SyncState, baseline: &Baseline, hook_touched: bool) {
+    if !hook_touched {
+        g.baseline = baseline.clone();
+        g.hook_touched = false;
+        return;
+    }
     for (p, sig) in baseline.entries.iter() {
         let cur = g.baseline.get(p);
         if sig.mtime > cur.mtime {
             g.baseline.put(p.clone(), *sig);
         }
     }
-    if let Err(e) = g.save_all() {
-        tracing::warn!("状态落盘失败（游标 + baseline 同一事务）: {e}");
-    }
+    // 合并完就把标记清掉：本轮更早的 persist 已经消费过它，后续 persist 可以整份替换。
+    g.hook_touched = false;
 }
 
 // ---------------------------------------------------------------- 事件
@@ -645,6 +840,9 @@ async fn reconcile_view(
     // 列每个目录 → 远端子项签名表
     let mut remote_map: BTreeMap<String, Sig> = BTreeMap::new();
     let mut scanned = 0usize;
+    // ★ 非 404 的列举失败数（网络错误 / 权限 / 服务端忙…）。
+    //   见下面「远端视图不完整时暂缓删除判定」。
+    let mut list_failures = 0usize;
     for dir in dirs.iter().take(cfg.max_dirs_per_poll) {
         match client.list(dir).await {
             Ok(entries) => {
@@ -666,7 +864,15 @@ async fn reconcile_view(
                 tracing::debug!("对账：目录已不存在 {dir}");
                 view.view.drop_listing(dir);
             }
-            Err(e) => report.error(format!("对账列举 {dir} 失败: {e}")),
+            Err(e) => {
+                // ★ 这不是「远端不存在」，而是**我们没看到**。记错误，并由调用方
+                //   暂缓本视图的删除判定（下面 `defer_deletes`）。
+                list_failures += 1;
+                if e.is_auth() {
+                    report.auth_failed = true;
+                }
+                report.error(format!("对账列举 {dir} 失败: {e}"));
+            }
         }
     }
     report.dirs_scanned += scanned;
@@ -679,19 +885,47 @@ async fn reconcile_view(
         ));
     }
 
-    // ★ M7：规则改了之后，被排除路径的 baseline 条目直接清掉 —— 不留幽灵状态。
-    //   注意**只清状态，不动本地内容**（排除 ≠ 删除）。
-    let stale: Vec<String> = baseline
+    // ★ M7 + M11+：被排除路径（用户规则 / 回收站）的 baseline 条目直接清掉 ——
+    //   不留幽灵状态。注意**只清状态，不动本地内容**（排除 ≠ 删除）。
+    //   真机取证：某用户 baseline 1991 条里 1425 条在 @Recycle 下、13 条在 .Trash-1000 下；
+    //   这些条目会被 QTS 清理回收站时变成批量「远端删除」候选（本轮 526 项被挡删除里
+    //   就有 13 条 .Trash-1000 —— 回收站不该进 baseline 的直接证据）。
+    let stale: Vec<(String, HideReason)> = baseline
         .entries
         .keys()
-        .filter(|p| under_root(p) && *p != &root && view.hidden(p, false).is_some())
-        .cloned()
+        .filter(|p| under_root(p) && *p != &root)
+        .filter_map(|p| view.hidden(p, false).map(|r| (p.clone(), r)))
         .collect();
     if !stale.is_empty() {
-        for p in &stale {
+        let trash = stale
+            .iter()
+            .filter(|(_, r)| *r == HideReason::Trash)
+            .count();
+        for (p, _) in &stale {
             remove_baseline_tree(baseline, p);
         }
-        report.note(format!("规则排除：清理了 {} 条 baseline 记录", stale.len()));
+        // ★ 队列里若已积累回收站路径的**上传**作业，一并撤掉（只撤队列，不碰文件）。
+        //   UploadQueue 没有「列出全部待传路径」的公开 API，但这里恰好知道具体路径
+        //   （baseline 里被排除的回收站条目）—— 逐个 cancel 是 daemon 侧能做到的全部；
+        //   更早版本入队、但 baseline 里没有记录的作业仍可能残留一次（见报告「未修」）。
+        if trash > 0 {
+            if let Some(q) = &view.upload {
+                for (p, reason) in &stale {
+                    if *reason == HideReason::Trash && q.cancel(p) {
+                        tracing::debug!("撤销回收站路径的待上传作业: {p}");
+                    }
+                }
+            }
+        }
+        if trash > 0 {
+            report.note(format!(
+                "回收站排除：清理了 {trash} 条 baseline 记录（回收站不参与同步；只清状态，不动文件）"
+            ));
+        }
+        let by_rules = stale.len() - trash;
+        if by_rules > 0 {
+            report.note(format!("规则排除：清理了 {by_rules} 条 baseline 记录"));
+        }
     }
 
     tracing::debug!(
@@ -738,6 +972,41 @@ async fn reconcile_view(
         ));
     }
 
+    // ★ 数据安全阀：远端视图**不完整**时，本轮不做删除判定。
+    //
+    //   两种来源都算「不完整」，判据在 [`delete_verdict_is_reliable`]：
+    //   1. 某个目录**列举失败**（非 404 的网络/权限/服务端错误）—— 其中所有条目
+    //      都不在 remote_map 里；
+    //   2. **目录数超过单轮扫描上限**（排序在后的目录这轮根本没扫）—— 同样地，
+    //      那些目录里的条目全都不在 remote_map 里。这一种**没有错误、没有失败计数**，
+    //      比 1 更隐蔽：漏判就会把「没看到」当成「远端已删」，真删本地节点（缓存一起没）
+    //      并清掉 baseline。真机 dirs=38 没触发，但目录多的任务会中。
+    //
+    //   最坏情况：某个目录一次超时/没扫到 → 其中所有文件都不在 remote_map 里 →
+    //   `decide` 对「本地干净」的条目判 `DeleteLocal`。所以这一轮**暂缓删除判定**
+    //   （其它决策照常），下一轮列全了再说。
+    let dirs_truncated = dirs.len() > cfg.max_dirs_per_poll;
+    let defer_deletes =
+        !delete_verdict_is_reliable(list_failures, dirs.len(), cfg.max_dirs_per_poll);
+    if defer_deletes {
+        let mut why: Vec<String> = Vec::new();
+        if list_failures > 0 {
+            why.push(format!("{list_failures} 个目录列举失败"));
+        }
+        if dirs_truncated {
+            why.push(format!(
+                "目录数 {} 超过单轮上限 {}（后 {} 个本轮没扫）",
+                dirs.len(),
+                cfg.max_dirs_per_poll,
+                dirs.len() - cfg.max_dirs_per_poll
+            ));
+        }
+        report.note(format!(
+            "对账：{} → 本轮跳过删除判定（远端视图不完整，不敢按缺失删本地）",
+            why.join("；")
+        ));
+    }
+
     let mut deletes: Vec<String> = Vec::new();
     for path in &candidates {
         if renamed_set.contains(path) {
@@ -754,7 +1023,11 @@ async fn reconcile_view(
             );
         }
         match d {
-            Decision::DeleteLocal => deletes.push(path.clone()),
+            Decision::DeleteLocal => {
+                if !defer_deletes {
+                    deletes.push(path.clone());
+                }
+            }
             _ => {
                 apply_decision(client, view, path, d, remote, baseline, report, state_store).await;
             }
@@ -776,8 +1049,14 @@ async fn reconcile_view(
                 report.note(format!("删除保护被 --force-deletes 放行：{reason}"));
             } else {
                 report.deletes_blocked += deletes.len() as u64;
+                // ★ 原因要带出去：`absorb_round` 用它和数量一起构成「熔断签名」，
+                //   同签名只 WARN / 记 journal 一次（真机每 30s 刷屏 13 小时的根因）。
+                report.delete_block_reason.get_or_insert(reason.clone());
                 report.note(format!("删除保护熔断（{} 项）：{reason}", deletes.len()));
-                tracing::warn!("删除保护熔断（{} 项）：{reason}", deletes.len());
+                tracing::debug!(
+                    "删除保护熔断（{} 项）：{reason}（重复轮次不重复 WARN，由 absorb_round 决定）",
+                    deletes.len()
+                );
                 return;
             }
         }
@@ -790,6 +1069,23 @@ async fn reconcile_view(
         }
         report.note(format!("删除 {} 项", deletes.len()));
     }
+}
+
+/// 本轮「按远端缺失删本地」的判定是否可信。
+///
+/// 远端视图**不完整**的两种来源，任何一种都禁止按缺失删本地：
+///
+/// 1. 本视图有**非 404** 的目录列举失败（网络/权限/服务端错误）——
+///    `remote_map` 里缺的项**不代表 NAS 上没有了**，只代表这轮没看到；
+///    「远端确实不存在」走 404/2/6（[`is_not_found`]），**不算**列举失败。
+/// 2. **目录数超过单轮扫描上限**（[`SyncConfig::max_dirs_per_poll`]）——
+///    排序在后的目录这轮**根本没扫**，其中所有条目同样会从 `remote_map` 里缺失。
+///    这一种最危险：没有错误、没有失败计数，漏判就会把「没看到」当成
+///    「远端已删」，真删本地节点/缓存并清 baseline。
+///
+/// 判定不可信时调用方**暂缓删除判定**（其它决策照常），下一轮列全了再说。
+fn delete_verdict_is_reliable(list_failures: usize, dirs_total: usize, max_dirs: usize) -> bool {
+    list_failures == 0 && dirs_total <= max_dirs
 }
 
 /// ★ M15/T9：收集本轮可能的改名对 —— 「远端已删」×「远端新增」，按 `file_id` 配。
@@ -880,6 +1176,16 @@ fn candidate_file_id(
         return None;
     }
     Some(fid)
+}
+
+/// 这条冲突是不是**第一次**入队？
+///
+/// 「每个文件都问我」策略下，用户裁决之前**每一轮都会重新看到同一个冲突**
+/// （local/remote/baseline 一直没变）。只有第一次入队才算「新冲突」：
+/// 计入 `conflicts`、记 note、进 journal。否则 30s 一轮会把计数器和
+/// 「更新中心」刷成几百条同一件事（真机 journal 3023/3046 条就是这么来的）。
+fn conflict_is_new(existing: &Option<qxync_core::store::DecisionRow>) -> bool {
+    existing.is_none()
 }
 
 /// 执行非删除类决策。
@@ -1099,17 +1405,17 @@ async fn resolve_conflict(
         }
         // ---- 每个文件都问我：没有裁决 → 入队等待；已有裁决 → 执行
         CONFLICT_ASK => {
-            let decided = {
+            let existing = {
                 let g = state_store.lock().unwrap();
                 match g.store.decision_by_path(path) {
-                    Ok(Some(row)) => row.resolution,
-                    Ok(None) => None,
+                    Ok(row) => row,
                     Err(e) => {
                         report.error(format!("读冲突待裁决队列失败 {path}: {e}"));
                         return;
                     }
                 }
             };
+            let decided = existing.as_ref().and_then(|r| r.resolution.clone());
             match decided.as_deref() {
                 Some("keep_local") => {
                     upload_local_over_remote(view, path, report, "按用户裁决：保留本地");
@@ -1133,6 +1439,12 @@ async fn resolve_conflict(
                 }
                 _ => {
                     // 入队（同路径只保留一条；每轮都冲突也只记一条）
+                    //
+                    // ★ 只有**新入队**才算一个「冲突」并记 note：同一条冲突在用户裁决前
+                    //   每 30s 都会被重新看到，以前每轮都 `conflicts += 1` + 写 journal
+                    //   「生成 N 个冲突副本」（其实一个副本都没生成）→ 计数器与
+                    //   「更新中心」被同一件事刷屏，而且总数看着像有几百个冲突。
+                    let is_new = conflict_is_new(&existing);
                     let (local_size, local_mtime) = (local.size, local.mtime);
                     let row = qxync_core::store::DecisionRow {
                         id: qxync_core::store::DecisionRow::id_for(path),
@@ -1148,10 +1460,17 @@ async fn resolve_conflict(
                     };
                     match state_store.lock().unwrap().store.decision_upsert(&row) {
                         Ok(()) => {
-                            report.conflicts += 1;
-                            report.note(format!(
-                                "{path}: 冲突等待裁决（策略：每个文件都问我）→ GUI 任务页 / `qxync conflicts`"
-                            ));
+                            if is_new {
+                                report.conflicts += 1;
+                                report.note(format!(
+                                    "{path}: 冲突等待裁决（策略：每个文件都问我）→ GUI 任务页 / `qxync conflicts`"
+                                ));
+                            } else {
+                                // 已入队过：只更新记录的签名（upsert 已做），不重复计数/刷日志。
+                                tracing::debug!(
+                                    "{path}: 冲突仍在等待裁决（已入队过，本轮不重复计数）"
+                                );
+                            }
                         }
                         Err(e) => report.error(format!("{path} 写入待裁决队列失败: {e}")),
                     }
@@ -1174,6 +1493,317 @@ fn finish_decision(state_store: &Mutex<SyncState>, path: &str) {
         Ok(false) => {}
         Err(e) => tracing::warn!("待裁决冲突出队失败 {path}: {e}"),
     }
+}
+
+/// 找出覆盖 `path` 的挂载视图（路径在远端根之下）。
+///
+/// 冲突策略挂在**挂载点**上（`MountEntry.conflict`），不是 `decisions` 表的
+/// `task_id` 字段上（那个字段目前恒为空串），所以有视图时用视图上的策略。
+///
+/// ⚠️ **没有视图 ≠ 任务被删**：daemon 刚启动 / 用户卸载 / 恢复挂载失败时视图都会
+/// 暂时不在。要判断「任务是不是真没了」必须看磁盘上的任务配置
+/// （[`unmounted_row_facts`]），不能拿这个函数的 `None` 当结论。
+fn view_for_path<'a>(views: &'a [MountView], path: &str) -> Option<&'a MountView> {
+    views.iter().find(|v| {
+        let root = v.remote_root.trim_end_matches('/');
+        path == root || path.starts_with(&format!("{root}/"))
+    })
+}
+
+/// 磁盘上「本机到底配了哪些同步任务」的快照 —— 区分「任务被删」与「只是现在没挂载」。
+///
+/// ## 为什么不能只看挂载视图（真机风险）
+///
+/// daemon 刚启动、用户卸载、恢复挂载失败时 `views` 是空的，那时**所有**队列行看起来
+/// 都「没有任务管」。旧实现据此伪造 `task_alive=false` + `remote_now=MISSING`，
+/// 巡检第 1 条（远端已不存在）先命中 → **整队待裁决被静默删光**，理由还显示成
+/// 「NAS 上的文件已不存在」—— 用户的裁决意图直接丢失。
+///
+/// 现在用磁盘上的任务配置做第二判据：**任务存在 → 留**（挂载回来还要执行裁决），
+/// 确认没有任何任务覆盖该路径 → 才允许出队。
+pub struct ConfiguredTasks {
+    pub tasks: Vec<qxync_core::tasks::Task>,
+    /// 任务文件是否**全部**解析成功。`false`（有坏文件 / 配置目录读不出）时
+    /// 「没有任务覆盖这条路径」这个结论不可信 → 巡检必须保守保留。
+    pub complete: bool,
+}
+
+impl ConfiguredTasks {
+    /// 从磁盘读一次（`~/.config/qxync/tasks/*.json`），**只装本连接的任务**。
+    ///
+    /// ★ M16：任务文件是全局共享的；不按 link 过滤的话，A 连接的任务会把 B 连接
+    /// 待裁决条目的「任务还活着」判据喂成 true（反之亦然），巡检就会误删/误留。
+    fn load(link_id: &str) -> Self {
+        match qxync_core::config::ConfigPaths::discover() {
+            Ok(paths) => {
+                let (links, bad_links) = qxync_core::config::LinkConfig::list(&paths);
+                if !bad_links.is_empty() {
+                    tracing::warn!(
+                        "巡检：{} 个连接配置解析失败，本轮不据此判定「任务已删除」",
+                        bad_links.len()
+                    );
+                }
+                let mut ids: Vec<String> = links.into_iter().map(|l| l.id).collect();
+                if !ids.iter().any(|id| id == link_id) {
+                    ids.push(link_id.to_string());
+                }
+                ids.sort();
+                let (tasks, bad) = qxync_core::tasks::Task::list_for_link(&paths, link_id, &ids);
+                if !bad.is_empty() {
+                    // 解析失败的任务文件里可能就写着覆盖关系 —— 不能据此判定「任务已删」。
+                    tracing::warn!(
+                        "巡检：{} 个任务文件解析失败，本轮不据此判定「任务已删除」",
+                        bad.len()
+                    );
+                }
+                Self {
+                    tasks,
+                    complete: bad.is_empty() && bad_links.is_empty(),
+                }
+            }
+            Err(e) => {
+                tracing::warn!("巡检：读不到配置目录，本轮不据此判定「任务已删除」: {e}");
+                Self {
+                    tasks: Vec::new(),
+                    complete: false,
+                }
+            }
+        }
+    }
+
+    /// 覆盖该**远端**路径的任务（一对一：比较任务生效的 NAS 文件夹）。
+    fn covering<'a>(&'a self, path: &str) -> Option<&'a qxync_core::tasks::Task> {
+        self.tasks
+            .iter()
+            .find(|t| path_under_root(path, &t.effective_root()))
+    }
+}
+
+/// `path` 是否在远端根 `root` 之下（含根本身）。
+fn path_under_root(path: &str, root: &str) -> bool {
+    let root = root.trim_end_matches('/');
+    path == root || path.starts_with(&format!("{root}/"))
+}
+
+/// 待裁决队列行是否属于**回收站**路径（要直接作废，不许留在队列里）。
+///
+/// 单独抽出来是为了能离线单测：sweep 的真正取事实路径需要 NAS，但「哪些行算回收站」
+/// 是纯判定，不该跟着一起只能靠真机验证。
+fn is_trash_decision_row(row: &qxync_core::store::DecisionRow) -> bool {
+    qxync_core::trash::is_trash_path(&row.path, local_uid())
+}
+
+/// 一行队列条目在**没有挂载视图**时的巡检事实。
+///
+/// * 任务存在（只是没挂载）→ `observed=false` + `task_alive=true` → 留（按磁盘上的
+///   策略判第 3 条；策略不再是 `ask` 时仍然可以出队，因为挂载回来也不会读这张表）；
+/// * 确认没有任何任务覆盖 → `task_alive=false` → 出队（没人会执行这条裁决）；
+/// * 配置读取不完整（有坏任务文件 / 读不到配置）→ 返回 `None` → 调用方**保留**。
+fn unmounted_row_facts(
+    row: &qxync_core::store::DecisionRow,
+    configured: &ConfiguredTasks,
+    baseline: &Baseline,
+) -> Option<qxync_core::decisions::DecisionFacts> {
+    let recorded_local = Sig::file(row.local_size, row.local_mtime);
+    let recorded_remote = Sig::file(row.remote_size, row.remote_mtime);
+    let base = baseline.get(&row.path);
+    match configured.covering(&row.path) {
+        Some(task) => Some(qxync_core::decisions::DecisionFacts {
+            // ★ 没有视图 = 没看到远端现状；没有本地视图 = 也没看到本地现状。
+            //   两个 flag 都必须是 false，`local_now`/`remote_now` 只是占位值。
+            observed: false,
+            local_observed: false,
+            recorded_local,
+            recorded_remote,
+            resolved: row.is_resolved(),
+            task_alive: true,
+            policy: task.conflict.clone(),
+            local_now: Sig::MISSING,
+            local_dirty: false,
+            remote_now: Sig::MISSING,
+            baseline: base,
+        }),
+        None if configured.complete => Some(qxync_core::decisions::DecisionFacts {
+            observed: false,
+            local_observed: false,
+            recorded_local,
+            recorded_remote,
+            resolved: row.is_resolved(),
+            task_alive: false,
+            policy: String::new(),
+            local_now: Sig::MISSING,
+            local_dirty: false,
+            remote_now: Sig::MISSING,
+            baseline: base,
+        }),
+        None => None,
+    }
+}
+
+/// 冲突待裁决队列巡检：把已经不该留着的行清掉。
+///
+/// ## 为什么需要这一步
+///
+/// 队列原本**只有一条删除路径**：引擎执行完裁决后调 [`finish_decision`]。于是三个
+/// 常见情况会让行永久残留 —— 冲突自己消失了、挂载策略从 `ask` 改成了别的、挂载被
+/// 卸载。行留着不丢数据，但用户看到的是「我明明决定好了，怎么还在」，**看着像卡住**。
+///
+/// ## 判据在哪
+///
+/// 纯逻辑在 [`qxync_core::decisions::sweep_decision`]（可离线单测）；这里只负责
+/// **取事实**（stat 远端、查视图、算本地签名）与**执行删除**。
+///
+/// ## 保守约束
+///
+/// * 查不到事实的行（stat 失败）→ **跳过**，绝不当成可删。查不到 ≠ 失效。
+/// * **没有挂载视图 ≠ 任务被删**：先用磁盘任务配置确认（见 [`unmounted_row_facts`]）。
+/// * 未裁决的行即便此刻不冲突也**不自动删**（理由见 `sweep_decision` 的文档）。
+/// * 只删行，**不碰任何文件** —— 与 `decisions_clear` 语义一致。
+async fn sweep_decision_queue(
+    client: &Client,
+    views: &[MountView],
+    baseline: &Baseline,
+    store: &Mutex<SyncState>,
+    report: &mut SyncReport,
+    link_id: &str,
+) {
+    let rows = {
+        let g = store.lock().unwrap();
+        match g.store.decisions() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("读待裁决队列失败，跳过本轮巡检: {e}");
+                return;
+            }
+        }
+    };
+    if rows.is_empty() {
+        return;
+    }
+
+    // 先把要 stat 的路径去重 —— 同一目录多条冲突时省往返
+    let mut remote_cache: BTreeMap<String, Option<Sig>> = BTreeMap::new();
+    let mut facts: BTreeMap<String, qxync_core::decisions::DecisionFacts> = BTreeMap::new();
+    // ★ 回收站路径的队列行：直接作废（不 stat、不许留在队列里）。
+    //   FUSE 侧本就拒绝操作回收站，同步引擎也不再管它 —— 一条「回收站的待裁决」
+    //   永远不会被执行，留着只是让用户以为还有事没做。**只删队列行，不碰任何文件**。
+    let mut trash_drops: Vec<(String, String)> = Vec::new();
+    // ★ 需要判「任务是不是真被删了」时才去读磁盘配置（正常路径下不会读）。
+    let mut configured: Option<ConfiguredTasks> = None;
+
+    for r in &rows {
+        if is_trash_decision_row(r) {
+            trash_drops.push((
+                r.id.clone(),
+                "回收站路径不参与同步（只清队列，不动文件）".to_string(),
+            ));
+            continue;
+        }
+        // 定位挂载视图：找不到 = 这个路径当前没有任何挂载在管它。
+        // ★ 但**不等于**任务被删（可能是卸载中 / daemon 刚启动 / 恢复失败）——
+        //   必须再用磁盘上的任务配置确认，否则会把整队静默删光。
+        let Some(view) = view_for_path(views, &r.path) else {
+            let cfg = configured.get_or_insert_with(|| ConfiguredTasks::load(link_id));
+            match unmounted_row_facts(r, cfg, baseline) {
+                Some(f) => {
+                    facts.insert(r.id.clone(), f);
+                }
+                None => {
+                    // 配置读不完整 → 无法判定任务是否还在 → 保留（宁可留，不可误删）。
+                    tracing::debug!("巡检：{} 没有挂载视图、任务配置又不完整 → 本轮保留", r.path);
+                }
+            }
+            continue;
+        };
+
+        // 远端签名：查一次缓存（stat 失败也缓存「查不到」，本轮不再重试）
+        let remote_now = match remote_cache.get(&r.path) {
+            Some(v) => *v,
+            None => {
+                let v = match stat_path(client, &r.path).await {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        // 查不到 → 这行的事实不完整，**跳过它**（不删）。
+                        if e.is_auth() {
+                            report.auth_failed = true;
+                        }
+                        tracing::debug!("巡检 stat {} 失败，跳过该行: {e}", r.path);
+                        None
+                    }
+                };
+                remote_cache.insert(r.path.clone(), v);
+                v
+            }
+        };
+        let Some(remote_now) = remote_now else {
+            continue;
+        };
+
+        let local = local_sig(view, &r.path);
+        facts.insert(
+            r.id.clone(),
+            qxync_core::decisions::DecisionFacts {
+                // 「有视图 + stat 成功」只保证**远端**观测到了（observed）。
+                // ★ 本地侧必须单独判：本地视图的节点表是进程内的，daemon 重启 /
+                //   路径还没被访问过时 node() 是 None，此时 local_now 只是占位
+                //   MISSING —— 拿它跑三向决策会把「本进程还没看过」当成「本地没有」，
+                //   把已裁决的行误判成「冲突已自行消解」清掉（吞用户裁决意图）。
+                observed: true,
+                local_observed: view.view.node(&r.path).is_some(),
+                recorded_local: Sig::file(r.local_size, r.local_mtime),
+                recorded_remote: Sig::file(r.remote_size, r.remote_mtime),
+                resolved: r.is_resolved(),
+                task_alive: true,
+                policy: view.conflict.clone(),
+                local_now: local.sig,
+                local_dirty: local.dirty,
+                remote_now,
+                baseline: baseline.get(&r.path),
+            },
+        );
+    }
+
+    // 判据（纯逻辑，在 core 里单测过）。**只跑一次**并把原因带出来 ——
+    // 后面记 note 时还要用同一份结论。
+    let mut drops: Vec<(String, String)> = facts
+        .iter()
+        .filter_map(|(id, f)| match qxync_core::decisions::sweep_decision(f) {
+            qxync_core::decisions::SweepVerdict::Keep => None,
+            qxync_core::decisions::SweepVerdict::Drop(why) => Some((id.clone(), why)),
+        })
+        .collect();
+    drops.extend(trash_drops);
+    if drops.is_empty() {
+        return;
+    }
+    let drop_ids: Vec<String> = drops.iter().map(|(id, _)| id.clone()).collect();
+
+    // 执行删除（一个事务）
+    let removed = {
+        let g = store.lock().unwrap();
+        match g.store.decisions_delete_many(&drop_ids) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!("巡检出队失败: {e}");
+                return;
+            }
+        }
+    };
+    if removed == 0 {
+        return;
+    }
+
+    // 逐条记原因：用户要能看懂「为什么这条自己没了」
+    for (id, why) in &drops {
+        let path = rows
+            .iter()
+            .find(|r| r.id == *id)
+            .map(|r| r.path.clone())
+            .unwrap_or_else(|| id.clone());
+        report.note(format!("待裁决队列自动清理：{path}（{why}）"));
+    }
+    report.decisions_swept = removed as u64;
+    tracing::info!("待裁决队列巡检：清掉 {removed} 条失效条目");
 }
 
 /// 冲突副本取名（原来内联在 resolve_conflict 里的一段）。
@@ -1770,15 +2400,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// `persist` 的可测包装（真正的 `persist` 还吃全局 `Cursors`，这里只验 baseline 合并）。
+    /// `persist` 的 baseline 部分的**真实实现**包装（`hook_touched=true` =
+    /// 本轮有并发 hook 写入 → 逐条合并模式；这些用例都在验证合并语义）。
     fn persist_test(st: &mut SyncState, baseline: &Baseline) {
-        for (p, sig) in baseline.entries.iter() {
-            let cur = st.baseline.get(p);
-            if sig.mtime > cur.mtime {
-                st.baseline.put(p.clone(), *sig);
-            }
-        }
+        merge_round_baseline(st, baseline, true);
         st.save_all().unwrap();
+    }
+
+    /// ★ 关键修复：一轮**没有并发 hook 写入**时，baseline 必须**整份替换** ——
+    /// 否则快照里删掉的条目（回收站清理 / 已执行的删除 / 改名旧路径）永远清不掉：
+    /// 内存 `g.baseline` 保留旧条目，下一轮克隆又把它带回来，`save_all` 再写回库。
+    ///
+    /// 这就是任务里那句「清理后下一轮又加回来」的根因，也是 `persist()` 写盘语义
+    /// 必须确认的地方。
+    #[test]
+    fn persist_applies_baseline_deletions_so_purges_really_land_on_disk() {
+        let d = tmpdir("persist-purge");
+        let mut st = SyncState::load(&d).unwrap();
+        let trash = "/home/@Recycle/files/old.txt";
+        let keep = "/home/kept.txt";
+        st.baseline.put(trash, Sig::file(1, 100));
+        st.baseline.put(keep, Sig::file(2, 200));
+        st.save_all().unwrap();
+
+        // 本轮快照：回收站条目已被 remove_baseline_tree 从**快照**里删掉（模拟 reconcile 清理）
+        let mut snapshot = st.baseline.clone();
+        snapshot.remove(trash);
+
+        // 本轮没有 hook 并发写 → 整份替换（这是真实 persist 走的路径）
+        merge_round_baseline(&mut st, &snapshot, false);
+        assert!(!st.baseline.get(trash).exists, "内存里必须真的删掉");
+        assert!(st.baseline.get(keep).exists, "没被清的正常条目要留着");
+        st.save_all().unwrap();
+
+        // 落盘后重新打开：清理结果必须还在（不是只在内存里）
+        let re = SyncState::load(&d).unwrap();
+        assert!(
+            !re.baseline.get(trash).exists,
+            "★ 回收站 baseline 清理必须落盘，否则下一轮克隆又活过来"
+        );
+        assert!(re.baseline.get(keep).exists);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 名字改了也一样：旧路径删除 + 新路径写入要在一次整份替换里一起落盘。
+    #[test]
+    fn persist_applies_baseline_renames_when_no_hook_wrote() {
+        let d = tmpdir("persist-rename");
+        let mut st = SyncState::load(&d).unwrap();
+        let old = "/home/old.txt";
+        let new = "/home/new.txt";
+        st.baseline.put(old, Sig::file(3, 300));
+        st.save_all().unwrap();
+
+        let mut snapshot = st.baseline.clone();
+        snapshot.remove(old);
+        snapshot.put(new, Sig::file(3, 300));
+
+        merge_round_baseline(&mut st, &snapshot, false);
+        st.save_all().unwrap();
+        let re = SyncState::load(&d).unwrap();
+        assert!(!re.baseline.get(old).exists, "旧路径必须落盘删除");
+        assert!(re.baseline.get(new).exists, "新路径必须落盘");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// 同一秒内两次保存（mtime 相同、size 不同）时，**较新的那份要赢**。
@@ -1887,7 +2571,7 @@ mod tests {
         }
         view.add_file(&refresh, 8, 1000, false, None);
         put(&client, &wd, "refresh.txt", b"DDDDDDDDDDDD", 2000).await;
-        let r = poll_once(&client, &views, &store, &cfg, &stats, "test1").await;
+        let r = poll_once(&client, &views, &store, &cfg, &stats, "default", "test1").await;
         println!("① 刷新: {r:?}");
         assert!(r.errors.is_empty(), "不该有错误: {:?}", r.errors);
         assert_eq!(r.refreshed, 1, "应识别到 1 个远端刷新");
@@ -1915,7 +2599,7 @@ mod tests {
         // 远端：别的设备改成了 6B / mtime 3500
         put(&client, &wd, "conflict.txt", &remote_bytes, 3500).await;
 
-        let r = poll_once(&client, &views, &store, &cfg, &stats, "test1").await;
+        let r = poll_once(&client, &views, &store, &cfg, &stats, "default", "test1").await;
         println!("② 冲突: {r:?}");
         assert!(r.errors.is_empty(), "不该有错误: {:?}", r.errors);
         assert_eq!(r.conflicts, 1, "应产生 1 个冲突副本");
@@ -1978,7 +2662,7 @@ mod tests {
             },
             ..cfg.clone()
         };
-        let r = poll_once(&client, &views, &store, &strict, &stats, "test1").await;
+        let r = poll_once(&client, &views, &store, &strict, &stats, "default", "test1").await;
         println!("③ 删除保护: {r:?}");
         assert_eq!(r.deletes_blocked, 5, "超阈值必须整批挡住");
         assert_eq!(r.deleted, 0);
@@ -2001,7 +2685,7 @@ mod tests {
             force_deletes: true,
             ..strict.clone()
         };
-        let r = poll_once(&client, &views, &store, &forced, &stats, "test1").await;
+        let r = poll_once(&client, &views, &store, &forced, &stats, "default", "test1").await;
         println!("③' 强制放行: {r:?}");
         assert_eq!(r.deleted, 5, "放行后应删掉 5 项");
         assert!(view.node(&format!("{deldir}/d0.txt")).is_none());
@@ -2089,5 +2773,552 @@ mod tests {
         assert!(plain.hidden("/home/secret", true).is_none());
         assert!(plain.hidden("/home/x.crdownload", false).is_some());
         let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// ★ M11+：同步引擎必须把**回收站子树**当「不归我管」。
+    ///
+    /// FUSE 侧本来就不允许操作回收站（`deny_trash`），引擎却曾把它当用户数据逐目录
+    /// 对账：真机 baseline 1991 条里 1425 条在 `@Recycle` 下、13 条在 `.Trash-1000` 下，
+    /// QTS 清回收站时这些条目会变成批量「远端删除」候选（= 每轮删除熔断刷屏），
+    /// FDO 的 `.trashinfo` 还会被反向同步上 NAS。
+    #[test]
+    fn sync_engine_ignores_trash_subtrees_but_not_lookalikes() {
+        let work = tmpdir("trash-hidden");
+        let view = FakeLocal::new(HOME_ROOT, work.join("stash"));
+        let mv = MountView {
+            mountpoint: PathBuf::from("/tmp/trash-mnt"),
+            remote_root: HOME_ROOT.to_string(),
+            view: view.clone(),
+            upload: None,
+            read_only: true,
+            rules: Arc::new(Rules::temp_only(true)),
+            conflict: qxync_core::tasks::DEFAULT_CONFLICT.to_string(),
+        };
+        let uid = local_uid();
+
+        // 回收站子树：任何深度、任何类型都隐藏，且原因必须是 Trash（不是用户规则）
+        for p in [
+            format!("{HOME_ROOT}/@Recycle"),
+            format!("{HOME_ROOT}/@Recycle/files/x.txt"),
+            format!("{HOME_ROOT}/.Trash-{uid}/files/a"),
+            format!("{HOME_ROOT}/.Trash/info/a.trashinfo"),
+        ] {
+            assert_eq!(
+                mv.hidden(&p, false),
+                Some(HideReason::Trash),
+                "{p} 必须按回收站排除"
+            );
+        }
+
+        // 正常名字一个都不许误伤（误伤 = 用户的文件从此不再同步）
+        for p in [
+            format!("{HOME_ROOT}/.recent"),
+            format!("{HOME_ROOT}/@Recycled"),
+            format!("{HOME_ROOT}/a.Trash-1000.txt"),
+            format!("{HOME_ROOT}/.trash"),
+            format!("{HOME_ROOT}/qxync-test/hello.txt"),
+        ] {
+            assert!(mv.hidden(&p, false).is_none(), "{p} 不是回收站，不能被排除");
+        }
+        // 根目录本身永远不隐藏（它是视图本身）
+        assert!(mv.hidden(HOME_ROOT, true).is_none());
+
+        // 用户规则 `!@Recycle` 不能把回收站「放回来」：回收站是硬约束，先于用户规则判。
+        let overridden = MountView {
+            mountpoint: PathBuf::from("/tmp/trash-mnt2"),
+            remote_root: HOME_ROOT.to_string(),
+            view,
+            upload: None,
+            read_only: true,
+            rules: Arc::new(Rules::parse(&["!@Recycle".to_string()], false).rules),
+            conflict: qxync_core::tasks::DEFAULT_CONFLICT.to_string(),
+        };
+        assert_eq!(
+            overridden.hidden(&format!("{HOME_ROOT}/@Recycle/x"), false),
+            Some(HideReason::Trash),
+            "回收站排除是硬约束，用户规则不能翻回来"
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    // ------------------------------------------------- ★ 巡检：没挂载 ≠ 任务被删
+
+    fn task_with_root(id: &str, root: &str, conflict: &str) -> qxync_core::tasks::Task {
+        qxync_core::tasks::Task {
+            id: id.into(),
+            root: Some(root.into()),
+            conflict: conflict.into(),
+            ..qxync_core::tasks::Task::default()
+        }
+    }
+
+    fn decision_row(
+        path: &str,
+        local_size: u64,
+        remote_size: u64,
+    ) -> qxync_core::store::DecisionRow {
+        qxync_core::store::DecisionRow {
+            id: qxync_core::store::DecisionRow::id_for(path),
+            path: path.into(),
+            task_id: String::new(),
+            is_dir: false,
+            local_size,
+            local_mtime: 100,
+            remote_size,
+            remote_mtime: 200,
+            created_unix: 1_700_000_000,
+            resolution: None,
+        }
+    }
+
+    /// 回收站路径的待裁决行要能识别出来（巡检会直接作废它们：只清队列、不动文件）。
+    #[test]
+    fn trash_decision_rows_are_recognized_for_queue_cleanup() {
+        let uid = local_uid();
+        assert!(is_trash_decision_row(&decision_row(
+            &format!("{HOME_ROOT}/@Recycle/files/x.txt"),
+            1,
+            2
+        )));
+        assert!(is_trash_decision_row(&decision_row(
+            &format!("{HOME_ROOT}/.Trash-{uid}/files/x"),
+            1,
+            2
+        )));
+        assert!(
+            !is_trash_decision_row(&decision_row(&format!("{HOME_ROOT}/.recent"), 1, 2)),
+            ".recent 是正常路径，队列行不能误清"
+        );
+        assert!(!is_trash_decision_row(&decision_row(
+            &format!("{HOME_ROOT}/@Recycled/x"),
+            1,
+            2
+        )));
+    }
+
+    /// ★ 真机事故面：daemon 刚启动 / 用户卸载时 `views` 为空。旧实现伪造
+    /// `task_alive=false` + `remote_now=MISSING` → 巡检第 1 条（远端已不存在）先命中
+    /// → **整队待裁决被静默删光**。现在：任务还在（磁盘配置里有人覆盖它）→ 保留。
+    #[test]
+    fn sweep_keeps_queue_rows_when_task_exists_but_mount_is_absent() {
+        use qxync_core::decisions::{sweep_decision, SweepVerdict};
+        let configured = ConfiguredTasks {
+            tasks: vec![task_with_root("t1", "/home", CONFLICT_ASK)],
+            complete: true,
+        };
+        let baseline = Baseline::default();
+        let row = decision_row("/home/.recent", 10, 20);
+        let facts = unmounted_row_facts(&row, &configured, &baseline).expect("任务在 → 能给出事实");
+        assert!(
+            !facts.observed,
+            "没有挂载视图 → 不得声称观测到了本地/远端现状"
+        );
+        assert_eq!(
+            sweep_decision(&facts),
+            SweepVerdict::Keep,
+            "任务还在、只是现在没挂载 → 绝不能删队列行（误删 = 用户裁决意图丢失）"
+        );
+    }
+
+    /// 确认**没有任何任务覆盖**这条路径时才允许出队（任务真被删了）。
+    #[test]
+    fn sweep_drops_queue_rows_only_when_no_task_covers_the_path() {
+        use qxync_core::decisions::{sweep_decision, SweepVerdict};
+        let configured = ConfiguredTasks {
+            tasks: vec![task_with_root("t1", "/Public", CONFLICT_ASK)],
+            complete: true,
+        };
+        let baseline = Baseline::default();
+        let row = decision_row("/home/orphan.txt", 10, 20);
+        let facts = unmounted_row_facts(&row, &configured, &baseline).expect("配置完整 → 能判定");
+        assert!(!facts.observed);
+        match sweep_decision(&facts) {
+            SweepVerdict::Drop(why) => assert!(why.contains("任务已删除"), "{why}"),
+            other => panic!("没有任何任务覆盖时才该出队，实际 {other:?}"),
+        }
+    }
+
+    /// 任务文件解析失败 / 配置目录读不出 → **不能**据此判定「任务已删」，一律保留。
+    #[test]
+    fn sweep_keeps_rows_when_task_config_is_unreadable() {
+        let configured = ConfiguredTasks {
+            tasks: Vec::new(),
+            complete: false,
+        };
+        let baseline = Baseline::default();
+        let row = decision_row("/home/maybe.txt", 10, 20);
+        assert!(
+            unmounted_row_facts(&row, &configured, &baseline).is_none(),
+            "配置不完整时不能给出「任务已删」的事实 → 调用方保留该行"
+        );
+    }
+
+    /// 没挂载时也要看**磁盘上任务当前的策略**：不再是 ask → 挂载回来也不读队列 → 出队。
+    #[test]
+    fn sweep_uses_disk_policy_when_unmounted() {
+        use qxync_core::decisions::{sweep_decision, SweepVerdict};
+        let configured = ConfiguredTasks {
+            tasks: vec![task_with_root("t1", "/home", "rename_local")],
+            complete: true,
+        };
+        let baseline = Baseline::default();
+        let row = decision_row("/home/x.txt", 10, 20);
+        let facts = unmounted_row_facts(&row, &configured, &baseline).expect("能判定");
+        match sweep_decision(&facts) {
+            SweepVerdict::Drop(why) => assert!(why.contains("策略已改为"), "{why}"),
+            other => panic!("策略不是 ask 应出队，实际 {other:?}"),
+        }
+    }
+
+    /// 远端根匹配的边界：根下的路径算覆盖，前缀相似的别误配。
+    #[test]
+    fn path_under_root_matches_only_real_prefixes() {
+        assert!(path_under_root("/home", "/home"));
+        assert!(path_under_root("/home/a.txt", "/home"));
+        assert!(path_under_root("/home/a/b", "/home/"));
+        assert!(
+            !path_under_root("/home2/a", "/home"),
+            "前缀相似但不是子路径"
+        );
+        assert!(!path_under_root("/Public/a", "/home"));
+        assert!(!path_under_root("/Home/a", "/home"), "大小写不同");
+    }
+
+    /// 「每个文件都问我」：同一条冲突在用户裁决前每轮都会被重新看到，
+    /// 只有**第一次**入队才算新冲突（否则计数器/journal 每 30s 刷同一件事）。
+    #[test]
+    fn only_first_queue_write_counts_as_a_new_conflict() {
+        let row = decision_row("/home/a.txt", 10, 20);
+        assert!(conflict_is_new(&None), "第一次入队 = 新冲突");
+        assert!(
+            !conflict_is_new(&Some(row)),
+            "已入队过（还等裁决）→ 不能重复计数 / 重复写 journal"
+        );
+    }
+
+    // ------------------------------------------------- ★ 对账：视图不完整时暂缓删除
+
+    /// 判据本身：只有「没有任何非 404 列举失败」**且「目录没被扫描上限截断」**
+    /// 才允许按远端缺失删本地。
+    #[test]
+    fn delete_verdict_requires_a_fully_listed_remote_view() {
+        // 正常：全部目录都列出来了、总量没超上限 → 删除判定可信（真机实测 dirs=38）
+        assert!(delete_verdict_is_reliable(0, 38, 200));
+        for n in [1, 3, 200] {
+            assert!(
+                !delete_verdict_is_reliable(n, 38, 200),
+                "{n} 个目录没列出来时绝不许按「远端缺失」删本地"
+            );
+        }
+
+        // ★ 目录数被截断 = 排序在后的目录**根本没扫**，里面的条目会全部「缺失」。
+        //   这一种没有错误、没有失败计数，最容易漏判成「远端已删」→ 真删本地节点。
+        assert!(
+            !delete_verdict_is_reliable(0, 201, 200),
+            "目录数超上限 → 未扫目录下的 baseline 会被当成「远端已删」"
+        );
+        assert!(!delete_verdict_is_reliable(0, 2001, 200));
+        assert!(
+            delete_verdict_is_reliable(0, 200, 200),
+            "恰好等于上限 = 全都扫了，不算截断"
+        );
+
+        // 两种来源同时发生也不可信（任一成立即不可信）
+        assert!(!delete_verdict_is_reliable(1, 201, 200));
+    }
+
+    /// ★ 数据安全回归（真机级）：对账时目录列举失败（网络错误 / 超时），
+    /// 旧逻辑把「没看到」当成「远端已删」→ 把本地干净节点连缓存一起删掉。
+    /// 现在必须**跳过删除判定**：节点与 baseline 都保持不动，只记错误 + 说明。
+    ///
+    /// 用 127.0.0.1:1 造一个必然 `connection refused` 的客户端 —— 不需要真机 NAS。
+    #[tokio::test]
+    async fn reconcile_never_deletes_locals_when_listing_failed() {
+        let work = tmpdir("reconcile-defer");
+        let view = FakeLocal::new(HOME_ROOT, work.join("stash"));
+        let path = format!("{HOME_ROOT}/qxync-defer/a.txt");
+        // 本地干净节点 + baseline 有签名：正常对账里「远端缺失」→ DeleteLocal
+        view.add_file(&path, 3, 100, false, None);
+        let mut baseline = Baseline::default();
+        baseline.put(path.clone(), Sig::file(3, 100));
+        let store = Mutex::new(SyncState::load(work.join("state")).unwrap());
+        let mut report = SyncReport::default();
+
+        let link = LinkConfig {
+            id: "t".into(),
+            host: "127.0.0.1".into(),
+            port: 1, // 必然 connection refused → 列举失败（非 404）
+            https: false,
+            insecure: true,
+            user: "test1".into(),
+            ipv4_only: false,
+            exclude: Vec::new(),
+            filter_temp: true,
+            peer_listen: None,
+            peer_name: None,
+        };
+        let client = Client::new(&link).expect("构造 client 不该需要联网");
+        let mv = MountView {
+            mountpoint: PathBuf::from("/tmp/reconcile-defer"),
+            remote_root: HOME_ROOT.to_string(),
+            view: view.clone(),
+            upload: None,
+            read_only: false,
+            rules: Arc::new(Rules::temp_only(true)),
+            conflict: qxync_core::tasks::DEFAULT_CONFLICT.to_string(),
+        };
+        let cfg = SyncConfig::default();
+        reconcile_view(&client, &mv, &cfg, &mut baseline, &mut report, &store).await;
+
+        assert!(
+            !report.errors.is_empty(),
+            "列举失败必须如实记错误: {report:?}"
+        );
+        assert_eq!(report.deleted, 0, "列举失败时不许删任何东西");
+        assert!(
+            view.node(&path).is_some(),
+            "★ 本地节点必须还在 —— 修复前这里会被当成「远端已删」删掉"
+        );
+        assert!(baseline.get(&path).exists, "baseline 也不能清");
+        assert!(
+            report.notes.iter().any(|n| n.contains("跳过删除判定")),
+            "要向用户说明为什么这轮没删: {report:?}"
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// ★ 任务 4 核心：回收站 baseline 条目要**真正清掉**（落盘、不是每轮复活），
+    /// 而且**只清 baseline，绝不动本地文件/节点**。
+    ///
+    /// 用必然连不上的 client（127.0.0.1:1）跑真实 `reconcile_view`：目录列举会失败，
+    /// 但 baseline 的「排除清理」发生在列举之后、不受影响。清理结果再用真实
+    /// `merge_round_baseline`（无 hook 写入 → 整份替换）+ `save_all` 落盘，重开库验证。
+    #[tokio::test]
+    async fn reconcile_purges_trash_baseline_entries_without_touching_files() {
+        let work = tmpdir("reconcile-trash");
+        let view = FakeLocal::new(HOME_ROOT, work.join("stash"));
+        let uid = local_uid();
+        let trash_recycle = format!("{HOME_ROOT}/@Recycle/files/old.txt");
+        let trash_fdo = format!("{HOME_ROOT}/.Trash-{uid}/files/x.bin");
+        let normal = format!("{HOME_ROOT}/notes.txt");
+        for p in [&trash_recycle, &trash_fdo, &normal] {
+            view.add_file(p, 3, 100, false, None);
+        }
+        let mut baseline = Baseline::default();
+        for p in [&trash_recycle, &trash_fdo, &normal] {
+            baseline.put(p.clone(), Sig::file(3, 100));
+        }
+        let store = Mutex::new(SyncState::load(work.join("state")).unwrap());
+        let mut report = SyncReport::default();
+
+        let link = LinkConfig {
+            id: "t".into(),
+            host: "127.0.0.1".into(),
+            port: 1, // 必然 connection refused（本用例只关心 baseline 排除清理）
+            https: false,
+            insecure: true,
+            user: "test1".into(),
+            ipv4_only: false,
+            exclude: Vec::new(),
+            filter_temp: true,
+            peer_listen: None,
+            peer_name: None,
+        };
+        let client = Client::new(&link).expect("构造 client 不该需要联网");
+        let mv = MountView {
+            mountpoint: PathBuf::from("/tmp/reconcile-trash"),
+            remote_root: HOME_ROOT.to_string(),
+            view: view.clone(),
+            upload: None,
+            read_only: false,
+            rules: Arc::new(Rules::temp_only(true)),
+            conflict: qxync_core::tasks::DEFAULT_CONFLICT.to_string(),
+        };
+        let cfg = SyncConfig::default();
+        reconcile_view(&client, &mv, &cfg, &mut baseline, &mut report, &store).await;
+
+        // ① baseline：回收站条目被清，正常条目保留
+        assert!(
+            !baseline.get(&trash_recycle).exists,
+            "@Recycle 下的 baseline 条目必须清掉"
+        );
+        assert!(
+            !baseline.get(&trash_fdo).exists,
+            ".Trash-<uid> 下的 baseline 条目必须清掉"
+        );
+        assert!(baseline.get(&normal).exists, "正常文件不能误清");
+        assert!(
+            report.notes.iter().any(|n| n.contains("回收站排除")),
+            "要说明清理原因: {report:?}"
+        );
+
+        // ② 文件/本地节点一个都不许动（排除 ≠ 删除）
+        assert!(
+            view.node(&trash_recycle).is_some(),
+            "只清 baseline，绝不删文件/节点"
+        );
+        assert!(view.node(&trash_fdo).is_some());
+        assert!(view.node(&normal).is_some());
+
+        // ③ 落盘：模拟 poll_once 结束（本轮没有 hook 写入 → 整份替换），重开库应仍干净
+        {
+            let mut g = store.lock().unwrap();
+            merge_round_baseline(&mut g, &baseline, false);
+            g.save_all().unwrap();
+        }
+        let re = SyncState::load(work.join("state")).unwrap();
+        assert!(
+            !re.baseline.get(&trash_recycle).exists,
+            "★ 清理必须落盘：否则下一轮克隆内存 baseline 时回收站条目又活过来"
+        );
+        assert!(!re.baseline.get(&trash_fdo).exists);
+        assert!(re.baseline.get(&normal).exists);
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    // ------------------------------------------------- ★ absorb_round（陈旧告警清理）
+
+    fn report_with_block(count: u64, reason: &str) -> SyncReport {
+        SyncReport {
+            deletes_blocked: count,
+            delete_block_reason: Some(reason.into()),
+            ..Default::default()
+        }
+    }
+
+    /// ★ 真机事故：同一批 526 项删除每 30s 刷一条 WARN + 一条 journal，连续 13 小时。
+    /// 现在只有**签名变化**（数量/原因变了）才算「新告警」。
+    #[test]
+    fn absorb_round_alerts_once_per_block_signature() {
+        let stats = SyncStats::default();
+        // ① 熔断出现 → 置告警 + 算新告警
+        let mut r = report_with_block(526, "526 项 > 阈值");
+        absorb_round(&stats, &mut r, true);
+        assert!(r.delete_block_changed, "第一次出现必须记一条");
+        assert_eq!(
+            stats.snapshot().delete_block_reason.as_deref(),
+            Some("本轮有 526 项删除被保护挡住")
+        );
+
+        // ② 同一签名重复轮次 → 不再算新告警（WARN / journal 不再刷屏）
+        let mut r = report_with_block(526, "526 项 > 阈值");
+        absorb_round(&stats, &mut r, true);
+        assert!(!r.delete_block_changed, "同一批删除的重复轮次不能当新告警");
+        assert!(
+            stats.snapshot().delete_block_reason.is_some(),
+            "告警本身要保留（用户还要看到问题没解决）"
+        );
+
+        // ③ 数量变了 → 又是新告警（用户在清理，要能看到进展）
+        let mut r = report_with_block(100, "100 项 > 阈值");
+        absorb_round(&stats, &mut r, true);
+        assert!(r.delete_block_changed, "数量变化算新告警");
+    }
+
+    /// ★ 真机事故：`delete_block_reason` 只写不清 → GUI 的熔断告警永远不消失。
+    /// 完整轮次没再被挡时必须清掉，并且记一次「已解除」。
+    #[test]
+    fn absorb_round_clears_stale_delete_alarm_after_a_clean_round() {
+        let stats = SyncStats::default();
+        let mut r = report_with_block(3, "3 项 > 阈值");
+        absorb_round(&stats, &mut r, true);
+        assert!(stats.snapshot().delete_block_reason.is_some());
+
+        let mut r = SyncReport::default();
+        absorb_round(&stats, &mut r, true);
+        assert!(
+            r.delete_block_changed,
+            "解除也要记一条（journal「已解除」）"
+        );
+        assert_eq!(
+            stats.snapshot().delete_block_reason,
+            None,
+            "★ 修复前这里永远不清 → GUI 首页/同步/诊断三处红字常驻"
+        );
+    }
+
+    /// 提前 return 的轮次（max_log 失败 / 服务端未就绪）**没做任何检查**，不许清旧告警。
+    #[test]
+    fn absorb_round_never_clears_alarms_on_early_return() {
+        let stats = SyncStats::default();
+        let mut r = report_with_block(3, "3 项 > 阈值");
+        absorb_round(&stats, &mut r, true);
+
+        let mut r = SyncReport {
+            errors: vec!["qbox_get_max_log 失败: status=3".into()],
+            ..Default::default()
+        };
+        absorb_round(&stats, &mut r, false);
+        assert_eq!(
+            stats.snapshot().delete_block_reason.as_deref(),
+            Some("本轮有 3 项删除被保护挡住"),
+            "没检查过 ≠ 检查通过：提前返回的轮次不能清熔断告警"
+        );
+        assert!(!r.delete_block_changed);
+        // 但当前的错误要立刻反映出来
+        assert!(stats
+            .snapshot()
+            .last_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("status=3"));
+    }
+
+    /// ★ 真机事故：`last_error` / `last_note` 同样只写不清 →
+    /// 错误早在 08:30 恢复，「⚠️ 最近错误」却常驻首页/诊断。
+    #[test]
+    fn absorb_round_clears_stale_last_error_and_note_on_clean_round() {
+        let stats = SyncStats::default();
+        let mut r = SyncReport {
+            errors: vec!["旧错误".into()],
+            notes: vec!["旧提示".into()],
+            ..Default::default()
+        };
+        absorb_round(&stats, &mut r, true);
+        assert_eq!(stats.snapshot().last_error.as_deref(), Some("旧错误"));
+        assert_eq!(stats.snapshot().last_note.as_deref(), Some("旧提示"));
+
+        let mut r = SyncReport::default();
+        absorb_round(&stats, &mut r, true);
+        let snap = stats.snapshot();
+        assert_eq!(snap.last_error, None, "完整跑完且零错误 → 清掉陈旧错误");
+        assert_eq!(
+            snap.last_note, None,
+            "陈旧提示也要清掉，否则上次的 note 永远常驻"
+        );
+    }
+
+    // ------------------------------------------------- ★ 会话失效自愈判据
+
+    /// ★ 真机证据（docs/M10 §1）：sid 过期后 `qbox_get_max_log` 回 `status=3`。
+    /// status=3 没有码表、也只在 max_log 上观测到 → 判据只给这个端点，不推广。
+    #[test]
+    fn status_3_on_max_log_is_session_loss_but_not_elsewhere() {
+        let e = CoreError::status_msg(3, "qbox_get_max_log", "会话过期");
+        assert!(
+            max_log_failure_is_session_loss(&e),
+            "真机实测：sid 过期后 max_log 回 status=3，不识别就会每 30s 报错到保活才恢复"
+        );
+        assert!(
+            !max_log_failure_is_session_loss(&CoreError::status(3, "qbox_get_sync_log")),
+            "status=3 只在 max_log 观测到，别的端点不推广"
+        );
+        // 4/5 与 Auth 本来就算会话失效（client/daemon/FUSE 三层同一判据）
+        assert!(max_log_failure_is_session_loss(&CoreError::status(
+            4,
+            "qbox_get_max_log"
+        )));
+        assert!(max_log_failure_is_session_loss(&CoreError::Auth(
+            "口令错".into()
+        )));
+        // 服务端未就绪（status=8）不是会话问题，重登没用
+        assert!(!max_log_failure_is_session_loss(&CoreError::status_msg(
+            8,
+            "qbox_get_max_log",
+            "Qsync Central is initializing."
+        )));
+        assert!(!max_log_failure_is_session_loss(&CoreError::Transport(
+            "断网".into()
+        )));
     }
 }

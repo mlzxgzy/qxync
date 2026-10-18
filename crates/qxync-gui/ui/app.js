@@ -67,7 +67,7 @@
     ? function (cmd, args) { return tauri.core.invoke(cmd, args); }
     : null;
 
-  // --------------------------------------------------------------- 状态
+  // --------------------------------------------------------------- ★ M16 多连接状态
   var state = {
     page: 'home',      // 一级目的地（PAGES）
     diag: 'status',    // 诊断页内的子 tab（DIAG_PANELS）
@@ -79,22 +79,18 @@
       loading: false,
       error: ''          // ★ M8.6：读取失败时的可见原因
     },
-    mounts: [],
-    tasks: null,        // ★ M8.2：tasks 请求的最近一次结果
-    journal: null,      // ★ M8.3：journal 请求的最近一次结果
-    errors: null,       // ★ M8.3：错误列表（journal level=error）
+    mounts: [],          // 当前连接的挂载表（诊断 / 主页退化展示用）
     busy: 0,
     home: '',
     appInfo: null,
-    lastStatus: null,
     pollTimer: null,
     logCount: 0,
     // ★ M8.4
     sec: 'connect',       // 设置页内的分区
-    settings: null,       // settings 请求的最近一次结果
-    link: null,           // link_read 的最近一次结果（LAN / 关于 要用）
-    space: null,          // space 请求的最近一次结果
-    fileStates: {},       // 文件名 → 三态（file_states 请求）
+    settings: null,       // settings 请求的最近一次结果（全局，所有连接共享一份文件）
+    link: null,           // link_read 的最近一次结果（**当前连接**的 LAN / 筛选器）
+    space: null,          // space 请求的最近一次结果（当前连接）
+    fileStates: {},       // 文件名 → 三态（file_states 请求，当前连接）
     fsSummary: null,      // file_states 的汇总（online/local/always）
     m84Info: null,        // GUI 侧 M8.4 能力（托盘/插件）
     // ★ M8.6：各列表的四态（loading / error）—— 首轮不再冒充「不可用」
@@ -108,12 +104,32 @@
     spaceLoading: false,
     settingsError: '',
     rowMenuTrigger: null, // 右键菜单的焦点来处（关闭时还回去）
-    lastErrorKey: '',     // 已通知过的错误条目（去重）
+    lastErrorKey: '',     // 已通知过的错误条目（去重，按「连接:条目」）
     errorTick: 0,         // 轮询计数器（每 3 次查一遍错误列表）
     rowMenu: null,        // 右键菜单当前作用的条目
-    decisions: null,      // 冲突待裁决队列
-    lastErrorId: 0,       // 已通知过的最大 journal id（桌面通知去重）
-    trayAction: ''        // 最近一次托盘动作（自检/排查用）
+    trayAction: '',       // 最近一次托盘动作（自检/排查用）
+
+    // ★ M16：多 NAS 连接。
+    //   `links` 是 links_status 的权威列表（含「没有 link 文件但 default daemon 在跑」
+    //   的合成项）；`statuses` 按 id 存每个 daemon 的状态；其余按连接分桶的字段只存
+    //   「最近一次 fanout 的结果」，页面上再合并。
+    links: [],            // [{id, host, port, https, insecure, user, link_exists,
+                          //   credential_present, socket, daemon}]
+    linksBad: [],         // [{path, error}]：解析失败、被跳过的 link 文件
+    linksLoading: true,   // 首轮 links_status 没回来前，连接列表显示「读取中」而不是「没有连接」
+    linksError: '',
+    linksLoaded: false,   // 首轮 links_status 是否已回来（顶部 chip 的「检测中」）
+    statuses: {},         // linkId -> DaemonStatus
+    currentLink: '',      // 当前连接 id（持久化到 localStorage 的 qxync.currentLink）
+    editingLinkId: '',    // 连接表单：'' = 新建
+    taskFormLink: '',     // 任务表单：这条任务属于哪个连接
+    taskFormEditing: false,
+    tasksByLink: {},      // linkId -> {data, error}
+    journalByLink: {},    // linkId -> {data, error}
+    errorsByLink: {},     // linkId -> {data, error}
+    decisionsByLink: {},  // linkId -> {data, error}
+    currentChanged: false,// 本轮 links_status 是否切换了当前连接
+    linksSig: ''          // 连接列表的渲染签名（没变就不重画，别打断键盘焦点）
   };
 
   // ============================================================ 小工具
@@ -218,8 +234,18 @@
     return (n < 10 ? '0' : '') + n;
   }
 
+  /**
+   * 时间戳 → `HH:MM:SS`（只用于「刚刚发生的日志/事件」；要日期请用 humanTimeFromEpoch）。
+   *
+   * ★ 以前这里写成 `isObj(ts) || ts instanceof Date ? new Date(ts) : new Date()`：
+   *   **数字时间戳不是对象**，于是传进来的 epoch 被丢掉、恒显示「现在」——
+   *   冲突卡片曾因此把每条的「发现于」都显示成当前时刻。
+   */
   function clock(ts) {
-    var d = isObj(ts) || ts instanceof Date ? new Date(ts) : new Date();
+    var d;
+    if (ts instanceof Date) { d = ts; }
+    else if (typeof ts === 'number' && isFinite(ts)) { d = new Date(ts); }
+    else { d = new Date(); }
     return pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
   }
 
@@ -401,21 +427,54 @@
     });
   }
 
-  /** ipc_call 的语义化包装：req 直接是 {v:1, method:...} 那一层。 */
-  function ipc(req) {
+  /** ipc_call 的语义化包装：**显式指定连接**（新代码一律用它）。 */
+  function ipcFor(linkId, req) {
+    var id = str(linkId) || 'default';
     if (isObj(req) && req.v === undefined) { req.v = 1; }
-    return call('ipc_call', { req: req }).then(function (r) {
+    return call('ipc_call', { linkId: id, req: req }).then(function (r) {
       var res = r.raw;
-      if (!r.ok) { return { ok: false, error: r.error, kind: r.kind }; }
+      if (!r.ok) { return { ok: false, error: r.error, kind: r.kind, linkId: id }; }
       if (isObj(res) && res.ok === true) {
-        return { ok: true, data: res.data, raw: res };
+        return { ok: true, data: res.data, raw: res, linkId: id };
       }
       var msg = (isObj(res) && isObj(res.error)) ? str(res.error.message) : '调用失败';
-      return { ok: false, error: msg, raw: res };
+      return { ok: false, error: msg, raw: res, linkId: id };
     });
   }
 
+  /** 当前连接的 ipc —— 「文件 / 诊断 / 当前连接的同步动作」都走它。 */
+  function ipc(req) { return ipcFor(currentId(), req); }
+
+  /** 并行 fanout 同一个请求到多个连接：返回 [{id, link, running, r}]（顺序与入参一致）。 */
+  function fanout(req, targets) {
+    var ts = targets || fanoutTargets();
+    var jobs = [];
+    for (var i = 0; i < ts.length; i++) {
+      (function (t) {
+        jobs.push(ipcFor(t.id, req).then(function (r) {
+          return { id: t.id, link: t.link, running: t.running, r: r };
+        }, function (e) {
+          return { id: t.id, link: t.link, running: t.running, r: { ok: false, error: str(e) } };
+        }));
+      })(ts[i]);
+    }
+    return Promise.all(jobs);
+  }
   // ============================================================ 忙碌标记
+  /**
+   * 按钮引用解析：既接受 index.html 里静态按钮的 **id 字符串**，也接受**元素本身**。
+   *
+   * ★ 为什么必须支持元素：卡片里的按钮是 `el('button')` 动态建的、**没有 id**。
+   *   以前调用方写 `withBusy({ buttons: btn ? [btn.id] : [] })` → `btn.id === ''`
+   *   → `getElementById('')` 恒 null → 「飞行中禁用」完全没生效，连点就会发重复请求
+   *   （裁决/忽略这种会改队列的操作尤其不能重复发）。
+   */
+  function busyButton(ref) {
+    if (!ref) { return null; }
+    if (typeof ref === 'string') { return $(ref); }
+    return (typeof ref === 'object' && ref.nodeType === 1) ? ref : null;
+  }
+
   function setBusy(on, ids, btnIds) {
     state.busy += on ? 1 : -1;
     if (state.busy < 0) { state.busy = 0; }
@@ -425,7 +484,7 @@
       if (n) { n.hidden = !on; }
     }
     for (i = 0; i < (btnIds || []).length; i++) {
-      var b = $(btnIds[i]);
+      var b = busyButton(btnIds[i]);
       if (b) { b.disabled = !!on; }
     }
   }
@@ -443,29 +502,31 @@
     });
   }
 
-  function requireDaemon() {
-    var st = state.lastStatus;
+  /** 当前连接（或指定连接）的 daemon 是否在跑。 */
+  function requireDaemon(linkId) {
+    var id = str(linkId) || currentId();
+    var st = statusOf(id);
     if (!st || !st.running) {
-      logInfo('qxyncd 未运行，操作已取消（先点「启动 daemon」）');
+      logInfo('连接 ' + linkLabelById(id) + ' 的 qxyncd 未运行，操作已取消（先点「启动 daemon」）');
       return false;
     }
     return true;
   }
 
-  function requireLogin() {
-    var st = state.lastStatus;
+  function requireLogin(linkId) {
+    var id = str(linkId) || currentId();
+    var st = statusOf(id);
     if (!st || !st.running) {
-      logInfo('qxyncd 未运行，请先启动 daemon');
+      logInfo('连接 ' + linkLabelById(id) + ' 的 qxyncd 未运行，请先启动 daemon');
       return false;
     }
     var status = st.status;
     if (!status || !status.logged_in) {
-      logInfo('当前未登录，请到「连接 / 登录」页登录');
+      logInfo('连接 ' + linkLabelById(id) + ' 当前未登录，请到「设置 → 连接」登录');
       return false;
     }
     return true;
   }
-
   // ============================================================ 弹窗
   var modalResolve = null;
   var modalLastFocus = null;   // ★ M8.6：打开前的焦点，关闭时还回去
@@ -551,83 +612,249 @@
     return String(v);
   }
 
-  // ============================================================ 顶部状态条
-  function renderTop(st) {
+  // ==================================================== ★ M16 多连接：取数 / 命名
+  //
+  // 约定（贯穿整个前端）：
+  //   * 只要请求是「按连接」的（文件 / 诊断 / 该连接的同步动作），一律走
+  //     `ipcFor(linkId, req)`；`ipc(req)` 只是「当前连接」的简写。
+  //   * 跨连接的展示（任务 / 更新 / 错误 / 待裁决）一律 `fanout`，并把来源连接
+  //     标在条目上；**绝不把 A 的错误算到 B 头上**。
+  var CURRENT_LINK_KEY = 'qxync.currentLink';
+
+  function linksList() { return state.links || []; }
+
+  function linkById(id) {
+    var want = str(id);
+    var ls = linksList();
+    for (var i = 0; i < ls.length; i++) {
+      if (ls[i] && str(ls[i].id) === want) { return ls[i]; }
+    }
+    return null;
+  }
+
+  function statusOf(linkId) { return state.statuses[str(linkId)] || null; }
+
+  function currentStatus() { return statusOf(state.currentLink); }
+
+  /** 连接的可读名：`user@host:port`；没有 link 文件（空转 daemon / 未配置）说「未配置」。 */
+  function linkLabel(link) {
+    if (!link) { return T('links.unconfigured'); }
+    if (link.link_exists === false || (!str(link.host) && !str(link.user))) {
+      return T('links.unconfigured');
+    }
+    return str(link.user) + '@' + str(link.host) + ':' + str(link.port);
+  }
+
+  /** 卡片 / 条目上的连接徽标（带 id：同一台 NAS 上可能存在多个账号的连接）。 */
+  function linkBadge(link) {
+    if (!link) { return T('links.unconfigured'); }
+    return str(link.id) + ' · ' + linkLabel(link);
+  }
+
+  function linkLabelById(id) {
+    var l = linkById(id);
+    return l ? linkLabel(l) : str(id);
+  }
+
+  function currentLinkEntry() { return linkById(state.currentLink); }
+
+  function linkDaemonRunning(link) { return !!(link && link.daemon && link.daemon.running); }
+
+  /** 当前连接的 id（给 ipc_call / link_* 用）：空列表时退回 'default'，与后端默认一致。 */
+  function currentId() { return state.currentLink || 'default'; }
+
+  function loadSavedLink() {
+    try { return str(window.localStorage.getItem(CURRENT_LINK_KEY)); } catch (e) { return ''; }
+  }
+
+  function saveCurrentLink(id) {
+    try { window.localStorage.setItem(CURRENT_LINK_KEY, str(id)); } catch (e) { /* 隐私模式忽略 */ }
+  }
+
+  /** 让 currentLink 落在一个真实存在的连接上：优先持久化值，失效则回退第一个。 */
+  function ensureCurrentLink() {
+    var prev = state.currentLink;
+    var saved = prev || loadSavedLink();
+    if (saved && linkById(saved)) {
+      state.currentLink = str(saved);
+    } else {
+      var ls = linksList();
+      state.currentLink = ls.length ? str(ls[0].id) : '';
+    }
+    saveCurrentLink(state.currentLink);
+    return state.currentLink !== prev;
+  }
+
+  /** 切连接时要清掉的「属于上一个连接」的缓存（不清会串台）。 */
+  function resetLinkScopedState() {
+    state.mounts = [];
+    state.link = null;
+    state.space = null;
+    state.fileStates = {};
+    state.fsSummary = null;
+    state.rootsLoaded = false;
+    state.files = { path: '/home', dir: '/home', entries: [], selected: null, loading: false, error: '' };
+    var fp = $('fp-path');
+    if (fp) { fp.value = '/home'; }
+  }
+
+  /** 切换当前连接：换掉所有「按连接」的缓存，并重拉当前页。 */
+  function setCurrentLink(id) {
+    var link = linkById(id);
+    if (!link) { return Promise.resolve(null); }
+    if (str(id) === state.currentLink) { renderConnSelect(); return Promise.resolve(null); }
+    state.currentLink = str(id);
+    saveCurrentLink(state.currentLink);
+    resetLinkScopedState();
+    renderTop();
+    renderConnSelect();
+    renderConnList();
+    renderFiles();
+    if (state.page === 'settings') { loadConnect(); refreshFilters(); refreshLan(); }
+    logInfo('切换当前连接：' + linkBadge(link));
+    // 让 refreshStatus 统一重拉当前页（切连接 = 所有按连接的数据都过期了）
+    state.currentChanged = true;
+    return refreshStatus(true);
+  }
+
+  /** 全局 fanout 的目标：所有**运行中**的连接；一个都没跑时仍对当前连接试一次
+   *  （这样旧后端 / 离线夹具 / 「所有 daemon 都停了」时也能拿到 IPC 层的准确错误，
+   *   而不是整页假装「没有数据」）。 */
+  function runningTargets() {
+    var ls = linksList();
+    var out = [];
+    for (var i = 0; i < ls.length; i++) {
+      if (linkDaemonRunning(ls[i])) {
+        out.push({ id: str(ls[i].id), link: ls[i], running: true });
+      }
+    }
+    return out;
+  }
+
+  function fanoutTargets() {
+    var out = runningTargets();
+    if (out.length) { return out; }
+    var id = currentId();
+    return [{ id: id, link: linkById(id), running: false }];
+  }
+
+  /** daemon 没在跑的连接（给列表页显示「连接 X 的 daemon 未运行」）。 */
+  function stoppedLinks() {
+    var ls = linksList();
+    var out = [];
+    for (var i = 0; i < ls.length; i++) {
+      if (!linkDaemonRunning(ls[i])) { out.push(ls[i]); }
+    }
+    return out;
+  }
+
+  /** 所有配置连接的 daemon 都没跑？（整页失败时换成这句人话，而不是 socket 报错原文） */
+  function noDaemonRunning() {
+    var ls = linksList();
+    for (var i = 0; i < ls.length; i++) {
+      if (linkDaemonRunning(ls[i])) { return false; }
+    }
+    return true;
+  }
+
+  /** `stoppedLinks()` → 一句可见说明（列表页顶部用）。 */
+  function stoppedLinksNote() {
+    var stopped = stoppedLinks();
+    if (!stopped.length) { return ''; }
+    var names = [];
+    for (var i = 0; i < stopped.length; i++) { names.push(linkLabel(stopped[i])); }
+    return T('list.conn_no_daemon', { links: names.join('、') });
+  }
+
+  // ============================================================ 顶部状态条（多连接聚合）
+  function renderTop() {
     var chipD = $('chip-daemon');
     var chipC = $('chip-conn');
     var chipL = $('chip-login');
     if (!chipD) { return; }
 
-    chipD.className = 'chip chip-unknown';
-    chipC.className = 'chip chip-unknown';
-    chipL.className = 'chip chip-unknown';
-
-    if (!st) {
-      chipD.textContent = T('top.daemon_checking');
-      return;
-    }
-    if (!st.running) {
-      chipD.textContent = T('top.daemon_down');
-      chipD.className = 'chip chip-err';
+    if (!state.linksLoaded) {
+      // 首轮状态还没回来：别把「检测中」显示成「未运行」
+      chipD.textContent = state.linksError ? T('top.daemon_error') : T('top.daemon_checking');
+      chipD.className = 'chip ' + (state.linksError ? 'chip-err' : 'chip-unknown');
       chipC.textContent = T('top.conn_dash');
+      chipC.className = 'chip chip-unknown';
       chipL.textContent = T('top.login_dash');
-      setText('meta-daemon', T('top.daemon_meta_down', { socket: str(st.socket) }));
+      chipL.className = 'chip chip-unknown';
+      setText('meta-daemon', state.linksError
+        ? T('top.meta_error', { msg: state.linksError })
+        : T('top.daemon_meta_down', { socket: '—' }));
       setText('meta-conn', T('top.meta_dash'));
       setText('meta-session', T('top.session_dash'));
       return;
     }
 
-    var ping = isObj(st.ping) ? st.ping : null;
-    chipD.textContent = T('top.daemon_up') + (ping ? ' v' + str(ping.daemon_version) : '');
-    chipD.className = 'chip chip-ok';
+    var ls = linksList();
+    var total = ls.length;
+    var up = 0;
+    var logged = 0;
+    for (var i = 0; i < ls.length; i++) {
+      var d = (ls[i] && isObj(ls[i].daemon)) ? ls[i].daemon : null;
+      if (d && d.running) {
+        up++;
+        if (isObj(d.status) && d.status.logged_in === true) { logged++; }
+      }
+    }
 
-    var s = isObj(st.status) ? st.status : null;
-    var link = (s && isObj(s.link)) ? s.link : null;
-    if (link) {
-      chipC.textContent = T('top.conn', {
-        value: str(link.host) + ':' + str(link.port) + (link.https ? ' (https)' : ' (http)')
-      });
-      chipC.className = 'chip chip-ok';
-    } else {
-      chipC.textContent = T('top.conn_none');
+    // daemon chip：N/M 运行
+    chipD.textContent = total ? T('top.daemon_count', { up: up, total: total }) : T('top.daemon_down');
+    chipD.className = 'chip ' + (total === 0 ? 'chip-err' : (up === 0 ? 'chip-err' : (up === total ? 'chip-ok' : 'chip-warn')));
+
+    // 连接 chip：当前连接
+    var cur = currentLinkEntry();
+    if (!total) {
+      chipC.textContent = T('top.conn_dash');
+      chipC.className = 'chip chip-unknown';
+    } else if (!cur || (cur.link_exists === false && !str(cur.host))) {
+      chipC.textContent = T('top.conn_unconfigured');
       chipC.className = 'chip chip-warn';
-    }
-
-    var logged = !!(s && s.logged_in);
-    var sess = (s && isObj(s.session)) ? s.session : null;
-    if (logged) {
-      chipL.textContent = T('top.login', {
-        value: str(sess ? sess.sid_masked : T('top.login_ok')) + (sess && !sess.alive ? T('top.login_alive_dead') : '')
-      });
-      chipL.className = 'chip ' + (sess && !sess.alive ? 'chip-warn' : 'chip-ok');
     } else {
-      chipL.textContent = T('top.login_none');
-      chipL.className = 'chip chip-warn';
+      chipC.textContent = T('top.conn', { value: linkLabel(cur) });
+      chipC.className = 'chip chip-ok';
     }
 
+    // login chip：已登录 N/M
+    if (!total) {
+      chipL.textContent = T('top.login_dash');
+      chipL.className = 'chip chip-unknown';
+    } else {
+      chipL.textContent = T('top.login_count', { up: logged, total: total });
+      chipL.className = 'chip ' + (logged === total ? 'chip-ok' : 'chip-warn');
+    }
+
+    // meta：**当前连接**的 daemon / socket / session（按连接分开显示，不混算）
+    var st = currentStatus();
+    var ping = (st && isObj(st.ping)) ? st.ping : null;
+    if (!st || !st.running) {
+      setText('meta-daemon', T('top.daemon_meta_down', { socket: str(st ? st.socket : (cur ? cur.socket : '')) }));
+      setText('meta-conn', cur ? T('top.conn_meta', { user: str(cur.user), host: str(cur.host), port: str(cur.port) }) : T('top.meta_dash'));
+      setText('meta-session', T('top.session_dash'));
+      return;
+    }
     setText('meta-daemon', T('top.daemon_meta', {
       pid: str(ping ? ping.pid : '—'), version: str(ping ? ping.daemon_version : '—'),
       uptime: humanDuration(ping ? ping.uptime_secs : 0), socket: str(st.socket)
     }));
-    setText('meta-conn', link
-      ? T('top.conn_meta', { user: str(link.user), host: str(link.host), port: str(link.port) }) +
-        (link.ipv4_only ? T('top.conn_ipv4') : '')
+    setText('meta-conn', cur
+      ? T('top.conn_meta', { user: str(cur.user), host: str(cur.host), port: str(cur.port) })
       : T('top.meta_dash'));
+    var s = isObj(st.status) ? st.status : null;
+    var sess = (s && isObj(s.session)) ? s.session : null;
     setText('meta-session', sess
       ? T('top.session_meta', { sid: str(sess.sid_masked), state: (sess.alive ? 'alive' : 'dead') })
       : T('top.session_dash'));
-
-    if (st.error) {
-      chipD.className = 'chip chip-warn';
-      chipD.textContent = T('top.daemon_up_err');
-    }
   }
-
-  // ============================================================ 主页
+  // ============================================================ 主页 / 任务卡片（★ M16 按连接聚合）
   /**
    * 把一个「同步任务」的状态压成一句话 + 一个状态标记（对齐 Qsync 的任务卡片语言）。
-   * 现阶段的「任务」= 一个挂载点（M8.2 才会引入真正的 Task 持久化）。
    * ⚠️ 只做**诚实**的归纳：拿不到证据就不说「已同步」。
+   *
+   * ★ M16：`st` / `sy` 必须是**该任务所属连接**的状态，不能拿当前连接的去套。
    */
   function taskState(st, sy, hasMounts) {
     if (!st || !st.running) {
@@ -660,86 +887,146 @@
     return { mark: '✅', tone: 'ok', text: T('task.state_all_synced') };
   }
 
-  function renderHome(st) {
-    if (!$('home-conn-text')) { return; }
-
+  /** 某个连接上的挂载点（优先用该连接 status 里的 mounts；当前连接再看 state.mounts）。 */
+  function mountsForLink(id) {
+    var st = statusOf(id);
     var s = (st && isObj(st.status)) ? st.status : null;
-    var link = (s && isObj(s.link)) ? s.link : null;
-    var dot = $('home-dot');
-    var txt = $('home-conn-text');
-
-    if (dot) { dot.className = 'conn-dot'; }
-    if (!st || !st.running) {
-      if (dot) { dot.className = 'conn-dot err'; }
-      if (txt) { txt.textContent = T('home.conn_down'); }
-    } else if (!link) {
-      if (dot) { dot.className = 'conn-dot warn'; }
-      if (txt) { txt.textContent = T('home.conn_no_link'); }
-    } else {
-      var logged = !!(s && s.logged_in);
-      if (dot) { dot.className = 'conn-dot ' + (logged ? 'ok' : 'warn'); }
-      if (txt) {
-        txt.textContent = T('home.conn_ok', {
-          user: str(link.user), host: str(link.host), port: str(link.port),
-          state: (logged ? T('home.conn_connected') : T('home.conn_disconnected'))
-        }) + (s && s.server && s.server.qsync_version
-          ? T('home.conn_qxync', { version: str(s.server.qsync_version) }) : '');
-      }
-    }
-
-    var mounts = (s && s.mounts && s.mounts.length) ? s.mounts : (state.mounts || []);
-    var sy = (s && isObj(s.sync)) ? s.sync : null;
-    // ★ M8.2：有任务登记就按任务展示（每张卡 = 一个同步任务），否则退回挂载点
-    var taskInfos = (state.tasks && state.tasks.tasks) ? state.tasks.tasks : null;
-    renderHomeTasks(st, sy, mounts, taskInfos);
-    renderHomeSync(sy);
+    if (s && Array.isArray(s.mounts)) { return s.mounts; }
+    return (str(id) === state.currentLink) ? (state.mounts || []) : [];
   }
 
-  /** ★ M8.2：把「任务登记」与「挂载点」统一成一种卡片视图。 */
-  function taskViews(mounts, taskInfos) {
+  /**
+   * ★ M16：把「任务登记」按**来源连接**分组。
+   *
+   * 每组 = 一个连接：`{link, id, views, error}`，`views` 里每项都带 `linkId`。
+   * 任务登记为空时退回该连接的挂载点（M8.1 的展示），**同样带连接标记** ——
+   * 这样主页不会出现「一张没有归属的卡片」。
+   */
+  function taskGroups() {
     var out = [];
-    if (taskInfos && taskInfos.length) {
-      for (var i = 0; i < taskInfos.length; i++) {
-        if (isObj(taskInfos[i]) && isObj(taskInfos[i].task)) {
-          out.push({ task: taskInfos[i].task, info: taskInfos[i], mounted: taskInfos[i].mounted === true });
+    var ls = linksList();
+    for (var i = 0; i < ls.length; i++) {
+      var link = ls[i];
+      var id = str(link.id);
+      var entry = state.tasksByLink[id] || null;
+      var data = (entry && entry.data) ? entry.data : null;
+      var err = (entry && entry.error) ? entry.error : '';
+      var infos = (data && data.tasks) ? data.tasks.filter(isObj) : [];
+      var views = [];
+      for (var j = 0; j < infos.length; j++) {
+        if (isObj(infos[j].task)) {
+          views.push({ task: infos[j].task, info: infos[j], mounted: infos[j].mounted === true, linkId: id });
         }
       }
-      return out;
-    }
-    // 没有任务登记 → 退回「一个挂载点 = 一个同步任务」（M8.1 的行为）
-    var list = (mounts || []).filter(isObj);
-    for (var k = 0; k < list.length; k++) {
-      out.push({ mount: list[k], mounted: true });
+      if (!views.length && !err) {
+        var mounts = mountsForLink(id);
+        for (var k = 0; k < mounts.length; k++) {
+          if (isObj(mounts[k])) { views.push({ mount: mounts[k], mounted: true, linkId: id }); }
+        }
+      }
+      out.push({ link: link, id: id, views: views, error: err });
     }
     return out;
   }
 
-  /** 这个任务/挂载对应的**那一个** NAS 文件夹（一对一）。空 = 没指定（用家目录 /home）。 */
+  /** 这个任务 / 挂载对应的**那一个** NAS 文件夹（一对一）。空 = 没指定（用家目录 /home）。 */
   function taskRoot(v) {
     if (v.task) { return str(v.task.root); }
     var m = v.mount || {};
     return str(m.remote);
   }
 
-  function renderHomeTasks(st, sy, mounts, taskInfos) {
+  /** 分组标题：连接徽标 + daemon / 登录状态（每组一眼看清属于谁）。 */
+  function buildTaskGroupHead(group) {
+    var head = el('div', 'task-group-head');
+    head.appendChild(el('span', 'task-group-label mono', linkBadge(group.link)));
+    var d = group.link && isObj(group.link.daemon) ? group.link.daemon : null;
+    var s = (d && isObj(d.status)) ? d.status : null;
+    var state0 = (!d || !d.running) ? T('links.daemon_stopped')
+      : ((s && s.logged_in) ? T('links.login_ok') : T('links.login_none'));
+    head.appendChild(el('span', 'badge ' + ((d && d.running) ? (s && s.logged_in ? 'badge-on' : 'badge-warn') : 'badge-off'), state0));
+    if (group.views.length) {
+      head.appendChild(el('span', 'task-group-count', T('home.task_count', { n: group.views.length })));
+    }
+    return head;
+  }
+
+  function renderHome() {
+    var cst = currentStatus();
+    var cs = (cst && isObj(cst.status)) ? cst.status : null;
+    var cur = currentLinkEntry();
+    var dot = $('home-dot');
+    var txt = $('home-conn-text');
+    if (dot) { dot.className = 'conn-dot'; }
+
+    if (!linksList().length) {
+      if (dot) { dot.className = 'conn-dot err'; }
+      if (txt) { txt.textContent = T('home.conn_down'); }
+    } else if (!cur || (cur.link_exists === false && !str(cur.host))) {
+      if (dot) { dot.className = 'conn-dot warn'; }
+      if (txt) { txt.textContent = T('home.conn_no_link'); }
+    } else if (!cst || !cst.running) {
+      if (dot) { dot.className = 'conn-dot warn'; }
+      if (txt) { txt.textContent = T('home.conn_no_daemon', { label: linkLabel(cur) }); }
+    } else {
+      var logged = !!(cs && cs.logged_in);
+      var link = (cs && isObj(cs.link)) ? cs.link : cur;
+      if (dot) { dot.className = 'conn-dot ' + (logged ? 'ok' : 'warn'); }
+      if (txt) {
+        txt.textContent = T('home.conn_ok', {
+          user: str(link.user), host: str(link.host), port: str(link.port),
+          state: (logged ? T('home.conn_connected') : T('home.conn_disconnected'))
+        }) + (cs && cs.server && cs.server.qsync_version
+          ? T('home.conn_qxync', { version: str(cs.server.qsync_version) }) : '');
+      }
+    }
+
+    renderHomeTasks();
+    renderHomeSync();
+  }
+
+  function renderHomeTasks() {
     var box = $('home-tasks');
     if (!box) { return; }
     clear(box);
-    var views = taskViews(mounts, taskInfos);
-    setText('home-task-count', views.length ? T('home.task_count', { n: views.length }) : '');
-    setListState('home-tasks-empty', views.length ? 'ready' : 'empty', T('home.tasks_empty'));
+    var groups = taskGroups();
+    var total = 0;
+    for (var gi = 0; gi < groups.length; gi++) { total += groups[gi].views.length; }
+    setText('home-task-count', total ? T('home.task_count', { n: total }) : '');
+    setListState('home-tasks-empty', total ? 'ready' : 'empty', T('home.tasks_empty'));
+    if (!total) { return; }
 
-    var ts = taskState(st, sy, views.length > 0);
-    for (var i = 0; i < views.length; i++) {
-      box.appendChild(buildTaskCard(views[i], ts, sy, false));
+    var stoppedNote = stoppedLinksNote();
+    if (stoppedNote) { box.appendChild(el('p', 'note', stoppedNote)); }
+
+    for (var g = 0; g < groups.length; g++) {
+      var group = groups[g];
+      if (!group.views.length && !group.error) { continue; }   // 没任务也没挂载的连接不占版面
+      box.appendChild(buildTaskGroupHead(group));
+      if (group.error) {
+        box.appendChild(el('div', 'task-group-empty', T('task.group_error', {
+          label: linkLabel(group.link), msg: group.error
+        })));
+        continue;
+      }
+      for (var i = 0; i < group.views.length; i++) {
+        box.appendChild(buildTaskCard(group.views[i], false));
+      }
     }
   }
 
   /**
    * 一张任务卡。`full=true` 时带完整操作（任务页用），否则只给「管理 + 立即同步」（主页用）。
+   * ★ M16：卡片右上带**来源连接**徽标；所有操作按 `v.linkId` 发到对应 daemon。
    */
-  function buildTaskCard(v, ts, sy, full) {
+  function buildTaskCard(v, full) {
     var t = v.task, m = v.mount || {};
+    var linkId = str(v.linkId) || currentId();
+    var link = linkById(linkId);
+    var st = statusOf(linkId);
+    var s = (st && isObj(st.status)) ? st.status : null;
+    var sy = (s && isObj(s.sync)) ? s.sync : null;
+    var ts = taskState(st, sy, v.mounted === true || !!(t || m.mountpoint));
     var card = el('div', 'task-card');
     var mark = ts.mark;
     if (t) {
@@ -759,6 +1046,15 @@
       else if (!v.mounted) { stateText = T('task.state_not_mounted'); blocked = false; }
     }
     body.appendChild(el('div', 'task-state', stateText));
+
+    // ★ M16：来源连接（徽标 + 人话名）。同一 NAS 多账号时 id 是唯一能区分的。
+    var linkRow = el('div', 'task-link-row');
+    linkRow.appendChild(el('span', 'badge badge-link', T('task.link_badge', { label: linkBadge(link) })));
+    if (!linkDaemonRunning(link)) {
+      linkRow.appendChild(document.createTextNode(' '));
+      linkRow.appendChild(el('span', 'badge badge-off', T('task.link_daemon_down')));
+    }
+    body.appendChild(linkRow);
 
     var root = taskRoot(v);
     var mp = t ? str(t.mountpoint) : str(m.mountpoint);
@@ -804,17 +1100,17 @@
       if (!t.enabled) {
         var bResume = el('button', 'mini primary', T('task.act_resume'));
         bResume.type = 'button';
-        bResume.addEventListener('click', function () { doTaskAction('resume', t.id, '继续', bResume); });
+        bResume.addEventListener('click', function () { doTaskAction('resume', t.id, '继续', bResume, linkId); });
         act.appendChild(bResume);
       } else if (v.mounted) {
         var bPause = el('button', 'mini', T('task.act_pause'));
         bPause.type = 'button';
-        bPause.addEventListener('click', function () { doTaskAction('pause', t.id, '暂停', bPause); });
+        bPause.addEventListener('click', function () { doTaskAction('pause', t.id, '暂停', bPause, linkId); });
         act.appendChild(bPause);
       } else {
         var bMount = el('button', 'mini primary', T('task.act_mount'));
         bMount.type = 'button';
-        bMount.addEventListener('click', function () { doTaskAction('mount', t.id, '挂载', bMount); });
+        bMount.addEventListener('click', function () { doTaskAction('mount', t.id, '挂载', bMount, linkId); });
         act.appendChild(bMount);
       }
     }
@@ -822,7 +1118,7 @@
     if (full && t) {
       var bEdit = el('button', 'mini', T('task.act_settings'));
       bEdit.type = 'button';
-      bEdit.addEventListener('click', function () { editTask(t); });
+      bEdit.addEventListener('click', function () { editTask(t, linkId); });
       act.appendChild(bEdit);
     }
 
@@ -848,7 +1144,7 @@
 
     var bSync = el('button', 'mini primary', T('task.act_sync_now'));
     bSync.type = 'button';
-    bSync.addEventListener('click', function () { doSync({ once: true }, [], '立即同步'); });
+    bSync.addEventListener('click', function () { doSync({ once: true }, [], '立即同步', linkId); });
     act.appendChild(bSync);
 
     if (full && t) {
@@ -857,7 +1153,7 @@
       bDel.addEventListener('click', function () {
         if (!window.confirm('删除任务登记？\n' + t.id + '\n\n只删 ~/.config/qxync/tasks/' + t.id +
           '.json，**不动挂载点里的文件，也不动 NAS 上的数据**。')) { return; }
-        doTaskAction('delete', t.id, '删除登记', bDel);
+        doTaskAction('delete', t.id, '删除登记', bDel, linkId);
       });
       act.appendChild(bDel);
     }
@@ -867,7 +1163,7 @@
     if (blocked) {
       var bForce = el('button', 'mini danger', T('sync.force_deletes'));
       bForce.type = 'button';
-      bForce.addEventListener('click', function () { doForceDeletes(bForce); });
+      bForce.addEventListener('click', function () { doForceDeletes(bForce, linkId); });
       act.appendChild(bForce);
     }
 
@@ -876,6 +1172,9 @@
   }
 
   // ============================================================ 更新中心 / 错误列表（M8.3）
+  //
+  // ★ M16：这两页是**跨连接**的 —— 对每个运行中的 daemon 各发一次 journal 请求，
+  //   合并后排序，并在每一行标出来源连接（同一个 ts 的两条不会再互相顶掉）。
   var KIND_LABEL = {
     remote_change: 'NAS 上的改动',
     upload: '上传',
@@ -913,23 +1212,67 @@
     return req;
   }
 
+  /** 合并各连接的 journal 条目：[{e, linkId}]，按时间倒序。 */
+  function mergedJournalEntries() {
+    var out = [];
+    var ls = linksList();
+    for (var i = 0; i < ls.length; i++) {
+      var id = str(ls[i].id);
+      var bucket = state.journalByLink[id];
+      if (!bucket || !bucket.data) { continue; }
+      var entries = (bucket.data.entries || []).filter(isObj);
+      for (var j = 0; j < entries.length; j++) {
+        out.push({ e: entries[j], linkId: id });
+      }
+    }
+    out.sort(function (a, b) { return num(b.e.ts, 0) - num(a.e.ts, 0); });
+    return out;
+  }
+
+  /** 逐连接失败 / daemon 没跑 → 一行说明（不冒充整页失败）。 */
+  function fanoutNotes(map) {
+    var notes = [];
+    var ls = linksList();
+    for (var i = 0; i < ls.length; i++) {
+      var id = str(ls[i].id);
+      var bucket = map[id];
+      if (bucket && bucket.error) {
+        notes.push(T('list.conn_error', { label: linkLabelById(id), msg: bucket.error }));
+      }
+    }
+    var stopped = stoppedLinksNote();
+    if (stopped) { notes.push(stopped); }
+    return notes;
+  }
+
   function refreshJournal(extra) {
     state.journalLoading = true;
     state.journalError = '';
     renderJournalPage();
+    var targets = fanoutTargets();
     return withBusy({ buttons: ['btn-journal-refresh'] }, function () {
-      return ipc(journalQuery(extra));
-    }).then(function (r) {
+      return fanout(journalQuery(extra), targets);
+    }).then(function (rs) {
       state.journalLoading = false;
-      if (!r.ok) {
-        logErr('journal 查询失败：' + str(r.error));
-        state.journalError = str(r.error);
-        renderJournalPage();
-        return r;
+      state.journalByLink = {};
+      var errors = 0;
+      var firstErr = '';
+      for (var i = 0; i < rs.length; i++) {
+        var id = str(rs[i].id);
+        if (rs[i].r.ok) {
+          state.journalByLink[id] = { data: isObj(rs[i].r.data) ? rs[i].r.data : null };
+        } else {
+          state.journalByLink[id] = { error: str(rs[i].r.error) };
+          errors++;
+          if (!firstErr) { firstErr = str(rs[i].r.error); }
+        }
       }
-      state.journal = isObj(r.data) ? r.data : null;
+      // 所有目标都失败才算「整页失败」；部分失败只出提示
+      state.journalError = (errors > 0 && errors === rs.length)
+        ? (noDaemonRunning() ? T('list.no_daemon_all') : firstErr) : '';
+      if (state.journalError) { logErr('journal 查询失败：' + state.journalError); }
       renderJournalPage();
-      return r;
+      return { ok: errors === 0, errors: errors };
     });
   }
 
@@ -938,35 +1281,55 @@
     if (!tb) { return; }
     clear(tb);
     setBusyState('journal-tbody', state.journalLoading === true);
-    var d = state.journal;
     if (state.journalError) {
       setText('journal-count', '');
       setListState('journal-empty', 'error', T('list.error', { msg: state.journalError }));
       show('journal-note', false);
       return;
     }
-    if (!d) {
+    if (state.journalLoading && !Object.keys(state.journalByLink).length) {
       setText('journal-count', '');
       setListState('journal-empty', 'loading', T('journal.loading'));
       show('journal-note', false);
       return;
     }
-    var list = (d.entries || []).filter(isObj);
-    var counts = isObj(d.counts) ? d.counts : {};
-    setText('journal-count', T('journal.counts', {
-      total: num(d.total, 0), ok: num(counts.ok, 0),
-      error: num(counts.error, 0), blocked: num(counts.blocked, 0)
-    }));
+    var list = mergedJournalEntries();
+    var ls = linksList();
+    if (!ls.length) {
+      setText('journal-count', '');
+      setListState('journal-empty', 'loading', T('journal.loading'));
+      return;
+    }
+    var total = 0, ok = 0, err = 0, blocked = 0;
+    var cleared = true;
+    var cleanDirs = true;
+    for (var bi = 0; bi < ls.length; bi++) {
+      var bucket = state.journalByLink[str(ls[bi].id)];
+      if (!bucket || !bucket.data) { cleared = false; cleanDirs = false; continue; }
+      total += num(bucket.data.total, 0);
+      var c = isObj(bucket.data.counts) ? bucket.data.counts : {};
+      ok += num(c.ok, 0);
+      err += num(c.error, 0);
+      blocked += num(c.blocked, 0);
+      if (!bucket.data.cleared) { cleared = false; }
+      if ((bucket.data.entries || []).length) { cleanDirs = false; }
+    }
+    setText('journal-count', T('journal.counts', { total: total, ok: ok, error: err, blocked: blocked }));
     if (list.length === 0) {
-      setListState('journal-empty', 'empty', d.cleared ? T('journal.cleared') : T('journal.empty_filtered'));
+      setListState('journal-empty', 'empty', (cleared && cleanDirs) ? T('journal.cleared') : T('journal.empty_filtered'));
     } else {
       setListState('journal-empty', 'ready');
     }
 
     for (var i = 0; i < list.length; i++) {
-      (function (e) {
+      (function (item) {
+        var e = item.e;
         var tr = el('tr');
         tr.appendChild(el('td', 'col-time mono', humanTimeFromEpoch(e.ts)));
+        // ★ M16：来源连接（同一日志表里合并了多个 daemon 的记录）
+        var tdLink = el('td', 'col-link');
+        tdLink.appendChild(el('span', 'badge badge-link', linkLabelById(item.linkId)));
+        tr.appendChild(tdLink);
         var tdKind = el('td', 'col-kind');
         tdKind.appendChild(el('span', null, statusMark(str(e.status)) + ' '));
         tdKind.appendChild(el('span', 'badge', kindLabel(e.kind)));
@@ -978,30 +1341,65 @@
       })(list[i]);
     }
 
+    var notes = fanoutNotes(state.journalByLink);
+    var daemonNotes = [];
+    for (var k = 0; k < ls.length; k++) {
+      var b2 = state.journalByLink[str(ls[k].id)];
+      if (b2 && b2.data && b2.data.note) {
+        daemonNotes.push(T('list.conn_note', { label: linkLabelById(str(ls[k].id)), note: str(b2.data.note) }));
+      }
+    }
+    var all = notes.concat(daemonNotes);
     var note = $('journal-note');
     if (note) {
-      note.hidden = !d.note;
-      note.textContent = d.note ? ('说明：' + String(d.note)) : '';
+      note.hidden = !all.length;
+      note.textContent = all.length ? (T('journal.note_prefix') + all.join('；')) : '';
     }
   }
 
-  /** 错误列表 = journal 里 status=error 的视图（复用同一份数据）。 */
+  /** 错误列表 = journal 里 status=error 的视图（复用同一份数据；同样跨连接 fanout）。 */
   function refreshErrors() {
     state.errorsLoading = true;
     state.errorsError = '';
     renderErrorsPage();
-    return ipc({ method: 'journal', level: 'error', limit: 500 }).then(function (r) {
+    var targets = fanoutTargets();
+    return fanout({ method: 'journal', level: 'error', limit: 500 }, targets).then(function (rs) {
       state.errorsLoading = false;
-      if (!r.ok) {
-        logErr('错误列表读取失败：' + str(r.error));
-        state.errorsError = str(r.error);
-        renderErrorsPage();
-        return r;
+      state.errorsByLink = {};
+      var errors = 0;
+      var firstErr = '';
+      for (var i = 0; i < rs.length; i++) {
+        var id = str(rs[i].id);
+        if (rs[i].r.ok) {
+          state.errorsByLink[id] = { data: isObj(rs[i].r.data) ? rs[i].r.data : null };
+        } else {
+          state.errorsByLink[id] = { error: str(rs[i].r.error) };
+          errors++;
+          if (!firstErr) { firstErr = str(rs[i].r.error); }
+        }
       }
-      state.errors = isObj(r.data) ? r.data : null;
+      state.errorsError = (errors > 0 && errors === rs.length)
+        ? (noDaemonRunning() ? T('list.no_daemon_all') : firstErr) : '';
+      if (state.errorsError) { logErr('错误列表读取失败：' + state.errorsError); }
       renderErrorsPage();
-      return r;
+      return { ok: errors === 0, errors: errors };
     });
+  }
+
+  function mergedErrorEntries() {
+    var out = [];
+    var ls = linksList();
+    for (var i = 0; i < ls.length; i++) {
+      var id = str(ls[i].id);
+      var bucket = state.errorsByLink[id];
+      if (!bucket || !bucket.data) { continue; }
+      var entries = (bucket.data.entries || []).filter(isObj);
+      for (var j = 0; j < entries.length; j++) {
+        out.push({ e: entries[j], linkId: id });
+      }
+    }
+    out.sort(function (a, b) { return num(b.e.ts, 0) - num(a.e.ts, 0); });
+    return out;
   }
 
   function renderErrorsPage() {
@@ -1009,31 +1407,34 @@
     if (!box) { return; }
     clear(box);
     setBusyState('errors-list', state.errorsLoading === true);
-    var d = state.errors;
     if (state.errorsError) {
       setText('errors-count', '');
       setListState('errors-empty', 'error', T('list.error', { msg: state.errorsError }));
       return;
     }
-    if (!d) {
+    if (state.errorsLoading && !Object.keys(state.errorsByLink).length) {
       setText('errors-count', '');
       setListState('errors-empty', 'loading', T('errors.loading'));
       return;
     }
-    var list = (d.entries || []).filter(isObj);
+    var list = mergedErrorEntries();
     setText('errors-count', list.length ? '（' + list.length + '）' : '');
     setListState('errors-empty', list.length ? 'ready' : 'empty', T('errors.empty'));
 
     for (var i = 0; i < list.length; i++) {
-      (function (e) {
+      (function (item) {
+        var e = item.e;
         var row = el('div', 'alert alert-err');
         row.appendChild(el('span', 'mono', humanTimeFromEpoch(e.ts) + '  '));
+        // ★ M16：来源连接 —— 同一份列表里 A 的失败不能被当成 B 的
+        row.appendChild(el('span', 'badge badge-link', linkLabelById(item.linkId)));
+        row.appendChild(document.createTextNode(' '));
         row.appendChild(el('span', 'badge badge-err', kindLabel(e.kind)));
-        row.appendChild(document.createTextNode('  ' + (str(e.detail) || '（无说明）')));
+        row.appendChild(document.createTextNode('  ' + (str(e.detail) || T('errors.no_detail'))));
         if (str(e.path)) {
           row.appendChild(document.createTextNode('  '));
           row.appendChild(el('span', 'mono', str(e.path)));
-          var b = el('button', 'mini', '复制路径');
+          var b = el('button', 'mini', T('errors.copy_path'));
           b.type = 'button';
           b.addEventListener('click', function () { copyText(str(e.path)); });
           row.appendChild(document.createTextNode(' '));
@@ -1041,6 +1442,13 @@
         }
         box.appendChild(row);
       })(list[i]);
+    }
+
+    var notes = fanoutNotes(state.errorsByLink);
+    var hint = $('errors-links-hint');
+    if (hint) {
+      hint.hidden = !notes.length;
+      hint.textContent = notes.join('；');
     }
   }
 
@@ -1054,34 +1462,70 @@
   }
 
   function doJournalClear() {
-    if (!window.confirm('清空同步日志？\n\n只删日志本身，**不动同步状态**（游标 / baseline / pin / 上传队列都不受影响），也不动 NAS 上的数据。')) {
+    if (!window.confirm('清空同步日志？\n\n只删日志本身，**不动同步状态**（游标 / baseline / pin / 上传队列都不受影响），也不动 NAS 上的数据。\n\n注意：所有连接的日志都会被清空。')) {
       return Promise.resolve(null);
     }
-    return refreshJournal({ clear: true }).then(function (r) {
-      if (r && r.ok) { logOk('同步日志已清空'); }
-      return r;
+    var targets = fanoutTargets();
+    return withBusy({ buttons: ['btn-journal-clear'] }, function () {
+      return fanout({ method: 'journal', clear: true }, targets);
+    }).then(function (rs) {
+      var ok = 0;
+      for (var i = 0; i < rs.length; i++) { if (rs[i].r.ok) { ok++; } }
+      logOk('同步日志已清空（' + ok + '/' + rs.length + ' 个连接）');
+      return refreshJournal();
     });
   }
 
   // ============================================================ 任务页（M8.2）
+  //
+  // ★ M16：任务按连接分布在各 daemon 上，`tasks list` 只回本连接的 → 这里 fanout 合并，
+  //   每张卡片标出来源连接，操作再按卡片的 linkId 发回对应 daemon。
   function refreshTasks() {
     state.tasksLoading = true;
     state.tasksError = '';
     renderTasksPage();
-    return ipc({ method: 'tasks', action: 'list' }).then(function (r) {
+    // 运行中的连接走 daemon（有挂载状态）；停跑的连接走 tasks_config（只读磁盘登记），
+    // 这样主页/任务页不会因为「daemon 没起」就把任务藏起来。
+    var stopped = stoppedLinks().filter(function (l) {
+      return l.link_exists !== false && str(l.id);
+    });
+    var offline = stopped.length
+      ? Promise.all(stopped.map(function (l) {
+          return call('tasks_config', { linkId: str(l.id) }).then(function (r) {
+            return { id: str(l.id), r: r };
+          });
+        }))
+      : Promise.resolve([]);
+    return Promise.all([fanout({ method: 'tasks', action: 'list' }, runningTargets()), offline]).then(function (both) {
+      var rs = both[0].slice();
+      var have = {};
+      for (var hi = 0; hi < rs.length; hi++) { have[str(rs[hi].id)] = true; }
+      var extra = both[1] || [];
+      for (var ei = 0; ei < extra.length; ei++) {
+        if (!have[str(extra[ei].id)]) { rs.push(extra[ei]); }
+      }
       state.tasksLoading = false;
+      state.tasksByLink = {};
+      var errors = 0;
+      var firstErr = '';
+      for (var i = 0; i < rs.length; i++) {
+        var id = str(rs[i].id);
+        if (rs[i].r.ok) {
+          state.tasksByLink[id] = { data: isObj(rs[i].r.data) ? rs[i].r.data : null };
+        } else {
+          state.tasksByLink[id] = { error: str(rs[i].r.error) };
+          errors++;
+          if (!firstErr) { firstErr = str(rs[i].r.error); }
+          logErr('tasks list 失败（' + linkLabelById(id) + '）：' + str(rs[i].r.error));
+        }
+      }
+      state.tasksError = (errors > 0 && errors === rs.length)
+        ? (noDaemonRunning() ? T('list.no_daemon_all') : firstErr) : '';
       // 任务列表回来后顺手刷一下冲突策略汇总与待裁决队列（M8.4）
       window.setTimeout(function () { renderConflictKv(); }, 0);
       refreshDecisions();
-      if (!r.ok) {
-        logErr('tasks list 失败：' + str(r.error));
-        state.tasksError = str(r.error);
-        renderTasksPage();
-        return r;
-      }
-      state.tasks = isObj(r.data) ? r.data : null;
       renderTasksPage();
-      return r;
+      return { ok: errors === 0, errors: errors };
     });
   }
 
@@ -1091,59 +1535,94 @@
     clear(box);
     clear($('tasks-bad'));
     setBusyState('tasks-list', state.tasksLoading === true);
-    var d = state.tasks;
     if (state.tasksError) {
       setText('tasks-count', '');
       setListState('tasks-empty', 'error', T('list.error', { msg: state.tasksError }));
       show('tasks-note', false);
       return;
     }
-    if (!d) {
+    if (state.tasksLoading && !Object.keys(state.tasksByLink).length) {
       setText('tasks-count', '');
       setListState('tasks-empty', 'loading', T('tasks.loading'));
       show('tasks-note', false);
       return;
     }
-    var infos = (d.tasks || []).filter(isObj);
-    var sy = (state.lastStatus && isObj(state.lastStatus.status)) ? state.lastStatus.status.sync : null;
-    var ts = taskState(state.lastStatus, sy, infos.length > 0);
-
-    setText('tasks-count', infos.length ? '（' + infos.length + '）' : '');
-    if (infos.length === 0) {
-      setListState('tasks-empty', 'empty', d.empty ? T('tasks.empty_never') : T('tasks.empty_files'));
+    var groups = taskGroups();
+    var ls = linksList();
+    var total = 0;
+    for (var gi = 0; gi < groups.length; gi++) { total += groups[gi].views.length; }
+    setText('tasks-count', total ? '（' + total + '）' : '');
+    if (total === 0) {
+      var anyData = false;
+      for (var ai = 0; ai < ls.length; ai++) {
+        if (state.tasksByLink[str(ls[ai].id)]) { anyData = true; }
+      }
+      var never = true;
+      for (var di = 0; di < ls.length; di++) {
+        var b = state.tasksByLink[str(ls[di].id)];
+        if (b && b.data && !b.data.empty) { never = false; }
+      }
+      setListState('tasks-empty', 'empty', (anyData && !never) ? T('tasks.empty_files') : T('tasks.empty_never'));
     } else {
       setListState('tasks-empty', 'ready');
     }
-    for (var i = 0; i < infos.length; i++) {
-      box.appendChild(buildTaskCard(
-        { task: infos[i].task, info: infos[i], mounted: infos[i].mounted === true }, ts, sy, true));
+
+    var stoppedNote = stoppedLinksNote();
+    if (stoppedNote) { box.appendChild(el('p', 'note', stoppedNote)); }
+
+    for (var g = 0; g < groups.length; g++) {
+      var group = groups[g];
+      if (!group.views.length && !group.error) { continue; }
+      box.appendChild(buildTaskGroupHead(group));
+      if (group.error) {
+        box.appendChild(el('div', 'task-group-empty', T('task.group_error', {
+          label: linkLabel(group.link), msg: group.error
+        })));
+        continue;
+      }
+      for (var i = 0; i < group.views.length; i++) {
+        box.appendChild(buildTaskCard(group.views[i], true));
+      }
     }
 
+    // 逐连接的附注 + 解析失败清单（同样标出连接）
+    var notes = [];
+    var badBox = $('tasks-bad');
+    var badCount = 0;
+    for (var li = 0; li < ls.length; li++) {
+      var b2 = state.tasksByLink[str(ls[li].id)];
+      if (b2 && b2.data && b2.data.note) {
+        notes.push(T('list.conn_note', { label: linkLabelById(str(ls[li].id)), note: str(b2.data.note) }));
+      }
+      if (b2 && b2.data) {
+        var bad = b2.data.bad_files || [];
+        for (var k = 0; k < bad.length; k++) {
+          var pair = bad[k];
+          badBox.appendChild(el('li', null, T('tasks.bad_file', {
+            file: str(pair[0]), err: str(pair[1])
+          }) + '（' + linkLabelById(str(ls[li].id)) + '）'));
+          badCount++;
+        }
+      }
+    }
+    if (badBox) { badBox.hidden = badCount === 0; }
     var note = $('tasks-note');
     if (note) {
-      note.hidden = !d.note;
-      note.textContent = d.note ? ('说明：' + String(d.note)) : '';
-    }
-    var badBox = $('tasks-bad');
-    var bad = (d.bad_files || []);
-    // 空的时候必须隐藏：`.plain-list:empty::after` 会渲染一个「(无)」，
-    // 放在「解析失败清单」下面会被误读成「有失败项」。
-    if (badBox) { badBox.hidden = bad.length === 0; }
-    for (var k = 0; k < bad.length; k++) {
-      var pair = bad[k];
-      badBox.appendChild(el('li', null,
-        T('tasks.bad_file', { file: str(pair[0]), err: str(pair[1]) })));
+      note.hidden = !notes.length;
+      note.textContent = notes.length ? (T('tasks.note_prefix') + notes.join('；')) : '';
     }
   }
 
-  function doTaskAction(action, id, label, btn) {
-    return withBusy({ buttons: btn ? [btn.id] : [] }, function () {
-      return ipc({ method: 'tasks', action: action, id: id });
+  /** 按**任务所属连接**执行 tasks 动作（暂停 / 继续 / 挂载 / 删除登记）。 */
+  function doTaskAction(action, id, label, btn, linkId) {
+    var lid = str(linkId) || currentId();
+    return withBusy({ buttons: btn ? [btn] : [] }, function () {
+      return ipcFor(lid, { method: 'tasks', action: action, id: id });
     }).then(function (r) {
       if (r.ok) {
-        logOk(label + ' ' + id + ' 完成');
+        logOk(label + ' ' + id + ' 完成（' + linkLabelById(lid) + '）');
       } else {
-        logErr(label + ' ' + id + ' 失败：' + str(r.error));
+        logErr(label + ' ' + id + ' 失败（' + linkLabelById(lid) + '）：' + str(r.error));
       }
       return refreshTasks().then(function () { return refreshStatus(true); }).then(function () { return r; });
     });
@@ -1187,20 +1666,34 @@
   // 用户反馈（2026-10-02）：NAS 目录原来是个「每行一个」的 textarea，能填多个 →
   // 挂载点被当成虚拟根，顶层多出一层目录名（本地 `/home/user/qsync` 里又出现 `home/`）。
   // Qsync 的「配对文件夹」是**一对一**的，所以这里改成单选：
-  //   * 候选来自 daemon 的 `roots`（NAS 上登记的 Qsync 同步文件夹 + 家目录）；
+  //   * 候选来自所选连接的 daemon `roots`（NAS 上登记的 Qsync 同步文件夹 + 家目录）；
   //   * 选不到就「浏览…」逐层挑（复用文件页的 `ls`），或选「手动输入」；
   //   * 保存时只写一个根 —— 多根会被 daemon 的 `tasks save` 直接拒掉。
+  //
+  // ★ M16：候选**按连接缓存** —— 编辑不同连接的任务时不能拿上一个连接的 NAS 目录列表。
 
   var NAS_MANUAL = '__manual__';
-  var nas = { loaded: false, inflight: null, candidates: [] };
+  var nasCache = {};   // linkId -> { loaded, inflight, candidates }
+
+  function nasFor(linkId) {
+    var id = str(linkId) || currentId();
+    if (!nasCache[id]) { nasCache[id] = { loaded: false, inflight: null, candidates: [] }; }
+    return nasCache[id];
+  }
+
+  /** 任务表单当前选中的连接 id。 */
+  function taskFormLinkId() {
+    return state.taskFormLink || currentId();
+  }
 
   /**
-   * 从一份 `roots` 响应里提取候选项。
+   * 从一份 `roots` 响应里提取候选项，存进**指定连接**的缓存。
    *
    * 诊断页「NAS 同步文件夹」卡片每次刷新都会把同一份响应喂进来（不额外请求），
    * 同时也缓存下来给任务表单用 —— 于是那边刷新之后，表单里的候选也是新的。
    */
-  function applyNasCandidates(data) {
+  function applyNasCandidates(data, linkId) {
+    var id = str(linkId) || currentId();
     var d = isObj(data) ? data : {};
     var out = [];
     var seen = {};
@@ -1218,21 +1711,29 @@
       if (!cp) { continue; }
       push(cp, T('task.nas_syncing_folder') + '：' + (str(sf[i].folder) || cp) + '（' + cp + '）');
     }
+    var nas = nasFor(id);
     nas.candidates = out;
     nas.loaded = true;
+    // 如果任务表单正停在同一个连接上，顺手重画候选（保留用户当前选择 / 手动模式）
+    if (state.taskFormLink === id) {
+      var sel = $('t-nas-folder');
+      renderNasFolderSelect(nasSelectCurrent(), !!sel && sel.value === NAS_MANUAL);
+    }
   }
 
-  /** 拿候选：已经有就直接重画（不重复请求 NAS），没有才走一次 `roots`。 */
+  /** 拿候选：已经有就直接重画（不重复请求 NAS），没有才走一次该连接的 `roots`。 */
   function loadNasCandidates() {
+    var id = taskFormLinkId();
+    var nas = nasFor(id);
     if (nas.inflight) { return nas.inflight; }
     if (nas.loaded) {
       var sel0 = $('t-nas-folder');
       renderNasFolderSelect(nasSelectCurrent(), !!sel0 && sel0.value === NAS_MANUAL);
       return Promise.resolve(null);
     }
-    nas.inflight = ipc({ method: 'roots' }).then(function (r) {
+    nas.inflight = ipcFor(id, { method: 'roots' }).then(function (r) {
       nas.inflight = null;
-      if (r.ok) { applyNasCandidates(r.data); } else { nas.candidates = []; }
+      if (r.ok) { applyNasCandidates(r.data, id); } else { nas.candidates = []; }
       // 候选是异步到的：**保留用户当前选中的值/模式**（可能是正在编辑的任务根）
       var sel = $('t-nas-folder');
       renderNasFolderSelect(nasSelectCurrent(), !!sel && sel.value === NAS_MANUAL);
@@ -1258,6 +1759,7 @@
     var sel = $('t-nas-folder');
     if (!sel) { return; }
     var cur = str(current).trim();
+    var list = nasFor(taskFormLinkId()).candidates;
     clear(sel);
     var add = function (value, label) {
       var o = el('option', null, label);
@@ -1266,8 +1768,8 @@
     };
     add('/home', T('task.nas_home'));
     var known = cur === '/home';
-    for (var i = 0; i < nas.candidates.length; i++) {
-      var c = nas.candidates[i];
+    for (var i = 0; i < list.length; i++) {
+      var c = list[i];
       if (c.path === '/home') { continue; }
       if (c.path === cur) { known = true; }
       add(c.path, c.label);
@@ -1314,6 +1816,7 @@
   }
 
   // ---------------------------------------------------- ★ NAS 文件夹浏览器（逐层挑）
+  // ★ M16：浏览动作属于**任务表单所选连接**，不是「当前连接」。
   var nasPicker = { dir: '', inflight: null };
 
   function openNasPicker() {
@@ -1337,7 +1840,7 @@
     setText('nas-picker-path', p);
     clear($('nas-picker-list'));
     setListState('nas-picker-empty', 'loading', T('nas_picker.loading'));
-    nasPicker.inflight = ipc({ method: 'ls', path: p }).then(function (r) {
+    nasPicker.inflight = ipcFor(taskFormLinkId(), { method: 'ls', path: p }).then(function (r) {
       nasPicker.inflight = null;
       var b = $('nas-picker-busy');
       if (b) { b.hidden = true; }
@@ -1349,7 +1852,7 @@
       nasPicker.dir = str(d.path || p);
       setText('nas-picker-path', nasPicker.dir);
       var dirs = (d.entries || []).filter(function (e) { return isObj(e) && e.isfolder === true; });
-      dirs.sort(function (a, b) { return str(a.filename).localeCompare(str(b.filename)); });
+      dirs.sort(function (a, b2) { return str(a.filename).localeCompare(str(b2.filename)); });
       renderNasPickerList(dirs);
       return r;
     });
@@ -1384,12 +1887,41 @@
   function pickNasFolder() {
     var p = nasPicker.dir;
     closeNasPicker();
-    if (p) { setNasFolder(p, null); }
+    if (p) { setNasFolder(p); }
+  }
+
+  /** ★ M16：任务表单的「NAS 连接」下拉（新建时可改；编辑时只读）。 */
+  /** 换连接后候选列表要重画（保留当前 NAS 路径作为「不在候选里」的一项）。 */
+  function nasSelectedRefresh() {
+    var sel = $('t-nas-folder');
+    renderNasFolderSelect(nasSelectCurrent(), !!sel && sel.value === NAS_MANUAL);
+  }
+
+  function renderTaskLinkSelect() {
+    var sel = $('t-link');
+    if (!sel) { return; }
+    clear(sel);
+    var ls = linksList();
+    for (var i = 0; i < ls.length; i++) {
+      var o = el('option', null, linkBadge(ls[i]));
+      o.value = str(ls[i].id);
+      sel.appendChild(o);
+    }
+    var want = state.taskFormLink || (ls.length ? str(ls[0].id) : '');
+    if (want && linkById(want)) { sel.value = want; }
+    sel.disabled = state.taskFormEditing === true;
+    var hint = $('t-link-hint');
+    if (hint) {
+      hint.hidden = !state.taskFormEditing;
+      hint.textContent = state.taskFormEditing ? T('task.link_locked') : '';
+    }
   }
 
   function resetTaskForm() {
     var set = function (id, v) { var n = $(id); if (n) { n.value = v; } };
     var chk = function (id, v) { var n = $(id); if (n) { n.checked = !!v; } };
+    state.taskFormEditing = false;
+    state.taskFormLink = state.currentLink || (linksList().length ? str(linksList()[0].id) : '');
     set('t-id', 'default');
     set('t-mountpoint', (str(state.home) || '~') + '/qxync-mnt');
     set('t-cache-dir', '');
@@ -1400,6 +1932,7 @@
     chk('t-smart-delete', false);
     chk('t-read-write', false);
     chk('t-do-mount', true);
+    renderTaskLinkSelect();
     setNasFolder('/home');
     setText('task-form-title', '文件夹对设置');
   }
@@ -1415,12 +1948,15 @@
     if (idEl) { idEl.focus(); }
   }
 
-  /** ★ M8.4：把已有任务填进「文件夹对设置」表单（冲突策略就在这里面改）。 */
-  function editTask(t) {
+  /** ★ M8.4：把已有任务填进「文件夹对设置」表单（冲突策略就在这里面改）。
+   *  ★ M16：`linkId` = 这条任务登记的连接；编辑时连接只读（换 NAS = 重建任务）。 */
+  function editTask(t, linkId) {
     var card = $('task-form-card');
     if (!card || !t) { return; }
     var set = function (id, v) { var n = $(id); if (n) { n.value = v; } };
     var chk = function (id, v) { var n = $(id); if (n) { n.checked = !!v; } };
+    state.taskFormEditing = true;
+    state.taskFormLink = str(linkId) || str(t.link_id) || currentId();
     set('t-id', str(t.id));
     set('t-mountpoint', str(t.mountpoint));
     set('t-cache-dir', t.cache_dir ? str(t.cache_dir) : '');
@@ -1431,6 +1967,7 @@
     chk('t-smart-delete', t.smart_delete === true);
     chk('t-read-write', t.read_write === true);
     chk('t-do-mount', t.enabled !== false);
+    renderTaskLinkSelect();
     // ★ 一对一：NAS 侧就一个文件夹（没写 = 用默认的家目录 /home）
     setNasFolder(str(t.root));
     setText('task-form-title', '文件夹对设置 · ' + str(t.id));
@@ -1442,6 +1979,8 @@
   function closeTaskForm() {
     var card = $('task-form-card');
     if (card) { card.hidden = true; }
+    state.taskFormEditing = false;
+    state.taskFormLink = '';
     setText('task-form-title', '文件夹对设置');
     show('task-result', false);
   }
@@ -1458,6 +1997,11 @@
     if (!nasPath) {
       renderError('task-result', '参数错误',
         'NAS 文件夹不能为空：一个配对文件夹 = 一个本地文件夹 + 一个 NAS 文件夹');
+      return Promise.resolve(null);
+    }
+    var linkId = taskFormLinkId();
+    if (!linkById(linkId)) {
+      renderError('task-result', '参数错误', '没有可用的 NAS 连接：先到「设置 → 连接」添加一台 NAS');
       return Promise.resolve(null);
     }
     var cdir = str($('t-cache-dir') ? $('t-cache-dir').value : '').trim();
@@ -1480,16 +2024,17 @@
     };
     var rows = [
       ['id', id], ['本地', mp],
+      ['NAS 连接', linkBadge(linkById(linkId))],
       ['NAS（一对一）', nasPath],
       ['缓存目录', cdir || '（默认 ~/.local/share/qxync/cache）'],
       ['冲突策略', conflictLabel(task.conflict)]
     ];
     return withBusy({ spinners: ['task-busy'], buttons: ['btn-task-save'] }, function () {
-      return ipc({ method: 'tasks', action: 'save', task: task });
+      return ipcFor(linkId, { method: 'tasks', action: 'save', task: task });
     }).then(function (r) {
       if (!r.ok) {
-        // daemon 的「目的地冲突 / 一对一」错误原样展示（它已经是人话了）
-        renderError('task-result', '保存任务失败', str(r.error));
+        // daemon 的「目的地冲突 / 一对一 / 跨连接覆盖」错误原样展示（它已经是人话了）
+        renderError('task-result', '保存任务失败（' + linkLabelById(linkId) + '）', str(r.error));
         return r;
       }
       // ★ daemon 的 NAS 侧提示（同一 NAS 目录被别的任务用了）—— 只提示，不拦保存
@@ -1503,7 +2048,7 @@
         return r;
       }
       return withBusy({ spinners: ['task-busy'] }, function () {
-        return ipc({ method: 'tasks', action: 'resume', id: id });
+        return ipcFor(linkId, { method: 'tasks', action: 'resume', id: id });
       }).then(function (r2) {
         var okMount = r2.ok;
         renderResult('task-result', okMount, okMount ? '任务已保存并挂载' : '任务已保存，但挂载失败',
@@ -1515,31 +2060,59 @@
     });
   }
 
-  function renderHomeSync(sy) {
+  /** 「最近一次同步」按**连接**分行汇总：A 的错误不会被算到 B 头上。 */
+  function renderHomeSync() {
     var dl = $('home-sync-kv');
     if (!dl) { return; }
     clear(dl);
     clearAlerts('home-alerts');
-    if (!sy) {
-      kvText(dl, '同步', '不可用（daemon 未运行或未上报）');
+    var ls = linksList();
+    if (!ls.length) {
+      kvText(dl, T('home.sync_title'), T('home.sync_no_link'));
       return;
     }
-    kvText(dl, '轮询', sy.enabled ? (num(sy.interval_secs, 0) + ' 秒') : '已暂停',
-      sy.enabled ? 'val-ok' : 'val-warn');
-    kvText(dl, '轮次', num(sy.polls, 0));
-    kvText(dl, '上次轮询', num(sy.last_poll_age_secs, 0) > 0
-      ? humanDuration(sy.last_poll_age_secs) + '前' : '未轮询');
-    kvText(dl, '刷新 / 上传 / 删除',
-      num(sy.refreshed, 0) + ' / ' + num(sy.uploaded, 0) + ' / ' + num(sy.deleted, 0));
-    kvText(dl, '冲突副本', num(sy.conflicts, 0), num(sy.conflicts, 0) > 0 ? 'val-warn' : null);
-    kvText(dl, 'baseline 条目', num(sy.baseline_entries, 0));
-
-    if (sy.last_error) { addAlert('home-alerts', '同步错误：' + String(sy.last_error)); }
-    if (sy.delete_block_reason) {
-      addAlert('home-alerts', T('sync.blocked_alert', { reason: String(sy.delete_block_reason) }),
-        null, { label: T('sync.force_deletes'), onClick: doForceDeletes });
+    var anyRunning = false;
+    for (var i = 0; i < ls.length; i++) {
+      (function (link) {
+        var id = str(link.id);
+        var st = statusOf(id);
+        var s = (st && isObj(st.status)) ? st.status : null;
+        var sy = (s && isObj(s.sync)) ? s.sync : null;
+        var label = linkLabel(link);
+        if (!st || !st.running) {
+          kvText(dl, T('home.sync_link', { label: label }), T('home.sync_no_daemon'), 'val-dim');
+          return;
+        }
+        anyRunning = true;
+        if (!sy) {
+          kvText(dl, T('home.sync_link', { label: label }), T('home.sync_missing'), 'val-dim');
+          return;
+        }
+        kvText(dl, T('home.sync_link', { label: label }), T('home.sync_brief', {
+          polls: num(sy.polls, 0),
+          uploaded: num(sy.uploaded, 0),
+          deleted: num(sy.deleted, 0),
+          conflicts: num(sy.conflicts, 0)
+        }), (sy.last_error || sy.delete_block_reason) ? 'val-warn' : null);
+        if (sy.last_error) {
+          addAlert('home-alerts', T('home.sync_err_link', {
+            label: label, msg: String(sy.last_error)
+          }));
+        }
+        if (sy.delete_block_reason) {
+          addAlert('home-alerts', T('home.sync_blocked_link', {
+            label: label, reason: String(sy.delete_block_reason)
+          }), null, {
+            label: T('sync.force_deletes'),
+            onClick: function (b) { doForceDeletes(b, id); }
+          });
+        }
+        if (sy.note) {
+          addAlert('home-alerts', T('home.sync_note_link', { label: label, note: String(sy.note) }), 'warn');
+        }
+      })(ls[i]);
     }
-    if (sy.note) { addAlert('home-alerts', '说明：' + String(sy.note), 'warn'); }
+    if (!anyRunning) { addAlert('home-alerts', T('home.sync_all_down'), 'warn'); }
   }
 
   // ============================================================ Tab 1 状态
@@ -1555,7 +2128,8 @@
 
     if (!st || !st.running) {
       show('sync-missing', true);
-      kvText(srv, '状态', 'qxyncd 未运行：请点顶部「启动 daemon」，或到「连接 / 登录」页保存配置后启动。');
+      kvText(srv, '状态', '连接 ' + linkLabelById(currentId()) +
+        ' 的 qxyncd 未运行：请点顶部「启动 daemon」，或到「设置 → 连接」保存配置后启动。');
       ['sess-kv', 'cursors-kv', 'hydro-kv', 'transfers-kv', 'uploads-kv', 'cache-kv', 'cache-blocked-kv', 'sync-summary-kv', 'sync-note']
         .forEach(function (id) { clear($(id)); });
       show('uploads-active', false);
@@ -1708,7 +2282,10 @@
       kvText(sum, 'conflicts', num(sy.conflicts, 0), num(sy.conflicts, 0) > 0 ? 'val-warn' : null);
       kvText(sum, 'uploaded', num(sy.uploaded, 0));
       kvText(sum, 'deleted', num(sy.deleted, 0));
-      kvText(sum, 'deletes_blocked', num(sy.deletes_blocked, 0), num(sy.deletes_blocked, 0) > 0 ? 'val-err' : null);
+      // ★ `deletes_blocked` 是**累计**计数（真机到过 692742），不是「当前被挡了多少」。
+      //   「当前有没有被挡」只看 `delete_block_reason`（有值 = 这一轮有删除被熔断）；
+      //   累计值配红字会让人以为现在还在熔断，所以这里不上色。
+      kvText(sum, '删除被挡（累计）', num(sy.deletes_blocked, 0));
       kvText(sum, 'events', num(sy.events, 0));
       kvText(sum, 'baseline_entries', num(sy.baseline_entries, 0));
       if (sy.last_error) {
@@ -1790,10 +2367,11 @@
    * ② 一定要二次确认；③ 按钮在飞行中禁用，防连点。
    * 只放行**这一轮**（daemon 侧 `force_deletes` 用完即置回 false）。
    */
-  function doForceDeletes(btn) {
-    if (!requireDaemon()) { return Promise.resolve(null); }
-    var st = state.lastStatus;
-    var sy = (st && st.status && isObj(st.status.sync)) ? st.status.sync : null;
+  function doForceDeletes(btn, linkId) {
+    var lid = str(linkId) || currentId();
+    if (!requireDaemon(lid)) { return Promise.resolve(null); }
+    var st = statusOf(lid);
+    var sy = (st && isObj(st.status) && isObj(st.status.sync)) ? st.status.sync : null;
     var reason = (sy && sy.delete_block_reason) ? String(sy.delete_block_reason) : '';
     var n = num(sy && sy.deletes_blocked, 0);
     if (!window.confirm(T('sync.force_deletes_confirm', {
@@ -1803,9 +2381,7 @@
       return Promise.resolve(null);
     }
     if (btn) { btn.disabled = true; }
-    return doSync({ once: true, force_deletes: true }, [], T('sync.force_deletes')).then(function (r) {
-      // 放行成功后这一轮就没有 delete_block_reason 了，刷新会把按钮一起收掉；
-      // 这里只保证「万一没消失，按钮不会卡在禁用态」。
+    return doSync({ once: true, force_deletes: true }, [], T('sync.force_deletes'), lid).then(function (r) {
       if (btn) { btn.disabled = false; }
       return r;
     }, function (e) {
@@ -1862,7 +2438,7 @@
   function doUmount(mountpoint, btn) {
     if (!requireDaemon()) { return; }
     if (!window.confirm('确定卸载挂载点？\n' + mountpoint)) { return; }
-    withBusy({ buttons: btn ? [btn.id] : [] }, function () {
+    withBusy({ buttons: btn ? [btn] : [] }, function () {
       return ipc({ method: 'umount', mountpoint: mountpoint });
     }).then(function (r) {
       if (r.ok) {
@@ -1889,7 +2465,8 @@
     if (!folders) { return; }
     // ★ 同一份响应顺手喂给「配对文件夹」的 NAS 候选（不额外请求 NAS）：
     //   在诊断页点过刷新之后，任务表单里的下拉也是新的。
-    applyNasCandidates(data);
+    // ★ M16：候选按连接缓存（诊断页只展示当前连接，所以直接用 currentLink）
+    applyNasCandidates(data, state.currentLink);
     clear(folders);
     clear($('roots-summary-kv'));
 
@@ -1961,7 +2538,18 @@
     if (state.page === 'diag' && state.diag === 'status') { refreshRoots(); }
   }
 
-  // ============================================================ Tab 2 连接
+  // ============================================================ Tab 2 连接（★ M16 多连接）
+  //
+  // 三个数据源分工：
+  //   * `links_status` —— 连接列表 + 每个 daemon 的运行/登录/凭据状态（每 2s 轮询）；
+  //   * `link_read`    —— 单个连接的**完整**配置（含 GUI 不编辑的 M7 字段，只读）；
+  //   * `credential_present` —— 只回「有没有凭据」，绝不回口令。
+  // 表单沿用旧的 f-* / btn-* id（截图矩阵与既有操作习惯不变），新增一个隐藏的编辑 id 状态。
+
+  function setFormValue(id, v) { var n = $(id); if (n) { n.value = v; } }
+  function setFormChecked(id, v) { var n = $(id); if (n) { n.checked = !!v; } }
+
+  /** 把 link_read 的结果填进「连接配置」表单（新建时 info.link 为空 = 全清空）。 */
   function fillConnectForm(info, present) {
     var hint = $('connect-hint');
     if (hint) {
@@ -1976,23 +2564,39 @@
     setText('link-path-hint', info ? ('link 文件：' + str(info.path)) : '—');
 
     var link = (info && isObj(info.link)) ? info.link : null;
-    if (link) {
-      var host = $('f-host'); if (host) { host.value = str(link.host); }
-      var port = $('f-port'); if (port) { port.value = str(link.port); }
-      var user = $('f-user'); if (user) { user.value = str(link.user); }
-      var ht = $('f-https'); if (ht) { ht.checked = link.https !== false; }
-      var ins = $('f-insecure'); if (ins) { ins.checked = link.insecure === true; }
-      var v4 = $('f-ipv4-only'); if (v4) { v4.checked = link.ipv4_only === true; }
-    }
+    var editing = str(state.editingLinkId);
+    setFormValue('f-link-id', editing);
+    setFormValue('f-host', link ? str(link.host) : '');
+    setFormValue('f-port', link ? str(link.port) : '');
+    setFormValue('f-user', link ? str(link.user) : '');
+    setFormChecked('f-https', link ? link.https !== false : true);
+    setFormChecked('f-insecure', link ? link.insecure === true : false);
+    setFormChecked('f-ipv4-only', link ? link.ipv4_only === true : false);
     var pw = $('f-password');
     if (pw) { pw.value = ''; }
+
+    // 表单标题 / 编辑提示 / 编辑态按钮
+    setText('conn-form-title', editing
+      ? T('conn.form_title_edit', { id: editing })
+      : T('conn.form_title_new'));
+    var eHint = $('conn-edit-hint');
+    if (eHint) {
+      eHint.hidden = !editing;
+      eHint.textContent = editing
+        ? T('conn.edit_hint', { id: editing })
+        : '';
+    }
+    show('conn-edit-actions', !!editing);
 
     var cred = $('cred-hint');
     if (cred) {
       if (present && present.present) {
-        cred.textContent = '已保存凭据：' + str(present.user) + '@' + str(present.host) + '   （' + str(present.path) + '）';
+        cred.textContent = T('connect.cred_present', {
+          user: str(present.user), host: str(present.host), path: str(present.path)
+        });
       } else {
-        cred.textContent = '无凭据' + (present ? '（' + str(present.path) + '）' : '') + '；保存并登录时需要输入口令。';
+        cred.textContent = T('connect.cred_missing',
+          { path: str(present ? present.path : '') });
       }
     }
   }
@@ -2013,6 +2617,8 @@
     kvText(dl, 'config_dir', str(info.config_dir));
     kvText(dl, 'data_dir', str(info.data_dir));
     kvText(dl, 'state_dir', str(info.state_dir));
+    kvText(dl, '连接数', ((info.links || []).length) + ' 个'
+      + (((info.links_bad || []).length) ? '（解析失败 ' + (info.links_bad || []).length + ' 个）' : ''));
     kvText(dl, 'daemon_bin', info.daemon_bin ? str(info.daemon_bin) : '未找到（先 cargo build --workspace）',
       info.daemon_bin ? null : 'val-warn');
     kvBool(dl, 'daemon_running', info.daemon_running === true, '运行中', '未运行');
@@ -2022,6 +2628,223 @@
     if (mp && !mp.value) {
       mp.value = (str(info.home) || '~') + '/qxync-mnt';
     }
+  }
+
+  // ------------------------------------------------------------ ★ M16：连接列表
+  /** 连接列表的「渲染签名」：只有当连接集合 / 运行 / 登录 / 凭据 / 当前连接变化时才重画。
+   *  轮询每 2s 一次，无脑重建 <select> 和行内按钮会打断正在用键盘操作的用户。 */
+  function linkSig() {
+    var parts = [str(state.currentLink)];
+    var ls = linksList();
+    for (var i = 0; i < ls.length; i++) {
+      var l = ls[i];
+      var d = isObj(l.daemon) ? l.daemon : {};
+      var st = isObj(d.status) ? d.status : null;
+      var tb = state.tasksByLink[str(l.id)];
+      var taskCount = (tb && tb.data && Array.isArray(tb.data.tasks)) ? tb.data.tasks.length : -1;
+      parts.push([
+        str(l.id),
+        str(l.user), str(l.host), str(l.port),
+        l.link_exists === false ? 0 : 1,
+        l.credential_present ? 1 : 0,
+        d.running ? 1 : 0,
+        st && st.logged_in ? 1 : 0,
+        taskCount,
+        str(d.error || ''),
+        str(d.socket || '')
+      ].join(':'));
+    }
+    return parts.join('|');
+  }
+
+  function renderConnSelect() {
+    var sel = $('conn-select');
+    if (!sel) { return; }
+    var cur = state.currentLink;
+    clear(sel);
+    var ls = linksList();
+    if (!ls.length) {
+      var o0 = el('option', null, T('links.unconfigured'));
+      o0.value = '';
+      sel.appendChild(o0);
+      sel.disabled = true;
+      return;
+    }
+    sel.disabled = false;
+    for (var i = 0; i < ls.length; i++) {
+      var l = ls[i];
+      var label = str(l.id) + ' · ' + linkLabel(l);
+      if (!linkDaemonRunning(l)) { label += T('links.daemon_down_suffix'); }
+      var o = el('option', null, label);
+      o.value = str(l.id);
+      sel.appendChild(o);
+    }
+    sel.value = cur;
+    if (sel.value !== cur) { sel.value = str(ls[0].id); }
+  }
+
+  /** 连接列表的一行：id · user@host:port + daemon/登录/凭据徽标 + 行内操作。 */
+  function buildConnRow(link) {
+    var id = str(link.id);
+    var d = (link && isObj(link.daemon)) ? link.daemon : null;
+    var st = (d && isObj(d.status)) ? d.status : null;
+    var running = !!(d && d.running);
+    var row = el('li', 'conn-row' + (id === state.currentLink ? ' current' : ''));
+    var main = el('div', 'conn-main');
+
+    var title = el('div', 'conn-title');
+    title.appendChild(el('span', 'conn-id mono', id));
+    title.appendChild(document.createTextNode(' '));
+    title.appendChild(el('span', 'conn-label mono', linkLabel(link)));
+    if (id === state.currentLink) {
+      title.appendChild(document.createTextNode(' '));
+      title.appendChild(el('span', 'badge badge-on', T('links.current')));
+    }
+    main.appendChild(title);
+
+    var badges = el('div', 'conn-badges');
+    badges.appendChild(el('span', 'badge ' + (running ? 'badge-on' : 'badge-off'),
+      running ? T('links.daemon_running') : T('links.daemon_stopped')));
+    if (!running) {
+      badges.appendChild(el('span', 'badge', T('links.login_unknown')));
+    } else if (st && st.logged_in) {
+      badges.appendChild(el('span', 'badge badge-on', T('links.login_ok')));
+    } else {
+      badges.appendChild(el('span', 'badge badge-warn', T('links.login_none')));
+    }
+    badges.appendChild(el('span', 'badge ' + (link.credential_present ? 'badge-on' : 'badge-off'),
+      link.credential_present ? T('links.cred_present') : T('links.cred_missing')));
+    if (link.link_exists === false) {
+      badges.appendChild(el('span', 'badge badge-warn', T('links.link_missing')));
+    }
+    // 任务数（可选）：列表已 fanout 过 tasks 才显示，否则不冒充 0
+    var tb = state.tasksByLink[id];
+    if (tb && tb.data && Array.isArray(tb.data.tasks)) {
+      badges.appendChild(el('span', 'badge', T('links.task_count', { n: tb.data.tasks.length })));
+    }
+    main.appendChild(badges);
+
+    var meta = [];
+    if (d && d.socket) { meta.push(str(d.socket)); }
+    if (st && isObj(st.session) && st.session.sid_masked) { meta.push(str(st.session.sid_masked)); }
+    if (d && d.error) { meta.push(T('links.daemon_error', { msg: str(d.error) })); }
+    main.appendChild(el('div', 'conn-meta mono', meta.join(' · ')));
+    row.appendChild(main);
+
+    var act = el('div', 'conn-actions');
+    // 设为当前
+    var bCur = el('button', 'mini' + (id === state.currentLink ? '' : ' primary'),
+      id === state.currentLink ? T('links.current') : T('links.act_current'));
+    bCur.type = 'button';
+    bCur.disabled = id === state.currentLink;
+    bCur.addEventListener('click', function () { setCurrentLink(id); });
+    act.appendChild(bCur);
+    // 启动 / 停止
+    var bRun = el('button', 'mini', running ? T('links.act_stop') : T('links.act_start'));
+    bRun.type = 'button';
+    bRun.addEventListener('click', function () {
+      if (running) { doDaemonStop(id, bRun); } else { doDaemonStart(id, bRun); }
+    });
+    act.appendChild(bRun);
+    // 编辑
+    var bEdit = el('button', 'mini', T('links.act_edit'));
+    bEdit.type = 'button';
+    bEdit.addEventListener('click', function () { editLink(id); });
+    act.appendChild(bEdit);
+    // 移除（没有 link 文件的合成项不可移除：删不了不存在的东西）
+    var bDel = el('button', 'mini danger', T('links.act_remove'));
+    bDel.type = 'button';
+    if (link.link_exists === false) {
+      bDel.disabled = true;
+      bDel.setAttribute('aria-disabled', 'true');
+      bDel.title = T('links.remove_unavailable');
+    } else {
+      bDel.addEventListener('click', function () { doLinkDelete(id, bDel); });
+    }
+    act.appendChild(bDel);
+    row.appendChild(act);
+    return row;
+  }
+
+  function renderLinksBad() {
+    var ul = $('links-bad');
+    if (!ul) { return; }
+    clear(ul);
+    var bad = state.linksBad || [];
+    ul.hidden = bad.length === 0;
+    for (var i = 0; i < bad.length; i++) {
+      ul.appendChild(el('li', null, T('links.bad_file', {
+        path: str(bad[i].path), err: str(bad[i].error)
+      })));
+    }
+  }
+
+  function renderConnList() {
+    var ul = $('conn-list');
+    if (!ul) { return; }
+    clear(ul);
+    setBusyState('conn-list', state.linksLoading === true);
+    var ls = linksList();
+    setText('links-count', ls.length ? T('links.count', { n: ls.length }) : '');
+    if (state.linksError) {
+      setListState('conn-list-empty', 'error', T('list.error', { msg: state.linksError }));
+    } else if (state.linksLoading && !ls.length) {
+      setListState('conn-list-empty', 'loading', T('links.loading'));
+    } else if (!ls.length) {
+      setListState('conn-list-empty', 'empty', T('links.empty'));
+    } else {
+      setListState('conn-list-empty', 'ready');
+    }
+    for (var i = 0; i < ls.length; i++) {
+      ul.appendChild(buildConnRow(ls[i]));
+    }
+    renderLinksBad();
+  }
+
+  function refreshLinks() {
+    state.linksLoading = true;
+    renderConnList();
+    return refreshStatus(true).then(function () {
+      state.linksLoading = false;
+      renderConnList();
+      return { ok: true };
+    }, function (e) {
+      state.linksLoading = false;
+      state.linksError = str(e);
+      renderConnList();
+      return { ok: false, error: str(e) };
+    });
+  }
+
+  /** 读当前连接的配置（表单用）+ app_info。正在编辑别的连接时不覆盖表单。 */
+  function loadConnect() {
+    var id = currentId();
+    return Promise.all([
+      call('link_read', { linkId: id }),
+      call('credential_present', { linkId: id }),
+      call('app_info', {})
+    ]).then(function (rs) {
+      var link = rs[0].ok ? rs[0].data : null;
+      var cred = rs[1].ok ? rs[1].data : null;
+      var info = rs[2].ok ? rs[2].data : null;
+      renderAppInfo(info);
+      if (str(state.editingLinkId) === '') {
+        fillConnectForm(link, cred);
+      } else if (str(state.editingLinkId) === id) {
+        fillConnectForm(link, cred);   // 编辑的就是当前连接：读回来的就是它
+      } else {
+        // 正在编辑另一条连接：只更新凭据提示，别把表单冲掉
+        var c = $('cred-hint');
+        if (c && cred) {
+          c.textContent = cred.present
+            ? T('connect.cred_present', { user: str(cred.user), host: str(cred.host), path: str(cred.path) })
+            : T('connect.cred_missing', { path: str(cred.path) });
+        }
+      }
+      renderConnList();
+      renderConnSelect();
+      return rs;
+    });
   }
 
   function buildLinkInput(withPassword) {
@@ -2038,26 +2861,61 @@
       user: user,
       ipv4_only: isOn('f-ipv4-only', false)
     };
+    // ★ 编辑态才带 id：新建交给后端自动生成（无连接 → default，否则 nas2/nas3…）
+    if (state.editingLinkId) { input.id = str(state.editingLinkId); }
     if (withPassword) {
       input.password = str($('f-password') ? $('f-password').value : '');
     }
     return { input: input };
   }
 
-  function loadConnect() {
-    return Promise.all([
-      call('link_read', { linkId: 'default' }),
-      call('credential_present', {}),
-      call('app_info', {})
-    ]).then(function (rs) {
-      var link = rs[0].ok ? rs[0].data : null;
-      var cred = rs[1].ok ? rs[1].data : null;
-      var info = rs[2].ok ? rs[2].data : null;
-      renderAppInfo(info);
-      fillConnectForm(link, cred);
+  function editLink(id) {
+    var lid = str(id);
+    return call('link_read', { linkId: lid }).then(function (r) {
+      if (!r.ok || !isObj(r.data)) {
+        renderError('login-result', '读取连接配置失败', str(r.error));
+        return r;
+      }
+      return call('credential_present', { linkId: lid }).then(function (c) {
+        state.editingLinkId = lid;
+        fillConnectForm(r.data, c.ok ? c.data : null);
+        var pw = $('f-password');
+        if (pw) { pw.focus(); }
+        return r;
+      });
     });
   }
 
+  /** 「＋ 添加 NAS」：清空表单回到新建态（不动已保存的连接）。 */
+  function newLink() {
+    state.editingLinkId = '';
+    fillConnectForm({ exists: false, path: T('conn.path_pending'), link: null }, null);
+    var host = $('f-host');
+    if (host) { host.focus(); }
+    return Promise.resolve(null);
+  }
+
+  function cancelLinkEdit() {
+    state.editingLinkId = '';
+    show('login-result', false);
+    return loadConnect();
+  }
+
+  function renderResult(boxId, ok, title, rows) {
+    var box = $(boxId);
+    if (!box) { return; }
+    clear(box);
+    box.hidden = false;
+    box.className = 'result ' + (ok ? 'ok' : 'err');
+    box.appendChild(el('div', 'result-title', title));
+    var dl = el('dl', 'kv');
+    for (var i = 0; i < (rows || []).length; i++) {
+      kvText(dl, rows[i][0], rows[i][1]);
+    }
+    box.appendChild(dl);
+  }
+
+  /** 保存连接配置（不登录）。新连接保存后自动切为当前连接。 */
   function doLinkSave() {
     var built = buildLinkInput(false);
     if (built.error) {
@@ -2065,21 +2923,29 @@
       return Promise.resolve({ ok: false, error: built.error });
     }
     return call('link_save', { input: built.input }).then(function (r) {
-      if (r.ok) {
-        var d = isObj(r.data) ? r.data : {};
-        renderResult('login-result', true, '连接配置已保存', [
-          ['文件', str(d.path)],
-          ['host:port', str(d.link && d.link.host) + ':' + str(d.link && d.link.port)],
-          ['user', str(d.link && d.link.user)],
-          ['https', d.link && d.link.https ? '是' : '否']
-        ]);
-      } else {
+      if (!r.ok) {
         renderError('login-result', '保存连接配置失败', str(r.error));
+        logErr('link_save 失败：' + str(r.error));
+        return r;
       }
-      return r;
+      var d = isObj(r.data) ? r.data : {};
+      var savedId = str(d.link && d.link.id);
+      state.editingLinkId = savedId;
+      renderResult('login-result', true, T('links.saved'), [
+        ['连接 id', savedId],
+        ['文件', str(d.path)],
+        ['NAS', str(d.link && d.link.user) + '@' + str(d.link && d.link.host) + ':' + str(d.link && d.link.port)],
+        ['https', d.link && d.link.https ? '是' : '否']
+      ]);
+      logOk('连接配置已保存：' + savedId);
+      return refreshStatus(true).then(function () {
+        if (savedId && savedId !== state.currentLink) { return setCurrentLink(savedId); }
+        return null;
+      }).then(function () { return loadConnect().then(function () { return r; }); });
     });
   }
 
+  /** 保存 + 写凭据 + （必要时）重启该连接的 daemon + 登录。**只动这一条连接**。 */
   function doLogin() {
     var built = buildLinkInput(true);
     if (built.error) {
@@ -2092,6 +2958,7 @@
       if (pw) { pw.focus(); }
       return Promise.resolve({ ok: false, error: '缺少口令' });
     }
+    var wantId = str(built.input.id || '');
     return withBusy({
       spinners: [],
       buttons: ['btn-login', 'btn-link-save']
@@ -2121,85 +2988,203 @@
       var ok = d.ok === true;
       renderResult('login-result', ok, ok ? '登录成功' : '登录失败', rows);
       if (ok) {
-        loadConnect();
-        refreshStatus(true);
-        refreshRootsIfVisible();
+        logOk('登录成功（' + (wantId || '新连接') + '）');
+        return adoptLink(wantId, built.input).then(function () { return loadConnect(); }).then(function () { return r; });
       }
-      return r;
+      return refreshStatus(true).then(function () { return r; });
     });
   }
 
-  function renderResult(boxId, ok, title, rows) {
-    var box = $(boxId);
-    if (!box) { return; }
-    clear(box);
-    box.hidden = false;
-    box.className = 'result ' + (ok ? 'ok' : 'err');
-    box.appendChild(el('div', 'result-title', title));
-    var dl = el('dl', 'kv');
-    for (var i = 0; i < (rows || []).length; i++) {
-      kvText(dl, rows[i][0], rows[i][1]);
-    }
-    box.appendChild(dl);
+  /** 登录/保存后把「刚配置的连接」设为当前：优先用已知 id，否则按 host/port/user 找回。 */
+  function adoptLink(knownId, input) {
+    return refreshStatus(true).then(function () {
+      var id = str(knownId);
+      if (id && linkById(id)) {
+        state.editingLinkId = id;
+        return setCurrentLink(id);
+      }
+      var ls = linksList();
+      for (var i = 0; i < ls.length; i++) {
+        var l = ls[i];
+        if (str(l.host).toLowerCase() === str(input.host).toLowerCase()
+          && num(l.port, 0) === num(input.port, 0)
+          && str(l.user) === str(input.user)) {
+          state.editingLinkId = str(l.id);
+          return setCurrentLink(str(l.id));
+        }
+      }
+      return null;
+    });
   }
 
-  function doDaemonStart() {
-    return withBusy({ buttons: ['btn-daemon-start', 'btn-connect-start'] }, function () {
-      return call('daemon_start', { linkId: 'default' });
+  /** 顶栏 / 连接页的「启动 daemon」——只启动 `linkId`（默认当前连接）。 */
+  function doDaemonStart(linkId, btn) {
+    var id = str(linkId) || currentId();
+    var buttons = btn ? [btn] : ['btn-daemon-start', 'btn-connect-start'];
+    return withBusy({ buttons: buttons }, function () {
+      return call('daemon_start', { linkId: id });
     }).then(function (r) {
-      if (!r.ok) { return r; }
-      var d = isObj(r.data) ? r.data : {};
-      if (d.error) {
-        logErr('daemon_start: ' + str(d.error));
-      } else if (d.already) {
-        logInfo('qxyncd 已在运行');
+      if (!r.ok) {
+        logErr('启动 daemon 失败（' + linkLabelById(id) + '）：' + str(r.error));
       } else {
-        logOk('qxyncd 已启动' + (d.bin ? '：' + str(d.bin) : ''));
+        var d = isObj(r.data) ? r.data : {};
+        if (d.error) {
+          logErr('daemon_start（' + linkLabelById(id) + '）: ' + str(d.error));
+        } else if (d.already) {
+          logInfo('连接 ' + linkLabelById(id) + ' 的 qxyncd 已在运行');
+        } else {
+          logOk('连接 ' + linkLabelById(id) + ' 的 qxyncd 已启动' + (d.bin ? '：' + str(d.bin) : ''));
+        }
       }
-      refreshStatus(true);
-      return r;
+      return refreshStatus(true).then(function () { return r; });
     });
   }
 
-  function doDaemonStop() {
-    if (!window.confirm('确定停止 qxyncd？\n会卸载全部挂载点并删除 socket / pid。')) {
+  function doDaemonStop(linkId, btn) {
+    var id = str(linkId) || currentId();
+    if (!window.confirm(T('links.stop_confirm', { label: linkLabelById(id) }))) {
       return Promise.resolve(null);
     }
-    return withBusy({ buttons: ['btn-daemon-stop', 'btn-connect-stop'] }, function () {
-      return call('daemon_stop', {});
+    var buttons = btn ? [btn] : ['btn-daemon-stop', 'btn-connect-stop'];
+    return withBusy({ buttons: buttons }, function () {
+      return call('daemon_stop', { linkId: id });
     }).then(function (r) {
       if (r.ok) {
         var d = isObj(r.data) ? r.data : {};
-        if (d.already) { logInfo('qxyncd 本来就没在运行'); }
-        else if (d.stopped) { logOk('qxyncd 已停止'); }
-        else { logErr('qxyncd 未能在超时内退出'); }
+        if (d.already) { logInfo('连接 ' + linkLabelById(id) + ' 的 qxyncd 本来就没在运行'); }
+        else if (d.stopped) { logOk('连接 ' + linkLabelById(id) + ' 的 qxyncd 已停止'); }
+        else { logErr('连接 ' + linkLabelById(id) + ' 的 qxyncd 未能在超时内退出'); }
+      } else {
+        logErr('停止 daemon 失败（' + linkLabelById(id) + '）：' + str(r.error));
       }
-      refreshStatus(true);
-      return r;
+      return refreshStatus(true).then(function () { return r; });
     });
   }
 
-  /** 顶部「立即登录」：用已保存的凭据 + 账密登录（不碰表单里的口令）。 */
+  function doLinksStartAll() {
+    return withBusy({ buttons: ['btn-links-start-all'] }, function () {
+      return call('daemon_start_all', {});
+    }).then(function (r) {
+      if (!r.ok) {
+        logErr('全部启动失败：' + str(r.error));
+        return r;
+      }
+      var d = isObj(r.data) ? r.data : {};
+      var ls = (d.links || []);
+      var okCount = 0;
+      for (var i = 0; i < ls.length; i++) {
+        var res = isObj(ls[i].result) ? ls[i].result : {};
+        if (res.error) {
+          logErr('启动 ' + str(ls[i].id) + ' 失败：' + str(res.error));
+        } else {
+          okCount++;
+        }
+      }
+      logOk('全部启动完成：' + okCount + '/' + ls.length + ' 个连接已在运行');
+      return refreshStatus(true).then(function () { return r; });
+    });
+  }
+
+  function doLinksStopAll() {
+    if (!window.confirm(T('links.stop_all_confirm'))) { return Promise.resolve(null); }
+    return withBusy({ buttons: ['btn-links-stop-all'] }, function () {
+      return call('daemon_stop_all', {});
+    }).then(function (r) {
+      if (!r.ok) { logErr('全部停止失败：' + str(r.error)); }
+      else { logOk('全部连接的 daemon 已停止'); }
+      return refreshStatus(true).then(function () { return r; });
+    });
+  }
+
+  /** 移除连接：先不带 deleteTasks 探一次；needs_confirm 时把「会删 N 个任务登记」摊开再确认。 */
+  function doLinkDelete(linkId, btn) {
+    var id = str(linkId);
+    var link = linkById(id);
+    if (!link) { return Promise.resolve(null); }
+    var label = linkLabel(link);
+    var callDelete = function (deleteTasks) {
+      return call('link_delete', { linkId: id, deleteTasks: !!deleteTasks });
+    };
+    // ★ 先问一次再动手：没有任何任务时后端会**直接删掉**，如果先探测后确认就变成
+    //   「已经删了才问要不要删」（而且点取消也回不去了）。有任务时后端只回
+    //   needs_confirm，不删任何东西，所以这个顺序对两种情况都安全。
+    if (!window.confirm(T('links.confirm_delete', { label: label }))) {
+      logInfo('已取消移除连接 ' + id);
+      return Promise.resolve(null);
+    }
+    return withBusy({ buttons: btn ? [btn] : [] }, function () { return callDelete(false); }).then(function (r) {
+      if (!r.ok) {
+        renderError('login-result', '移除连接失败', str(r.error));
+        logErr('移除连接 ' + id + ' 失败：' + str(r.error));
+        return r;
+      }
+      var d = isObj(r.data) ? r.data : {};
+      if (d.needs_confirm === true) {
+        var tasks = (d.tasks || []).filter(isObj);
+        var lines = [];
+        for (var i = 0; i < tasks.length; i++) {
+          lines.push('  · ' + str(tasks[i].id) + '  ' + str(tasks[i].mountpoint) + ' ⇄ NAS ' + str(tasks[i].root));
+        }
+        var bad = (d.bad_task_files || []).filter(isObj);
+        for (var bi = 0; bi < bad.length; bi++) {
+          lines.push('  · [无法解析的任务文件] ' + str(bad[bi].path) + '：' + str(bad[bi].error));
+        }
+        var ok = window.confirm(T('links.confirm_delete_tasks', {
+          label: label, n: num(d.task_count, tasks.length), tasks: lines.join('\n')
+        }));
+        if (!ok) {
+          logInfo('已取消移除连接 ' + id);
+          return r;
+        }
+        return withBusy({ buttons: btn ? [btn] : [] }, function () { return callDelete(true); }).then(function (r2) {
+          return afterLinkRemoved(id, r2);
+        });
+      }
+      return afterLinkRemoved(id, r);
+    });
+  }
+
+  function afterLinkRemoved(id, r) {
+    if (!r || !r.ok) {
+      if (r) { renderError('login-result', '移除连接失败', str(r.error)); logErr('移除连接失败：' + str(r.error)); }
+      return r;
+    }
+    var d = isObj(r.data) ? r.data : {};
+    logOk('已移除连接 ' + id + '（删除任务登记 ' + num(d.tasks_deleted, 0) + ' 个；' +
+      '本地文件 / NAS 数据 / 缓存未动）');
+    if (str(state.editingLinkId) === id) { state.editingLinkId = ''; }
+    // 当前连接被删掉后，refreshStatus 里的 ensureCurrentLink 会自动切到第一个剩余连接
+    return refreshStatus(true).then(function () {
+      return loadConnect().then(function () { return refreshCurrentPage(); });
+    }).then(function () { return r; });
+  }
+
+  /** 顶部「立即登录」：用**当前连接**已保存的凭据 + 账密登录（不碰表单里的口令）。 */
   function doQuickLogin() {
-    return call('credential_present', {}).then(function (r) {
+    var id = currentId();
+    return call('credential_present', { linkId: id }).then(function (r) {
       var d = r.ok ? r.data : null;
       if (!d || !d.present) {
-        logInfo('没有已保存的凭据：请到「连接 / 登录」页填写口令并「保存并登录」');
+        logInfo('连接 ' + linkLabelById(id) + ' 没有已保存的凭据：请到「设置 → 连接」填写口令并「保存并登录」');
         switchPage('settings');
-        var pw = $('f-password');
-        if (pw) { pw.focus(); }
+        state.editingLinkId = str(id);
+        editLink(id).then(function () {
+          var pw = $('f-password');
+          if (pw) { pw.focus(); }
+        });
         return null;
       }
-      return call('daemon_start', { linkId: 'default' }).then(function () {
+      return call('daemon_start', { linkId: id }).then(function () {
         return withBusy({ buttons: ['btn-quick-login'] }, function () {
-          // 不带 user/password：daemon 自己读 credentials.json
-          return ipc({ method: 'login' });
+          // 不带 user/password：daemon 自己读该连接的 credentials 文件
+          return ipcFor(id, { method: 'login' });
         });
       }).then(function (lr) {
         if (lr && lr.ok) {
-          logOk('登录成功：' + str(lr.data && lr.data.sid_masked) + ' user=' + str(lr.data && lr.data.user));
+          logOk('登录成功（' + linkLabelById(id) + '）：' + str(lr.data && lr.data.sid_masked) +
+            ' user=' + str(lr.data && lr.data.user));
         } else {
-          logErr('登录失败：' + str(lr && lr.error));
+          logErr('登录失败（' + linkLabelById(id) + '）：' + str(lr && lr.error));
         }
         refreshStatus(true);
         return lr;
@@ -2210,10 +3195,13 @@
   // ============================================================ Tab 3 挂载
   function refreshMounts() {
     state.mountsLoading = true;
-    return call('daemon_status', {}).then(function (r) {
+    var id = currentId();
+    return call('daemon_status', { linkId: id }).then(function (r) {
       state.mountsLoading = false;
       if (r.ok && isObj(r.data)) {
         state.mountsError = '';
+        // 顺手更新该连接的状态缓存：顶部聚合 / 任务卡不必等下一轮轮询
+        state.statuses[id] = r.data;
         var s = isObj(r.data.status) ? r.data.status : null;
         state.mounts = (s && s.mounts) ? s.mounts : [];
       } else {
@@ -2300,12 +3288,13 @@
     var target = pathNormalize(path === undefined ? state.files.path : path);
     // ★ M8.6：先区分「daemon 没跑」/「没登录」/「真的读失败」，别把三种情况揉成一句空态。
     // 但**首轮 status 还没回来**不算错误 —— 那是「读取中」，不是「不可用」（M4 踩坑 #2 的同类）。
+    var cst = currentStatus();
     if (!requireDaemon() || !requireLogin()) {
       state.files.loading = false;
       state.files.error = '';
-      if (state.lastStatus && !state.lastStatus.running) {
-        state.files.error = T('list.error_daemon');
-      } else if (state.lastStatus && state.lastStatus.running) {
+      if (cst && !cst.running) {
+        state.files.error = T('files.error_daemon_link', { label: linkLabelById(currentId()) });
+      } else if (cst && cst.running) {
         state.files.error = T('files.not_logged_in');
       } else {
         state.files.loading = true;   // 状态未到：如实显示「读取中」
@@ -2725,7 +3714,7 @@
     if (!requireDaemon()) { return; }
     var req = { method: 'pin', path: path };
     if (pinState) { req.state = pinState; }
-    withBusy({ buttons: btn ? [btn.id] : [] }, function () {
+    withBusy({ buttons: btn ? [btn] : [] }, function () {
       return ipc(req);
     }).then(function (r) {
       if (!r.ok) {
@@ -2753,7 +3742,7 @@
         if (!target) { return null; }
         return withBusy({
           spinners: ['files-busy'],
-          buttons: btn ? [btn.id] : []
+          buttons: btn ? [btn] : []
         }, function () {
           return ipc({ method: 'get', dir: state.files.dir, name: str(e.filename), dest: target });
         }).then(function (r) {
@@ -2779,7 +3768,7 @@
     if (!requireDaemon()) { return; }
     withBusy({
       spinners: ['dehy-busy', 'files-busy'],
-      buttons: btn ? [btn.id] : []
+      buttons: btn ? [btn] : []
     }, function () {
       return ipc({ method: 'dehydrate', path: path, force: true });
     }).then(function (r) {
@@ -2893,7 +3882,8 @@
     kvText(dl, 'conflicts', num(sy.conflicts, 0), num(sy.conflicts, 0) > 0 ? 'val-warn' : null);
     kvText(dl, 'uploaded', num(sy.uploaded, 0));
     kvText(dl, 'deleted', num(sy.deleted, 0));
-    kvText(dl, 'deletes_blocked', num(sy.deletes_blocked, 0), num(sy.deletes_blocked, 0) > 0 ? 'val-err' : null);
+    // ★ 累计值（不是「当前」）：当前是否被熔断只看下面的 delete_block_reason。
+    kvText(dl, '删除被挡（累计）', num(sy.deletes_blocked, 0));
     kvText(dl, 'events', num(sy.events, 0));
     kvText(dl, 'devices', (sy.devices || []).length);
     kvText(dl, 'last_error', sy.last_error ? String(sy.last_error) : '—', sy.last_error ? 'val-err' : null);
@@ -2951,8 +3941,10 @@
     setCacheBar('cache2-bar-fill', 'cache2-bar-label', c);
   }
 
-  function doSync(req, btnIds, label) {
-    if (!requireDaemon()) { return Promise.resolve(null); }
+  /** 同步动作（★ M16：默认当前连接；任务卡 / 放行删除显式传该任务所属连接）。 */
+  function doSync(req, btnIds, label, linkId) {
+    var lid = str(linkId) || currentId();
+    if (!requireDaemon(lid)) { return Promise.resolve(null); }
     var r0 = { method: 'sync' };
     if (isObj(req)) {
       for (var k in req) {
@@ -2960,15 +3952,15 @@
       }
     }
     return withBusy({ spinners: ['sync-busy'], buttons: btnIds || [] }, function () {
-      return ipc(r0);
+      return ipcFor(lid, r0);
     }).then(function (r) {
       if (r.ok) {
         var d = isObj(r.data) ? r.data : {};
-        logOk((label || 'sync') + '完成：refreshed=' + num(d.refreshed, 0) + ' conflicts=' + num(d.conflicts, 0) +
-          ' uploaded=' + num(d.uploaded, 0) + ' deleted=' + num(d.deleted, 0) +
-          ' blocked=' + num(d.deletes_blocked, 0));
+        logOk((label || 'sync') + '完成（' + linkLabelById(lid) + '）：refreshed=' + num(d.refreshed, 0) +
+          ' conflicts=' + num(d.conflicts, 0) + ' uploaded=' + num(d.uploaded, 0) +
+          ' deleted=' + num(d.deleted, 0) + ' blocked=' + num(d.deletes_blocked, 0));
       } else {
-        logErr((label || 'sync') + '失败：' + str(r.error));
+        logErr((label || 'sync') + '失败（' + linkLabelById(lid) + '）：' + str(r.error));
       }
       refreshStatus(true);
       return r;
@@ -3090,68 +4082,168 @@
     });
   }
 
-  // ============================================================ 状态轮询
-  var inflight = null;   // 进行中的 daemon_status Promise（避免重叠请求）
+  // ============================================================ 状态轮询（★ M16 多连接）
+  var linksInflight = null;   // 进行中的 links_status Promise（避免重叠请求）
 
-  function refreshStatus(force) {
-    if (inflight) { return inflight; }
-    inflight = call('daemon_status', {}).then(function (r) {
-      inflight = null;
-      if (!r.ok) {
-        renderTop(null);
+  /** 把 links_status 的结果灌进 state；返回是否切换了当前连接。 */
+  function applyLinksStatus(d) {
+    var ls = (d.links || []).filter(isObj);
+    state.linksBad = (d.bad || []).filter(isObj);
+    if (!ls.length) {
+      // 没有任何 link 文件：合成一个 default 占位项，让「启动 / 添加」仍然有落点。
+      // （后端只在 default daemon 在跑时才合成；这里补上「没跑」的情况，UI 才有东西可点。）
+      ls.push({
+        id: 'default', host: '', port: 0, https: true, insecure: false, user: '',
+        link_exists: false, credential_present: false, socket: '',
+        daemon: { link_id: 'default', running: false, socket: '', ping: null, status: null, error: null }
+      });
+    }
+    state.links = ls;
+    state.linksError = '';
+    state.linksLoaded = true;
+    state.statuses = {};
+    for (var i = 0; i < ls.length; i++) {
+      state.statuses[str(ls[i].id)] = isObj(ls[i].daemon) ? ls[i].daemon : null;
+    }
+    return ensureCurrentLink();
+  }
+
+  /** 兼容旧后端 / 离线夹具：没有 links_status 时退回单连接 daemon_status。 */
+  function applyLegacyStatus(r) {
+    var st = (r && r.ok && isObj(r.data)) ? r.data : null;
+    var id = str(st && st.link_id) || 'default';
+    state.links = [{
+      id: id, host: '', port: 0, https: true, insecure: false, user: '',
+      link_exists: false, credential_present: false, socket: st ? str(st.socket) : '',
+      daemon: st, synthetic: true
+    }];
+    state.linksBad = [];
+    state.statuses = {};
+    state.statuses[id] = st;
+    state.currentLink = id;
+    state.linksError = '';
+    state.linksLoaded = true;
+  }
+
+  function fetchLinksStatus() {
+    return call('links_status', {}).then(function (r) {
+      if (r.ok && isObj(r.data) && Array.isArray(r.data.links)) {
+        var changed = applyLinksStatus(r.data);
+        if (changed) { resetLinkScopedState(); }
         return r;
       }
-      var st = isObj(r.data) ? r.data : null;
-      state.lastStatus = st;
-      renderTop(st);
-      var s = (st && isObj(st.status)) ? st.status : null;
-      if (s && s.mounts) { state.mounts = s.mounts; }
-      if (state.page === 'home') {
-        renderHome(st);
-      } else if (state.page === 'tasks') {
-        renderTasksPage();
-      } else if (state.page === 'diag' && (state.diag === 'status' || state.diag === 'sync')) {
-        renderStatusPanel(st);
-      } else if (state.page === 'diag' && state.diag === 'mounts') {
-        renderMountTable('tbl-mounts', 'mounts-empty', 'mounts-count', state.mounts);
-      }
-      return r;
-    }, function (e) {
-      inflight = null;
-      throw e;
+      // 旧后端 / 桩：退回单连接 daemon_status（default）
+      return call('daemon_status', {}).then(function (r2) {
+        applyLegacyStatus(r2);
+        resetLinkScopedState();
+        return r2;
+      });
     });
-    return inflight;
+  }
+
+  function refreshStatus(force) {
+    if (linksInflight) { return linksInflight; }
+    linksInflight = fetchLinksStatus().then(function () {
+      linksInflight = null;
+      state.linksLoading = false;
+      var changed = state.currentChanged === true;
+      state.currentChanged = false;
+      var sig = linkSig();
+      var connUiChanged = (sig !== state.linksSig);
+      state.linksSig = sig;
+      renderTop();
+      if (connUiChanged) {
+        renderConnSelect();
+        renderConnList();
+      }
+      renderScopeHints();
+      if (changed) {
+        // 当前连接被外部改掉/删掉了：按连接的缓存已经清空，要重新拉当前页
+        refreshCurrentPage();
+      } else {
+        renderCurrentPage();
+      }
+      return { ok: true };
+    }, function (e) {
+      linksInflight = null;
+      state.linksLoading = false;
+      state.linksError = str(e);
+      renderTop();
+      renderConnSelect();
+      renderConnList();
+      return { ok: false, error: str(e) };
+    });
+    return linksInflight;
+  }
+
+  /** 「这一页只作用于当前连接」的可见说明（文件 / 诊断页顶部）。 */
+  function renderScopeHints() {
+    var cur = currentLinkEntry();
+    var label = cur ? linkLabel(cur) : T('links.unconfigured');
+    setText('diag-link-hint', T('diag.link_hint', { label: label }));
+    setText('files-link-hint', T('files.link_hint', { label: label }));
+    var jh = $('journal-link-hint');
+    if (jh) { jh.textContent = T('journal.scope_hint'); }
+    var eh = $('errors-link-hint');
+    if (eh) { eh.textContent = T('errors.scope_hint'); }
+    var th = $('tasks-links-hint');
+    if (th) { th.textContent = T('tasks.scope_hint'); }
+  }
+
+  /** 轮询 / 切连接后只**重画**当前页（不发新请求，避免每 2s 打一遍 NAS）。 */
+  function renderCurrentPage() {
+    if (state.page === 'home') { renderHome(); }
+    else if (state.page === 'tasks') { renderTasksPage(); }
+    else if (state.page === 'settings') {
+      if (state.sec === 'connect') { renderConnList(); renderConnSelect(); }
+      else if (state.sec === 'free') { renderSpace(); }
+    } else if (state.page === 'diag') {
+      if (state.diag === 'status' || state.diag === 'sync') { renderStatusPanel(currentStatus()); }
+      else if (state.diag === 'mounts') {
+        renderMountTable('tbl-mounts', 'mounts-empty', 'mounts-count', state.mounts);
+        renderMountTable('tbl-status-mounts', 'status-mounts-empty', 'mounts-status-count', state.mounts);
+      }
+    }
+  }
+
+  /** 切页 / 切连接后**按需重拉**当前页的数据。 */
+  function refreshCurrentPage() {
+    if (state.page === 'home') {
+      renderHome();
+      refreshMounts();
+      refreshTasks();
+    } else if (state.page === 'tasks') {
+      refreshTasks();
+      refreshDecisions();
+    } else if (state.page === 'journal') {
+      refreshJournal();
+    } else if (state.page === 'errors') {
+      refreshErrors();
+    } else if (state.page === 'files') {
+      refreshFiles(state.files.path);
+    } else if (state.page === 'settings') {
+      loadConnect();
+      refreshSettings();
+      if (state.sec === 'free') { refreshSpace(); }
+      if (state.sec === 'lan') { refreshLan(); }
+      if (state.sec === 'sync') { refreshFilters(); }
+    } else if (state.page === 'diag') {
+      if (state.diag === 'mounts') { refreshMounts(); }
+      else if (state.diag === 'status') { refreshRoots(); }
+    }
+    return Promise.resolve(null);
   }
 
   function startPolling() {
     if (state.pollTimer) { return; }
     state.pollTimer = window.setInterval(function () {
       if (document.hidden) { return; }
-      if (inflight) { return; }
+      if (linksInflight) { return; }
       refreshStatus(true);
       // ★ M8.4：每 3 个 tick（≈6s）看一次错误列表，有新错误就发桌面通知
       state.errorTick = (state.errorTick || 0) + 1;
       if (state.errorTick % 3 === 0) { checkErrorsForNotify(); }
     }, POLL_MS);
-  }
-  // 首轮 status 到位前切到某些页（用户手快，或 QXNYC_GUI_TAB 指定）时，
-  // requireLogin() 还拿不到状态 → refreshFiles 会直接返回空态。status 回来后补一次。
-  function refreshCurrentPage() {
-    if (state.page === 'home') {
-      renderHome(state.lastStatus);
-      refreshMounts();
-      refreshTasks();
-    } else if (state.page === 'tasks') {
-      refreshTasks();
-    } else if (state.page === 'files' && !state.files.entries.length) {
-      refreshFiles(state.files.path);
-    } else if (state.page === 'settings') {
-      loadConnect();
-      refreshSettings();
-    } else if (state.page === 'diag') {
-      if (state.diag === 'mounts') { refreshMounts(); }
-      else if (state.diag === 'status') { refreshRoots(); }
-    }
   }
 
   // ============================================================ ★ M8.4 设置中心
@@ -3188,8 +4280,18 @@
     return 'Auto-detect（自动检测）';
   }
 
+  /** 全局设置读哪台 daemon：当前连接在跑就用它；否则用第一台运行中的；都没有就试当前
+   *  （拿 IPC 层的准确错误，而不是假装「没有设置」）。 */
+  function settingsLinkId() {
+    var cur = currentId();
+    var st = statusOf(cur);
+    if (st && st.running) { return cur; }
+    var ts = fanoutTargets();
+    return (ts.length && ts[0].running) ? ts[0].id : cur;
+  }
+
   function refreshSettings() {
-    return ipc({ method: 'settings' }).then(function (r) {
+    return ipcFor(settingsLinkId(), { method: 'settings' }).then(function (r) {
       if (r.ok) {
         state.settings = isObj(r.data) ? r.data : null;
         state.settingsError = '';
@@ -3319,27 +4421,52 @@
     return s;
   }
 
-  /** 整体回写设置（带 autostart_exe：开机自启要写 GUI 自己的绝对路径）。 */
+  /** 整体回写设置（带 autostart_exe：开机自启要写 GUI 自己的绝对路径）。
+   *
+   *  ★ M16：settings.json 是所有连接共用的**全局**设置，但每个 daemon 各有一份内存态 ——
+   *  保存时必须广播给**所有运行中的** daemon（Promise.all），失败逐条提示；
+   *  一台都没跑时只留文件，下次 daemon 起来自己会读。 */
   function saveSettings(s, resultBox, okTitle, rows) {
     var done = function (exe) {
       var req = { method: 'settings_save', settings: s };
       if (exe) { req.autostart_exe = exe; }
+      var targets = fanoutTargets();
       return withBusy({
         buttons: ['btn-proxy-save', 'btn-personal-save', 'btn-advanced-save', 'btn-free-save']
       }, function () {
-        return ipc(req);
-      }).then(function (r) {
-        if (!r.ok) {
-          renderError(resultBox, '保存失败', str(r.error));
-          return r;
+        return fanout(req, targets);
+      }).then(function (rs) {
+        var okCount = 0;
+        var fails = [];
+        var savedData = null;
+        for (var i = 0; i < rs.length; i++) {
+          if (rs[i].r && rs[i].r.ok) {
+            okCount++;
+            if (!savedData) { savedData = isObj(rs[i].r.data) ? rs[i].r.data : null; }
+          } else {
+            fails.push({ id: rs[i].id, msg: str(rs[i].r && rs[i].r.error) });
+            logErr('设置保存失败（' + linkLabelById(rs[i].id) + '）：' + str(rs[i].r && rs[i].r.error));
+          }
         }
-        state.settings = isObj(r.data) ? r.data : null;
+        if (savedData) { state.settings = savedData; }
         renderSettings();
-        var extra = rows || [];
-        var out = [['设置文件', str(isObj(r.data) ? r.data.path : '')]].concat(extra);
-        renderResult(resultBox, true, okTitle, out);
-        logOk(okTitle);
-        return r;
+        if (!okCount) {
+          // 一台都没写成功：如实报错（不要显示「已保存」）
+          renderError(resultBox, T('settings.save_failed'),
+            fails.length ? T('settings.broadcast_fail', { n: fails.length, msg: fails[0].msg })
+                         : T('settings.save_no_daemon'));
+          return { ok: false, errors: fails };
+        }
+        var extra = (rows || []).slice();
+        extra.push(['广播', T('settings.broadcast', { ok: okCount, total: rs.length })]);
+        if (fails.length) {
+          extra.push(['失败', fails.map(function (f) {
+            return linkLabelById(f.id) + ': ' + f.msg;
+          }).join('；')]);
+        }
+        renderResult(resultBox, fails.length === 0, okTitle, extra);
+        logOk(okTitle + '（' + okCount + '/' + rs.length + ' 个运行中的 daemon）');
+        return { ok: fails.length === 0, errors: fails };
       });
     };
     // GUI 可执行文件路径：给 daemon 写 autostart 的 Exec=（拿不到就让 daemon 自己找同目录）
@@ -3404,7 +4531,8 @@
     kvText(dl, '缓存占用', humanSize(num(d.cache_used_bytes, 0)));
     kvText(dl, '本轮判定', (d.would_run ? '会触发' : '不触发') + ' —— ' + str(d.reason));
     if (num(d.last_run_unix, 0) > 0) {
-      kvText(dl, '上次触发', clock(num(d.last_run_unix, 0) * 1000));
+      // ★ 用带日期的格式化：只显示 HH:MM:SS 会让人分不清是今天还是上周跑的。
+      kvText(dl, '上次触发', humanTimeFromEpoch(num(d.last_run_unix, 0)));
     }
     if (d.injected === true) {
       kvRow(dl, '⚠ 注入', '正在使用 QXNYC_TEST_FAST_STATVFS 注入值（验收模式）', 'val-warn');
@@ -3449,7 +4577,8 @@
   // ------------------------------------------------------------ 筛选器（link.exclude）
 
   function refreshFilters() {
-    return call('link_read', { linkId: 'default' }).then(function (r) {
+    // ★ M16：筛选器挂在**当前连接**的 link 文件上（不是全局）
+    return call('link_read', { linkId: currentId() }).then(function (r) {
       if (!r.ok || !isObj(r.data)) {
         setText('flt-note', '读取连接配置失败：' + str(r.error));
         return r;
@@ -3499,13 +4628,15 @@
       //   （规则解析器忽略 `#` 开头的行，效果等价于「没有任何排除规则」）。
       lines = ['# 已清空（GUI）'];
     }
-    var link = state.link || {};
+    // ★ M16：写回**当前连接**的 link 文件（id 显式传当前连接）
+    var link = state.link || currentLinkEntry() || {};
     if (!link.host || !link.user) {
-      renderError('flt-match-result', '无法保存筛选器', '连接配置里缺少 host/user：先在「连接」分区保存一次连接配置');
+      renderError('flt-match-result', '无法保存筛选器',
+        '当前连接缺少 host/user：先在「连接」分区保存一次连接配置');
       return Promise.resolve(null);
     }
     var input = {
-      id: link.id || 'default',
+      id: currentId(),
       host: str(link.host),
       port: num(link.port, 9834),
       https: link.https !== false,
@@ -3570,13 +4701,17 @@
     return '重命名本地文件（默认，双方都不丢）';
   }
 
+  /** 所有连接的任务登记（带来源连接）：设置页的冲突策略汇总用。 */
   function taskList() {
-    var d = state.tasks;
     var out = [];
-    if (d && d.tasks && d.tasks.length) {
-      for (var i = 0; i < d.tasks.length; i++) {
-        var t = d.tasks[i] && d.tasks[i].task ? d.tasks[i].task : null;
-        if (t) { out.push(t); }
+    var ls = linksList();
+    for (var i = 0; i < ls.length; i++) {
+      var id = str(ls[i].id);
+      var b = state.tasksByLink[id];
+      var infos = (b && b.data && b.data.tasks) ? b.data.tasks : [];
+      for (var j = 0; j < infos.length; j++) {
+        var t = infos[j] && infos[j].task ? infos[j].task : null;
+        if (t) { out.push({ task: t, linkId: id }); }
       }
     }
     return out;
@@ -3592,91 +4727,375 @@
       return;
     }
     for (var i = 0; i < ts.length; i++) {
-      kvText(dl, str(ts[i].id), conflictLabel(str(ts[i].conflict) || 'rename_local'));
+      kvText(dl, str(ts[i].task.id) + ' · ' + linkLabelById(ts[i].linkId),
+        conflictLabel(str(ts[i].task.conflict) || 'rename_local'));
     }
+  }
+
+  // ------------------------------------------------------------ ★ M16：冲突待裁决（跨连接）
+  //
+  // 每个 daemon 有自己的队列；这里 fanout 合并，卡片标出来源连接，裁决 / 忽略 / 对比 /
+  // 清空都按**条目来源连接**路由 —— A 的裁决绝不能发到 B 的 daemon 上。
+
+  function mergedDecisions() {
+    var out = [];
+    var ls = linksList();
+    for (var i = 0; i < ls.length; i++) {
+      var id = str(ls[i].id);
+      var b = state.decisionsByLink[id];
+      if (!b || !b.data) { continue; }
+      var items = (b.data.decisions || []).filter(isObj);
+      for (var j = 0; j < items.length; j++) {
+        out.push({ x: items[j], linkId: id });
+      }
+    }
+    out.sort(function (a, b2) {
+      return num(b2.x.created_unix, 0) - num(a.x.created_unix, 0);
+    });
+    return out;
   }
 
   function refreshDecisions() {
     state.decisionsLoading = true;
     state.decisionsError = '';
     renderDecisions();
-    return ipc({ method: 'decisions', action: 'list' }).then(function (r) {
+    return fanout({ method: 'decisions', action: 'list' }).then(function (rs) {
       state.decisionsLoading = false;
-      if (!r.ok) {
-        logErr('读取冲突待裁决队列失败：' + str(r.error));
-        state.decisionsError = str(r.error);
-        renderDecisions();
-        return r;
+      state.decisionsByLink = {};
+      var errors = 0;
+      var firstErr = '';
+      for (var i = 0; i < rs.length; i++) {
+        var id = str(rs[i].id);
+        if (rs[i].r.ok) {
+          state.decisionsByLink[id] = { data: isObj(rs[i].r.data) ? rs[i].r.data : null };
+        } else {
+          state.decisionsByLink[id] = { error: str(rs[i].r.error) };
+          errors++;
+          if (!firstErr) { firstErr = str(rs[i].r.error); }
+          logErr('读取冲突待裁决队列失败（' + linkLabelById(id) + '）：' + str(rs[i].r.error));
+        }
       }
-      state.decisions = isObj(r.data) ? r.data : null;
+      state.decisionsError = (errors > 0 && errors === rs.length)
+        ? (noDaemonRunning() ? T('list.no_daemon_all') : firstErr) : '';
       renderDecisions();
-      return r;
+      return { ok: errors === 0, errors: errors };
     });
   }
 
   function renderDecisions() {
     var box = $('decisions-list');
     if (!box) { return; }
-    var d = state.decisions;
-    var items = (d && d.decisions) ? d.decisions : [];
+    var items = mergedDecisions();
     clear(box);
     setBusyState('decisions-list', state.decisionsLoading === true);
-    setText('decisions-count', items.length ? (items.length + ' 条（待裁决 ' + num(d.pending, 0) + '）') : '');
+    setText('decisions-count', items.length ? T('home.task_count', { n: items.length }) : '');
     if (state.decisionsError) {
       setListState('decisions-empty', 'error', T('list.error', { msg: state.decisionsError }));
-    } else if (!d) {
+    } else if (state.decisionsLoading && !Object.keys(state.decisionsByLink).length) {
       setListState('decisions-empty', 'loading', T('decisions.loading'));
     } else if (items.length === 0) {
       setListState('decisions-empty', 'empty', T('decisions.empty'));
     } else {
       setListState('decisions-empty', 'ready');
     }
+
+    // 逐连接附注（部分失败 / 某连接 daemon 未跑 / 各 daemon 的 note）
+    var notes = fanoutNotes(state.decisionsByLink);
+    var ls = linksList();
+    for (var k = 0; k < ls.length; k++) {
+      var b = state.decisionsByLink[str(ls[k].id)];
+      if (b && b.data && b.data.note) {
+        notes.push(T('list.conn_note', { label: linkLabelById(str(ls[k].id)), note: str(b.data.note) }));
+      }
+    }
     var note = $('decisions-note');
     if (note) {
-      note.hidden = !(d && d.note);
-      note.textContent = d && d.note ? str(d.note) : '';
+      note.hidden = !notes.length;
+      note.textContent = notes.join('；');
     }
     for (var i = 0; i < items.length; i++) {
-      box.appendChild(buildDecisionCard(items[i]));
+      box.appendChild(buildDecisionCard(items[i].x, items[i].linkId));
     }
   }
 
-  function buildDecisionCard(x) {
-    var card = el('div', 'task-card');
+  function buildDecisionCard(x, linkId) {
+    var lid = str(linkId) || currentId();
+    var card = el('div', 'task-card dec-card');
     var body = el('div', 'task-body');
-    body.appendChild(el('div', 'task-state', pathBase(str(x.path)) + (x.resolution ? '（已裁决，待执行）' : '（待裁决）')));
+    body.appendChild(el('div', 'task-state',
+      pathBase(str(x.path)) + (x.resolution ? T('decisions.resolved_pending') : T('decisions.pending'))));
+    var linkRow = el('div', 'task-meta');
+    linkRow.appendChild(el('span', 'badge badge-link', T('task.link_badge', { label: linkBadge(linkById(lid)) })));
+    body.appendChild(linkRow);
     body.appendChild(el('div', 'task-meta', 'NAS ' + str(x.path)));
     body.appendChild(el('div', 'task-meta',
       '本地 ' + humanSize(num(x.local_size, 0)) + ' / NAS ' + humanSize(num(x.remote_size, 0)) +
-      ' · 发现于 ' + clock(num(x.created_unix, 0) * 1000)));
+      ' · 发现于 ' + (humanTimeFromEpoch(num(x.created_unix, 0)) || '—')));
     card.appendChild(body);
 
     var acts = el('div', 'task-actions');
     var mk = function (label, res, cls) {
       var b = el('button', 'mini' + (cls ? ' ' + cls : ''), label);
       b.type = 'button';
-      b.addEventListener('click', function () { doDecisionResolve(str(x.id), res, b); });
+      b.addEventListener('click', function () { doDecisionResolve(x, res, b, lid); });
       return b;
     };
-    acts.appendChild(mk('保留本地', 'keep_local', 'primary'));
-    acts.appendChild(mk('保留 NAS 上的', 'keep_remote'));
-    acts.appendChild(mk('两份都留', 'keep_both'));
+    // ★ 决定「保留哪边」之前得先能**看见差在哪** —— 没有内容对比就只能靠猜。
+    var cmp = el('button', 'mini', T('decisions.act_diff'));
+    cmp.type = 'button';
+    cmp.setAttribute('aria-label', T('decisions.act_diff_aria', { name: pathBase(str(x.path)) }));
+    cmp.addEventListener('click', function () { toggleDecisionDiff(x, card, cmp, lid); });
+    acts.appendChild(cmp);
+    acts.appendChild(mk(T('decisions.keep_local'), 'keep_local', 'primary'));
+    acts.appendChild(mk(T('decisions.keep_remote'), 'keep_remote'));
+    acts.appendChild(mk(T('decisions.keep_both'), 'keep_both'));
+    // ★ 出口：这条我不想管 → 只删队列行，不动文件。
+    var fgt = el('button', 'mini', T('decisions.act_forget'));
+    fgt.type = 'button';
+    fgt.addEventListener('click', function () { doDecisionForget(x, fgt, lid); });
+    acts.appendChild(fgt);
     card.appendChild(acts);
     return card;
   }
 
-  function doDecisionResolve(id, res, btn) {
-    return withBusy({ buttons: btn ? [btn.id] : [] }, function () {
-      return ipc({ method: 'decisions', action: 'resolve', id: id, resolution: res });
+  function doDecisionResolve(x, res, btn, linkId) {
+    var lid = str(linkId) || currentId();
+    var id = str(x.id);
+    return withBusy({ buttons: btn ? [btn] : [] }, function () {
+      return ipcFor(lid, { method: 'decisions', action: 'resolve', id: id, resolution: res });
     }).then(function (r) {
       if (!r.ok) {
-        logErr('裁决失败：' + str(r.error));
+        logErr(T('decisions.resolve_err', { msg: str(r.error) }));
         return r;
       }
-      logOk('已裁决 ' + id + ' → ' + res + '（下一轮同步执行）');
+      // 用**路径**而不是内部 id 记日志：id 是路径压平后的内部键，对用户没有意义。
+      logOk(T('decisions.resolve_ok', { path: str(x.path), res: resolutionLabel(res) }) +
+        '（' + linkLabelById(lid) + '）');
       refreshDecisions();
       return r;
     });
+  }
+
+  /// 「忽略这条」：只删队列行，**不动任何文件**。给用户一个明确的出口 ——
+  /// 否则已裁决的条目只能干等下一轮同步，看着像卡住。
+  function doDecisionForget(x, btn, linkId) {
+    var lid = str(linkId) || currentId();
+    if (!confirm(T('decisions.forget_confirm', { path: str(x.path) }))) { return Promise.resolve(); }
+    return withBusy({ buttons: btn ? [btn] : [] }, function () {
+      return ipcFor(lid, { method: 'decisions', action: 'forget', id: str(x.id) });
+    }).then(function (r) {
+      if (!r.ok) {
+        logErr(T('decisions.forget_err', { msg: str(r.error) }));
+        return r;
+      }
+      logOk(T('decisions.forget_ok', { path: str(x.path) }));
+      refreshDecisions();
+      return r;
+    });
+  }
+
+  /** 清空**所有连接**的待裁决队列（只删队列记录，不动文件）。 */
+  function doDecisionsClear(btn) {
+    if (!confirm(T('decisions.clear_confirm'))) { return Promise.resolve(); }
+    var targets = fanoutTargets();
+    return withBusy({ buttons: btn ? [btn] : [] }, function () {
+      return fanout({ method: 'decisions', action: 'clear' }, targets);
+    }).then(function (rs) {
+      var n = 0;
+      var failed = 0;
+      for (var i = 0; i < rs.length; i++) {
+        if (rs[i].r.ok) { n += isObj(rs[i].r.data) ? num(rs[i].r.data.removed, 0) : 0; }
+        else { failed++; logErr(T('decisions.clear_err', { msg: str(rs[i].r.error) })); }
+      }
+      logOk(T('decisions.clear_ok', { n: n }) + (failed ? T('decisions.clear_partial', { n: failed }) : ''));
+      refreshDecisions();
+      return rs;
+    });
+  }
+
+  /// 展开 / 收起某一条的本地↔NAS 文本对比。
+  ///
+  /// ★ 竞态：请求飞行中再点会**再发一次请求**（第一问没回来时 `.dec-diff` 还不存在，
+  ///   收起分支接不住），回包后可能 append 出第二个面板。所以飞行中禁用按钮（点击
+  ///   不再触发），回包时先清掉旧面板再挂新的；列表若在飞行中被刷新（卡片已被重画、
+  ///   脱离文档），就别往死节点里塞东西。
+  function toggleDecisionDiff(x, card, btn, linkId) {
+    var lid = str(linkId) || currentId();
+    var open = card.querySelector('.dec-diff');
+    if (open) {
+      open.remove();
+      btn.disabled = false;
+      btn.removeAttribute('aria-busy');
+      btn.textContent = T('decisions.act_diff');
+      return Promise.resolve();
+    }
+    if (btn.disabled) { return Promise.resolve(); }   // 飞行中：忽略重复点击
+    btn.disabled = true;
+    btn.setAttribute('aria-busy', 'true');
+    btn.textContent = T('decisions.act_diff_busy');
+    var settle = function () {
+      btn.disabled = false;
+      btn.removeAttribute('aria-busy');
+      btn.textContent = T('decisions.act_diff');
+    };
+    return ipcFor(lid, { method: 'decisions', action: 'diff', id: str(x.id) }).then(function (r) {      card.appendChild(buildDiffView(isObj(r.data) ? r.data : null));
+      return r;
+    }, function (e) {
+      settle();
+      throw e;
+    });
+  }
+
+  /** 一行 diff 的 wire 形状（`DiffLine`）：`kind` 是 `' '`/`'+'`/`'-'` 单字符，两侧行号是数字，`text` 是字符串。 */
+  function isDiffLine(l) {
+    if (!isObj(l)) { return false; }
+    var k = str(l.kind);
+    return (k === ' ' || k === '+' || k === '-') &&
+      typeof l.local_no === 'number' && isFinite(l.local_no) &&
+      typeof l.remote_no === 'number' && isFinite(l.remote_no) &&
+      typeof l.text === 'string';
+  }
+
+  /// 渲染 diff 面板。**`outcome.status` 不是 `diff` 时必须显示原因** ——
+  /// 静默显示「无差异」会让人以为两边一样，那是危险的假象。
+  ///
+  /// ★ wire 形状（`crates/qxync-core/src/decisions.rs` 的 `#[serde(tag = "status")]`
+  ///   newtype 变体）：`DiffResult` 的字段与 `status` **平级**，不嵌套在 `diff` 下：
+  ///   `{"status":"diff","lines":[…],"added":N,"removed":M,"truncated":bool}`。
+  ///   读错一层时旧代码有 `{}` 兜底 → 恒显「+0/-0 / 两边内容逐行相同」。
+  ///   所以这里在 `status=diff` 之后**还要验形状**；缺字段就显示错误，
+  ///   **绝不落成「逐行相同」**（没比过和比出零差异在界面上必须长得不一样）。
+  ///
+  /// 语义方向（与 `text_diff`/`removed`/`added` 的实际实现一致）：
+  ///   `-` 行 = 只有本地有（`local_no>0`、`remote_no=0`），`removed` = 本地独有行数；
+  ///   `+` 行 = 只有 NAS 有（`local_no=0`、`remote_no>0`），`added` = NAS 独有行数。
+  function buildDiffView(d) {
+    var box = el('div', 'dec-diff');
+    if (!isObj(d)) {
+      box.appendChild(buildDiffSkip(T('decisions.diff_no_data'), true));
+      return box;
+    }
+    var o = isObj(d.outcome) ? d.outcome : null;
+    if (!o) {
+      box.appendChild(buildDiffSkip(T('decisions.diff_no_data'), true));
+      return box;
+    }
+    var status = str(o.status);
+    if (status === 'skipped') {
+      box.appendChild(buildDiffSkip(diffSkipText(o), false));
+      return box;
+    }
+    if (status !== 'diff') {
+      // 既不是 diff 也不是 skipped：形状不认识。显示成错误说明（不是「无差异」）。
+      box.appendChild(buildDiffSkip(T('decisions.diff_no_data'), true));
+      return box;
+    }
+
+    // ★ 平级字段。缺任何一项都按「结果不可信」处理。
+    var lines = Array.isArray(o.lines) ? o.lines : null;
+    var added = (typeof o.added === 'number' && isFinite(o.added)) ? o.added : null;
+    var removed = (typeof o.removed === 'number' && isFinite(o.removed)) ? o.removed : null;
+    var linesOk = lines !== null && lines.every(isDiffLine);
+    if (!linesOk || added === null || removed === null) {
+      box.appendChild(buildDiffSkip(T('decisions.diff_bad_shape'), true));
+      return box;
+    }
+    // 「统计说有差异、却一行都画不出来」是自相矛盾的结果 —— 同样不能当「逐行相同」。
+    if (lines.length === 0 && (added > 0 || removed > 0)) {
+      box.appendChild(buildDiffSkip(T('decisions.diff_bad_shape'), true));
+      return box;
+    }
+    var truncated = o.truncated === true;
+
+    var head = el('div', 'dec-diff-head');
+    var stat = el('span', 'dec-diff-stat');
+    // 顺序与颜色跟语义对齐：本地独有 = `-`（红），NAS 独有 = `+`（绿）。
+    var del = el('span', 'del', '-' + removed);
+    del.title = T('decisions.diff_local_only_hint');
+    var add = el('span', 'add', '+' + added);
+    add.title = T('decisions.diff_nas_only_hint');
+    stat.appendChild(document.createTextNode(T('decisions.diff_local_only') + ' '));
+    stat.appendChild(del);
+    stat.appendChild(document.createTextNode(' / ' + T('decisions.diff_nas_only') + ' '));
+    stat.appendChild(add);
+    head.appendChild(stat);
+    head.appendChild(el('span', null, T('decisions.diff_size', {
+      l: humanSize(num(d.local_size, 0)),
+      r: humanSize(num(d.remote_size, 0))
+    })));
+    box.appendChild(head);
+
+    var body = el('div', 'dec-diff-body');
+    if (lines.length === 0) {
+      // 只有形状校验通过、且统计也确实是 0 差异时才敢这么说。
+      body.appendChild(el('div', 'dec-diff-foot', T('decisions.diff_identical')));
+    }
+    for (var i = 0; i < lines.length; i++) {
+      body.appendChild(buildDiffRow(lines[i]));
+    }
+    box.appendChild(body);
+    if (truncated) {
+      box.appendChild(el('div', 'dec-diff-foot', T('decisions.diff_truncated', { n: num(lines.length, 0) })));
+    }
+    return box;
+  }
+
+  function buildDiffRow(l) {
+    var x = isObj(l) ? l : {};
+    var kind = str(x.kind) === '+' ? 'add' : (str(x.kind) === '-' ? 'del' : 'eq');
+    var row = el('div', 'dec-diff-row ' + kind);
+    var lno = num(x.local_no, 0);
+    var rno = num(x.remote_no, 0);
+    row.appendChild(el('span', 'no', lno === 0 ? '' : String(lno)));
+    row.appendChild(el('span', 'no', rno === 0 ? '' : String(rno)));
+    row.appendChild(el('span', 'tx', str(x.text)));
+    return row;
+  }
+
+  function buildDiffSkip(msg, isErr) {
+    return el('div', 'dec-diff-skip' + (isErr ? ' err' : ''), msg);
+  }
+
+  /// 把 `DiffSkip` 的结构化原因翻成人话。
+  function diffSkipText(o) {
+    var reason = str(o.reason);
+    if (reason === 'too_large') {
+      return T('decisions.diff_too_large', {
+        size: humanSize(num(o.size, 0)),
+        limit: humanSize(num(o.limit, 0))
+      });
+    }
+    if (reason === 'binary') { return T('decisions.diff_binary'); }
+    if (reason === 'is_dir') { return T('decisions.diff_is_dir'); }
+    if (reason === 'no_content') {
+      // 「哪一侧读不到 + 人话原因」。
+      //
+      // ★ 前缀判重：`DiffSkip::NoContent.detail` 可能**已经自带**同义前缀 ——
+      //   ① 旧 daemon 对本地读失败写的是 `detail: "本地内容读不到：{e}"`；
+      //   ② fuse 的 WouldBlock 人话原因本身就以「本地内容还没水合完整（…）」开头。
+      //   这时再套一层 `{side}内容读不到：{detail}` 会显示
+      //   「本地内容读不到：本地内容读不到：…」。daemon 侧后续会去掉自己那层前缀，
+      //   所以这里做**双向兼容**：有前缀就原样用，没有才补。
+      //   `which` 只可能是 local / remote（daemon 赋值）；`unknown` 是 DiffData 的默认值，
+      //   到了这里也不能瞎猜成 NAS（CLI 侧同样是「两侧之一」口径）。
+      var isLocal = str(o.which) === 'local';
+      var isRemote = str(o.which) === 'remote';
+      var which = isLocal ? T('decisions.side_local')
+        : (isRemote ? T('decisions.side_remote') : '两侧之一');
+      var detail = str(o.detail).trim();
+      if (detail.indexOf('内容读不到') >= 0 || detail.indexOf(which) === 0) {
+        return detail;   // 已自带侧别/前缀，别重复
+      }
+      return T('decisions.diff_no_content', { side: which, detail: detail });
+    }
+    return T('decisions.diff_unknown');
+  }
+
+  function resolutionLabel(v) {
+    if (v === 'keep_local') { return T('decisions.keep_local'); }
+    if (v === 'keep_remote') { return T('decisions.keep_remote'); }
+    if (v === 'keep_both') { return T('decisions.keep_both'); }
+    return str(v);
   }
 
   // ------------------------------------------------------------ LAN 加速
@@ -3747,7 +5166,9 @@
     else if (state.lanLoading) { setListState('lan-events-empty', 'loading', T('lan.events_loading')); }
     else { setListState('lan-events-empty', 'empty', T('lan.events_empty')); }
     for (var i = 0; i < evs.length; i++) {
-      ul.appendChild(el('li', null, clock(num(evs[i].ts, 0) * 1000) + '  ' + str(evs[i].kind) + '  ' + str(evs[i].path)));
+      // ts 是 unix 秒；用带日期的格式化（同一个 clock(n) 曾把数字时间戳丢掉、恒显现在）。
+      ul.appendChild(el('li', null, humanTimeFromEpoch(num(evs[i].ts, 0)) + '  ' +
+        str(evs[i].kind) + '  ' + str(evs[i].path)));
     }
   }
 
@@ -3760,7 +5181,8 @@
     var listen = str($('lan-listen') ? $('lan-listen').value : '').trim();
     var name = str($('lan-name') ? $('lan-name').value : '').trim();
     var input = {
-      id: link.id || 'default',
+      // ★ M16：LAN 对等配置写在**当前连接**的 link 文件里
+      id: currentId(),
       host: str(link.host),
       port: num(link.port, 9834),
       https: link.https !== false,
@@ -3826,12 +5248,18 @@
     kvText(dl, '配置目录', info ? str(info.config_dir) : '—');
     kvText(dl, '数据目录', info ? str(info.data_dir) : '—');
     kvText(dl, '状态目录', info ? str(info.state_dir) : '—');
-    var st = state.lastStatus;
-    var s = (st && isObj(st.status)) ? st.status : null;
-    if (s && isObj(s.link)) {
-      kvText(dl, 'NAS', str(s.link.host) + ':' + str(s.link.port));
+    // ★ M16：关于页显示「当前连接」；daemon 运行数按全部连接聚合。
+    var cur = currentLinkEntry();
+    if (cur) {
+      kvText(dl, '当前连接', linkBadge(cur));
+      kvText(dl, 'NAS', cur.link_exists === false ? T('links.unconfigured')
+        : str(cur.user) + '@' + str(cur.host) + ':' + str(cur.port));
     }
-    kvBool(dl, 'daemon', !!(s || (info && info.daemon_running)),
+    var running = 0;
+    var ls = linksList();
+    for (var i = 0; i < ls.length; i++) { if (linkDaemonRunning(ls[i])) { running++; } }
+    kvText(dl, 'daemon', running + ' / ' + ls.length + ' 运行中');
+    kvBool(dl, '当前连接的 daemon', !!(currentStatus() && currentStatus().running),
       '运行中', '未运行');
     var note = $('about-m84');
     if (note) {
@@ -3879,9 +5307,11 @@
   }
 
   function fileStationUrl() {
-    var st = state.lastStatus;
+    // ★ M16：File Station 打的是**当前连接**那台 NAS；daemon status 里的 link 最准，
+    // 没有就退回 link 文件（state.link / links_status 里的条目）。
+    var st = currentStatus();
     var s = (st && isObj(st.status)) ? st.status : null;
-    var link = (s && isObj(s.link)) ? s.link : (state.link || null);
+    var link = (s && isObj(s.link)) ? s.link : (state.link || currentLinkEntry() || null);
     if (!link || !link.host) { return ''; }
     var scheme = link.https === false ? 'http' : 'https';
     return scheme + '://' + str(link.host) + ':' + str(link.port) + '/cgi-bin/filemanager/index.html';
@@ -3899,21 +5329,33 @@
    * 刻意**不通知成功项**：Qsync 的「每个活动都通知」在 Linux 桌面上是噪声。
    */
   function checkErrorsForNotify() {
-    return ipc({ method: 'journal', level: 'error', limit: 1 }).then(function (r) {
-      if (!r.ok) { return r; }
-      var d = isObj(r.data) ? r.data : {};
-      var es = d.entries || [];
-      if (!es.length) { return r; }
-      var e = es[0];
-      var key = str(e.ts) + '|' + str(e.path) + '|' + str(e.detail);
-      if (state.lastErrorKey === key) { return r; }
+    // ★ M16：错误来自**哪个连接**必须一起看：去重键 = `linkId + ':' + 条目 id`
+    //   （条目没有 id 时退回 ts|path|detail，语义等价）。
+    return fanout({ method: 'journal', level: 'error', limit: 1 }, fanoutTargets()).then(function (rs) {
+      var best = null;
+      for (var i = 0; i < rs.length; i++) {
+        if (!rs[i].r.ok) { continue; }
+        var d = isObj(rs[i].r.data) ? rs[i].r.data : {};
+        var es = (d.entries || []).filter(isObj);
+        if (!es.length) { continue; }
+        var e = es[0];
+        if (!best || num(e.ts, 0) > num(best.e.ts, 0)) { best = { id: str(rs[i].id), e: e }; }
+      }
+      if (!best) { return { ok: true, entries: 0 }; }
+      var e = best.e;
+      var entryId = (e.id !== undefined && e.id !== null && str(e.id) !== '')
+        ? str(e.id)
+        : (str(e.ts) + '|' + str(e.path) + '|' + str(e.detail));
+      var key = best.id + ':' + entryId;
+      if (state.lastErrorKey === key) { return { ok: true, entries: 1 }; }
       state.lastErrorKey = key;
       if (state.settings && isObj(state.settings.settings) &&
           state.settings.settings.desktop_notifications === false) {
-        return r;   // 用户关掉了通知
+        return { ok: true, entries: 1 };   // 用户关掉了通知
       }
-      notifyUser('qxync 同步出错', str(e.path) + ' —— ' + str(e.detail));
-      return r;
+      notifyUser('qxync 同步出错（' + linkLabelById(best.id) + '）',
+        str(e.path) + ' —— ' + str(e.detail));
+      return { ok: true, entries: 1 };
     }, function () { return { ok: false }; });
   }
 
@@ -3966,29 +5408,14 @@
     }
     setText('page-title', PAGE_TITLE[name] || name);
 
-    if (name === 'home') {
-      renderHome(state.lastStatus);
-      refreshMounts();
-      refreshTasks();
-    } else if (name === 'tasks') {
-      refreshTasks();
-      refreshDecisions();
-    } else if (name === 'journal') {
-      refreshJournal();
-    } else if (name === 'errors') {
-      refreshErrors();
-    } else if (name === 'files') {
-      if (!state.files.entries.length) { refreshFiles(state.files.path); }
-      else { renderFiles(); refreshFileStates(); }
-    } else if (name === 'settings') {
+    // ★ M16：切页只决定「去哪」，取数统一走 refreshCurrentPage（它知道每页要拉什么）。
+    if (name === 'settings') {
       switchSettingsSec(sec || state.sec);
-      loadConnect();
-      refreshSettings();
-      if (state.sec === 'free') { refreshSpace(); }
-      if (state.sec === 'lan') { refreshLan(); }
     } else if (name === 'diag') {
       switchDiag(state.diag);
+      return;   // switchDiag 自己会拉当前子页的数据
     }
+    refreshCurrentPage();
   }
 
   /** ★ M8.4：切设置页内的分区。 */
@@ -4015,6 +5442,7 @@
     setText('page-title', T('page.settings_sec', { sec: SEC_TITLE[name] || name }));
     if (name === 'free') { refreshSpace(); }
     if (name === 'lan') { refreshLan(); }
+    if (name === 'connect') { loadConnect(); renderConnList(); }
     if (name === 'about') { renderAbout(); }
     if (name === 'sync') { refreshFilters(); }
   }
@@ -4045,7 +5473,8 @@
     }
 
     if (name === 'status' || name === 'sync') {
-      renderStatusPanel(state.lastStatus);
+      renderStatusPanel(currentStatus());
+      renderScopeHints();
       // 切到「状态」拉一次 NAS 目录（家目录 + 登记的同步文件夹）；重复点同一子页不重复拉
       if (name === 'status' && prev !== 'status') { refreshRoots(); }
     }
@@ -4150,7 +5579,15 @@
     on('btn-nas-up', 'click', function () { loadNasPickerDir(pathParent(nasPicker.dir || '/home')); });
     on('btn-nas-pick', 'click', function () { pickNasFolder(); });
     on('btn-nas-cancel', 'click', function () { closeNasPicker(); });
-    var nasSel = $('t-nas-folder');
+    // ★ M16：任务表单的「NAS 连接」——换连接 = 换 daemon 取候选 + 换保存落点
+    on('t-link', 'change', function (ev) {
+      if (state.taskFormEditing) { return; }   // 编辑时只读
+      state.taskFormLink = str(ev.target && ev.target.value) || state.taskFormLink;
+      renderTaskLinkSelect();
+      nasSelectedRefresh();
+      loadNasCandidates();
+    });
+    var nasSel = $('t-nas-folder');    var nasSel = $('t-nas-folder');
     if (nasSel) { nasSel.addEventListener('change', function () { syncNasManual(); }); }
     var nasBox = $('nas-picker');
     if (nasBox) {
@@ -4181,10 +5618,16 @@
       doSync({ once: true }, ['btn-home-sync-now'], '立即同步');
     });
 
-    // 顶部动作
+    // 顶部动作（★ M16：作用在**当前连接**上）
     on('btn-daemon-start', 'click', function () { doDaemonStart(); });
     on('btn-daemon-stop', 'click', function () { doDaemonStop(); });
     on('btn-quick-login', 'click', function () { doQuickLogin(); });
+
+    // ★ M16：顶部「当前连接」选择器（键盘/读屏都能用；select 自带 label）
+    on('conn-select', 'change', function (ev) {
+      var v = str(ev.target && ev.target.value);
+      if (v) { setCurrentLink(v); }
+    });
 
     // 连接页
     var f = $('form-connect');
@@ -4198,6 +5641,17 @@
     on('btn-connect-start', 'click', function () { doDaemonStart(); });
     on('btn-connect-stop', 'click', function () { doDaemonStop(); });
     on('btn-app-info-refresh', 'click', function () { loadConnect(); });
+    // ★ M16：连接列表的工具栏
+    on('btn-link-add', 'click', function () { newLink(); });
+    on('btn-links-refresh', 'click', function () { refreshLinks(); });
+    on('btn-links-start-all', 'click', function () { doLinksStartAll(); });
+    on('btn-links-stop-all', 'click', function () { doLinksStopAll(); });
+    on('btn-link-cancel-edit', 'click', function () { cancelLinkEdit(); });
+    on('btn-link-delete', 'click', function (ev) {
+      var id = str(state.editingLinkId);
+      if (!id) { logInfo('没有正在编辑的连接'); return; }
+      doLinkDelete(id, ev && ev.currentTarget);
+    });
 
     // 挂载页
     var fm = $('form-mount');
@@ -4321,6 +5775,9 @@
       });
     });
     on('btn-decisions-refresh', 'click', function () { refreshDecisions(); });
+    on('btn-decisions-clear', 'click', function (ev) {
+      doDecisionsClear(ev && ev.currentTarget);
+    });
 
     // 页面可见性恢复时立刻刷一次
     document.addEventListener('visibilitychange', function () {
@@ -4331,6 +5788,12 @@
   /**
    * ★ M8.4：托盘菜单动作。
    * Rust 侧只负责 emit（`tray://action`），真正的动作在前端做 —— 前端持有 IPC 与界面状态。
+   */
+  /** ★ M16：托盘动作（立即同步 / 暂停）要遍历**所有运行中的**连接。 */
+  /**
+   * ★ M8.4：托盘菜单动作。
+   * Rust 侧只负责 emit（`tray://action`），真正的动作在前端做 —— 前端持有 IPC 与界面状态。
+   * ★ M16：同步 / 暂停要**遍历所有运行中的连接**（托盘没有「当前连接」的概念）。
    */
   function wireTray() {
     if (!tauri || !tauri.event || !isFn(tauri.event.listen)) {
@@ -4344,11 +5807,36 @@
         call('window_show', {});
         switchPage('home');
       } else if (action === 'sync') {
-        doSync({ once: true }, [], '托盘：立即与 NAS 同步');
+        trayFanout({ once: true }, '托盘：立即与 NAS 同步');
       } else if (action === 'pause') {
-        doSync({ interval_secs: 0 }, [], '托盘：暂停轮询');
+        trayFanout({ interval_secs: 0 }, '托盘：暂停轮询');
       }
       renderAbout();
+    });
+  }
+
+  function trayFanout(req, label) {
+    var targets = fanoutTargets();
+    if (!targets.length || !targets[0].running) {
+      logInfo(label + '：没有运行中的 daemon');
+      return Promise.resolve(null);
+    }
+    // req 只是 sync 的参数（once / interval_secs），method 必须在这里补上
+    var r0 = { method: 'sync' };
+    if (isObj(req)) {
+      for (var k in req) {
+        if (Object.prototype.hasOwnProperty.call(req, k)) { r0[k] = req[k]; }
+      }
+    }
+    return fanout(r0, targets).then(function (rs) {
+      var ok = 0;
+      for (var i = 0; i < rs.length; i++) {
+        if (rs[i].r.ok) { ok++; }
+        else { logErr(label + '（' + linkLabelById(rs[i].id) + '）失败：' + str(rs[i].r.error)); }
+      }
+      logOk(label + '：' + ok + '/' + rs.length + ' 个连接已完成');
+      refreshStatus(true);
+      return rs;
     });
   }
 
@@ -4427,14 +5915,25 @@
       }
     });
 
+    // ★ M16：先把持久化的「当前连接」读出来，再发任何按连接的请求
+    state.currentLink = loadSavedLink();
+    renderConnSelect();
+    renderConnList();
+    renderTop();
+    renderScopeHints();
+
     loadConnect();
     refreshSettings();
     m84InfoRefresh();
     refreshDecisions();
-    refreshStatus(true).then(function () { startPolling(); refreshCurrentPage(); },
-                             function () { startPolling(); refreshCurrentPage(); });
-    refreshMounts();
-    refreshTasks();
+    // 首轮状态 → 再按当前页重拉（顺序很重要：当前连接校验过、状态到齐才发按连接的请求）
+    refreshStatus(true).then(function () {
+      startPolling();
+      return refreshCurrentPage();
+    }, function () {
+      startPolling();
+      return refreshCurrentPage();
+    });
     renderFiles();
   }
 

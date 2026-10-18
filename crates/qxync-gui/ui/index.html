@@ -85,6 +85,12 @@
           <span id="chip-login" class="chip chip-unknown">登录：—</span>
         </div>
 
+        <!-- ★ M16：当前连接选择器（决定「文件 / 诊断」页和顶栏 meta 显示哪个 daemon） -->
+        <label class="conn-picker">
+          <span data-i18n="top.switch">当前连接</span>
+          <select id="conn-select" aria-label="当前连接" data-i18n-aria-label="top.switch_aria"></select>
+        </label>
+
         <div class="topbar-actions">
           <button id="btn-daemon-start" type="button">启动 daemon</button>
           <button id="btn-daemon-stop" type="button">停止 daemon</button>
@@ -135,14 +141,21 @@
 
       <!-- ======================= 页面 2：任务（M8.2，M8.4 补冲突策略） ======================= -->
       <section class="page" id="page-tasks">
+        <p class="hint" id="tasks-links-hint"></p>
         <!-- ★ M8.4：冲突策略 =「每个文件都问我」时攒下的待裁决队列 -->
         <div class="card" id="decisions-card">
           <h2>冲突待裁决 <span class="count" id="decisions-count"></span>
-            <button type="button" class="mini" id="btn-decisions-refresh">刷新</button>
+            <button type="button" class="mini" id="btn-decisions-refresh"
+              data-i18n="decisions.act_refresh">刷新</button>
+            <button type="button" class="mini" id="btn-decisions-clear"
+              data-i18n="decisions.act_clear">清空全部</button>
           </h2>
+          <!-- 注意：这里**不要**加 data-i18n —— 本段含内联 <code>ask</code>，
+               apply() 用 textContent 覆盖会吃掉标记（i18n.js 文件头已把「含内联标记的
+               混合段落」划出 i18n 范围）；静态中文文案与 i18n.js 的 decisions.hint 保持一致。 -->
           <p class="hint">
             只有把某个任务的冲突策略设成 <code>ask</code>（每个文件都问我）时才会有条目。
-            待裁决期间**两边都不动**（谁的改动都不会被覆盖）；裁决后由下一轮同步执行。
+            待裁决期间两边都不动（谁的改动都不会被覆盖）；裁决后由下一轮同步执行。
           </p>
           <div id="decisions-list" class="task-list"></div>
           <p class="empty-hint" id="decisions-empty" hidden data-state="ready" data-i18n="decisions.empty">没有待裁决的冲突。</p>
@@ -165,6 +178,11 @@
         <div class="card" id="task-form-card" hidden>
           <h2 id="task-form-title">文件夹对设置</h2>
           <form id="form-task" class="form" autocomplete="off">
+            <!-- ★ M16：这条任务登记在哪个连接上（新建默认当前连接；编辑时只读） -->
+            <label>NAS 连接
+              <select id="t-link" class="mono"></select>
+            </label>
+            <p class="hint" id="t-link-hint" hidden></p>
             <div class="row-2">
               <label>任务 id（也是文件名）
                 <input type="text" id="t-id" class="mono" value="default" spellcheck="false">
@@ -248,6 +266,7 @@
       <section class="page" id="page-files">
         <div class="card">
           <h2>NAS 上的目录</h2>
+          <p class="hint" id="files-link-hint"></p>
           <form id="form-path" class="pathbar" autocomplete="off">
             <input type="text" id="fp-path" value="/home" spellcheck="false" class="mono">
             <button type="submit" id="btn-path-go">打开</button>
@@ -296,6 +315,7 @@
       <section class="page" id="page-journal">
         <div class="card">
           <h2>文件更新中心 <span class="count" id="journal-count"></span></h2>
+          <p class="hint" id="journal-link-hint"></p>
           <div class="toolbar">
             <input type="text" id="j-query" class="mono" placeholder="按文件名 / 说明搜索" spellcheck="false">
             <select id="j-level">
@@ -313,6 +333,7 @@
             <thead>
               <tr>
                 <th class="col-time">时间</th>
+                <th class="col-link">连接</th>
                 <th class="col-kind">活动</th>
                 <th>路径</th>
                 <th>说明</th>
@@ -331,7 +352,9 @@
       <!-- ======================= 页面 5：错误列表（M8.3） ======================= -->
       <section class="page" id="page-errors">
         <div class="card">
+          <p class="hint" id="errors-link-hint"></p>
           <h2>错误列表 <span class="count" id="errors-count"></span>
+            <span class="hint" id="errors-links-hint" hidden></span>
             <button type="button" class="mini" id="btn-errors-refresh">刷新</button>
           </h2>
           <div id="errors-list" class="alert-stack"></div>
@@ -357,13 +380,31 @@
 
         <!-- ---------------- 设置 1：连接 ---------------- -->
         <div class="settings-sec active" id="sec-connect" role="tabpanel" aria-labelledby="sec-tab-connect">
+          <!-- ★ M16：多 NAS 连接列表（当前连接 / 启停 / 编辑 / 移除） -->
+          <div class="card" id="links-card">
+            <h2>NAS 连接 <span class="count" id="links-count"></span>
+              <button type="button" class="mini" id="btn-links-refresh" data-i18n="links.refresh">刷新</button>
+              <button type="button" class="mini" id="btn-links-start-all" data-i18n="links.start_all">全部启动</button>
+              <button type="button" class="mini" id="btn-links-stop-all" data-i18n="links.stop_all">全部停止</button>
+              <button type="button" class="mini primary" id="btn-link-add" data-i18n="links.add">＋ 添加 NAS</button>
+            </h2>
+            <p class="hint" data-i18n="links.hint">每一行是一台 NAS。当前连接决定「文件 / 诊断」页与顶部状态条显示哪个 daemon；同步任务可以分属不同连接，任务卡上会标出来源。</p>
+            <ul class="conn-list" id="conn-list"></ul>
+            <p class="empty-hint" id="conn-list-empty" hidden data-state="ready" data-i18n="links.empty">还没有 NAS 连接。点「＋ 添加 NAS」配置第一台。</p>
+            <ul class="plain-list mono" id="links-bad"></ul>
+          </div>
+
           <div class="grid-2">
             <div class="card">
               <h2>连接配置</h2>
+              <h3 class="sub" id="conn-form-title" data-i18n="conn.form_title_new">添加 NAS 连接</h3>
+              <p class="hint" id="conn-edit-hint" hidden></p>
               <p class="hint" id="connect-hint">加载中…</p>
               <p class="hint mono" id="cred-hint">凭据：—</p>
 
               <form id="form-connect" class="form" autocomplete="off">
+                <!-- ★ M16：编辑态的连接 id（新建时留空，后端自动生成 default/nas2/nas3…） -->
+                <input type="hidden" id="f-link-id" value="">
                 <label>主机 / NAS 地址
                   <input type="text" id="f-host" placeholder="nas.local 或 192.168.1.10" spellcheck="false">
                 </label>
@@ -388,6 +429,10 @@
                   <button type="button" id="btn-login" class="primary">保存并登录</button>
                   <button type="button" id="btn-connect-start">启动 daemon</button>
                   <button type="button" id="btn-connect-stop">停止 daemon</button>
+                </div>
+                <div class="btn-row" id="conn-edit-actions" hidden>
+                  <button type="button" class="danger" id="btn-link-delete" data-i18n="conn.remove">移除这个连接</button>
+                  <button type="button" id="btn-link-cancel-edit" data-i18n="conn.cancel_edit">取消编辑</button>
                 </div>
               </form>
 
@@ -648,6 +693,7 @@
 
       <!-- ======================= 页面 7：诊断（专家模式） ======================= -->
       <section class="page" id="page-diag">
+        <p class="hint" id="diag-link-hint"></p>
         <nav class="tabs diag-tabs" id="diag-tabs" role="tablist"
              aria-label="诊断子页" data-i18n-aria-label="diag.tabs_aria">
           <button type="button" class="tab active" id="diag-tab-status" data-panel="status" role="tab" aria-selected="true"  aria-controls="panel-status" data-i18n="diag.status">状态 / 进度</button>

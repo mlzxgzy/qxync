@@ -99,6 +99,31 @@ impl MountsFile {
         paths.state_dir.join("qxync").join("mounts.json")
     }
 
+    /// ★ M16：某个连接的挂载记录文件。
+    ///
+    /// `default` 继续用旧的 `mounts.json`；其它连接一瓶一个文件，多 daemon
+    /// 各写各的，不再有「全量重写把别人的记录抹掉」的竞态。
+    pub fn file_for(paths: &ConfigPaths, link: &crate::config::LinkConfig) -> PathBuf {
+        paths.mounts_file_for(link)
+    }
+
+    /// ★ M16：按连接读挂载记录（语义同 [`Self::load`]：任何失败都当「没有」）。
+    pub fn load_for(
+        paths: &ConfigPaths,
+        link: &crate::config::LinkConfig,
+    ) -> (Option<Self>, Vec<String>) {
+        Self::load_path(Self::file_for(paths, link))
+    }
+
+    /// ★ M16：按连接写挂载记录。
+    pub fn save_for(
+        &self,
+        paths: &ConfigPaths,
+        link: &crate::config::LinkConfig,
+    ) -> Result<PathBuf> {
+        self.save_path(&Self::file_for(paths, link))
+    }
+
     /// 读 `mounts.json`。**任何失败都当「没有」**（返回 `(None, [])`），由调用方决定降级。
     ///
     /// 刻意不让失败变成 `Err`：这个文件的失败模式全是「磁盘上那份读不懂」，
@@ -108,7 +133,10 @@ impl MountsFile {
     /// [`crate::tasks::Task::list`] 同风格）：解析失败不能静默 —— 用户会以为
     /// 自己的挂载配置凭空丢了。文件不存在不算警告（第一次用而已）。
     pub fn load(paths: &ConfigPaths) -> (Option<Self>, Vec<String>) {
-        let p = Self::file(paths);
+        Self::load_path(Self::file(paths))
+    }
+
+    fn load_path(p: PathBuf) -> (Option<Self>, Vec<String>) {
         let raw = match std::fs::read(&p) {
             Ok(r) => r,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (None, Vec::new()),
@@ -147,8 +175,11 @@ impl MountsFile {
     /// 临时文件用 `.json.tmp` 后缀（`with_extension`）—— 与 `Task::save` 一致，
     /// 这样中途崩了留下的临时文件也一眼认得出是什么。
     pub fn save(&self, paths: &ConfigPaths) -> Result<PathBuf> {
-        // 目标路径一律问 `file()`，不自己拼 —— 两边各拼一次迟早会对不上
-        let target = Self::file(paths);
+        self.save_path(&Self::file(paths))
+    }
+
+    fn save_path(&self, target: &Path) -> Result<PathBuf> {
+        // 目标路径一律问 `file*()`，不自己拼 —— 两边各拼一次迟早会对不上
         if let Some(dir) = target.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -161,8 +192,8 @@ impl MountsFile {
             f.write_all(&body)?;
             f.sync_all()?;
         }
-        std::fs::rename(&tmp, &target)?;
-        Ok(target)
+        std::fs::rename(&tmp, target)?;
+        Ok(target.to_path_buf())
     }
 
     /// 按挂载点 upsert（`mount()` 成功后调用）。

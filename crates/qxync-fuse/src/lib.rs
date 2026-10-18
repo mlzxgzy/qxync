@@ -280,6 +280,20 @@ fn state_load(cache: &Path) -> Option<ChunkState> {
     }
 }
 
+/// **只读**地取一份 `.qxstate` 位图（**不删任何东西**）。
+///
+/// [`state_load`] 在 v1 老格式上会顺手把 `.qxstate` / `.qxsum` 删掉 —— 那是**认领**
+/// 路径该做的「作废重水合」动作。而这里的调用方是 [`FsHandle::read_cached`]（纯读的
+/// 「看一眼本地存稿」），它只回答「这份位图能不能信」，不该借读的机会改磁盘。
+/// 所以复用 `state_verdict` / `state_decode` 的解析，但不复制作废副作用。
+fn state_load_ro(cache: &Path) -> Option<ChunkState> {
+    let buf = std::fs::read(state_path(cache)).ok()?;
+    match state_verdict(&buf) {
+        StateVerdict::Ok => state_decode(&buf),
+        _ => None,
+    }
+}
+
 /// 读回整张 per-chunk 校验和表（长度必须正好是 `8 × nchunks`，否则全 [`NO_HASH`]）。
 fn sum_load(cache: &Path, nchunks: usize) -> Vec<u64> {
     let want = nchunks * 8;
@@ -1482,6 +1496,173 @@ impl FileSyncState {
 impl FsHandle {
     pub fn cache_dir(&self) -> &Path {
         &self.cache_dir
+    }
+
+    /// ★ 读某个路径**已缓存**的本地内容（最多 `max` 字节）。
+    ///
+    /// ## 为什么只读缓存、绝不触发认领 / 水合
+    ///
+    /// 这个方法给「冲突文本对比」用（daemon 侧调）。它要回答的是「**本地现在
+    /// 是什么样**」，而冲突恰恰意味着本地有未上传的改动 —— 那份内容就在缓存里。
+    ///
+    /// 如果走 `QxyncFs::cache_file_for`，会顺带做认领（逐区间 `xxhash64` 校验，
+    /// 坏区间直接清成未就绪）；要真读内容还会再走 `ensure_range` → 未水合的区间
+    /// 去问 NAS 拉。那是**读路径**该干的事，不是「看一眼本地存稿」该干的。
+    /// 所以这里只做纯读：读得到就给，读不到明确报为什么。
+    ///
+    /// ## ★ 未水合的区间绝不能当成「本地内容」返回
+    ///
+    /// 缓存是**稀疏文件**（apparent size = 文件大小）：没下载过的区间读出来是
+    /// 一串 **0**。早期实现直接 `read_to_end` 返回前 `max` 字节 —— 对「部分水合」
+    /// 的文件，daemon 的文本对比会拿一堆 0 去跟 NAS 比，显示**大量假差异**，
+    /// 用户可能据此选错「保留哪边」（这种误操作撤销不了）。所以返回前必须先确认
+    /// **这次要读的区间都已就绪**：
+    ///
+    /// * 本次挂载已认领（`node.cache` 有值）→ 用内存里的 `chunks_done`
+    ///   （它比磁盘位图新：本地写/水合都是先改内存再落 `.qxstate`）；
+    /// * 还没认领（重启后还没读过这个文件）→ 只读 `.qxstate` 位图，且**签名与
+    ///   身份都要对得上**当前节点，否则位图可能属于旧版本 / 别的文件的缓存。
+    ///
+    /// 未就绪就回 [`io::ErrorKind::WouldBlock`] + 人话原因（daemon 会把它转成
+    /// `DiffSkip::NoContent` 显示给用户），**绝不返回带假 0 的数据**。
+    ///
+    /// ## 锁粒度
+    /// 主锁（`inner`）只用来取内存快照，读位图 / 读缓存文件都在**锁外** ——
+    /// 这条路径由 IPC 的「文本对比」调用，在锁里做慢 IO 会把整个挂载点的
+    /// FUSE 请求一起卡住。
+    ///
+    /// ## 为什么截断
+    ///
+    /// 只读前 `max` 字节：调用方（diff）本来就有大小上限，超大文件直接走
+    /// 「不做对比」分支，没必要先把它整个读进内存。
+    pub fn read_cached(&self, remote: &str, max: u64) -> std::io::Result<Vec<u8>> {
+        use std::io::Read as _;
+
+        // ① 锁内：只做内存快照（含「要读的区间里哪些已就绪」）。**不做任何 IO**。
+        let (ino, cache, name, size, want, mtime, mem_done) = {
+            let g = self.inner.lock().unwrap();
+            let Some(&ino) = g.by_remote.get(remote) else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("{remote} 不在挂载视图里（没 lookup 过 / 已卸载）"),
+                ));
+            };
+            let Some(n) = g.nodes.get(&ino) else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("{remote} 的节点已消失"),
+                ));
+            };
+            // 只校验「这次真要读的那段」覆盖的区间，不是整个文件
+            let want = max.min(n.attr.size).min(u64::from(u32::MAX));
+            let mem_done = if want == 0 {
+                Vec::new()
+            } else {
+                let (first, last) = chunk_indices(0, want, self.chunk_size);
+                (first..=last)
+                    .map(|i| n.chunks_done.get(i as usize).copied().unwrap_or(false))
+                    .collect::<Vec<bool>>()
+            };
+            (
+                ino,
+                n.cache.clone(),
+                n.name.clone(),
+                n.attr.size,
+                want,
+                epoch_secs(n.attr.mtime),
+                mem_done,
+            )
+        };
+
+        // 空文件 / 只要 0 字节：没有任何区间会被读成「未水合的 0」，直接给结果。
+        if want == 0 {
+            return Ok(Vec::new());
+        }
+
+        // ② 确定缓存路径 + 「要读的区间是否就绪」。
+        let (path, done) = match cache {
+            // 已认领：内存位图是本次挂载的真相（比磁盘上的 `.qxstate` 新）。
+            Some(p) => (p, mem_done),
+            // 没认领：磁盘上的缓存文件 + `.qxstate` 位图是唯一线索。纯读，不认领、不水合。
+            None => {
+                let p = self.cache_dir.join(cache_name_for(remote, &name));
+                let Some(st) = state_load_ro(&p) else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!(
+                            "{remote} 还没有本地缓存内容（没有缓存文件或水合位图）：\
+                             先读取一遍这个文件再对比"
+                        ),
+                    ));
+                };
+                let Some(cur_id) = compute_node_file_id(&self.inner, ino) else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("{remote} 的节点已消失"),
+                    ));
+                };
+                // 位图描述的是不是**当前这一版**文件？（签名 + 身份 + 文件长度）
+                // 对不上就可能是「同一路径删了重建」留下的旧缓存 ——
+                // 拿它的「就绪」当自己的会读出错内容，必须拒绝。
+                let len = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(u64::MAX);
+                if st.chunk_size != self.chunk_size
+                    || st.size != size
+                    || st.mtime != mtime
+                    || st.file_id != cur_id
+                    || len != size
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "{remote} 的本地缓存与当前文件版本对不上（水合位图是旧版本 / \
+                             别的文件的），不能拿来对比"
+                        ),
+                    ));
+                }
+                let (first, last) = chunk_indices(0, want, self.chunk_size);
+                let done = (first..=last)
+                    .map(|i| st.done.get(i as usize).copied().unwrap_or(false))
+                    .collect::<Vec<bool>>();
+                (p, done)
+            }
+        };
+
+        // ③ 只要有区间未就绪就拒绝：稀疏空洞读出来是 0，拿去对比 = 假差异。
+        let missing = done.iter().filter(|d| !**d).count();
+        if missing > 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                format!(
+                    "本地内容还没水合完整（要读的前 {want} 字节覆盖 {} 个区间，其中 {missing} 个\
+                     还没下载；文件共 {size} 字节）。未下载的区间读出来是 0 字节，直接对比会显示\
+                     假差异，所以这次不返回内容 —— 先完整读一遍该文件再对比",
+                    done.len()
+                ),
+            ));
+        }
+
+        // ④ 慢 IO 全在锁外：打开 + 读。缓存被脱水清掉 / 截断时明确报错，不给半截内容。
+        let f = std::fs::File::open(&path).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("{remote} 的本地缓存文件打不开（可能刚被脱水清掉）：{e}"),
+            )
+        })?;
+        if f.metadata().map(|m| m.len() < size).unwrap_or(false) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{remote} 的本地缓存文件比记录的文件大小短（缓存被截断），不能拿来对比"),
+            ));
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        f.take(want).read_to_end(&mut buf)?;
+        if buf.len() as u64 != want {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("{remote} 的本地缓存只读到 {} / {want} 字节", buf.len()),
+            ));
+        }
+        Ok(buf)
     }
 
     // ------------------------------------------------ ★ T9 稳定身份索引（`nodes` 表）
@@ -3026,24 +3207,9 @@ impl QxyncFs {
         format!("{}/{}", parent_remote.trim_end_matches('/'), name)
     }
 
-    /// 把 NAS 路径映射成缓存文件名。
-    ///
-    /// ★ 前缀必须是**远端路径的稳定哈希**，不能用 ino：ino 是按需分配的，
-    /// 两次挂载（或 readdir 顺序不同）里同一个 ino 可能对应不同文件，
-    /// 那样就会把 A 的内容当成 B 的缓存读到 —— 属于最危险的「静默错数据」。
+    /// 把 NAS 路径映射成缓存文件名（命名规则见 [`cache_name_for`]）。
     fn cache_path(&self, remote: &str, name: &str) -> PathBuf {
-        let safe: String = name
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        self.cache_dir
-            .join(format!("{:016x}_{}", fnv1a64(remote.as_bytes()), safe))
+        self.cache_dir.join(cache_name_for(remote, name))
     }
 
     /// ★ M7：规则判定 —— 被排除 / 是临时文件的路径在挂载点里**根本不存在**。
@@ -4055,6 +4221,28 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
+}
+
+/// 把 NAS 路径映射成缓存文件名。
+///
+/// ★ 前缀必须是**远端路径的稳定哈希**，不能用 ino：ino 是按需分配的，
+/// 两次挂载（或 readdir 顺序不同）里同一个 ino 可能对应不同文件，
+/// 那样就会把 A 的内容当成 B 的缓存读到 —— 属于最危险的「静默错数据」。
+///
+/// [`QxyncFs::cache_path`] 与 [`FsHandle::read_cached`] 共用这一份命名规则
+/// （后者没有挂载视图，只能按同一规则现算路径）。
+fn cache_name_for(remote: &str, name: &str) -> String {
+    let safe: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("{:016x}_{}", fnv1a64(remote.as_bytes()), safe)
 }
 
 /// ★ M11：这个路径段是不是回收站目录名。
@@ -5861,6 +6049,151 @@ mod tests {
         )
         .unwrap();
         assert!(h.has_pending("/home/a (conflicted copy from pc 2026-09-30).txt"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------------------ ★ read_cached（冲突文本对比）
+
+    /// 造一个「缓存文件已存在、但还没水合」的节点（读 `read_cached` 用）。
+    fn cached_file_fixture(
+        dir: &Path,
+        name: &str,
+        size: u64,
+        mtime: i64,
+    ) -> (QxyncFs, INodeNo, PathBuf) {
+        let fs = test_fs(dir, false);
+        let entry = DirEntry::local(name, false, size, mtime);
+        let remote = format!("/home/{name}");
+        let node = fs.insert_node(INodeNo::ROOT, name, &remote, &entry);
+        let cache = fs.cache_file_for(node.ino).unwrap();
+        (fs, node.ino, cache)
+    }
+
+    /// 把稀疏缓存文件填成「真内容」（length 已经是文件大小，这里只覆盖数据）。
+    fn fill_cache(cache: &Path, payload: &[u8]) {
+        std::fs::write(cache, payload).unwrap();
+        assert_eq!(payload.len() as u64, cache.metadata().unwrap().len());
+    }
+
+    /// **回归**：部分水合的稀疏文件绝不能把未下载区间当 0 字节返回。
+    ///
+    /// 这是「冲突文本对比」最危险的失败模式：稀疏空洞读出来是 0，拿去跟 NAS 比就会
+    /// 显示一大堆假差异，用户可能据此选错「保留哪边」。修复前 `read_cached` 只看
+    /// `max` 直接读 —— 部分水合的文件必然中招。
+    #[test]
+    fn read_cached_refuses_holes_instead_of_returning_fake_zeros() {
+        const SIZE: u64 = 300 * 1024; // 3 个 128 KiB 区间
+        let dir = std::env::temp_dir().join(format!("qxync-read-cached-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (fs, ino, cache) = cached_file_fixture(&dir, "a.txt", SIZE, 111);
+        let payload: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8 + 1).collect();
+        fill_cache(&cache, &payload);
+
+        let h = fs.handle();
+        {
+            let mut g = fs.inner.lock().unwrap();
+            let n = g.nodes.get_mut(&ino).unwrap();
+            n.chunks_done = vec![true; n.chunk_count(DEFAULT_CHUNK_SIZE)];
+        }
+        // 全就绪：max 小于文件 → 前 max 字节；max 大于文件 → 整个文件
+        assert_eq!(h.read_cached("/home/a.txt", 100).unwrap(), payload[..100]);
+        assert_eq!(h.read_cached("/home/a.txt", SIZE + 10).unwrap(), payload);
+
+        // 中间一块未水合 → 拒绝（不是返回带 0 的数据）
+        {
+            let mut g = fs.inner.lock().unwrap();
+            g.nodes.get_mut(&ino).unwrap().chunks_done[1] = false;
+        }
+        let err = h.read_cached("/home/a.txt", SIZE + 10).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock, "{err}");
+        let msg = format!("{err}");
+        assert!(msg.contains("没水合完整"), "原因要说清: {msg}");
+        assert!(msg.contains("0 字节"), "要说清假差异的来源: {msg}");
+        // 只要读的范围不碰未就绪区间，仍然可以给（前 100 字节就在第 0 块里）
+        assert_eq!(h.read_cached("/home/a.txt", 100).unwrap(), payload[..100]);
+        // 但 max 一旦越过第 2 块就必须拒绝
+        let err = h
+            .read_cached("/home/a.txt", 2 * DEFAULT_CHUNK_SIZE + 1)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 还没认领（重启后没读过这个文件）时，用磁盘上的 `.qxstate` 位图判断；
+    /// 位图签名/身份对不上就拒绝（旧缓存不能冒充当前内容）。
+    #[test]
+    fn read_cached_falls_back_to_qxstate_and_rejects_stale_state() {
+        const SIZE: u64 = 300 * 1024;
+        let dir =
+            std::env::temp_dir().join(format!("qxync-read-cached-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (fs1, ino, cache) = cached_file_fixture(&dir, "b.txt", SIZE, 222);
+        let payload: Vec<u8> = (0..SIZE).map(|i| (i % 249) as u8 + 1).collect();
+        fill_cache(&cache, &payload);
+        {
+            let mut g = fs1.inner.lock().unwrap();
+            let n = g.nodes.get_mut(&ino).unwrap();
+            n.chunks_done = vec![true; n.chunk_count(DEFAULT_CHUNK_SIZE)];
+        }
+        persist_chunk_state(&fs1.inner, fs1.chunk_size, ino);
+
+        // 新挂载视图：节点 cache=None（= 本次挂载还没读过它），磁盘位图必须能兜住。
+        let fs2 = test_fs(&dir, false);
+        let entry = DirEntry::local("b.txt", false, SIZE, 222);
+        fs2.insert_node(INodeNo::ROOT, "b.txt", "/home/b.txt", &entry);
+        let h2 = fs2.handle();
+        assert_eq!(h2.read_cached("/home/b.txt", SIZE + 1).unwrap(), payload);
+
+        // 签名变了（mtime 不同）→ 位图属于旧版本，必须拒绝而不是读旧内容。
+        let fs3 = test_fs(&dir, false);
+        let stale = DirEntry::local("b.txt", false, SIZE, 223);
+        fs3.insert_node(INodeNo::ROOT, "b.txt", "/home/b.txt", &stale);
+        let err = fs3
+            .handle()
+            .read_cached("/home/b.txt", SIZE + 1)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+
+        // 位图说只有第 0 块就绪 → 拒绝；前 100 字节可以给。
+        {
+            let mut g = fs1.inner.lock().unwrap();
+            let n = g.nodes.get_mut(&ino).unwrap();
+            n.chunks_done = vec![false; n.chunk_count(DEFAULT_CHUNK_SIZE)];
+            n.chunks_done[0] = true;
+        }
+        persist_chunk_state(&fs1.inner, fs1.chunk_size, ino);
+        let err = h2.read_cached("/home/b.txt", SIZE + 1).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock, "{err}");
+        assert_eq!(h2.read_cached("/home/b.txt", 100).unwrap(), payload[..100]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 没有缓存 / 未知路径 / 0 字节文件的行为。
+    #[test]
+    fn read_cached_reports_missing_cache_and_handles_empty_files() {
+        let dir =
+            std::env::temp_dir().join(format!("qxync-read-cached-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let fs = test_fs(&dir, false);
+        let e = DirEntry::local("c.txt", false, 10, 1);
+        fs.insert_node(INodeNo::ROOT, "c.txt", "/home/c.txt", &e);
+        let h = fs.handle();
+        // 节点在、但从没建过缓存文件 → 明确报「没有本地缓存内容」
+        let err = h.read_cached("/home/c.txt", 1024).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
+        assert!(format!("{err}").contains("本地缓存内容"), "{err}");
+        // 完全没 lookup 过的路径 → NotFound
+        let err = h.read_cached("/home/nope.txt", 1024).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        // 0 字节文件：没有任何区间会读成 0，直接给空内容
+        let z = DirEntry::local("zero.txt", false, 0, 1);
+        let zn = fs.insert_node(INodeNo::ROOT, "zero.txt", "/home/zero.txt", &z);
+        fs.cache_file_for(zn.ino).unwrap();
+        assert!(h.read_cached("/home/zero.txt", 1024).unwrap().is_empty());
+        // max=0：只要 0 字节 → 空（不管有没有水合）
+        assert!(h.read_cached("/home/c.txt", 0).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

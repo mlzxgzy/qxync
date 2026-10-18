@@ -1,0 +1,850 @@
+<!doctype html>
+<!--
+  qxync GUI —— 「冲突待裁决」卡片 + 本地/NAS 文本对比的**离线自检夹具**
+
+  为什么需要它
+  ------------
+  这两个功能的验收需要「真样式 + 真文案 + 真渲染函数」，但真机路径在容器里走不通：
+    * 无 /dev/fuse → 起不了真挂载，造不出真冲突；
+    * 无浏览器二进制 → 截不了真窗口图。
+  所以换一条路：**这个页面把真实的 index.html / app.js / i18n.js / style.css 都原样加载进来**，
+  只把唯一不可用的一层（`window.__TAURI__.core.invoke`，即 IPC 传输）换成桩 ——
+  跑的是真正的 buildDecisionCard / buildDiffView / diffSkipText / renderDecisions，
+  样式与文案也全部来自真实文件，不复刻、不手抄。
+
+  怎么用
+  ------
+  直接用浏览器打开本文件即可（无需构建、无需 daemon、无需 FUSE）。
+  页面顶部会给出总判定，失败项红字列出原因；`document.body[data-selftest]`
+  为 `pass` / `fail`，便于脚本或截图脚本断言。
+
+  覆盖的断言
+  ----------
+    A 卡片与按钮：真实 DecisionsData → 3 张卡，按钮含「对比本地/NAS」「忽略这条」
+    B diff 展开：head 统计、语义方向（- 本地独有 / + NAS 独有）、行号列对齐
+      （只有一侧有的行，另一侧行号留空、不显示 0）
+    C 截断：脚注 + 统计报**全量**差异而不是截断后的行数；`truncated` 文案同时覆盖
+      「输出行数截断」与「输入过大走有界回退」两种来源，不说成精确行数
+    D 零差异：明说「逐行相同」，不画空面板
+    E skipped：binary / too_large / is_dir / no_content 四种都明说原因，
+      **没有一个退化成「零差异」**（那是最危险的假象）
+    F 收起：再点一次「对比」移除面板、按钮文案复位
+    G 清空全部：走 action=clear，回执带删除条数
+    H 忽略这条：走 action=forget，回执写明「未动文件」
+    I 三个裁决按钮：仍走 action=resolve + resolution=keep_local
+    J i18n / innerHTML 自检：与 `qxync-gui --self-test` 的 ui_spec 同口径
+    K 形状坏掉：status=diff 但缺 lines/added/removed 时**显示错误**，
+      绝不落成「两边内容逐行相同」
+    L 竞态：diff 请求飞行中按钮禁用，重复点击不会再发一次请求
+    M 竞态：resolve 请求飞行中按钮禁用，重复点击不会再发一次请求
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>qxync — 冲突待裁决 / 文本对比 自检</title>
+<!-- ★ 真实样式表：与 Tauri 里加载的是同一份文件 -->
+<link rel="stylesheet" href="../../crates/qxync-gui/ui/style.css">
+<style>
+  /* 夹具自己的少量样式（只管自检面板，不碰被测界面） */
+  #harness { position: fixed; right: 0; top: 0; bottom: 0; width: 430px; z-index: 999;
+    background: var(--bg-elev); border-left: 1px solid var(--border);
+    box-shadow: var(--shadow-lg); overflow: auto; padding: 10px 12px 20px; font-size: 12px; }
+  #harness h1 { font-size: 13px; margin: 0 0 6px; }
+  #harness .verdict { display: inline-block; padding: 2px 8px; border-radius: var(--radius-pill);
+    font-weight: 700; margin-bottom: 8px; }
+  #harness .verdict.good { background: var(--ok-soft); color: var(--ok); }
+  #harness .verdict.bad { background: var(--err-soft); color: var(--err); }
+  #harness .verdict.idle { background: var(--bg-sunken); color: var(--fg-dim); }
+  #harness ul { list-style: none; margin: 0; padding: 0; }
+  #harness li { border-top: 1px solid var(--border-soft); padding: 4px 0; }
+  #harness li code { font-weight: 700; }
+  #harness li.p code { color: var(--ok); }
+  #harness li.f code { color: var(--err); }
+  #harness .why { color: var(--fg-dim); font-family: var(--mono); font-size: 11px;
+    margin-top: 2px; word-break: break-all; }
+  #harness .note { color: var(--fg-dim); margin: 6px 0 10px; line-height: 1.5; }
+  /* 把被测界面挤到左边，别被自检面板盖住 */
+  body.harness-on .shell { margin-right: 430px; }
+  body.harness-on .logbox { display: none; }
+  #stage { position: relative; }
+</style>
+</head>
+<body class="harness-on">
+
+<!-- ★ 被测界面：真实的 index.html 会整体被搬进这里（见本文件末尾的 loader） -->
+<div id="stage"></div>
+
+<!-- 自检面板 -->
+<aside id="harness">
+  <h1>冲突待裁决 / 文本对比 —— 离线自检</h1>
+  <span class="verdict idle" id="verdict">运行中…</span>
+  <p class="note">
+    加载的是<b>真实</b>的 <code>app.js</code> / <code>i18n.js</code> / <code>style.css</code>，
+    只有 IPC 传输层被打桩。左侧就是被测界面，点「对比本地/NAS」可看真实渲染效果。
+  </p>
+  <div id="selftest"><p class="note">等待自检…</p></div>
+</aside>
+
+<script>
+/* ============================================================================
+ * 1) IPC 桩 ——必须在 app.js 加载**之前**就位（app.js 的 IIFE 一进去就读它）。
+ *    这一层是整个夹具唯一被替换的东西。
+ * ========================================================================== */
+(function () {
+  'use strict';
+
+  // 字段名严格照 crates/qxync-core/src/ipc.rs 的 DecisionsData / DecisionInfo / DiffData。
+  var BASE = [
+    { id: 'd-0001', path: '/home/user/qxync/deploy.conf', task_id: 'default',
+      local_size: 4821, local_mtime: 1757011200, remote_size: 4790, remote_mtime: 1757011100,
+      is_dir: false, created_unix: 1757011500, resolution: null },
+    { id: 'd-0002', path: '/home/user/qxync/notes.md', task_id: 'default',
+      local_size: 1200, local_mtime: 1757000000, remote_size: 1180, remote_mtime: 1757000100,
+      is_dir: false, created_unix: 1757000200, resolution: 'keep_local' },
+    { id: 'd-0003', path: '/home/user/qxync/logo.png', task_id: 'default',
+      local_size: 900000, local_mtime: 1756990000, remote_size: 880000, remote_mtime: 1756990100,
+      is_dir: false, created_unix: 1756990200, resolution: null }
+  ];
+
+  // action=diff 的各种结局。键是 id。
+  //
+  // ★ wire 形状（**独立于前端代码、照 Rust 真值推导**）：
+  //   `DiffOutcome` 是 `#[serde(tag = "status")]` 的 **newtype 变体**，
+  //   `DiffResult` 的字段被 serde **平铺**到与 `status` 同级 —— **没有** `diff` 键：
+  //     {"status":"diff","lines":[…],"added":N,"removed":M,"truncated":bool}
+  //   契约锁定测试：crates/qxync-core/tests/decisions_wire_contract.rs。
+  //   本夹具曾照前端的**错误读法**捏了一层 `diff:`，于是「夹具照着前端写、前端照着
+  //   夹具写」自洽假绿 —— 现在按平级形状来，前端读错就会被这里的断言抓住。
+  //
+  // ★ 语义方向（照 `crates/qxync-core/src/decisions.rs` 的 `text_diff` 实现 +
+  //   `diff_marks_local_only_and_remote_only` 单测）：
+  //     '-' = 只有本地有（local_no>0, remote_no=0），计入 removed；
+  //     '+' = 只有 NAS 有（local_no=0, remote_no>0），计入 added。
+  var DIFFS = {
+    'd-0001': { path: '/home/user/qxync/deploy.conf', local_size: 4821, remote_size: 4790,
+      outcome: { status: 'diff', added: 3, removed: 2, truncated: false, lines: [
+        { kind: ' ', local_no: 1, remote_no: 1, text: '# qxync 部署配置' },
+        { kind: ' ', local_no: 2, remote_no: 2, text: 'listen = 0.0.0.0:9834' },
+        { kind: '-', local_no: 3, remote_no: 0, text: 'workers = 4' },
+        { kind: '+', local_no: 0, remote_no: 3, text: 'workers = 8' },
+        { kind: ' ', local_no: 4, remote_no: 4, text: 'cache_dir = /home/user/.cache/qxync' },
+        { kind: '-', local_no: 5, remote_no: 0, text: 'log_level = debug' },
+        { kind: '+', local_no: 0, remote_no: 5, text: 'conflict_policy = ask' },
+        { kind: '+', local_no: 0, remote_no: 6, text: 'verify_ssl = false' },
+        { kind: ' ', local_no: 6, remote_no: 7, text: 'log_level = info' }
+      ] } },
+    // 零差异：lines 为空 **且** added/removed 都是 0 → 必须明说「逐行相同」
+    'd-0002': { path: '/home/user/qxync/notes.md', local_size: 1200, remote_size: 1180,
+      outcome: { status: 'diff', added: 0, removed: 0, truncated: false, lines: [] } },
+    // 二进制
+    'd-0003': { path: '/home/user/qxync/logo.png', local_size: 900000, remote_size: 880000,
+      outcome: { status: 'skipped', reason: 'binary' } },
+    // 超限（含真实大小与上限，用于验文案）
+    'd-0004': { path: '/home/user/qxync/dump.sql', local_size: 5242880, remote_size: 5240000,
+      outcome: { status: 'skipped', reason: 'too_large', size: 5242880, limit: 524288 } },
+    // 目录
+    'd-0005': { path: '/home/user/qxync/subdir', local_size: 0, remote_size: 0,
+      outcome: { status: 'skipped', reason: 'is_dir' } },
+    // 截断：统计报全量（本地独有 850 / NAS 独有 900），只画 2 行
+    'd-0006': { path: '/home/user/qxync/cold.txt', local_size: 4096, remote_size: 4096,
+      outcome: { status: 'diff', added: 900, removed: 850, truncated: true, lines: [
+        { kind: '+', local_no: 0, remote_no: 1, text: 'line only on NAS' },
+        { kind: '-', local_no: 1, remote_no: 0, text: 'line only in local' }
+      ] } }
+  };
+
+  // 追加到列表里的三条（验 too_large / is_dir / truncated）
+  var EXTRA = [
+    { id: 'd-0004', path: '/home/user/qxync/dump.sql', task_id: 'default',
+      local_size: 5242880, local_mtime: 1756980000, remote_size: 5240000, remote_mtime: 1756980100,
+      is_dir: false, created_unix: 1756980200, resolution: null },
+    { id: 'd-0005', path: '/home/user/qxync/subdir', task_id: 'default',
+      local_size: 0, local_mtime: 0, remote_size: 0, remote_mtime: 0,
+      is_dir: true, created_unix: 1756980300, resolution: null },
+    { id: 'd-0006', path: '/home/user/qxync/cold.txt', task_id: 'default',
+      local_size: 4096, local_mtime: 1756970000, remote_size: 4096, remote_mtime: 1756970100,
+      is_dir: false, created_unix: 1756970200, resolution: null }
+  ];
+
+  // 桩里的「当前队列」：初始 3 条；C 段调用 addExtra() 模拟 daemon 又发现 3 条冲突。
+  // 用**有状态**的队列而不是每次回一份固定数组，是为了让 clear/forget 的回执数字
+  // （G3/H2）反映真实删了几条，而不是写死一个数。
+  var QUEUE = BASE.slice();
+
+  var H = window.__HARNESS__ = {
+    calls: [],
+    addExtra: function () { QUEUE = QUEUE.concat(EXTRA); },
+    resetCalls: function () { H.calls.length = 0; }
+  };
+
+  function ok(data) { return { v: 1, ok: true, data: data }; }
+
+  function decisionsData(action, extra) {
+    var pending = 0;
+    for (var i = 0; i < QUEUE.length; i++) { if (!QUEUE[i].resolution) { pending++; } }
+    var d = { action: action, decisions: QUEUE, pending: pending,
+      resolved: QUEUE.length - pending, removed: 0, removed_one: null,
+      note: '冲突策略 ask：待裁决期间两边都不动；已失效的条目会在下一轮同步时自动清掉。' };
+    if (extra) {
+      for (var k in extra) {
+        if (Object.prototype.hasOwnProperty.call(extra, k)) { d[k] = extra[k]; }
+      }
+    }
+    return d;
+  }
+
+  function handle(req) {
+    H.calls.push({ method: req.method, action: req.action, id: req.id, resolution: req.resolution });
+    var m = req.method;
+    if (m === 'decisions') {
+      if (req.action === 'diff') {
+        var d = DIFFS[req.id];
+        if (!d) { return { v: 1, ok: false, error: { kind: 'not_found', message: '没有这一条' } }; }
+        return ok(d);
+      }
+      if (req.action === 'forget') {
+        var one = null;
+        for (var i = 0; i < QUEUE.length; i++) {
+          if (QUEUE[i].id === req.id) {
+            one = QUEUE[i];
+            QUEUE = QUEUE.slice(0, i).concat(QUEUE.slice(i + 1));
+            break;
+          }
+        }
+        return ok(decisionsData('forget', { removed: one ? 1 : 0, removed_one: one }));
+      }
+      if (req.action === 'clear') {
+        var n = QUEUE.length;
+        QUEUE = [];
+        return ok(decisionsData('clear', { removed: n }));
+      }
+      if (req.action === 'resolve') {
+        for (var j = 0; j < QUEUE.length; j++) {
+          if (QUEUE[j].id === req.id) {
+            // 模拟 daemon：置 resolution 后仍留在队列里（等下一轮同步执行）
+            QUEUE[j] = { id: QUEUE[j].id, path: QUEUE[j].path, task_id: QUEUE[j].task_id,
+              local_size: QUEUE[j].local_size, local_mtime: QUEUE[j].local_mtime,
+              remote_size: QUEUE[j].remote_size, remote_mtime: QUEUE[j].remote_mtime,
+              is_dir: QUEUE[j].is_dir, created_unix: QUEUE[j].created_unix,
+              resolution: req.resolution };
+          }
+        }
+        return ok(decisionsData('resolve'));
+      }
+      return ok(decisionsData('list'));
+    }
+    // 其余请求给「不至于崩」的最小回包：夹具只关心冲突卡片这一块。
+    if (m === 'tasks') { return ok({ tasks: [], bad_files: [], empty: true, note: null }); }
+    if (m === 'rules') { return ok({ roots: [], exclude: [], patterns: [], bad: [], filter_temp: true, temp_patterns: [] }); }
+    if (m === 'roots') { return ok({ syncing_folders: [], note: null }); }
+    if (m === 'journal') { return ok({ entries: [], total: 0, counts: {}, cleared: false, removed: 0, limit_rows: 200, max_age_days: 30, note: null }); }
+    if (m === 'file_states') { return ok({ path: '/home', mountpoint: null, root: null, entries: [], online: 0, local: 0, always: 0, note: '夹具' }); }
+    if (m === 'settings') { return ok({ settings: {}, path: '', autostart_path: '', autostart_present: false, saved: false, proxy_env: {} }); }
+    if (m === 'space') { return ok({ fs_path: '/', fs_total: 0, fs_avail: 0, fs_free: 0, fs_avail_pct: 0, cache_used_bytes: 0, auto: false, mode: 'below_pct', below_pct: 10, every_hours: 24, would_run: false, reason: '夹具', last_run_unix: 0, injected: false, ran: false, dehydrated: 0, freed_bytes: 0, blocked: [], note: null }); }
+    if (m === 'ls') { return ok({ path: req.path, total: 0, entries: [] }); }
+    if (m === 'peer') { return ok({ action: 'status', devices: [], events: [] }); }
+    return ok({});
+  }
+
+  window.__TAURI__ = {
+    core: { invoke: function (cmd, args) {
+      if (cmd === 'ipc_call') { return Promise.resolve(handle((args && args.req) || {})); }
+      if (cmd === 'app_info') {
+        return Promise.resolve({ version: '0.6.0', home: '/home/user',
+          socket: '/run/user/1000/qxync/qxyncd.sock',
+          config_dir: '/home/user/.config/qxync',
+          data_dir: '/home/user/.local/share/qxync',
+          state_dir: '/home/user/.local/state/qxync',
+          daemon_bin: '(夹具)', daemon_running: true, initial_tab: 'tasks' });
+      }
+      if (cmd === 'daemon_status') { return Promise.resolve({ running: false, socket: '' }); }
+      if (cmd === 'link_read') { return Promise.resolve({ path: '', link: null }); }
+      if (cmd === 'credential_present') { return Promise.resolve({ present: false, path: '' }); }
+      if (cmd === 'm84_info') { return Promise.resolve({ tray: false, plugins: [] }); }
+      return Promise.resolve({});
+    } },
+    event: { listen: function () { return Promise.resolve(function () {}); } }
+  };
+
+  // 夹具里 confirm 直接放行（真实 confirm 在自动化环境会被吞掉或阻塞）
+  window.confirm = function () { return true; };
+})();
+</script>
+
+<script>
+/* ============================================================================
+ * 2) 断言 —— 全部针对**真实渲染产物**做检查，不是对自己的假数据做自证。
+ * ========================================================================== */
+(function () {
+  'use strict';
+  var results = [];
+
+  function $(id) { return document.getElementById(id); }
+  function q(sel, root) { return (root || document).querySelector(sel); }
+  function qa(sel, root) { return Array.prototype.slice.call((root || document).querySelectorAll(sel)); }
+  function txt(n) { return n ? (n.textContent || '').trim() : ''; }
+  function esc(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+  function pass(name) { results.push({ name: name, pass: true }); paint(); }
+  function fail(name, why) { results.push({ name: name, pass: false, why: why }); paint(); }
+  function assert(cond, name, why) { if (cond) { pass(name); } else { fail(name, why || '断言不成立'); } }
+
+  function paint() {
+    var box = $('selftest');
+    if (!box) { return; }
+    var p = 0, f = 0, html = '';
+    for (var i = 0; i < results.length; i++) {
+      if (results[i].pass) { p++; } else { f++; }
+      html += '<li class="' + (results[i].pass ? 'p' : 'f') + '"><code>' +
+        (results[i].pass ? 'PASS' : 'FAIL') + '</code> ' + esc(results[i].name) +
+        (results[i].why ? '<div class="why">' + esc(results[i].why) + '</div>' : '') + '</li>';
+    }
+    box.innerHTML = '<ul>' + html + '</ul>';
+  }
+
+  function waitFor(fn, limitMs) {
+    var deadline = Date.now() + (limitMs || 4000);
+    return new Promise(function (resolve) {
+      (function tick() {
+        var v;
+        try { v = fn(); } catch (e) { v = false; }
+        if (v) { return resolve(v); }
+        if (Date.now() > deadline) { return resolve(false); }
+        setTimeout(tick, 40);
+      })();
+    });
+  }
+
+  /** 在卡片里按可见文案找按钮（文案全部来自真实 i18n 表）。 */
+  function btn(card, label) {
+    var found = null;
+    qa('.task-actions button', card).forEach(function (b) {
+      if (txt(b) === label) { found = b; }
+    });
+    return found;
+  }
+
+  function cards() { return qa('.dec-card', $('decisions-list')); }
+  function calls() { return window.__HARNESS__.calls; }
+  function resetCalls() { window.__HARNESS__.resetCalls(); }
+
+  /**
+   * 在操作日志里找**匹配文案的那一行**。
+   * 不能只看第一条 `.logline.ok`：`call()` 对每个成功的 IPC 都会记一条
+   * 「ipc_call decisions → ok」，它比业务回执更新（日志是新的在上）。
+   */
+  function findOkLog(re) {
+    var lines = qa('#log-body .logline.ok .c');
+    for (var i = 0; i < lines.length; i++) {
+      if (re.test(txt(lines[i]))) { return lines[i]; }
+    }
+    return false;
+  }
+
+  /** 把匹配的 IPC 请求延迟 ms 再交给原桩 —— 用来验证「飞行中禁用/不重复发请求」。 */
+  function delayInvoke(pred, ms) {
+    var orig = window.__TAURI__.core.invoke;
+    window.__TAURI__.core.invoke = function (cmd, args) {
+      if (pred(cmd, args)) {
+        return new Promise(function (resolve) {
+          setTimeout(function () { resolve(orig(cmd, args)); }, ms);
+        });
+      }
+      return orig(cmd, args);
+    };
+  }
+
+  /** 覆盖某条 diff 的回包（不延迟）—— 用来构造「status=diff 但形状坏掉」的 wire。 */
+  function stubDiff(id, data) {
+    var orig = window.__TAURI__.core.invoke;
+    window.__TAURI__.core.invoke = function (cmd, args) {
+      if (cmd === 'ipc_call' && args && args.req && args.req.method === 'decisions' &&
+          args.req.action === 'diff' && args.req.id === id) {
+        window.__HARNESS__.calls.push({ method: 'decisions', action: 'diff', id: id });
+        return Promise.resolve({ v: 1, ok: true, data: data });
+      }
+      return orig(cmd, args);
+    };
+  }
+
+  function run() {
+    // =================================================== A. 卡片与按钮
+    return waitFor(function () { return cards().length === 3; })
+      .then(function (got) {
+        assert(got === true, 'A1 真实 DecisionsData 渲染出 3 张卡片',
+          '实际 ' + cards().length + ' 张');
+        var cs = cards();
+        if (cs.length < 3) { return false; }
+
+        var want = ['对比本地/NAS', '保留本地', '保留 NAS 上的', '两份都留', '忽略这条'];
+        var have = qa('.task-actions button', cs[0]).map(function (b) { return txt(b); });
+        var miss = want.filter(function (w) { return have.indexOf(w) < 0; });
+        assert(miss.length === 0, 'A2 卡片按钮齐全（对比 / 三裁决 / 忽略）',
+          '缺：' + miss.join('、') + '；有：' + have.join('、'));
+
+        assert(/deploy\.conf/.test(txt(q('.task-state', cs[0]))), 'A3 卡片标题是文件名',
+          '实际：' + txt(q('.task-state', cs[0])));
+        assert(/待裁决/.test(txt(q('.task-state', cs[0]))), 'A4 未裁决项标「待裁决」', '');
+        assert(/已裁决/.test(txt(q('.task-state', cs[1]))), 'A5 已裁决项标「已裁决，待执行」', '');
+        assert($('btn-decisions-clear') !== null, 'A6 标题栏有「清空全部」按钮', '');
+        assert(qa('.dec-card.dec-card', $('decisions-list')).length === 3,
+          'A7 卡片带 dec-card 类（diff 才能换行到下一行）', '');
+        // created_unix=1757011500 → 2025-09-05；系统「现在」是 2026 年。
+        // 若 clock(num) 又把数字时间戳丢掉（旧 bug），这里会显示今天的日期 → 直接抓住。
+        assert(/发现于 2025-\d\d-\d\d \d\d:\d\d:\d\d/.test(txt(cs[0])),
+          'A8 卡片「发现于」显示队列里的时间，不是当前时刻', '实际：' + txt(cs[0]));
+        return true;
+      })
+
+      // =================================================== B. 展开 diff
+      .then(function () {
+        var card = cards()[0];
+        var b = btn(card, '对比本地/NAS');
+        if (!b) { fail('B0 找到「对比本地/NAS」按钮', ''); return false; }
+        b.click();
+        return waitFor(function () { return q('.dec-diff', card); })
+          .then(function (box) {
+            if (!box) { fail('B1 点击后展开 .dec-diff', '超时未出现'); return false; }
+            pass('B1 点击「对比本地/NAS」展开 .dec-diff');
+
+            var head = q('.dec-diff-head', box);
+            var stat = txt(q('.dec-diff-stat', head));
+            // ★ 方向按真实实现：本地独有 = removed = 2（`-`，红）；NAS 独有 = added = 3（`+`，绿）。
+            assert(/本地独有\s*-2/.test(stat) && /NAS 独有\s*\+3/.test(stat),
+              'B2 head 统计「本地独有 -2 / NAS 独有 +3」（方向按真实实现）',
+              '实际：' + stat);
+            var delSpan = q('.dec-diff-stat .del', head);
+            var addSpan = q('.dec-diff-stat .add', head);
+            assert(txt(addSpan) === '+3', 'B2b NAS 独有行数 +N 用 .add 类（绿）',
+              '实际：' + txt(addSpan));
+            assert(txt(delSpan) === '-2', 'B2c 本地独有行数 -N 用 .del 类（红）',
+              '实际：' + txt(delSpan));
+            assert(/只有本地有/.test(delSpan.title), 'B2d 本地独有 -N 带方向正确的说明（不会丢本地行）',
+              '实际：' + delSpan.title);
+            assert(/只有 NAS 上有/.test(addSpan.title), 'B2e NAS 独有 +N 带方向正确的说明（不会丢 NAS 行）',
+              '实际：' + addSpan.title);
+            assert(stat.indexOf('本地独有') < stat.indexOf('-2') &&
+              stat.indexOf('-2') < stat.indexOf('NAS 独有') &&
+              stat.indexOf('NAS 独有') < stat.indexOf('+3'),
+              'B2f 图例顺序是「本地独有 -N / NAS 独有 +M」', '实际：' + stat);
+            assert(/KiB|B$/.test(txt(head)), 'B2g head 给出两侧大小', '实际：' + txt(head));
+
+            var rows = qa('.dec-diff-row', box);
+            assert(rows.length === 9, 'B3 body 渲染 9 行（含上下文）', '实际 ' + rows.length);
+
+            var addN = qa('.dec-diff-row.add', box).length;
+            var delN = qa('.dec-diff-row.del', box).length;
+            var eqN = qa('.dec-diff-row.eq', box).length;
+            assert(addN === 3 && delN === 2 && eqN === 4,
+              'B4 + / - / = 行数与统计一致（3/2/4）',
+              '实际 add=' + addN + ' del=' + delN + ' eq=' + eqN);
+
+            // 行号对齐：只有一侧有的行，另一侧行号必须留空（wire 上是 0），绝不能显示 0。
+            var delRow = qa('.dec-diff-row.del', box)[0];
+            var n1 = qa('.no', delRow).map(function (n) { return txt(n); });
+            assert(n1[0] === '3' && n1[1] === '',
+              'B5 「-」行（只有本地有）：本地行号=3、NAS 行号留空',
+              '实际 [' + n1.join('|') + ']');
+            var addRow = qa('.dec-diff-row.add', box)[0];
+            var n2 = qa('.no', addRow).map(function (n) { return txt(n); });
+            assert(n2[0] === '' && n2[1] === '3',
+              'B6 「+」行（只有 NAS 有）：NAS 行号=3、本地行号留空',
+              '实际 [' + n2.join('|') + ']');
+            assert(txt(q('.tx', delRow)) === 'workers = 4', 'B7 行内容原样保留', '');
+            assert(!q('.dec-diff-foot', box), 'B8 未截断时不显示脚注', '');
+            return true;
+          });
+      })
+
+      // =================================================== F. 收起
+      .then(function () {
+        var card = cards()[0];
+        var b = btn(card, '对比本地/NAS');
+        b.click();
+        assert(!q('.dec-diff', card), 'F1 再次点击收起 .dec-diff', '');
+        assert(txt(b) === '对比本地/NAS', 'F2 按钮文案复位', '实际：' + txt(b));
+        return true;
+      })
+
+      // =================================================== L. diff 飞行中禁用（竞态）
+      .then(function () {
+        var card = cards()[0];
+        var b = btn(card, '对比本地/NAS');
+        if (!b) { fail('L0 找到「对比本地/NAS」按钮', ''); return false; }
+        resetCalls();
+        delayInvoke(function (cmd, args) {
+          return cmd === 'ipc_call' && args && args.req &&
+            args.req.method === 'decisions' && args.req.action === 'diff' && args.req.id === 'd-0001';
+        }, 300);
+        b.click();
+        assert(b.disabled === true, 'L1 diff 请求飞行中按钮禁用（防重复请求）', '');
+        assert(txt(b) === '对比中…', 'L2 飞行中按钮文案是「对比中…」', '实际：' + txt(b));
+        b.click();   // 禁用态不应再触发 click
+        return waitFor(function () { return q('.dec-diff', card); }).then(function (box) {
+          if (!box) { fail('L3 延迟回包后仍能展开面板', '超时'); return false; }
+          var n = calls().filter(function (c) { return c.action === 'diff' && c.id === 'd-0001'; }).length;
+          assert(n === 1, 'L3 飞行中重复点击没有再发一次请求', '实际发了 ' + n + ' 次');
+          assert(b.disabled === false, 'L4 回包后按钮恢复可用', '');
+          b.click();   // 收起，恢复干净状态给后面的断言
+          assert(!q('.dec-diff', card), 'L5 收起成功（状态复位）', '');
+          return true;
+        });
+      })
+
+      // =================================================== D. 零差异
+      .then(function () {
+        var card = cards()[1];
+        btn(card, '对比本地/NAS').click();
+        return waitFor(function () { return q('.dec-diff', card); })
+          .then(function (box) {
+            if (!box) { fail('D1 展开第二张卡的 diff', '超时'); return false; }
+            assert(txt(q('.dec-diff-foot', box)) === '两边内容逐行相同。',
+              'D1 零差异时明说「逐行相同」（不是空白面板）',
+              '实际：' + txt(q('.dec-diff-foot', box)));
+            assert(qa('.dec-diff-row', box).length === 0, 'D2 零差异时不画空行', '');
+            return true;
+          });
+      })
+
+      // =================================================== E. skipped：binary
+      .then(function () {
+        var card = cards()[2];
+        btn(card, '对比本地/NAS').click();
+        return waitFor(function () { return q('.dec-diff', card); })
+          .then(function (box) {
+            if (!box) { fail('E1 展开二进制卡的 diff', '超时'); return false; }
+            var skip = q('.dec-diff-skip', box);
+            assert(skip !== null, 'E1 skipped 用 .dec-diff-skip 呈现', '');
+            assert(/二进制/.test(txt(skip)), 'E2 binary → 文案说明「含 NUL 字节」',
+              '实际：' + txt(skip));
+            assert(/保留本地/.test(txt(skip)) && /两份都留/.test(txt(skip)),
+              'E3 skipped 仍指出「保留本地 / 保留 NAS / 两份都留」这个出口',
+              '实际：' + txt(skip));
+            assert(qa('.dec-diff-row', box).length === 0, 'E4 skipped 不画任何差异行', '');
+            assert(!q('.dec-diff-skip.err', box), 'E5 skipped 属「说明」不是「错误」', '');
+            return true;
+          });
+      })
+
+      // =================================================== 追加三张卡
+      .then(function () {
+        window.__HARNESS__.addExtra();   // 模拟 daemon 又发现 3 条冲突（队列 3 → 6）
+        $('btn-decisions-refresh').click();
+        return waitFor(function () { return cards().length === 6; });
+      })
+      .then(function (got) {
+        assert(got === true, 'C0 追加 3 张卡后刷新出 6 张', '实际 ' + cards().length + ' 张');
+        var cs = cards();
+
+        // too_large
+        btn(cs[3], '对比本地/NAS').click();
+        return waitFor(function () { return q('.dec-diff-skip', cs[3]); })
+          .then(function (skip) {
+            var s = txt(skip);
+            assert(/超出/.test(s) && /512(?:\.0)? KiB/.test(s),
+              'C1 超限 → 文案带真实大小与 512 KiB 上限', '实际：' + s);
+            assert(/保留本地/.test(s) && /两份都留/.test(s), 'C2 超限时仍给裁决出口', '实际：' + s);
+
+            // is_dir
+            btn(cs[4], '对比本地/NAS').click();
+            return waitFor(function () { return q('.dec-diff-skip', cs[4]); });
+          })
+          .then(function (skip) {
+            assert(/目录/.test(txt(skip)), 'C3 目录 → 文案说明「这是目录」',
+              '实际：' + txt(skip));
+
+            // truncated
+            btn(cs[5], '对比本地/NAS').click();
+            return waitFor(function () { return q('.dec-diff-foot', cs[5]); });
+          })
+          .then(function (foot) {
+            if (!foot) { fail('C4 截断时出现脚注', '超时'); return false; }
+            // truncated 有两种来源（输出截断 / 输入有界回退），文案不承诺精确行数。
+            assert(/差异过多/.test(txt(foot)) && /结果已截断/.test(txt(foot)),
+              'C4 截断脚注说明「只显示前 N 行（结果已截断）」', '实际：' + txt(foot));
+            var stat = txt(q('.dec-diff-stat', cs[5]));
+            assert(/本地独有\s*-850/.test(stat) && /NAS 独有\s*\+900/.test(stat),
+              'C5 统计报**全量**差异（本地独有 850 / NAS 独有 900），不是截断后的 1/1',
+              '实际：' + stat);
+            return true;
+          });
+      })
+
+      // =================================================== no_content（解释性 Skip，不是错误）
+      .then(function () {
+        // 复用 d-0004：换成 no_content 再点一次（先手动收起已有面板）
+        var card = cards()[3];
+        var open = q('.dec-diff', card);
+        if (open) { open.remove(); }
+        var b = btn(card, '对比本地/NAS');
+
+        // ① **旧 daemon** 的形状：detail 自带「本地内容读不到：」前缀
+        //    （daemon.rs 的 `decision_diff_cmd` 对 read_cached 失败就是这么写的），
+        //    GUI 绝不能再套一层，否则显示「本地内容读不到：本地内容读不到：…」。
+        stubDiff('d-0004', {
+          path: '/home/user/qxync/dump.sql', local_size: 5242880, remote_size: 5240000,
+          outcome: { status: 'skipped', reason: 'no_content', which: 'local',
+            detail: '本地内容读不到：本地内容还没水合完整（要读的前 524289 字节覆盖 5 个区间，' +
+              '其中 3 个还没下载；文件共 900000 字节）。未下载的区间读出来是 0 字节，直接对比会显示假的差异。' }
+        });
+        b.click();
+        return waitFor(function () { return q('.dec-diff-skip', card); }).then(function (s) {
+          if (!s) { fail('C6 no_content → 文案说明哪一侧读不到', '超时或文案不符'); return false; }
+          var t = txt(s);
+          assert(/本地/.test(t) && /还没水合完整/.test(t),
+            'C6 no_content → 点明「本地」侧与原因', '实际：' + t);
+          assert((t.match(/内容读不到/g) || []).length === 1,
+            'C6b 旧 daemon detail 已带前缀时不重复（「内容读不到」只出现 1 次）', '实际：' + t);
+          assert(!q('.dec-diff-skip.err', card),
+            'C6c no_content（含 WouldBlock/未水合）是解释性 Skip，不画成错误', '');
+
+          // ② **新 daemon** 的形状：detail 不再带前缀，GUI 要自己补一次 side。
+          stubDiff('d-0004', {
+            path: '/home/user/qxync/dump.sql', local_size: 5242880, remote_size: 5240000,
+            outcome: { status: 'skipped', reason: 'no_content', which: 'local',
+              detail: '要读的前 524289 字节覆盖 5 个区间，其中 3 个还没下载' }
+          });
+          var open2 = q('.dec-diff', card);
+          if (open2) { open2.remove(); }
+          var b2 = btn(card, '对比本地/NAS');
+          b2.click();
+          return waitFor(function () {
+            var s2 = q('.dec-diff-skip', card);
+            return s2 && /要读的前/.test(txt(s2)) ? s2 : false;
+          }).then(function (s2) {
+            if (!s2) { fail('C7 无前缀 detail 时仍能补齐侧别', '超时'); return false; }
+            var t2 = txt(s2);
+            assert(/^本地内容读不到：/.test(t2),
+              'C7 daemon detail 不带前缀时 GUI 补一次「本地内容读不到：」', '实际：' + t2);
+            assert((t2.match(/内容读不到/g) || []).length === 1,
+              'C7b 新版 detail 也不会双重前缀', '实际：' + t2);
+            return true;
+          });
+        });
+      })
+
+      // =================================================== K. status=diff 但形状坏掉
+      .then(function () {
+        var card = cards()[3];   // d-0004：先把上一段留下的面板收掉
+        var open = q('.dec-diff', card);
+        if (open) { open.remove(); }
+        // 平级字段缺失（没有 lines）—— 旧代码 `isObj(o.diff) ? o.diff : {}` 会兜底成
+        // 空 diff，界面显示「+0/-0 / 两边内容逐行相同」——**没比过却长得像比出零差异**。
+        stubDiff('d-0004', { path: '/home/user/qxync/dump.sql',
+          local_size: 5242880, remote_size: 5240000,
+          outcome: { status: 'diff', added: 2, removed: 1 } });
+        var b = btn(card, '对比本地/NAS');
+        if (!b) { fail('K0 找到 d-0004 的「对比本地/NAS」按钮', ''); return false; }
+        b.click();
+        return waitFor(function () { return q('.dec-diff-skip.err', card); }).then(function (skip) {
+          if (!skip) { fail('K1 status=diff 但缺 lines 时显示错误', '超时或没有显示错误'); return false; }
+          assert(/格式不对/.test(txt(skip)),
+            'K1 形状坏掉 → 显示「格式不对」（绝不是零差异）', '实际：' + txt(skip));
+          assert(!/逐行相同/.test(txt(q('.dec-diff', card))),
+            'K2 绝不落成「两边内容逐行相同」', '实际：' + txt(q('.dec-diff', card)));
+          assert(qa('.dec-diff-row', card).length === 0, 'K3 不画任何差异行', '');
+          return true;
+        });
+      })
+
+      // =================================================== I. 裁决仍走 resolve
+      .then(function () {
+        resetCalls();
+        var b = btn(cards()[0], '保留本地');
+        if (!b) { fail('I0 找到「保留本地」按钮', ''); return false; }
+        b.click();
+        return waitFor(function () {
+          return calls().some(function (c) {
+            return c.method === 'decisions' && c.action === 'resolve' && c.resolution === 'keep_local';
+          });
+        }).then(function (got) {
+          assert(got === true, 'I1 裁决仍发 action=resolve + resolution=keep_local', '');
+          return true;
+        });
+      })
+
+      // =================================================== M. resolve 飞行中禁用（竞态）
+      .then(function () {
+        resetCalls();
+        var card = cards()[1];
+        var b = btn(card, '保留本地');
+        if (!b) { fail('M0 找到「保留本地」按钮', ''); return false; }
+        delayInvoke(function (cmd, args) {
+          return cmd === 'ipc_call' && args && args.req &&
+            args.req.method === 'decisions' && args.req.action === 'resolve';
+        }, 300);
+        b.click();
+        assert(b.disabled === true, 'M1 resolve 请求飞行中按钮禁用（防重复裁决）', '');
+        b.click();   // 禁用态不应再触发 click
+        return waitFor(function () {
+          var n = calls().filter(function (c) { return c.action === 'resolve'; }).length;
+          return n === 1 && b.disabled === false;
+        }).then(function (got) {
+          assert(got === true, 'M2 resolve 重复点击没有再发请求、回包后按钮恢复',
+            '实际：' + JSON.stringify(calls()));
+          return true;
+        });
+      })
+
+      // =================================================== H. 忽略这条
+      .then(function () {
+        resetCalls();
+        var card = cards()[0];
+        var b = btn(card, '忽略这条');
+        if (!b) { fail('H0 找到「忽略这条」按钮', ''); return false; }
+        b.click();
+        return waitFor(function () {
+          return calls().some(function (c) { return c.method === 'decisions' && c.action === 'forget'; });
+        }).then(function (got) {
+          assert(got === true, 'H1 「忽略这条」发出 action=forget', '');
+          return waitFor(function () { return findOkLog(/已忽略/); });
+        }).then(function (b2) {
+          assert(b2 !== false && /未动文件/.test(txt(b2)),
+            'H2 忽略回执写明「未动文件」', b2 === false ? '没等到回执' : txt(b2));
+          return waitFor(function () { return cards().length === 5; });
+        }).then(function (n5) {
+          assert(n5 === true, 'H3 忽略后队列 6 条 → 5 条（只有这一条被删）',
+            '实际 ' + cards().length + ' 条');
+          return true;
+        });
+      })
+
+      // =================================================== G. 清空全部（最后做：会清空队列）
+      .then(function () {
+        resetCalls();
+        $('btn-decisions-clear').click();
+        return waitFor(function () {
+          return calls().some(function (c) { return c.method === 'decisions' && c.action === 'clear'; });
+        }).then(function (got) {
+          assert(got === true, 'G1 「清空全部」发出 action=clear', '');
+          return waitFor(function () { return findOkLog(/已清空待裁决队列/); });
+        }).then(function (b) {
+          assert(b !== false, 'G2 清空后有回执', b === false ? '没等到回执' : txt(b));
+          if (b !== false) {
+            assert(/5 条/.test(txt(b)), 'G3 回执写明删了几条（5 条，未动文件）', '实际：' + txt(b));
+          }
+          return true;
+        });
+      })
+
+      // =================================================== J. i18n / innerHTML
+      .then(function () {
+        var missing = (window.QXNYC_I18N && window.QXNYC_I18N.missingInDOM)
+          ? window.QXNYC_I18N.missingInDOM(document) : ['<i18n 未加载>'];
+        assert(missing.length === 0, 'J1 DOM 里所有 data-i18n 都在文案表里',
+          '缺：' + missing.join('、'));
+        return fetchText('app.js').then(function (src) {
+          if (src === null) {
+            pass('J2/J3 跳过（file:// 下 fetch 不到 app.js 源码；编译期 ui_spec 已覆盖）');
+            return true;
+          }
+          var used = {}, re = /T\('([^']+)'/g, m;
+          while ((m = re.exec(src)) !== null) { used[m[1]] = true; }
+          var table = (window.QXNYC_I18N && window.QXNYC_I18N.tables)
+            ? (window.QXNYC_I18N.tables['zh-CN'] || {}) : {};
+          var absent = Object.keys(used).filter(function (k) {
+            return typeof table[k] !== 'string';
+          });
+          assert(absent.length === 0, 'J2 app.js 里所有 T(\'key\') 都在文案表里',
+            '缺：' + absent.join('、'));
+          assert(!/innerHTML\s*=/.test(src), 'J3 app.js 不用 innerHTML 拼字符串',
+            '出现了 innerHTML 赋值');
+          return true;
+        });
+      })
+
+      // =================================================== 收尾
+      .then(function () {
+        var f = results.filter(function (r) { return !r.pass; });
+        var badge = $('verdict');
+        badge.textContent = f.length ? ('✗ ' + f.length + ' 项失败') : ('✓ 全部 ' + results.length + ' 项通过');
+        badge.className = 'verdict ' + (f.length ? 'bad' : 'good');
+        document.body.setAttribute('data-selftest', f.length ? 'fail' : 'pass');
+        return f.length === 0;
+      });
+  }
+
+  /** 读 app.js 源码；file:// 下 fetch 会失败 → 返回 null（该两项断言跳过）。 */
+  function fetchText(rel) {
+    return fetch(rel).then(function (r) { return r.text(); })
+      .catch(function () { return null; });
+  }
+
+  window.__runSelftest = run;
+})();
+</script>
+
+<script>
+/* ============================================================================
+ * 3) loader —— 把真实的 index.html 搬进 #stage，然后按真实顺序加载真实脚本。
+ *    用 iframe 不行（同源限制拿不到内容），所以直接取源码再注入，
+ *    这样样式与结构 100% 来自 ui/index.html，没有第二份副本。
+ * ========================================================================== */
+(function () {
+  'use strict';
+  var UI = '../../crates/qxync-gui/ui/';
+
+  function injectAppJs() {
+    return new Promise(function (resolve, reject) {
+      var s = document.createElement('script');
+      s.src = UI + 'app.js';
+      s.onload = resolve;
+      s.onerror = function () { reject(new Error('加载 app.js 失败：' + s.src)); };
+      document.body.appendChild(s);
+    });
+  }
+
+  function injectI18n() {
+    return new Promise(function (resolve, reject) {
+      var s = document.createElement('script');
+      s.src = UI + 'i18n.js';
+      s.onload = resolve;
+      s.onerror = function () { reject(new Error('加载 i18n.js 失败：' + s.src)); };
+      document.body.appendChild(s);
+    });
+  }
+
+  function fail(msg) {
+    document.body.setAttribute('data-selftest', 'fail');
+    var b = document.getElementById('verdict');
+    b.textContent = '✗ 夹具加载失败';
+    b.className = 'verdict bad';
+    document.getElementById('selftest').innerHTML =
+      '<ul><li class="f"><code>FAIL</code> 夹具加载<div class="why">' + msg + '</div></li></ul>';
+  }
+
+  fetch(UI + 'index.html').then(function (r) { return r.text(); })
+    .then(function (html) {
+      // 抽出 <body> 内的内容（去掉它自己的 <script src=…>，我们要自己控制顺序）
+      var m = html.match(/<body[^>]*>([\s\S]*)<\/body>/i);
+      if (!m) { throw new Error('index.html 里找不到 <body>'); }
+      var body = m[1]
+        .replace(/<script\s+src="[^"]*"\s*><\/script>/gi, '')
+        // 夹具不需要环境横幅（Tauri 桩已就位，它本不该出现）
+        .replace(/<div id="env-banner"[\s\S]*?<\/div>/i, '');
+
+      var stage = document.getElementById('stage');
+      stage.innerHTML = body;
+      document.title = 'qxync — 冲突待裁决 / 文本对比 自检';
+
+      return injectI18n().then(injectAppJs);
+    })
+    .then(function () {
+      // app.js 的 boot() 是 DOMContentLoaded 时跑的；这里 DOM 已就绪，
+      // 它会同步执行。等一拍让它把首批卡片画出来，再启动断言。
+      setTimeout(function () {
+        if (typeof window.__runSelftest === 'function') {
+          window.__runSelftest();
+        } else {
+          fail('app.js 没跑起来（__runSelftest 未定义）');
+        }
+      }, 400);
+    })
+    .catch(function (e) { fail(String(e && e.message ? e.message : e)); });
+})();
+</script>
+
+</body>
+</html>

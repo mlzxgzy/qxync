@@ -24,7 +24,7 @@ NAS 上的文件在本地只是一个「占位符」，`ls -l` 显示真实大�
 | 二进制 | 角色 |
 |---|---|
 | `qxync` | 命令行（登录 / 列举 / 上传下载 / 挂载 / 同步 / 脱水 / 任务 / 设置 / 日志 / LAN 对等） |
-| `qxyncd` | 常驻守护进程：**唯一**持有 FUSE 挂载与 NAS 会话，对外提供本地 unix socket JSON IPC |
+| `qxyncd` | 常驻守护进程（**每条 NAS 连接一个**）：持有该连接的 FUSE 挂载与 NAS 会话，对外提供本地 unix socket JSON IPC |
 | `qxync-gui` | Tauri 2 桌面应用（零依赖静态前端，全部经 daemon 的 IPC） |
 
 **它是什么**：对 QNAP 官方客户端所做行为的**互操作性实现** —— 协议细节来自对
@@ -50,12 +50,14 @@ NAS 上的文件在本地只是一个「占位符」，`ls -l` 显示真实大�
 | **删除** | `unlink`/`rmdir` **立刻返回**，远端删除由后台队列**同目录攒批**推送（对齐官方 Smart Delete 形态）；崩溃可恢复；大批量误删仍被**熔断**挡住 | [CHANGELOG](CHANGELOG.md) |
 | **挂载点不提供回收站** | 桌面环境（KDE Dolphin 的 `trash:` 协议）想在挂载点里造 `.Trash-$UID` 时直接拒 —— 删文件就是真删，不进回收站 | [CHANGELOG](CHANGELOG.md) |
 | **变更发现** | 三游标轮询 + baseline 三向对账；冲突生成**冲突副本**，远端批量删除有**熔断**保护 | [M2c](docs/M2c-变更发现.md) |
+| **冲突待裁决** | 冲突策略 =「每个文件都问我」时进队列：可**对比本地/NAS**（行级 diff，方向不反）、**保留本地 / 保留 NAS / 两份都留 / 忽略这条 / 清空**；失效条目由引擎巡检自动出队（只动队列、不动文件）；**回收站子树（`@Recycle` / `.Trash-*`）不同步** | [M8 §⑤](docs/M8-向Qsync-Client-6靠拢.md) · [M4 §4.1.2](docs/M4-GUI.md) |
 | **脱水（释放空间）** | 完整安全检查链（pin / 未上传改动 / 打开的 fd / 被 mmap / 正在水合 / 刚访问过）后才清本地内容 | [M3](docs/M3-脱水.md) |
 | **本地状态库** | SQLite 承载游标 / baseline / pin / 上传队列，**同一事务**落盘；librsync 兼容的 delta 编解码 + 能力门控 | [M5](docs/M5-SQLite与delta.md) |
 | **共享文件夹** | NAS 文件夹**一对一**配到本地；读写与否由 NAS 决定（登记成 Qsync 同步文件夹的目录可写） | [M6](docs/M6-多根与共享文件夹.md) · [CHANGELOG](CHANGELOG.md) |
 | **选择性同步** | gitignore 风味的 `exclude` 规则（锚定 / `**` / 反向包含 / 子树剪枝）+ 内置临时文件过滤 | [M7](docs/M7-选择性同步与LAN直连.md) |
 | **LAN 直连** | qxync↔qxync 自研对等协议：设备配对、事件快路径、本地区间直传（失败一律静默回落 NAS） | [M7](docs/M7-选择性同步与LAN直连.md) |
 | **同步任务** | `tasks/<id>.json` 持久化的挂载登记，逐任务暂停/继续，重启可 `--restore-tasks` 恢复 | [M8](docs/M8-向Qsync-Client-6靠拢.md) |
+| **多 NAS 连接** | **一条连接一个 `qxyncd` 进程**（各自独立 socket / pid / 日志 / 状态库 / 缓存 / 上传队列），default 保持旧路径；每条连接下可建多个任务；CLI `qxync links` / `daemon … --all`，GUI 连接列表与「当前连接」切换 | [M16](docs/M16-多NAS连接.md) |
 | **同步日志** | `sync.db` 的 `journal` 表 + 后台批量落库与轮转，驱动 GUI 的「文件更新中心 / 错误列表」 | [M8](docs/M8-向Qsync-Client-6靠拢.md) |
 | **桌面 GUI** | 主页 / 任务 / 文件 / 更新 / 错误 / 设置 / 诊断；托盘 + 通知 + 开机自启 + 文件选择器 + **任务卡「打开目录」**（用系统里用户自己配的默认目录工具打开本地挂载点） | [M4](docs/M4-GUI.md) · [M8](docs/M8-向Qsync-Client-6靠拢.md) |
 | **设置中心** | 代理三模式（Auto-detect / No proxy / Manual）、自动释放空间、冲突策略五选、文件三态 | [M8](docs/M8-向Qsync-Client-6靠拢.md) |
@@ -208,6 +210,20 @@ sudo loginctl enable-linger "$USER"      # 想「不登录也常驻」（开机�
 > 那条路是给没有 systemd 的用法准备的，两边同时用只会互相打架。
 > （`qxync daemon stop` 走 IPC 让进程自己退出，systemd 会看到主进程消失。）
 
+**多台 NAS**：上面装的是 `default` 连接的单元。额外连接用**模板单元** `qxyncd@<link_id>`
+（`<link_id>` 对应 `~/.config/qxync/links/<id>.json`，例如 `nas2`）：
+
+```bash
+systemctl --user enable --now qxyncd@nas2    # 启动 / 启用第 nas2 条连接
+systemctl --user status qxyncd@nas2
+journalctl --user -u qxyncd@nas2 -f          # 该连接的日志（qxyncd-nas2.log 同内容）
+```
+
+`default` 仍用 `qxyncd.service`，**别**和 `qxyncd@default` 同时启用（同一条连接会被拉起两个
+进程）；也别让 GUI 和 systemd 同时管同一条连接。每条连接一个独立 daemon（独立 socket /
+pid / 日志 / 状态库），停掉一条不影响其它连接；GUI「设置 → 连接」里也能启动 / 停止每个连接。
+完整说明见 [`docs/M16-多NAS连接.md`](docs/M16-多NAS连接.md)。
+
 ### 5. GUI
 
 ```bash
@@ -333,6 +349,10 @@ pin=pinned/excluded、未上传改动/队列在途、打开的 fd、被 mmap（�
   混合标记段落**有意不进表**。文案表由 `qxync-gui --self-test` 的 `ui_spec` 双向自检守住，
   **不引入任何 i18n 框架**。
 * **直连（`--direct`）模式下改 `settings.json` 只写文件**，跑着的 daemon 要重启才读到新设置。
+* **多 NAS 连接（M16）的两条边界**：① 同一台 NAS 上的两条连接**不要同时双向同步同一个
+  远端目录**（各有独立 baseline，会互相判成对方的改动）；② 非 default 连接的数据在**旧版本里
+  不存在**，回退旧版本会让这些连接失效（default 不受影响）。详见
+  [`M16-多NAS连接.md`](docs/M16-多NAS连接.md)。
 * **能力门控而非能力假设**：NAS 侧没有历史版本时，delta 走门控、真实路径仍是整文件传输
   （见 [`M5-SQLite与delta.md`](docs/M5-SQLite与delta.md)）。
 * 本项目只在 **QNAP TS-464C / QTS 5.2.9 / Qsync QPKG 5.0.0.7（build 20260723）**
@@ -530,6 +550,7 @@ cargo test -p qxync-daemon -- --ignored --test-threads=1 --nocapture     # M2c �
 | [`docs/M6-多根与共享文件夹.md`](docs/M6-多根与共享文件夹.md) | **历史文档**：多根布局（已删除）、只读规则、真机共享文件夹探测 |
 | [`docs/M7-选择性同步与LAN直连.md`](docs/M7-选择性同步与LAN直连.md) | exclude 规则引擎、对等协议线格式、事件快路径、直传 |
 | [`docs/M8-向Qsync-Client-6靠拢.md`](docs/M8-向Qsync-Client-6靠拢.md) | GUI 改造研究 + M8.1–M8.6 执行方案与决策记录 |
+| [`docs/M16-多NAS连接.md`](docs/M16-多NAS连接.md) | 多 NAS：一连接一 daemon、命名空间与存储布局、旧数据迁移、CLI/GUI 入口、安全边界与验收 |
 | [`docs/验收记录.md`](docs/验收记录.md) | 里程碑级验收结论（跑了什么、结果是什么） |
 | [`docs/发布清单-v0.1.0.md`](docs/发布清单-v0.1.0.md) | 发版前检查清单（维护者用） |
 | [`CHANGELOG.md`](CHANGELOG.md) | 变更日志 |
