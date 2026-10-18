@@ -191,20 +191,7 @@
               <select id="t-link" class="mono"></select>
             </label>
             <p class="hint" id="t-link-hint" hidden></p>
-            <div class="row-2">
-              <label>任务 id（也是文件名）
-                <input type="text" id="t-id" class="mono" value="default" spellcheck="false">
-              </label>
-              <label>缓存模式
-                <select id="t-cache-mode">
-                  <option value="pagecache">pagecache（默认）</option>
-                  <option value="direct">direct（绕过 page cache，不可 mmap）</option>
-                </select>
-              </label>
-            </div>
-            <label>本地文件夹（挂载点，绝对路径）
-              <input type="text" id="t-mountpoint" class="mono" spellcheck="false">
-            </label>
+            <!-- ★ M18：先选 NAS 文件夹 —— 任务 id 与两条本地路径都由它派生 -->
             <label>NAS 文件夹（一对一映射）
               <span class="select-row">
                 <select id="t-nas-folder" class="mono"></select>
@@ -225,9 +212,34 @@
               没登记过的共享文件夹会被服务端拒绝（<code>status:20</code>）—— 勾了「读写」仍失败的话，
               错误会进「更新 / 错误」页，客户端不会替你改只读。
             </p>
-            <label>水合缓存目录（留空 = 默认 <code>~/.local/share/qxync/cache</code>）
+            <div class="row-2">
+              <label>任务 id（也是文件名；默认取 NAS 文件夹名）
+                <input type="text" id="t-id" class="mono" spellcheck="false"
+                       placeholder="home">
+              </label>
+              <label>缓存模式
+                <select id="t-cache-mode">
+                  <option value="pagecache">pagecache（默认）</option>
+                  <option value="direct">direct（绕过 page cache，不可 mmap）</option>
+                </select>
+              </label>
+            </div>
+            <label>本地文件夹（挂载点，绝对路径）
+              <input type="text" id="t-mountpoint" class="mono" spellcheck="false"
+                     placeholder="默认 ~/qxync/&lt;连接 id&gt;/&lt;任务 id&gt;">
+            </label>
+            <p class="hint" id="t-defaults-hint">
+              ★ 默认值按「<strong>连接 + NAS 文件夹</strong>」自动生成，不会再出现两条任务
+              id / 路径一模一样的情况：任务 id 取文件夹名（<code>/home</code> →
+              <code>home</code>，重名自动加 <code>-2</code>）；本地文件夹 =
+              <code>~/qxync/&lt;连接 id&gt;/&lt;任务 id&gt;</code>；水合缓存 =
+              <code>&lt;data_dir&gt;/cache/tasks/&lt;连接 id&gt;/&lt;任务 id&gt;</code>。
+              手动改过的字段不再被自动覆盖，想恢复点
+              <button type="button" class="mini" id="btn-task-defaults">重置为默认路径</button>。
+            </p>
+            <label>水合缓存目录（留空 = 按连接共享；默认按任务隔离）
               <input type="text" id="t-cache-dir" class="mono" spellcheck="false"
-                     placeholder="留空用默认；实际缓存会再拼一层 NAS 主机名">
+                     placeholder="留空 = 按连接共享；实际缓存会再拼一层连接的命名空间">
             </label>
             <div class="row-2">
               <label>冲突策略（Conflict policies）
@@ -958,6 +970,8 @@
 </div>
 
 <script src="i18n.js"></script>
+<!-- ★ M18：任务默认路径（纯函数，先于 app.js 装载） -->
+<script src="task-defaults.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

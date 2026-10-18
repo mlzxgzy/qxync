@@ -70,6 +70,12 @@
     ? function (cmd, args) { return tauri.core.invoke(cmd, args); }
     : null;
 
+  // ★ M18：任务默认路径的纯函数（任务 id / 本地文件夹 / 水合缓存）。
+  //   单独放在 ui/task-defaults.js：能 node 单测，也能被无头浏览器集成测试复用。
+  //   资源没加载（旧包）时退化成 null —— 表单只是不再自动派生，不会抛错。
+  var TD = (typeof window !== 'undefined' && window.QXNYC_TASK_DEFAULTS)
+    ? window.QXNYC_TASK_DEFAULTS : null;
+
   // --------------------------------------------------------------- ★ M16 多连接状态
   var state = {
     page: 'home',      // 一级目的地（PAGES）
@@ -128,6 +134,10 @@
     creatingLink: false,  // ★ M16.1：'' 有两种含义（「展示当前连接」/「正在新建」），用它区分
     taskFormLink: '',     // 任务表单：这条任务属于哪个连接
     taskFormEditing: false,
+    // ★ M18：新任务表单里哪些字段还是「自动派生」的。
+    //   用户一旦手改某个字段，就把对应标志置 false —— 之后换 NAS 文件夹 / 换连接
+    //   都不会再把用户的输入覆盖掉（点「重置为默认路径」可全部恢复 true）。
+    taskFormAuto: { id: true, mountpoint: true, cache: true },
     tasksByLink: {},      // linkId -> {data, error}
     journalByLink: {},    // linkId -> {data, error}
     errorsByLink: {},     // linkId -> {data, error}
@@ -1691,6 +1701,80 @@
     return state.taskFormLink || currentId();
   }
 
+  // ---------------------------------------------------- ★ M18 任务默认路径
+  // 背景（用户反馈）：新任务表单里「任务 id=default、本地文件夹=~/qxync-mnt、
+  // 水合缓存=按连接的缓存根」三处默认值对所有任务都一样 —— 第二条任务一提交就
+  // 要么撞 id（tasks/<id>.json 是唯一文件名）、要么撞挂载点，只能手工改三处。
+  // 现在按「连接 + NAS 文件夹」派生，天然唯一；规则在 ui/task-defaults.js（纯函数）。
+
+  /** 已经用掉的任务 id。id 是**全局**文件名（`tasks/<id>.json`），跨连接也不能重复。 */
+  function takenTaskIds() {
+    var out = {};
+    var ls = linksList();
+    for (var i = 0; i < ls.length; i++) {
+      var entry = state.tasksByLink[str(ls[i].id)];
+      var infos = (entry && entry.data && Array.isArray(entry.data.tasks)) ? entry.data.tasks : [];
+      for (var j = 0; j < infos.length; j++) {
+        if (isObj(infos[j]) && isObj(infos[j].task)) { out[str(infos[j].task.id)] = true; }
+      }
+    }
+    return out;
+  }
+
+  /** 表单里 NAS 一侧当前选中的路径（下拉 / 手动输入两种模式都算）。 */
+  function taskFormNasPath() {
+    return nasSelectedPath() || '/home';
+  }
+
+  /**
+   * 按当前「连接 + NAS 文件夹」刷新自动派生的字段（编辑已有任务时什么都不做）。
+   *
+   * 只覆盖 `state.taskFormAuto` 里仍为 true 的字段：用户改过的 id / 路径不会再被
+   * 换 NAS 文件夹或换连接冲掉。
+   */
+  function applyTaskDefaults() {
+    if (!TD || state.taskFormEditing) { return; }
+    var linkId = taskFormLinkId();
+    var auto = state.taskFormAuto || { id: true, mountpoint: true, cache: true };
+    var idEl = $('t-id');
+    var mpEl = $('t-mountpoint');
+    var cEl = $('t-cache-dir');
+    if (auto.id && idEl) {
+      idEl.value = TD.uniqueId(TD.idBaseFromRoot(taskFormNasPath()), takenTaskIds());
+    }
+    // 下面两处跟着「当前 id」走：id 被用户清空时先不动，免得打字中途把路径改花
+    var id = str(idEl ? idEl.value : '').trim();
+    if (!id) { return; }
+    var info = isObj(state.appInfo) ? state.appInfo : {};
+    if (auto.mountpoint && mpEl) { mpEl.value = TD.mountpoint(str(state.home), linkId, id); }
+    if (auto.cache && cEl) { cEl.value = TD.cacheDir(str(info.data_dir), linkId, id); }
+  }
+
+  /** 「重置为默认路径」：把三个字段都交回自动派生（用户手改后想恢复时用）。 */
+  function resetTaskDefaults() {
+    state.taskFormAuto = { id: true, mountpoint: true, cache: true };
+    applyTaskDefaults();
+    var idEl = $('t-id');
+    if (idEl) { idEl.focus(); }
+  }
+
+  /** 用户手动改了 id：之后不再自动覆盖它，但挂载点 / 缓存（若仍自动）继续跟着 id 走。 */
+  function onTaskIdEdited() {
+    state.taskFormAuto.id = false;
+    var idEl = $('t-id');
+    var id = str(idEl ? idEl.value : '').trim();
+    if (!id) { return; }
+    var info = isObj(state.appInfo) ? state.appInfo : {};
+    if (state.taskFormAuto.mountpoint) {
+      var mpEl = $('t-mountpoint');
+      if (mpEl && TD) { mpEl.value = TD.mountpoint(str(state.home), taskFormLinkId(), id); }
+    }
+    if (state.taskFormAuto.cache) {
+      var cEl = $('t-cache-dir');
+      if (cEl && TD) { cEl.value = TD.cacheDir(str(info.data_dir), taskFormLinkId(), id); }
+    }
+  }
+
   /**
    * 从一份 `roots` 响应里提取候选项，存进**指定连接**的缓存。
    *
@@ -1812,12 +1896,14 @@
     return str(sel.value).trim();
   }
 
-  /** 表单填值入口（打开新表单 / 编辑已有任务都走这里）。 */
+  /** 表单填值入口（打开新表单 / 编辑已有任务都走这里）。
+   *  ★ M18：新任务模式下，换 NAS 文件夹会重算 id / 本地路径（编辑模式不动）。 */
   function setNasFolder(path) {
     var p = str(path).trim();
     var inp = $('t-nas-manual');
     if (inp) { inp.value = p; }
     renderNasFolderSelect(p);
+    applyTaskDefaults();
   }
 
   // ---------------------------------------------------- ★ NAS 文件夹浏览器（逐层挑）
@@ -1933,9 +2019,11 @@
     var set = function (id, v) { var n = $(id); if (n) { n.value = v; } };
     var chk = function (id, v) { var n = $(id); if (n) { n.checked = !!v; } };
     state.taskFormEditing = false;
+    // ★ M18：三个默认值全部交回自动派生（按「连接 + NAS 文件夹」生成，见 applyTaskDefaults）
+    state.taskFormAuto = { id: true, mountpoint: true, cache: true };
     state.taskFormLink = state.currentLink || (linksList().length ? str(linksList()[0].id) : '');
-    set('t-id', 'default');
-    set('t-mountpoint', (str(state.home) || '~') + '/qxync-mnt');
+    set('t-id', '');
+    set('t-mountpoint', '');
     set('t-cache-dir', '');
     set('t-cache-mode', 'pagecache');
     set('t-conflict', 'rename_local');
@@ -1945,8 +2033,11 @@
     chk('t-read-write', false);
     chk('t-do-mount', true);
     renderTaskLinkSelect();
+    // setNasFolder → applyTaskDefaults：按当前 NAS 文件夹（默认 /home）填唯一默认值
     setNasFolder('/home');
     setText('task-form-title', '文件夹对设置');
+    // ★ M18：编辑任务时不做派生，所以「默认值说明 + 重置按钮」只在新建时显示
+    show('t-defaults-hint', true);
   }
 
   function openTaskForm() {
@@ -1956,8 +2047,10 @@
     card.hidden = false;
     card.scrollIntoView({ block: 'nearest' });
     loadNasCandidates();
-    var idEl = $('t-id');
-    if (idEl) { idEl.focus(); }
+    // ★ M18：焦点默认落在 NAS 文件夹（先选它，id/路径都会跟着变），而不是让用户
+    //   先看见一个「看起来要手填」的 id 输入框。
+    var nasSel = $('t-nas-folder');
+    if (nasSel) { nasSel.focus(); }
   }
 
   /** ★ M8.4：把已有任务填进「文件夹对设置」表单（冲突策略就在这里面改）。
@@ -1968,6 +2061,8 @@
     var set = function (id, v) { var n = $(id); if (n) { n.value = v; } };
     var chk = function (id, v) { var n = $(id); if (n) { n.checked = !!v; } };
     state.taskFormEditing = true;
+    // ★ M18：编辑已有任务 = 所有字段都是用户/磁盘上的既有值，一律不自动派生。
+    state.taskFormAuto = { id: false, mountpoint: false, cache: false };
     state.taskFormLink = str(linkId) || str(t.link_id) || currentId();
     set('t-id', str(t.id));
     set('t-mountpoint', str(t.mountpoint));
@@ -1983,6 +2078,8 @@
     // ★ 一对一：NAS 侧就一个文件夹（没写 = 用默认的家目录 /home）
     setNasFolder(str(t.root));
     setText('task-form-title', '文件夹对设置 · ' + str(t.id));
+    // ★ M18：编辑时字段都是磁盘上的既有值 —— 隐藏「默认值说明 + 重置按钮」
+    show('t-defaults-hint', false);
     card.hidden = false;
     card.scrollIntoView({ block: 'nearest' });
     loadNasCandidates();
@@ -1998,10 +2095,33 @@
   }
 
   function doTaskSave() {
-    var id = str($('t-id') ? $('t-id').value : '').trim() || 'default';
+    // ★ M18：id 不再默默回落成 "default" —— 那正是「第二条任务把第一条覆盖掉」的来源。
+    //   id 是全局唯一文件名（tasks/<id>.json），空 / 非法字符 / 重名都在提交前说清楚。
+    var id = str($('t-id') ? $('t-id').value : '').trim();
+    if (!id) {
+      renderError('task-result', '参数错误',
+        '任务 id 不能为空：它是任务登记的文件名（如 home / public / home-2）');
+      return Promise.resolve(null);
+    }
+    if (TD && !TD.isValidId(id)) {
+      renderError('task-result', '参数错误',
+        '任务 id 不合法：' + id + '（只允许 A-Za-z0-9 . _ -，最长 64 字符，且不能是 . 或 ..）');
+      return Promise.resolve(null);
+    }
+    if (!state.taskFormEditing && takenTaskIds()[id]) {
+      renderError('task-result', '参数错误',
+        '任务 id「' + id + '」已经被另一条任务用了（同一份任务登记里 id 是唯一文件名）：'
+        + '换个 id，点「重置为默认路径」会自动加 -2 后缀');
+      return Promise.resolve(null);
+    }
     var mp = str($('t-mountpoint') ? $('t-mountpoint').value : '').trim();
     if (!mp) {
       renderError('task-result', '参数错误', '本地文件夹（挂载点）不能为空');
+      return Promise.resolve(null);
+    }
+    if (mp.charAt(0) !== '/') {
+      renderError('task-result', '参数错误',
+        '本地文件夹必须是绝对路径（以 / 开头）：' + mp);
       return Promise.resolve(null);
     }
     // ★ 一对一：NAS 侧**一个**目录（下拉 / 浏览 / 手输，三选一）
@@ -2038,7 +2158,7 @@
       ['id', id], ['本地', mp],
       ['NAS 连接', linkBadge(linkById(linkId))],
       ['NAS（一对一）', nasPath],
-      ['缓存目录', cdir || '（默认 ~/.local/share/qxync/cache）'],
+      ['缓存目录', cdir || '（留空 = 按连接共享，实际在 <data_dir>/cache/<连接命名空间>）'],
       ['冲突策略', conflictLabel(task.conflict)]
     ];
     return withBusy({ spinners: ['task-busy'], buttons: ['btn-task-save'] }, function () {
@@ -5713,9 +5833,25 @@
       renderTaskLinkSelect();
       nasSelectedRefresh();
       loadNasCandidates();
+      // ★ M18：换连接 = 路径里的连接段、id 去重集合都可能变 → 重算自动派生字段
+      applyTaskDefaults();
     });
-    var nasSel = $('t-nas-folder');    var nasSel = $('t-nas-folder');
-    if (nasSel) { nasSel.addEventListener('change', function () { syncNasManual(); }); }
+    var nasSel = $('t-nas-folder');
+    if (nasSel) {
+      // ★ M18：换 NAS 文件夹（先选它）→ 任务 id 取文件夹名、两条路径跟着 id 走
+      nasSel.addEventListener('change', function () { syncNasManual(); applyTaskDefaults(); });
+    }
+    // ★ M18：手动输入 NAS 路径同样是「选 NAS 文件夹」的一种（改动在 blur/回车时生效）
+    var nasManual = $('t-nas-manual');
+    if (nasManual) { nasManual.addEventListener('change', function () { applyTaskDefaults(); }); }
+    // ★ M18：用户手改了哪个字段，就停止自动派生那个字段（id 改动仍会带动两条路径）
+    var tidEl = $('t-id');
+    if (tidEl) { tidEl.addEventListener('input', function () { onTaskIdEdited(); }); }
+    var tmpEl = $('t-mountpoint');
+    if (tmpEl) { tmpEl.addEventListener('input', function () { state.taskFormAuto.mountpoint = false; }); }
+    var tcdEl = $('t-cache-dir');
+    if (tcdEl) { tcdEl.addEventListener('input', function () { state.taskFormAuto.cache = false; }); }
+    on('btn-task-defaults', 'click', function () { resetTaskDefaults(); });
     var nasBox = $('nas-picker');
     if (nasBox) {
       // 点遮罩 / Esc 关掉（列表项可聚焦，所以 Esc 在键盘浏览时也能用）

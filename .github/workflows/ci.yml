@@ -70,6 +70,12 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --locked
 
+      # ★ M18：GUI 前端的**纯函数**单测（任务默认 id / 本地文件夹 / 水合缓存按连接与 id 派生）。
+      # 不依赖浏览器、不连 NAS —— GitHub runner 自带 node，直接跑。
+      # 无头浏览器集成（chromium + 打桩后端）仍在 xtask/tests/gui-task-defaults.sh 里手动跑。
+      - name: node 前端纯函数单测（task-defaults）
+        run: node xtask/tests/task-defaults.test.mjs
+
   # ---------------------------------------------------------------- MSRV
   msrv:
     name: MSRV check (rust 1.90)

@@ -24,6 +24,8 @@ pub fn ui_assets() -> Value {
         "style_css": include_str!("../ui/style.css").len(),
         // ★ M8.6：文案表也是前端资源的一部分，漏打包 = 界面全是 key
         "i18n_js": include_str!("../ui/i18n.js").len(),
+        // ★ M18：任务默认路径的纯函数；漏打包 = 新任务表单退回「三处默认值都一样」
+        "task_defaults_js": include_str!("../ui/task-defaults.js").len(),
     })
 }
 
@@ -676,8 +678,30 @@ pub fn ui_spec() -> Value {
     let i18n_ok =
         missing_used.is_empty() && missing_dom.is_empty() && zh.len() >= 100 && en_reserved;
 
+    // 5) ★ M18：任务默认路径 —— 纯函数资源必须**先于 app.js** 装载，且 app.js 真的用了它。
+    //    漏装载 / 装载顺序反了，新任务表单就会退回「三处默认值都一样」
+    //    （id=default、本地 ~/qxync-mnt、缓存按连接共享），第二条任务必然撞车。
+    let td = strip_comments(include_str!("../ui/task-defaults.js"));
+    let td_loaded = index.contains("task-defaults.js");
+    let td_before_app = match (index.find("task-defaults.js"), index.find("app.js")) {
+        (Some(script), Some(app_js)) => script < app_js,
+        _ => false,
+    };
+    let td_used = app.contains("QXNYC_TASK_DEFAULTS") && app.contains("applyTaskDefaults");
+    let task_defaults = json!({
+        "ok": td_loaded && td_before_app && td_used
+            && td.contains("function uniqueId")
+            && td.contains("function mountpoint")
+            && td.contains("function cacheDir"),
+        "loaded": td_loaded,
+        "before_app_js": td_before_app,
+        "app_uses_it": td_used,
+        "js_bytes": td.len(),
+    });
+    let task_defaults_ok = task_defaults["ok"].as_bool().unwrap_or(false);
+
     json!({
-        "ok": sinks.is_empty() && i18n_ok && a11y_ok && states_ok,
+        "ok": sinks.is_empty() && i18n_ok && a11y_ok && states_ok && task_defaults_ok,
         "html_sinks": sinks,
         "i18n": {
             "ok": i18n_ok,
@@ -691,6 +715,7 @@ pub fn ui_spec() -> Value {
         },
         "a11y": a11y,
         "states": states,
+        "task_defaults": task_defaults,
     })
 }
 
@@ -824,7 +849,9 @@ async fn self_test_inner() -> Value {
     let assets_ok = assets["index_html"].as_u64().unwrap_or(0) > 64
         && assets["app_js"].as_u64().unwrap_or(0) > 256
         && assets["style_css"].as_u64().unwrap_or(0) > 64
-        && assets["i18n_js"].as_u64().unwrap_or(0) > 256;
+        && assets["i18n_js"].as_u64().unwrap_or(0) > 256
+        // ★ M18：任务默认路径的纯函数资源
+        && assets["task_defaults_js"].as_u64().unwrap_or(0) > 256;
 
     // ★ M8.6：UI 的静态合规性（文案表 / 焦点环 / 四态 / 无 innerHTML）也进自检
     let spec = ui_spec();

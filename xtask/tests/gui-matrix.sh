@@ -185,6 +185,30 @@ else
   skip "i18n 回落语义（没有 node，跳过）"
 fi
 
+# ------------------------------------------------------------------ 2c-3. ★ M18 任务默认路径
+# 用户反馈：「不同任务的任务 id / 默认文件夹地址 / 水合目录都默认一样，不友好」。
+# 现在三处默认值按「连接 + NAS 文件夹」派生；这里三层都验：
+#   ① 打进二进制的资源里有纯函数（ui_assets）且装载顺序对（ui_spec）；
+#   ② 纯函数单测（node，不依赖浏览器）；
+#   ③ 真 app.js 的无头集成（chromium + 打桩后端，真实点按钮/改下拉/读 DOM）。
+echo "== 2c-3. M18 任务默认路径（id / 本地文件夹 / 水合缓存按连接与 id 派生） =="
+check "$([ "$(jqs .ui_assets.task_defaults_js)" -gt 256 ] && echo 0 || echo 1)" \
+  "任务默认路径函数已嵌入（task-defaults.js $(jqs .ui_assets.task_defaults_js) B）"
+check "$([ "$(jqs .ui_spec.task_defaults.ok)" = "true" ] && echo 0 || echo 1)" \
+  "task-defaults 接线：index 装载=$(jqs .ui_spec.task_defaults.loaded) / 先于 app.js=$(jqs .ui_spec.task_defaults.before_app_js) / app 在用=$(jqs .ui_spec.task_defaults.app_uses_it)"
+if command -v node >/dev/null; then
+  node "$REPO/xtask/tests/task-defaults.test.mjs" >"$RUNDIR/task-defaults.test.log" 2>&1
+  check $? "M18 纯函数单测：$(tail -1 "$RUNDIR/task-defaults.test.log" 2>/dev/null)"
+else
+  skip "M18 纯函数单测（没有 node，跳过）"
+fi
+if command -v chromium >/dev/null; then
+  bash "$REPO/xtask/tests/gui-task-defaults.sh" >"$RUNDIR/gui-task-defaults.log" 2>&1
+  check $? "M18 无头集成（真 app.js + 打桩后端）：$(tail -2 "$RUNDIR/gui-task-defaults.log" 2>/dev/null | head -1)"
+else
+  skip "M18 无头集成（没有 chromium，跳过）"
+fi
+
 # 负向对照：daemon 停了必须以非 0 退出（否则自检没有意义）
 kill "$DAEMON_PID" 2>/dev/null; DAEMON_PID=""; rm -f "$SOCK"; sleep 0.8
 "$GUI" --self-test >/dev/null 2>&1
