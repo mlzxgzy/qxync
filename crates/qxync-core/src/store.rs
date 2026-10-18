@@ -23,7 +23,7 @@
 use crate::error::{Error, Result};
 use crate::file_id::FileId;
 use crate::sync::{Baseline, Cursors, Sig, BASELINE_FILE, CURSORS_FILE};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -384,6 +384,27 @@ impl Store {
         }
         let conn = Connection::open(&path).map_err(Error::from)?;
         Self::init(conn, path)
+    }
+
+    /// 只读打开一个**已经存在**的状态库（★ M19：「删除相关数据」的预览用）。
+    ///
+    /// 与 [`Self::open`] 的关键区别：**不建目录、不建表、不写任何 PRAGMA**
+    /// （只读连接写不了），库不存在时返回 `Ok(None)` 而不是凭空造一个空库。
+    /// 这样 GUI 的 `purge_plan` 可以在 daemon 正跑着的时候统计行数（WAL 允许并发读），
+    /// 也不会因为点开一个删除确认框就在磁盘上留下一个新的 `sync.db`。
+    pub fn open_readonly(path: impl AsRef<Path>) -> Result<Option<Self>> {
+        let path = path.as_ref().to_path_buf();
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(Error::from)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(Error::from)?;
+        Ok(Some(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            path,
+        }))
     }
 
     /// 内存库（单测用）。
@@ -1274,6 +1295,65 @@ impl Store {
         let n = self
             .conn()
             .execute("DELETE FROM deletes", [])
+            .map_err(Error::from)?;
+        Ok(n)
+    }
+
+    // ------------------------------------------------------------ ★ M19：按路径子树清理
+
+    /// `table` 只允许这张白名单：它们都有 `path` 列、且路径都是**远端绝对路径**。
+    ///
+    /// 不接受任意表名 —— 这个函数会被「删除任务相关数据」直接调用，拼错表名
+    /// 或接受调用方传字符串都不该发生。
+    fn path_table(table: &str) -> Result<&'static str> {
+        match table {
+            "baseline" => Ok("baseline"),
+            "journal" => Ok("journal"),
+            "decisions" => Ok("decisions"),
+            other => Err(Error::Db(format!(
+                "不支持按路径清理的表: {other:?}（只允许 baseline / journal / decisions）"
+            ))),
+        }
+    }
+
+    /// 统计 `path` 落在 `root` 子树里的行数（含 `root` 自身）。
+    ///
+    /// 前缀用 [`like_prefix`] 转义 `%` / `_` / `\` —— 文件名里出现它们是合法的，
+    /// 不转义就会把不在范围内的行一起算进来 / 删掉。
+    pub fn count_path_rows_under(&self, table: &str, root: &str) -> Result<u64> {
+        let table = Self::path_table(table)?;
+        let root = root.trim_end_matches('/');
+        let (root, prefix) = if root.is_empty() {
+            ("/", like_prefix("/"))
+        } else {
+            (root, like_prefix(&format!("{root}/")))
+        };
+        let sql =
+            format!("SELECT COUNT(*) FROM {table} WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'");
+        let n: i64 = self
+            .conn()
+            .query_row(&sql, params![root, prefix], |r| r.get(0))
+            .map_err(Error::from)?;
+        Ok(n.max(0) as u64)
+    }
+
+    /// 删除 `path` 落在 `root` 子树里的行（含 `root` 自身），返回删除行数。
+    ///
+    /// ⚠️ 只动库、不动内存副本：daemon 的 `SyncState.baseline` 是工作副本，
+    /// 删完必须由调用方把内存里对应条目也摘掉再 `save_all()`，否则下一轮
+    /// `persist` 会把它们原样写回来（这是 M5 起就有的「内存副本为真」约定）。
+    pub fn delete_path_rows_under(&self, table: &str, root: &str) -> Result<usize> {
+        let table = Self::path_table(table)?;
+        let root = root.trim_end_matches('/');
+        let (root, prefix) = if root.is_empty() {
+            ("/", like_prefix("/"))
+        } else {
+            (root, like_prefix(&format!("{root}/")))
+        };
+        let sql = format!("DELETE FROM {table} WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'");
+        let n = self
+            .conn()
+            .execute(&sql, params![root, prefix])
             .map_err(Error::from)?;
         Ok(n)
     }

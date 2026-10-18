@@ -220,6 +220,38 @@ enum Cmd {
         action: TaskAction,
     },
 
+    /// ★ M19：删除相关数据（任务 / 连接 / 本机全部）。
+    ///
+    /// **默认只预览**（等价于 `--dry-run`），真正删除必须显式加 `--yes`。
+    ///
+    /// ```text
+    /// qxync purge --task home            # 这条任务 + 缓存 + baseline/日志/待裁决
+    /// qxync --link nas2 purge --connection  # 这条连接 + 它的全部本地数据
+    /// qxync purge --all                  # 本机所有 qxync 数据（恢复出厂）
+    /// ```
+    ///
+    /// 任何作用域都**不动 NAS 数据、不动挂载点里的文件**；`--all` 会先停掉所有 daemon。
+    Purge {
+        /// 只删这条任务及其相关数据
+        #[arg(long)]
+        task: Option<String>,
+        /// 删掉 `--link` 选中的这条连接及其全部本地数据
+        #[arg(long)]
+        connection: bool,
+        /// 删掉本机所有 qxync 数据（所有连接 / 任务 / 缓存 / 状态 / 日志）
+        #[arg(long)]
+        all: bool,
+        /// 只打印将要删除的内容（不加 --yes 时的默认行为）
+        #[arg(long)]
+        dry_run: bool,
+        /// 真的删除（不加这个参数时只预览）
+        #[arg(long)]
+        yes: bool,
+        /// 直接输出 JSON（脚本/验收用）
+        #[arg(long)]
+        json: bool,
+    },
+
     /// ★ M7：LAN 对等设备（配对 / 探活 / 事件快路径 / 直传自检）
     Peer {
         #[command(subcommand)]
@@ -669,6 +701,11 @@ async fn main() -> Result<()> {
     if let Cmd::Links { json } = &cli.cmd {
         return links_cmd(*json).await;
     }
+    // ★ M19：「删除相关数据」自己决定走 daemon 还是本地（连接级 / 全局要先停 daemon），
+    // 因此放在自动路由之前，和 daemon / links 命令同一类。
+    if let Cmd::Purge { .. } = &cli.cmd {
+        return run_purge(&cli).await;
+    }
 
     // ---- 路由：显式指定 > 自动探测（socket 可连就走 daemon）----
     // ★ T3：`verify` 是**纯本地**的（只读缓存文件，不问 NAS、不用 daemon），
@@ -913,6 +950,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Daemon { .. } => unreachable!("daemon 命令在路由前已处理"),
         Cmd::Links { .. } => unreachable!("links 命令在路由前已处理"),
+        Cmd::Purge { .. } => unreachable!("purge 命令在路由前已处理"),
         Cmd::Mount {
             mountpoint,
             remote,
@@ -1357,9 +1395,11 @@ fn to_request(cli: &Cli) -> Option<Request> {
             mountpoint: mount.clone(),
         },
         // verify / state / daemon 都不走 IPC
-        Cmd::Verify { .. } | Cmd::State { .. } | Cmd::Daemon { .. } | Cmd::Links { .. } => {
-            return None
-        }
+        Cmd::Verify { .. }
+        | Cmd::State { .. }
+        | Cmd::Daemon { .. }
+        | Cmd::Links { .. }
+        | Cmd::Purge { .. } => return None,
     })
 }
 
@@ -1780,7 +1820,9 @@ async fn route_via_daemon(
                 );
             }
         }
-        Cmd::State { .. } | Cmd::Daemon { .. } | Cmd::Links { .. } => unreachable!(),
+        Cmd::State { .. } | Cmd::Daemon { .. } | Cmd::Links { .. } | Cmd::Purge { .. } => {
+            unreachable!()
+        }
     }
     Ok(())
 }
@@ -2816,6 +2858,292 @@ async fn daemon_action_one(
 }
 
 /// ★ M16：`qxync links [--json]` —— 所有连接 + 各自 daemon/凭据状态。
+// ---------------------------------------------------------------- ★ M19 删除相关数据
+
+/// `--socket` 显式值优先，否则按连接 id 推导（与其它命令同一口径）。
+fn purge_socket(cli: &Cli) -> PathBuf {
+    cli.socket
+        .clone()
+        .unwrap_or_else(|| socket_path_for(&cli.link))
+}
+
+/// 某个连接的任务列表（包含「文件在但解析失败」的兜底 id）。
+fn purge_tasks_for_link(p: &ConfigPaths, link_id: &str) -> Vec<qxync_core::Task> {
+    let (links, _bad) = LinkConfig::list(p);
+    let mut ids: Vec<String> = links.into_iter().map(|l| l.id).collect();
+    if !ids.iter().any(|id| id == link_id) {
+        ids.push(link_id.to_string());
+    }
+    ids.sort();
+    qxync_core::tasks::Task::list_for_link(p, link_id, &ids).0
+}
+
+/// 停掉某个 socket 上的 daemon 并等它真的消失（删除连接/全局数据的前提）。
+async fn stop_daemon_at(socket: &std::path::Path) {
+    if !ipc_client::available(socket).await {
+        return;
+    }
+    let _ = ipc_client::call_ok(socket, Request::Shutdown).await;
+    for _ in 0..40 {
+        if !ipc_client::available(socket).await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    eprintln!(
+        "⚠️  daemon 没有在 10s 内退出：{}（相关数据可能在它退出后又被写回，建议稍后重跑）",
+        socket.display()
+    );
+}
+
+fn print_purge_plan(plan: &qxync_core::purge::PurgePlan) {
+    println!("将删除（{}）：", plan.title);
+    for it in &plan.items {
+        println!(
+            "  [{}] {:<10} {}  （{} / {} 个文件）",
+            if it.optional { "数据" } else { "基础" },
+            it.label,
+            it.path,
+            human_size(it.bytes),
+            it.files
+        );
+    }
+    if let Some(rows) = plan.db_rows {
+        if rows.total() > 0 {
+            println!(
+                "  [状态库] baseline {} 行 / 日志 {} 行 / 待裁决 {} 行",
+                rows.baseline, rows.journal, rows.decisions
+            );
+        }
+    }
+    for w in &plan.warnings {
+        println!("  ⚠️  {w}");
+    }
+    for n in &plan.notes {
+        println!("  · {n}");
+    }
+    println!(
+        "合计：{} / {} 个文件（其中勾选/确认后删除 {} / {} 个文件）",
+        human_size(plan.total_bytes),
+        plan.total_files,
+        human_size(plan.optional_bytes),
+        plan.optional_files
+    );
+}
+
+fn print_purge_outcome_value(v: &serde_json::Value) {
+    let target = v
+        .get("task_id")
+        .or_else(|| v.get("target"))
+        .or_else(|| v.get("id"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("?");
+    let paths = v
+        .get("deleted_paths")
+        .and_then(|x| x.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let bytes = v.get("bytes").and_then(|x| x.as_u64()).unwrap_or(0);
+    let files = v.get("files").and_then(|x| x.as_u64()).unwrap_or(0);
+    println!(
+        "✅ 已删除「{target}」的相关数据：{} 条路径 / {} / {} 个文件",
+        paths,
+        human_size(bytes),
+        files
+    );
+    if let Some(rows) = v.get("db_rows") {
+        let n = |k: &str| rows.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+        if n("baseline") + n("journal") + n("decisions") > 0 {
+            println!(
+                "   状态库：baseline {} 行 / 日志 {} 行 / 待裁决 {} 行",
+                n("baseline"),
+                n("journal"),
+                n("decisions")
+            );
+        }
+    }
+    for w in v
+        .get("warnings")
+        .and_then(|x| x.as_array())
+        .into_iter()
+        .flatten()
+    {
+        println!("   ⚠️  {}", w.as_str().unwrap_or("?"));
+    }
+    println!("   NAS 数据与挂载点里的文件未受影响");
+}
+
+/// 打印计划；`json` 时直接输出计划对象（脚本可解析）。
+fn purge_preview(plan: &qxync_core::purge::PurgePlan, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(plan)?);
+    } else {
+        print_purge_plan(plan);
+        println!("（预览：没有改动任何东西；真正删除请加 --yes）");
+    }
+    Ok(())
+}
+
+/// 执行计划并打印结果（连接级 / 全局用；两者的路径都已归一化好）。
+fn purge_execute(p: &ConfigPaths, plan: &qxync_core::purge::PurgePlan, json: bool) -> Result<()> {
+    qxync_core::purge::validate_plan(plan)?;
+    let out = qxync_core::purge::execute(plan);
+    let v = serde_json::json!({
+        "purged": true,
+        "scope": out.scope,
+        "target": out.target,
+        "deleted_paths": out.deleted_paths,
+        "bytes": out.bytes,
+        "files": out.files,
+        "db_rows": out.db_rows,
+        "warnings": out.warnings,
+        "notes": out.notes,
+    });
+    if json {
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else {
+        print_purge_outcome_value(&v);
+    }
+    if plan.scope == qxync_core::purge::SCOPE_ALL {
+        // 没有连接了；提示下一步（不自动重建目录 —— 让用户/下次启动决定）。
+        println!("   本机已回到「从未配置过」的状态");
+    }
+    let _ = p;
+    Ok(())
+}
+
+/// ★ M19：`qxync purge` —— 删除相关数据（任务 / 连接 / 本机全部）。
+///
+/// 默认**只预览**；`--yes` 才真的删。作用域三选一。
+async fn run_purge(cli: &Cli) -> Result<()> {
+    let Cmd::Purge {
+        task,
+        connection,
+        all,
+        dry_run,
+        yes,
+        json,
+    } = &cli.cmd
+    else {
+        unreachable!()
+    };
+    let p = paths()?;
+    let execute_now = *yes && !*dry_run;
+    // 作用域必须**恰好一个**：三个都给时静默取一个（比如 --all 压掉 --task）会很危险。
+    let scopes = usize::from(*all) + usize::from(*connection) + usize::from(task.is_some());
+    if scopes != 1 {
+        bail!("purge 需要 --task <id> / --connection / --all 三种作用域**恰好一个**（现在是 {scopes} 个）");
+    }
+
+    if *all {
+        let (links, bad) = LinkConfig::list(&p);
+        let plan = qxync_core::purge::plan_all(&p, &links);
+        if !execute_now {
+            return purge_preview(&plan, *json);
+        }
+        // 先停所有 daemon：状态库 / 缓存 / 日志不能被正在跑的进程继续写。
+        for l in &links {
+            stop_daemon_at(&socket_path_for(&l.id)).await;
+        }
+        // 解析失败的 link 文件也可能还有 daemon 在跑：从文件名取 id 试着停一下。
+        for (path, _err) in &bad {
+            if let Some(id) = path.file_stem().and_then(|s| s.to_str()) {
+                stop_daemon_at(&socket_path_for(id)).await;
+            }
+        }
+        stop_daemon_at(&purge_socket(cli)).await;
+        return purge_execute(&p, &plan, *json);
+    }
+
+    if *connection {
+        let lid = cli.link.clone();
+        let link = LinkConfig::load(&p, &lid)?;
+        let tasks = purge_tasks_for_link(&p, &lid);
+        let plan = qxync_core::purge::plan_link(&p, &link, &tasks);
+        if !execute_now {
+            return purge_preview(&plan, *json);
+        }
+        stop_daemon_at(&purge_socket(cli)).await;
+        return purge_execute(&p, &plan, *json);
+    }
+
+    let tid = task
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("purge 需要 --task <id> / --connection / --all 三者之一"))?;
+    let t = qxync_core::Task::load(&p, &tid)?;
+    let (links, _bad) = LinkConfig::list(&p);
+    let ids: Vec<String> = links.into_iter().map(|l| l.id).collect();
+    let lid = t
+        .effective_link_id(&ids)
+        .unwrap_or_else(|| "default".into());
+    let link = LinkConfig::load(&p, &lid)?;
+    let others = purge_tasks_for_link(&p, &lid);
+    let db_path = p.sync_dir_for(&link).join(qxync_core::store::DB_FILE);
+    let db_ro = qxync_core::Store::open_readonly(&db_path).ok().flatten();
+    let plan = qxync_core::purge::plan_task(&p, &link, &t, &others, db_ro.as_ref());
+    if !execute_now {
+        return purge_preview(&plan, *json);
+    }
+
+    // daemon 在跑时**必须**走 IPC：挂载表与 SyncState 内存副本都在它手里。
+    let socket = purge_socket(cli);
+    if !cli.direct && ipc_client::available(&socket).await {
+        let v: serde_json::Value = ipc_client::call(
+            &socket,
+            Request::Tasks {
+                action: "purge".into(),
+                id: Some(tid),
+                task: None,
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!(e.message))?;
+        if *json {
+            println!("{}", serde_json::to_string_pretty(&v)?);
+        } else {
+            print_purge_outcome_value(&v);
+        }
+        return Ok(());
+    }
+
+    // daemon 没在跑：本进程直接执行（与 GUI 的 `task_purge` 同一条路）。
+    qxync_core::purge::validate_plan(&plan)?;
+    let out = qxync_core::purge::execute(&plan);
+    qxync_core::purge::forget_mount_record(&p, &link, &t.mountpoint);
+    let root = t.effective_root();
+    let shared_root = others
+        .iter()
+        .filter(|o| o.id != t.id)
+        .any(|o| o.effective_root() == root);
+    let mut rows = qxync_core::purge::PurgeDbRows::default();
+    if !shared_root && db_ro.is_some() {
+        let store = qxync_core::Store::open(&db_path)?;
+        rows = qxync_core::purge::delete_task_rows(&store, &root)?;
+    }
+    let v = serde_json::json!({
+        "purged": true,
+        "task_id": tid,
+        "link_id": lid,
+        "unmounted": false,
+        "deleted_paths": out.deleted_paths,
+        "bytes": out.bytes,
+        "files": out.files,
+        "db_rows": {
+            "baseline": rows.baseline,
+            "journal": rows.journal,
+            "decisions": rows.decisions,
+        },
+        "warnings": out.warnings,
+        "notes": out.notes,
+    });
+    if *json {
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else {
+        print_purge_outcome_value(&v);
+    }
+    Ok(())
+}
+
 async fn links_cmd(json: bool) -> Result<()> {
     let p = paths()?;
     let (links, bad) = LinkConfig::list(&p);

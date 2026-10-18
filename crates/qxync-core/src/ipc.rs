@@ -198,6 +198,8 @@ pub enum Request {
     /// * `action="get"`    → 单个任务（`id` 必填）；
     /// * `action="save"`   → 落盘一个任务（`task` 必填，做归一化 + 校验）；
     /// * `action="delete"` → 删掉登记（**不动挂载点里的任何数据**）；
+    /// * `action="purge"`  → ★ M19：删掉登记 + 该任务的水合缓存 / baseline / 日志 /
+    ///   待裁决（先卸载；挂载点里的文件与 NAS 数据不动）；
     /// * `action="pause"`  → `enabled=false` 并**卸载**该任务（见 docs/M8 §M8.2 的语义说明）；
     /// * `action="resume"` → `enabled=true` 并重新挂载；
     /// * `action="mount"`  → 按任务登记的参数挂载（不改登记）。

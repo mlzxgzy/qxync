@@ -3969,6 +3969,68 @@ async fn tasks_cmd(
                 "note": "只删任务登记，未改动挂载点里的任何数据",
             }))
         }
+        "purge" => {
+            let id = id.ok_or_else(|| bad_req("purge 需要 id"))?;
+            let t = load_task_for_link(&paths, state, &ids, &id)?;
+            let (others, _bad) = Task::list_for_link(&paths, &state.link.id, &ids);
+            // ① 先卸载：没卸载就删水合缓存，等于从正在读的文件下面把数据抽走。
+            let mp = t.mountpoint.clone();
+            let canon = std::fs::canonicalize(&mp).unwrap_or_else(|_| mp.clone());
+            let mounted = state.mounts.lock().unwrap().contains_key(&canon);
+            let mut unmounted = false;
+            if mounted {
+                umount(state, mp.clone()).await?;
+                unmounted = true;
+            }
+            // ② 预览（含状态库行数）→ 删文件。daemon 手里有 Store，统计是准的。
+            let plan = {
+                let g = state.sync_store.lock().unwrap();
+                qxync_core::purge::plan_task(&paths, &state.link, &t, &others, Some(&g.store))
+            };
+            qxync_core::purge::validate_plan(&plan).map_err(core_err)?;
+            let out = qxync_core::purge::execute(&plan);
+            // 没挂载时 umount 不会跑，这里兜底把残留的挂载记录摘掉 ——
+            // 否则下次 daemon 启动会按 mounts.json 把刚删掉的任务又挂回来。
+            qxync_core::purge::forget_mount_record(&paths, &state.link, &t.mountpoint);
+
+            // ③ 状态库行 + 内存副本必须一起清：只删库的话，下一轮 persist
+            //    会把 `SyncState.baseline` 里的旧副本原样写回来。
+            let root = t.effective_root();
+            let shared_root = others
+                .iter()
+                .filter(|o| o.id != t.id)
+                .any(|o| o.effective_root() == root);
+            let mut rows = qxync_core::purge::PurgeDbRows::default();
+            if !shared_root {
+                let mut g = state.sync_store.lock().unwrap();
+                rows = qxync_core::purge::delete_task_rows(&g.store, &root).map_err(core_err)?;
+                g.baseline
+                    .entries
+                    .retain(|p, _| !qxync_core::purge::under_root(p, &root));
+                if let Err(e) = g.save_all() {
+                    tracing::warn!("删除任务相关数据后回写同步状态失败: {e}");
+                }
+            } else {
+                tracing::warn!(
+                    "任务 {id} 的 NAS 文件夹 {root} 与本连接的另一条任务共用：baseline/日志保留"
+                );
+            }
+            to_value(serde_json::json!({
+                "purged": true,
+                "task_id": id,
+                "unmounted": unmounted,
+                "deleted_paths": out.deleted_paths,
+                "bytes": out.bytes,
+                "files": out.files,
+                "db_rows": {
+                    "baseline": rows.baseline,
+                    "journal": rows.journal,
+                    "decisions": rows.decisions,
+                },
+                "warnings": out.warnings,
+                "notes": out.notes,
+            }))
+        }
         "pause" => {
             let id = id.ok_or_else(|| bad_req("pause 需要 id"))?;
             let mut t = load_task_for_link(&paths, state, &ids, &id)?;
@@ -4017,7 +4079,7 @@ async fn tasks_cmd(
             to_value(serde_json::json!({ "id": id, "mount": m }))
         }
         other => Err(bad_req(format!(
-            "未知的 tasks action: {other:?}（可用 list/get/save/delete/pause/resume/mount）"
+            "未知的 tasks action: {other:?}（可用 list/get/save/delete/purge/pause/resume/mount）"
         ))),
     }
 }
