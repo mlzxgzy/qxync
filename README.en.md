@@ -1,11 +1,11 @@
 # qxync — Qsync for Linux (with on-demand sync)
 
 [![CI](https://github.com/mlzxgzy/qxync/actions/workflows/ci.yml/badge.svg)](https://github.com/mlzxgzy/qxync/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/mlzxgzy/qxync?label=release)](https://github.com/mlzxgzy/qxync/releases)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-[![Rust](https://img.shields.io/badge/rust-1.90%2B-orange.svg)](Cargo.toml)
-[![Platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](#quick-start)
+[![Platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](#install)
 
-[中文](README.md) · **English** · [Disclaimer](DISCLAIMER.md) · [Changelog](CHANGELOG.md) · [Acceptance log](docs/验收记录.md)
+[中文](README.md) · **English** · [Download](https://github.com/mlzxgzy/qxync/releases) · [Changelog](CHANGELOG.en.md) · [Disclaimer](DISCLAIMER.md)
 
 A **third-party QNAP Qsync client for Linux**, written in Rust + FUSE, whose core is
 **on-demand sync**: a file on the NAS is merely a "placeholder" locally — `ls -l` shows its
@@ -13,61 +13,38 @@ real size with **zero download**, and only the range you actually read gets fetc
 anything you don't want to keep can be **dehydrated** back into a placeholder, so local disk
 usage stays under your control at all times.
 
+Installing it gives you three programs: `qxync` (command line), `qxyncd` (long-running daemon)
+and `qxync-gui` (desktop GUI).
+
 > ⚠️ **Only for QNAP NAS devices that you own or are explicitly authorized to use.**
-> This project **does not distribute** any QNAP binary, installer, or decompiled artifact, and
-> **does not circumvent** any licensing or technical protection measure. It is
-> **in no way affiliated with QNAP Systems, Inc.** See the
-> **[Disclaimer](DISCLAIMER.md)** for the full terms.
+> This project is **in no way affiliated with QNAP Systems, Inc.** and does not distribute any
+> QNAP binary or installer — see the **[Disclaimer](DISCLAIMER.md)**.
+> It **reads and writes real files on your NAS**, so try it on a test directory before trusting
+> it with important data.
 
----
+## Features
 
-## What this is
-
-A **Qsync client that runs on Linux**, made up of three binaries:
-
-| Binary | Role |
-|---|---|
-| `qxync` | Command line (login / list / upload & download / mount / sync / dehydrate / tasks / settings / logs / LAN peering) |
-| `qxyncd` | Long-running daemon (**one per NAS connection**): holds that connection's FUSE mount and NAS session, exposing a local unix-socket JSON IPC |
-| `qxync-gui` | Tauri 2 desktop app (dependency-free static frontend, everything goes through the daemon's IPC) |
-
-**What it is**: an **interoperability implementation** of the behaviour exhibited by QNAP's
-official client — the protocol details come from static reverse engineering of
-**Qsync for Windows v6.1.0.0831**, and every conclusion was verified
-against a real NAS.
-
-**What it is not** (the scope, stated explicitly):
-
-- ❌ **Not** the official client, and it does not represent QNAP's position ([Disclaimer](DISCLAIMER.md))
-- ❌ Does **not** implement cloud account / QID / myQNAPcloud login: the one and only supported path is "a local account talking straight to the NAS"
-- ❌ Does **not** interoperate with the official client's binary WebSocket channel (its wire format was not recovered), so LAN acceleration is qxync's own qxync↔qxync protocol
-- ❌ Does **not** write the NAS device list, does no device registration, and modifies no NAS-side configuration whatsoever
-- ❌ No Windows / macOS support (FUSE and `/proc` semantics are Linux-only)
-
-## What it can do today
-
-| Capability | Description | Docs |
-|---|---|---|
-| **On-demand hydration** | placeholder + **128 KiB range** downloads on demand (`head -c 100 big.bin` fetches exactly 1 range, not the whole file) | [M1.5](docs/M1.5-设计.md) |
-| **Cache first** | content already on disk is **adopted as-is** (the hydration bitmap is persisted next to it), so a cache-hit `cat` makes **zero NAS round trips**; `ls`/`lookup` are served from a local snapshot of the NAS file list (refreshed on a timer) instead of waiting on the network every time | [M9](docs/M9-缓存优先与映射.md) |
-| **Session self-healing** | the sid is **hot-swappable**: on an auth failure a mount asks the daemon to log in again, takes the new sid and retries in place; a successful login **pushes the new sid to every mount of the same account**, with a periodic keepalive as a safety net (no more "sid expires → EIO until remount") | [M10](docs/M10-会话热更新.md) |
-| **Read-write mount** | after `--rw`, local changes are pushed back to the NAS through an upload queue; writes are **read-modify-write**, so a range that was never fetched is never uploaded as zeros | [M2b](docs/M2b-写路径.md) |
-| **Deleting** | `unlink`/`rmdir` **return immediately**; the remote delete is pushed by a background queue that **coalesces same-directory items into one request** (the official Smart Delete shape); survives crashes; bulk accidental deletes are still stopped by the **circuit breaker** | [CHANGELOG](CHANGELOG.en.md) |
-| **No trash bin on the mount point** | when the desktop (KDE Dolphin's `trash:` protocol) tries to create `.Trash-$UID` inside the mount, it is rejected — deleting a file really deletes it | [CHANGELOG](CHANGELOG.en.md) |
-| **Change discovery** | three-cursor polling + three-way baseline reconciliation; conflicts produce a **conflicted copy**, and bulk remote deletes are guarded by a **circuit breaker** | [M2c](docs/M2c-变更发现.md) |
-| **Conflict decisions** | under the "ask me for every file" policy, pending conflicts land in a queue where you can **compare local vs NAS** (line-level diff with correct direction), **keep local / keep NAS / keep both / ignore this one / clear**; stale rows are swept automatically (queue rows only, never files); **recycle-bin subtrees (`@Recycle` / `.Trash-*`) are never synced** | [M8 §⑤](docs/M8-向Qsync-Client-6靠拢.md) · [M4 §4.1.2](docs/M4-GUI.md) |
-| **Dehydration (free up space)** | the full safety-check chain (pin / unuploaded changes / open fd / mmap'd / currently hydrating / recently accessed) must pass before local content is dropped | [M3](docs/M3-脱水.md) |
-| **Local state store** | SQLite carries cursors / baseline / pin / upload queue, persisted in **one and the same transaction**; librsync-compatible delta codec + capability gating | [M5](docs/M5-SQLite与delta.md) |
-| **Shared folders** | NAS folders are paired **one-to-one** onto local folders; writability is decided by the NAS (folders registered as Qsync sync folders are writable) | [M6](docs/M6-多根与共享文件夹.md) · [CHANGELOG](CHANGELOG.en.md) |
-| **Selective sync** | gitignore-flavoured `exclude` rules (anchoring / `**` / negation / subtree pruning) + built-in temporary-file filtering | [M7](docs/M7-选择性同步与LAN直连.md) |
-| **LAN direct** | qxync↔qxync peer protocol: device pairing, event fast path, direct local range transfer (any failure silently falls back to the NAS) | [M7](docs/M7-选择性同步与LAN直连.md) |
-| **Sync tasks** | mount registrations persisted in `tasks/<id>.json`, pause/resume per task, restorable after a restart with `--restore-tasks` | [M8](docs/M8-向Qsync-Client-6靠拢.md) |
-| **Multiple NAS connections** | **one `qxyncd` process per connection** (its own socket / pid / log / state store / cache / upload queue); `default` keeps the legacy paths; many tasks per connection; CLI `qxync links` / `daemon … --all`, GUI connection list and "current connection" switcher | [M16](docs/M16-多NAS连接.md) |
-| **Two-step verification (2SV)** | supports **TOTP** (authenticator apps) in QNAP's two-step verification: the `security_code` goes into the login form directly, and once the TOTP secret is stored the daemon computes a fresh code on every re-login (long-running mounts do not drop when a code expires); CLI `--otp-secret` / `--otp-code`, or the field under GUI Settings → Connections. Other second factors (security questions / email codes / QR-code approval / device approval) are **not implemented** | [M17](docs/M17-两步验证.md) |
-| **Delete related data** | Three-scope purge (task / connection / everything): **a plan first** (what would be deleted, how big, how many state rows), GUI confirmation dialog, CLI preview by default. No scope ever deletes NAS data or files inside the mountpoint; shared caches / shared NAS folders are skipped with a warning | [M19](docs/M19-删除相关数据.md) |
-| **Sync log** | the `journal` table of `sync.db` plus background batched writes and rotation, driving the GUI's "File Update Center / error list" | [M8](docs/M8-向Qsync-Client-6靠拢.md) |
-| **Desktop GUI** | Home / Tasks / Files / Updates / Errors / Settings / Diagnostics; tray + notifications + autostart + file picker + **"Open folder"** on task cards (opens the local mount point with the desktop's default directory tool) | [M4](docs/M4-GUI.md) · [M8](docs/M8-向Qsync-Client-6靠拢.md) |
-| **Settings center** | three proxy modes (Auto-detect / No proxy / Manual), automatic space freeing, five conflict policies, three file states | [M8](docs/M8-向Qsync-Client-6靠拢.md) |
+- **On-demand sync**: placeholders + on-demand 128 KiB range downloads; `head -c 100 big.bin`
+  fetches only the range it needs, not the whole file
+- **Cache first**: content already on disk is reused as-is; directory listings come from a local
+  snapshot, so `ls` does not wait on the network every time
+- **Mounts survive session expiry**: an expired login is renewed automatically and the operation is
+  retried in place — no manual remount
+- **Read-write mount**: with `--rw`, local changes are pushed back through an upload queue;
+  writes are read-modify-write, so un-fetched ranges are never uploaded as zeros
+- **Free up space**: automatic dehydration by idle time / cache quota, or manually with
+  `qxync dehydrate`
+- **Conflict handling**: when both sides changed, a conflicted copy is created; you can choose
+  per file to keep the local version, the NAS version, or both
+- **Selective sync**: gitignore-flavoured `exclude` rules + built-in temporary-file filtering
+- **Shared folders**: the home directory and Qsync sync folders registered on the NAS can both be
+  mounted; whether they are writable is decided by the NAS
+- **Multiple NAS boxes**: one independent daemon per connection; mount and sync several NAS
+  devices at once
+- **Two-step verification**: supports TOTP (authenticator apps) in QNAP's 2SV
+- **LAN direct**: qxync↔qxync transfers directly on the same LAN, with silent fallback to the NAS
+- **Desktop GUI**: an overview, task list, file browser, update center, error list, settings and
+  diagnostics, plus tray, notifications and autostart
 
 ## Screenshots
 
@@ -81,603 +58,271 @@ against a real NAS.
 |---|---|
 | ![Updates](docs/images/gui-journal.png) | ![Proxy](docs/images/gui-settings-proxy.png) |
 
-## Quick start
+## Install
 
-### 1. Dependencies
+Download a prebuilt artifact from [Releases](https://github.com/mlzxgzy/qxync/releases), or build
+from source. The prebuilt artifacts are **x86_64 Linux** and require **glibc ≥ 2.35**; each release
+ships a `SHA256SUMS` file for verification. On the NAS side, **Qsync** (the QPKG) must be installed
+and enabled, and the Qsync service must be turned on in QTS (default port `9834`).
 
-- **Rust 1.90+** (see `rust-version` in [`Cargo.toml`](Cargo.toml))
-- **FUSE 3**: the kernel's `/dev/fuse` + `fusermount3` (installing `fuse3` is enough on most distributions)
-- **The GUI additionally needs** the WebKitGTK 4.1 and GTK 3 development packages
-  (e.g. `libwebkit2gtk-4.1-dev` + `libgtk-3-dev` on Debian/Ubuntu;
-  see the Prerequisites section of the official Tauri 2 documentation for the full list per distribution)
-- The frontend is the **dependency-free static trio** under `crates/qxync-gui/ui/`, so **no npm / bundler is needed**
+### Arch Linux
 
-### 2. Build
+```bash
+# download qxync-bin-<version>-1-x86_64.pkg.tar.zst from the Release
+sudo pacman -U qxync-bin-<version>-1-x86_64.pkg.tar.zst
+```
+
+The package contains the three programs, a desktop entry, icons and the systemd user units.
+The repo also carries an AUR package definition ([`packaging/arch/`](packaging/arch/)): under
+`packaging/arch/`, run `updpkgsums` first to fill in the checksums of the Release artifacts, then
+`makepkg -si` (see the README in that directory).
+
+### Debian / Ubuntu
+
+The Release ships a single `.deb` that works on **both Debian and Ubuntu** (amd64):
+
+| Download this | Supported distributions |
+|---|---|
+| `qxync_<version>-1_amd64.deb` | Debian 12 / 13, Ubuntu 22.04 / 24.04 / 26.04 |
+
+```bash
+sudo apt install ./qxync_<version>-1_amd64.deb
+```
+
+The package is built from the same tarball as the other Release artifacts (the three binaries plus
+the desktop entry / icons / systemd user units / documentation). It is built in an `ubuntu:22.04`
+container; `Depends` is measured with `dpkg-shlibdeps` against the three binaries and then gets a
+hand-added `fuse3`. `apt install ./<file>.deb` pulls in the dependencies from your configured apt
+sources; if you prefer `dpkg -i`, follow it with `sudo apt-get -f install` to install whatever is
+missing. Every dependency is a standard package in the official Debian / Ubuntu archives (GTK 3,
+WebKitGTK 4.1, libsoup 3, FUSE 3, …), so **the common Chinese mirrors (Tsinghua, Aliyun, …) carry
+them** — our packaging and CI install checks actually run against the Tsinghua mirror.
+
+CI install-tests it in clean `debian:12` / `debian:13` / `ubuntu:22.04` / `ubuntu:24.04` /
+`ubuntu:26.04` containers (`qxync --version` correct, `ldd` shows no `not found`,
+`qxync-gui --self-test` prints JSON; newer releases renamed GTK 3 to `t64` packages such as
+`libgtk-3-0t64`, which carry `Provides: libgtk-3-0 (= version)`, so dependencies with a version
+floor are still satisfied). The package ships the systemd user units, so you can enable them right
+after installing:
+
+```bash
+systemctl --user enable --now qxyncd
+```
+
+Like the other Release artifacts, the binaries are **intentionally not stripped** (so user-reported
+stack traces stay readable); the installed size is about 190 MB. See
+[`packaging/debian/README.md`](packaging/debian/README.md) for the dependency list, packaging
+details and the expected lintian warnings.
+
+**Upgrading from the old packages**: if you previously installed
+`qxync_<old-version>-1~deb12_amd64.deb` / `qxync_<old-version>-1~ubuntu22.04_amd64.deb`, just
+`sudo apt install ./qxync_<version>-1_amd64.deb` — by dpkg version ordering `<version>-1` is greater
+than `<old-version>-1~deb12` (a tilde sorts before the empty string), so apt upgrades normally; to check
+first, run `dpkg --compare-versions <version>-1 gt <old-version>-1~deb12 && echo newer`.
+
+### Other x86_64 Linux
+
+```bash
+# download qxync-<version>-x86_64-unknown-linux-gnu.tar.gz from the Release
+tar xzf qxync-<version>-x86_64-unknown-linux-gnu.tar.gz
+cd qxync-<version>-x86_64-unknown-linux-gnu
+install -Dm755 qxync qxyncd qxync-gui ~/.local/bin/
+```
+
+The tarball also contains `qxync.desktop`, icons and the systemd units. Note that the unit's
+`ExecStart` assumes the binaries live in `/usr/bin` (the distro-package layout); if you installed
+them into `~/.local/bin`, either change `ExecStart` to the real path or skip the unit and use
+`qxync daemon start`. Keep the three programs in the same directory: the GUI first looks for
+`qxyncd` next to itself and only then falls back to `PATH`.
+
+Runtime requirements:
+
+- **Mounting** needs FUSE 3: `/dev/fuse` + `fusermount3` (install the `fuse3` package)
+- **The GUI** needs the WebKitGTK 4.1 and GTK 3 runtimes
+  (`libwebkit2gtk-4.1-0` + `libgtk-3-0` on Debian/Ubuntu)
+
+### Build from source
+
+Requires **Rust 1.90+** and FUSE 3; building the GUI additionally needs the WebKitGTK 4.1 / GTK 3
+development packages (`libwebkit2gtk-4.1-dev` + `libgtk-3-dev` on Debian/Ubuntu).
 
 ```bash
 git clone https://github.com/mlzxgzy/qxync.git
 cd qxync
-cargo build --workspace           # debug
-cargo build --workspace --release # release (lto=thin is already configured; line numbers in backtraces are kept so bug reports stay useful)
+cargo build --release --workspace
+# binaries: target/release/{qxync,qxyncd,qxync-gui}
 ```
 
-If you want `.deb` / AppImage packages, `crates/qxync-gui/tauri.conf.json` already sets
-`bundle.targets = ["deb", "appimage"]` — just package with the Tauri CLI.
+The frontend is the dependency-free static set under `crates/qxync-gui/ui/` — **no npm or bundler
+is needed**; after editing it, rebuild with `cargo build` (the assets are embedded at compile
+time). For an AppImage, use the Tauri CLI — `tauri.conf.json` already configures the targets. To
+build a Debian / Ubuntu `.deb` locally, use the debian packaging scripts in the repo — see
+[`packaging/debian/README.md`](packaging/debian/README.md).
 
-**Prebuilt artifacts**: pushing a `v*` tag (or manually running the `Release` workflow) makes
-[`.github/workflows/release.yml`](.github/workflows/release.yml) build and attach them to the
-matching [Release](https://github.com/mlzxgzy/qxync/releases):
+## Quick start
 
-| Asset | What it is |
-|---|---|
-| `qxync-<version>-x86_64-unknown-linux-gnu.tar.gz` | all three binaries + desktop entry / icons + licences / disclaimer |
-| `qxync-bin-<version>-1-x86_64.pkg.tar.zst` | the **Arch package** (built by CI with the real `makepkg` from the archlinux image, out of the tarball above) |
-| `qxync` · `qxyncd` · `qxync-gui` | the three binaries on their own, from the same build |
-| `SHA256SUMS` | checksums for the assets above |
-
-Just keep the three binaries in the **same directory**: the GUI first looks for `qxyncd` next to
-itself and only then falls back to `PATH`. Running the GUI also needs the WebKitGTK 4.1 / GTK 3
-runtime (`libwebkit2gtk-4.1-0` + `libgtk-3-0` on Debian/Ubuntu). **Building from source is still
-the recommended path** (reproducible and auditable).
-
-**Arch Linux**: each release ships a ready-made `qxync-bin-<version>-1-x86_64.pkg.tar.zst` —
-install it with `sudo pacman -U`. The repo also carries an AUR package definition
-([`packaging/arch/PKGBUILD`](packaging/arch/), package name `qxync-bin`) so you can run
-`makepkg -si` yourself; once it is published to the AUR it is `yay -S qxync-bin`. The package is
-**intentionally not stripped** (readable backtraces, see above), so it installs ~190 MB — see
-[`packaging/arch/README.md`](packaging/arch/README.md) for details and the checksum bump after
-each release.
-
-### 2.5 Upgrading from 0.1.x (the rename)
-
-On 0.1.x the command line was called `qsync`, which fought the **official QNAP Qsync client**
-for the same name in `PATH`; from 0.2.2 it is `qxync`. The full list is in the
-[CHANGELOG](CHANGELOG.en.md#022---2026-10-02).
-
-On the first run after upgrading, the local directories are **migrated automatically**:
-`~/.config/qsync`, `~/.local/share/qsync` and `~/.local/state/qsync` are renamed to their
-`qxync` counterparts (falling back to a copy across filesystems), so credentials, the state
-database and logs come along — **no need to `login` again**. If both the old and the new
-directory exist (for example an early prototype's `~/.local/share/qxync`), only the entries
-**missing** from the new directory are filled in, **nothing already there is overwritten**, and a
-note prints both paths. The only things you must update are your own scripts:
-
-| Old (0.1.x) | New (0.2.2+) |
-|---|---|
-| `qsync …` | `qxync …` |
-| `QSYNC_PASSWORD` / `QSYNC_HOST` / `QSYNC_USER` / `QSYNC_SOCKET` | `QXNYC_PASSWORD` / `QXNYC_HOST` / `QXNYC_USER` / `QXNYC_SOCKET` |
-| `QSYNC_TEST_*` (acceptance matrices) | `QXNYC_TEST_*` |
-| `getfattr -n user.qsync.state` | `getfattr -n user.qxync.state` |
-
-> **Where the line is drawn**: only **our own** identifiers changed. The NAS protocol surface is
-> untouched — `cgi-bin/qsync/qsyncsrv.cgi`, `qsync_version`, `service=Qsync`,
-> `WFM_QSYNC_DISABLED` and friends are exactly as before.
-
-> **The daemon does not need a login to start**: with no connection configured `qxyncd` goes into
-> **idle standby** (the UI shows "not configured", and `qxync daemon status` reports the link as
-> unconfigured); as soon as a connection is saved it switches to sync mode by itself — so
-> "run the daemon in the background now" and "log in later" are no longer in conflict.
-
-### 2.6 Upgrading from 0.2.x (one-to-many is gone)
-
-**0.3.0 is a breaking release**: "one mount point / one task against several NAS folders" is no
-longer supported. What was removed and why is in the [CHANGELOG](CHANGELOG.en.md#030---2026-10-02)
-and [release notes v0.3.0](docs/发布说明-v0.3.0.md). There is very little to change:
-
-| Old (≤0.2.3) | New (0.3.0+) |
-|---|---|
-| `qxync mount ~/mnt --remote /home --remote /Public` | create two mounts, or two tasks (one mount point = one NAS folder) |
-| `"roots": ["/home"]` in a task JSON | `"root": "/home"` (a single `roots` entry migrates automatically; **several are reported as a bad task file**, telling you to split the task) |
-| `roots` / `home_root` in the link config | both are gone (unknown fields are ignored); the home directory is fixed to `/home` in the Qsync protocol |
-| the Connection page "Advanced" section | removed; the form is host/port/user/password/https/insecure/ipv4-only |
-
-Nothing on the NAS — data, cache, baseline, credentials — is affected. If a multi-root mount is
-still mounted, `qxync umount <mountpoint>` before upgrading, then re-create it one-to-one.
-
-### 3. First login
-
-Credentials are written to `~/.config/qxync/credentials.json` (mode `0600`).
+### 1. Log in to your NAS
 
 ```bash
-cargo run -p qxync-cli -- \
-  --host <your-NAS> --port 9834 --insecure \
-  --user <user> --password '<password>' login
+QXNYC_PASSWORD='<password>' qxync login --host <NAS-address> --user <user> --insecure
 ```
 
-> `--insecure` = accept self-signed certificates. **Keep the password out of your shell history**:
-> `--password` can also be replaced by the `QXNYC_PASSWORD` environment variable.
+- `--insecure` = accept the **self-signed certificate** served by QTS; drop it if your NAS uses a
+  trusted certificate.
+- The port defaults to `9834` (use `--port` if you changed it in QTS).
+- Pass the password via `QXNYC_PASSWORD` to keep it out of your shell history; credentials are
+  stored in `~/.config/qxync/credentials.json` (mode `0600`; non-`default` connections use
+  `~/.config/qxync/links/<id>.credentials.json`).
+- If the account has **two-step verification** enabled, add `--otp-secret '<TOTP secret>'`
+  (stored; the daemon then computes codes on every re-login — recommended) or
+  `--otp-code <6-digit code>` (this login only, not stored).
 
-If the account has **two-step verification (2SV)** enabled, add a TOTP secret (recommended —
-after that the daemon computes codes for every re-login by itself):
+### 2. Start the daemon
+
+If you installed a distro package (Arch / Debian / Ubuntu, or the binaries are in `/usr/bin` and
+you installed the systemd unit yourself), the user unit is recommended:
 
 ```bash
-# store the secret (Base32, or paste the authenticator's otpauth:// URI)
-qxync login --otp-secret '<TOTP secret>'
-# or use a code for this login only (not stored; rotates every 30 s)
-qxync login --otp-code 123456
+systemctl --user enable --now qxyncd
+journalctl --user -u qxyncd -f        # logs
+sudo loginctl enable-linger "$USER"   # optional: keep it running without an active login
 ```
 
-> Both can also be passed on the first login by putting `--otp-secret '<TOTP secret>'` before
-> `login`. The environment-variable versions are `QXNYC_OTP_SECRET` / `QXNYC_OTP_CODE` (they stay
-> out of your shell history). Accounts **without** 2SV do not need either flag and behave exactly
-> as before; details and limits are in [`docs/M17-两步验证.md`](docs/M17-两步验证.md).
-> (The `cargo run -p qxync-cli --` prefix shown above works the same way.)
-
-### 4. Mount the on-demand sync view
+Without systemd, use the CLI:
 
 ```bash
-cargo run -p qxync-cli -- daemon start            # bring up qxyncd (idempotent)
-mkdir -p ~/qxync-mnt
-qxync mount ~/qxync-mnt --remote /home            # the FUSE mount is held by the daemon (read-only by default)
-qxync mount ~/qxync-mnt --remote /home --rw       # add --rw when you need writes to go back
-
-ls -l ~/qxync-mnt/qxync-test          # real size, nothing downloaded yet
-cat ~/qxync-mnt/qxync-test/hello.txt  # the first read triggers on-demand hydration (only the ranges needed)
-getfattr -n user.qxync.state ~/qxync-mnt/qxync-test/hello.txt   # placeholder / partial / hydrated
-
-qxync dehydrate --path /home/qxync-test/big.bin --force   # dehydrate: drop the local content, keep only a placeholder (--force skips the "recently accessed" window)
-qxync umount ~/qxync-mnt
-qxync daemon stop                                 # clean exit: unmount everything + delete socket/pid
-```
-
-> **You can start the daemon before configuring anything**: with no connection configured it goes
-> into **idle standby** (alive but doing nothing; the UI shows "not configured") and switches to
-> syncing by itself once a connection is saved — so "run it in the background now, log in later"
-> is no longer a conflict.
-
-#### 4.1 Keep it running with systemd (recommended)
-
-`packaging/systemd/qxyncd.service` is a **user unit**; if you installed the package it lives at
-`/usr/lib/systemd/user/qxyncd.service`:
-
-```bash
-systemctl --user enable --now qxyncd     # start at login (and start it now)
-systemctl --user status qxyncd
-journalctl --user -u qxyncd -f           # logs (the daemon's stderr goes to journald)
-systemctl --user stop qxyncd             # graceful stop: unmount FUSE + remove socket/pid
-sudo loginctl enable-linger "$USER"      # only if you want it up without an active login
-```
-
-> Once the unit is in use, **stop managing the daemon with** `qxync daemon start` /
-> `qxync daemon stop` — that path is for systems without systemd, and using both at once only
-> makes them fight (`qxync daemon stop` exits via IPC, so systemd sees its main process vanish).
-
-**Several NAS boxes**: the unit above is for the `default` connection. For additional
-connections use the **template unit** `qxyncd@<link_id>` (`<link_id>` corresponds to
-`~/.config/qxync/links/<id>.json`, e.g. `nas2`):
-
-```bash
-systemctl --user enable --now qxyncd@nas2    # start / enable the nas2 connection
-systemctl --user status qxyncd@nas2
-journalctl --user -u qxyncd@nas2 -f          # that connection's log (same content as qxyncd-nas2.log)
-```
-
-`default` keeps using `qxyncd.service`; do **not** enable `qxyncd@default` as well (it would
-start two processes for the same connection), and do not let the GUI and systemd manage the
-same connection at the same time. Each connection gets its own daemon (own socket / pid / log /
-state store), stopping one leaves the others alone, and the GUI's "Settings → Connections" can
-start / stop each connection too. See [`docs/M16-多NAS连接.md`](docs/M16-多NAS连接.md).
-
-### 5. GUI
-
-```bash
-cargo build -p qxync-gui
 qxync daemon start
-./target/debug/qxync-gui
-
-# headless self-test (for scripts / CI; exit code 0 while the daemon is running)
-./target/debug/qxync-gui --self-test
-./target/debug/qxync-gui --self-test-login   # additionally runs the whole "save and log in" chain (restarts the daemon)
-./target/debug/qxync-gui --self-test-purge   # delete-related-data self-test (task / connection / all), isolated
 ```
 
-The left edge of the window is an icon bar: **Home / Tasks / Files / Updates / Errors / Settings / Diagnostics**.
-The GUI issues no HTTP itself — **everything goes through the daemon's IPC**.
+> Do not use both: once the systemd unit is in use, stop managing the daemon with
+> `qxync daemon start` / `stop`.
 
-The **"Open folder"** button on a task card opens that task's local mount point with the
-**default file manager you configured for directories** (KDE Dolphin / GNOME Files / Thunar…):
-it looks up the desktop entry via `xdg-mime`, then resolves the *real* executable from that
-entry's `Exec=` line before launching (the ID `xdg-mime` prints is not an executable — running
-it as-is fails). With no default directory handler configured, it falls back to the `xdg-open`
-chain. See [`docs/M4-GUI.md`](docs/M4-GUI.md) §4.1.1.
+Several NAS boxes: each connection gets its own daemon. For connections other than `default`, use
+the template unit `qxyncd@<link_id>` (`<link_id>` corresponds to
+`~/.config/qxync/links/<id>.json`, e.g. `systemctl --user enable --now qxyncd@nas2`), or run
+`qxync daemon start --all`. `qxync links` lists all connections with their daemon / login state.
 
-Defaults for a new task ("+ Add paired folder") are derived from the **connection + task id**, so
-different tasks never collide:
-
-| Field | Default | Example (connection `default`, NAS folder `/home`) |
-|---|---|---|
-| Task id | NAS folder name (suffixed `-2` on collision) | `home` / `home-2` |
-| Local folder | `~/qxync/<connection id>/<task id>` | `~/qxync/default/home` |
-| Hydration cache | `<data_dir>/cache/tasks/<connection id>/<task id>` (parent dir) | `~/.local/share/qxync/cache/tasks/default/home` |
-
-Pick the NAS folder first — the id and both paths follow it; fields you edit by hand are not
-overwritten ("reset to default paths" restores them). Existing tasks are never moved. See
-[`docs/M18-任务默认路径.md`](docs/M18-任务默认路径.md) (Chinese).
-
-When deleting a task or removing a connection, the dialog **first lists** the local data that
-would go with it (hydration cache / sync state / logs, with sizes): **the checkbox is off by
-default**, and leaving it off keeps the old behaviour (registration only). Settings → Advanced →
-**Danger zone** wipes all qxync data on this machine (factory reset) and requires an explicit
-acknowledgement. No entry point ever deletes NAS data or files inside the mountpoint. See
-[`docs/M19-删除相关数据.md`](docs/M19-删除相关数据.md) (Chinese).
-
-### 6. Common commands cheat sheet
+### 3. Mount
 
 ```bash
-qxync status                     # session + server + cursors + hydration stats + mounts
-qxync ls /home                   # list a directory (auto-paginates)
-qxync store [--integrity|--json] # state-store snapshot (cursors / baseline / pin / upload queue)
-qxync roots [--json]             # sync folders registered on the NAS (the NAS folders you can pair)
-qxync rules [--match <path>]     # selective-sync rule verdict (visible / excluded / temp / outside-roots)
-qxync sync [--once]              # change-discovery status; --force-deletes releases bulk deletes
-qxync task list|add|pause|resume|rm
-qxync purge --task <id>|--connection|--all [--yes]   # delete related data (preview by default; never touches NAS / mountpoint files)
-qxync journal [--level error]    # sync activity log (--level error is exactly the "error list")
-qxync settings [--set k=v]       # proxy / autostart / notifications / free up space
-qxync space [--now]              # free-up-space status / free up space now
-qxync conflicts --resolve <id> --as keep_local|keep_remote|keep_both
-qxync file-states /home          # three file states: online-only / locally available / always available
-qxync peer status|pair|ping|events|fetch    # LAN peering (configure peer_listen in the link first)
+mkdir -p ~/qxync-mnt
+qxync mount ~/qxync-mnt --remote /home          # read-only (default)
+# for write-back, use this instead (pick one):
+qxync mount ~/qxync-mnt --remote /home --rw     # read-write
 ```
 
-All subcommands are listed in `qxync --help`; the IPC contract (unix socket + one JSON per line) is in
-[`docs/M1.5-设计.md`](docs/M1.5-设计.md).
+The mount point *is* that NAS folder's content; **one mount point = one NAS folder**
+(for several folders, create several mount points / tasks).
 
-## Architecture
-
-**Process model**: `qxyncd` is the **only** process holding the FUSE mounts and the NAS session.
-`qxync` **routes automatically** by default — if the socket is reachable it goes over IPC
-(`--via-daemon` forces it, `--direct` skips it), so `qxync ls /home/x` is seamless for the user.
-
-```
-qxync (CLI) ──┐
-              ├─IPC(unix socket)──> qxyncd ──┬── FUSE mount (on-demand hydration / write-back / dehydration)
-qxync-gui ────┘                              ├── sync engine (polling + baseline reconciliation + conflict/delete protection)
-                                             └── qxync-client ──HTTP──> NAS
-                                                  └── LAN peering (qxync↔qxync)
+```bash
+ls -l ~/qxync-mnt/qxync-test              # real size, nothing downloaded yet
+cat ~/qxync-mnt/qxync-test/hello.txt      # the first read hydrates on demand, only the ranges needed
+getfattr -n user.qxync.state ~/qxync-mnt/qxync-test/hello.txt   # placeholder / partial / hydrated
+qxync dehydrate --path /home/qxync-test/big.bin                 # dehydrate, reclaim local space
+qxync umount ~/qxync-mnt
 ```
 
-```
-crates/
-├── qxync-core/        shared types + config layout + state store (SQLite) + delta codec + single-root normalization + rule engine
-├── qxync-client/      NAS HTTP API wrapper (login / metadata / upload & download) + LAN peer protocol
-├── qxync-fuse/        FUSE layer: read-only/read-write mounts + range hydration + dehydration (incl. the upload queue)
-├── qxync-daemon/      the qxyncd binary: long-running process + IPC server + sync engine + peer listener
-├── qxync-cli/         the qxync binary: command line
-├── qxync-gui/         the qxync-gui binary: Tauri 2 app (ui/ is a dependency-free static frontend)
-└── qxync-proto-test/  real-NAS integration tests (#[ignore] by default, run manually)
-xtask/tests/           8 acceptance matrix scripts (see "Acceptance & testing")
-xtask/probe/           protocol probe tools (qs_probe / qs_fixture / nas_manifest / p0_device_probe)
-docs/                  design and execution documents
-DISCLAIMER.md          disclaimer and legal boundaries
+### 4. Desktop GUI
+
+```bash
+qxync-gui
 ```
 
-Dependency direction (only downwards allowed): `cli → core` (plus daemon access over IPC);
-`daemon → fuse/client → core`.
+On first launch, fill in the NAS address, account and password under **设置 → 连接**
+(*Settings → Connections*) and log in, then click **启动 daemon** (*Start daemon*) in the top bar.
+If systemd already started the daemon, you can skip that last step.
+The GUI currently ships Chinese UI strings only — see "Known limitations".
 
-## Implementation notes
+### 5. Common commands
 
-**Metadata never rides the data path**: `ls -l` is answered straight from NAS metadata (real size,
-zero download). The cache is a sparse file whose "apparent size = file size", and only the ranges
-that are read get `pwrite`-ten into it; `user.qxync.state` exposes
-`placeholder`/`partial`/`hydrated`, and `user.qxync.chunks` exposes "ready / total".
-Cache file names use a **stable hash of the remote path** (not the ino — the same ino can map to
-different files across two mounts).
+| Command | What it does |
+|---|---|
+| `qxync status` | session, server, cursors, hydration stats and mounts |
+| `qxync ls /home` | list a NAS directory |
+| `qxync mount ~/qxync-mnt --remote /home --rw` | mount (`--rw` for read-write) |
+| `qxync umount ~/qxync-mnt` | unmount |
+| `qxync sync --once` | run one change-discovery round now |
+| `qxync dehydrate --path <remote-path>` | dehydrate, free local space |
+| `qxync space --now` | free up space now using the current policy |
+| `qxync task list` / `task pause <id>` / `task resume <id>` | list / pause / resume sync tasks |
+| `qxync journal --level error` | sync log / error list |
+| `qxync conflicts --resolve <id> --as keep_local\|keep_remote\|keep_both` | resolve a conflict |
+| `qxync file-states <remote-dir>` | file states: online-only / locally available / always available |
+| `qxync settings` / `settings --set k=v` | view / change settings (proxy, automatic space freeing, …) |
+| `qxync links` | list all NAS connections (with their daemon / login state) |
+| `qxync peer status\|pair\|ping\|events\|fetch` | LAN peering (enable `peer_listen` in the connection config first) |
+| `qxync purge --task <id>` | delete a task and its local data (preview by default; add `--yes` to execute) |
 
-**Dehydration passes the full safety-check chain first** (`qxync-core/src/dehydrate.rs` + `qxync-fuse`/`qxyncd`):
-pin=pinned/excluded, unuploaded changes / in-flight queue entries, open fds, mmap'd (scanning
-`/proc/*/maps`), currently hydrating, recently accessed. Only once all of them pass does it follow
-**iron rule 2**: `inval_inode(0,0)` → wipe the cached content → update the placeholder; if
-`inval_inode` fails, **nothing at all is wiped**. It does **not** dehydrate automatically by default;
-that is triggered by `QXNYC_DEHYDRATE_IDLE=600` (idle) / `QXNYC_CACHE_LIMIT=2G|25%` (quota, LRU),
-or manually with `qxync dehydrate`. `--cache-mode direct` uses `FOPEN_DIRECT_IO` to bypass the page
-cache (dehydration becomes inherently safe, at the cost of no readahead and no mmap).
+All subcommands are listed in `qxync --help`; the GUI and the CLI share the same daemon.
 
-**Change discovery treats baseline reconciliation as the main path**: the daemon runs a round of
-"three cursors + baseline reconciliation" every 30s (`QXNYC_POLL_INTERVAL` is adjustable) — taking
-the event fast path first, then falling back to "list the known directories + baseline difference".
-A remote change → if the file is **hydrated** the old content stays readable while the new version is
-downloaded in the background and **atomically swapped in** (until the swap, `cat` returns the complete
-old version, and `stat` reports its size); if the file is **dehydrated** only metadata is refreshed;
-both sides changed → a **conflicted copy** (the remote keeps the original name, the local content is
-stored as `xxx (conflicted copy from <device> <date>).txt` and uploaded); bulk remote deletes →
-**circuit breaker** (only `qxync sync --force-deletes` lets them through).
+## Upgrading
 
-**State moved into SQLite** (`qxync-core/src/store.rs`): `<data>/sync/<host>/sync.db` carries the
-three event cursors + baseline + **pin** (previously in memory only, so a daemon restart lost it →
-the dehydration safety check silently failed open) + the upload queue.
-**Cursors and baseline are persisted in the same transaction** — in the JSON era, a crash between
-the two `rename` calls produced "cursor advanced, baseline not". The old
-`cursors.json`/`baseline.json` are migrated automatically on first start and archived as
-`*.json.migrated` (backups kept, idempotent).
+After replacing the binaries, **restart the daemon** (a running process does not update itself):
 
-**One-to-one: one mount point = one NAS folder.** The mount point *is* that folder's content
-(pair `/home` and you see the home directory directly — no extra `home/` level). Cache / baseline /
-pin / xattr / upload queue all key by remote path; the home directory is **fixed to `/home`** in the
-Qsync protocol (it is not a config field).
+```bash
+systemctl --user restart qxyncd       # with the systemd unit
+# without systemd:
+qxync daemon stop && qxync daemon start
+```
 
-> ★ 2026-10-02: **one-to-many (multi-root) mounts were removed entirely** (the `roots` config,
-> `--remote A --remote B`, the FUSE virtual root, and the legacy multi-root `roots` array in task
-> files). To sync several NAS folders, create several tasks — one task = one local folder + one NAS
-> folder. A legacy file with a single `roots` entry migrates to `root` automatically; several
-> entries are reported as a bad task file (telling you to split it) instead of silently narrowing
-> the sync scope.
+Breaking changes when upgrading from 0.1.x (named `qsync`) or 0.2.x (multi-root mounts) are in the
+[CHANGELOG](CHANGELOG.en.md).
 
 ## Known limitations
 
-* **The tray needs an SNI host**: qxync speaks `org.kde.StatusNotifierItem` (a ksni implementation,
-  not libappindicator). It covers Plasma / waybar / polybar / XFCE (the `statusnotifier` plugin) /
-  LXQt / Cinnamon / GNOME + AppIndicator extension; but **IceWM / Fluxbox / Openbox+tray / old
-  XFCE·MATE panels only speak XEmbed**, and **bare GNOME supports neither protocol** — in those two
-  kinds of environment the tray icon will not appear
-  (you can install [`snixembed`](https://sr.ht/~steef/snixembed/) to bridge SNI into an old-style tray).
-  The program **probes** whether it is genuinely visible (the watcher has a host and this process's
-  item is registered); **when it is not visible, closing the window really closes it**, rather than
-  hiding the window in a tray that nobody draws.
-* The "last triggered" timestamp of **"free up space by frequency"** lives only in memory and restarts
-  its clock when the daemon restarts ("when space is below X%" is unaffected).
-* **i18n covers UI strings only**: `ui/i18n.js` is a zh-CN string table plus an `en` table (from
-  v0.6.2 the four two-step-verification strings exist in both languages; every other key still
-  **falls back** to zh-CN, so nothing ever comes out blank). Diagnostic logs and the mixed-markup
-  paragraphs with inline `<code>` in `index.html` are **deliberately left out of the table**. The
-  string table is guarded by the two-way `ui_spec` self-check in `qxync-gui --self-test`, and
-  **no i18n framework is introduced**.
-* **In direct mode (`--direct`), editing `settings.json` only writes the file**: a running daemon must
-  be restarted before it reads the new settings.
-* **Two boundaries of multiple NAS connections (M16)**: (1) do **not** bidirectionally sync the same
-  remote directory through two connections to the same NAS at the same time (each connection has its
-  own baseline, so the two would read each other's writes as local changes); (2) non-default
-  connections **do not exist in older versions** — rolling back makes them unavailable (`default` is
-  unaffected). See [`M16-多NAS连接.md`](docs/M16-多NAS连接.md).
-* **Two-step verification covers TOTP only** (authenticator apps): security questions / email
-  codes / QR-code approval / device approval are **not implemented**; codes depend on the local
-  clock, and a badly skewed clock is rejected by the NAS. The secret is plaintext in a `0600`
-  credentials file, same as the password (keyring support is future work). See
-  [`M17-两步验证.md`](docs/M17-两步验证.md).
-* **Capability gating rather than capability assumptions**: when the NAS has no historical versions,
-  delta goes through the gate and the real path is still a whole-file transfer
-  (see [`M5-SQLite与delta.md`](docs/M5-SQLite与delta.md)).
-* This project has only had full real-NAS verification on
-  **QNAP TS-464C / QTS 5.2.9 / Qsync QPKG 5.0.0.7 (build 20260723)**; other models/QTS versions may
-  run into behavioural differences that are not covered.
-
-## Protocol notes (pitfalls we hit)
-
-The full evidence and exploration history are in [`docs/执行方案-M0M1.md`](docs/执行方案-M0M1.md);
-these are the ones most likely to bite you while writing code:
-
-**Login & read path**
-
-1. **Login**: `POST /cgi-bin/authLogin.cgi`, and the body must be `serviceKey=1` + `pwd=base64(password)`.
-   A plaintext password, or the `service=Qsync` written in the report, only ever yields
-   `authPassed=0 / errorValue=-1`. (The authoritative reference for the login protocol is the
-   frontend shipped on the NAS itself, `/cgi-bin/js/qos-core-login.js`, not the Windows binary.)
-2. **`q_token` is not required**: on a real NAS `qsyncsrv_login.cgi` always returns `status:-50`, yet
-   the read-only endpoints work with the QTS `sid` directly.
-3. **Namespace split**: metadata goes through `/cgi-bin/qsync/qsyncsrv.cgi`;
-   **byte streams go through `/cgi-bin/filemanager/utilRequest.cgi?func=download` (download) and
-   `/cgi-bin/qsync/upload.php` (upload)**. `qsyncsrv.cgi?func=download` always returns `status:20` — don't use it.
-4. **The upload multipart field name must be `files[]`** (blueimp style);
-   `upload_and_move` / `func=upload` will not receive the file body otherwise.
-5. **Spaces in the query string must be encoded as `%20`**: using `+` makes file names containing
-   spaces or Chinese characters 404 (which is why this project does not use `serde_urlencoded`).
-6. **`stat` needs `path=<dir>&file_name=<name>&file_total=1`**, not a full path;
-   `get_list` needs `hidden_file=1` before hidden files show up.
-7. **`/home` is the home-directory root of a regular user** (the real path is `/share/homes/<user>`),
-   while `/home/<user>` returns `status:5`.
-8. `Range: bytes=0-99` → **HTTP 206 + `Content-Range`**, so range hydration has native support.
-9. **`stat` uses `exist` to test existence**: a path that does not exist still returns a placeholder
-   entry (named after what you asked for, with `filesize=0`), and only `exist=0` tells them apart;
-   getting this wrong makes `lookup` report false positives and `mkdir` return `EEXIST` outright.
-
-**Write path & FUSE**
-
-10. **Write-operation namespace split**: `rename`/`move` can only be done through FileStation
-    (`utilRequest.cgi`), while `createdir`/`delete` use `qsyncsrv.cgi`; `move` must carry
-    `source_total=1`, and **`dest_file` is ignored** (renaming across directories = move + rename, two steps).
-11. **Read-modify-write is mandatory before a write**: before writing a placeholder, the ranges that
-    will not be fully overwritten must be filled in, otherwise the ranges never fetched are 0 and a
-    whole-file upload zeroes out the remote content (we hit this for real).
-12. **The return value of `listxattr` must be NUL-terminated**: the kernel's
-    `fuse_verify_xattr_list()` runs `strnlen` on each entry, and a missing terminator on the last
-    entry makes it **judge the whole listxattr as `-EIO`** — the symptom is that `ls -l` on the entire
-    directory reports "Input/output error", while `stat`/`cat` are perfectly fine. The measured
-    discriminator: `size<66` returns `ERANGE` while `size>=66` returns `EIO` — that is this check firing.
-13. **`attr_timeout`/`entry_timeout`/`max_read` are not fusermount mount options**; passing them to
-    `-o` fails the mount outright with `unknown option`. TTLs should be passed through each
-    `reply.entry/attr(&ttl, ..)`, and `max_readahead` is set in `init()`.
-14. **fuser 0.17's `AutoUnmount` requires `SessionACL != Owner`** (i.e. `allow_other`, and an
-    unprivileged mount additionally needs `user_allow_other` in `/etc/fuse.conf`), otherwise the
-    mount fails with `auto_unmount requires acl != Owner`.
-15. Inside FUSE calls, `block_on` needs a **separate runtime**, and the mount thread must not use
-    `tokio::spawn_blocking` (a blocking thread carries runtime context, and calling `block_on` on
-    another runtime from there panics).
-16. **fuser's `mount2()` gives you no `Notifier`** → switch to `fuser::spawn_mount2()` (on the daemon
-    side), which yields a `BackgroundSession` (join/unmount) + a `Notifier` (`inval_inode`).
-17. When a peer publishes AAAA but the IPv6 route does not work, you get `Network is unreachable` or
-    a body-decode failure mid-transfer → work around it with `--ipv4` (the client binds
-    `local_address` to an IPv4 source address).
-
-**Change discovery**
-
-18. **`lower` in `qbox_get_sync_log` is an inclusive lower bound** (`lower=30` returns `log_id=30`)
-    → advance the cursor to "the last `log_id` + 1"; when the range contains no events it returns
-    **`status:-17`**, which is not a protocol error.
-19. **`isfolder` in an event is `1`=directory / `2`=file / `0`=deleted entry** (not a boolean);
-    `size` is a string.
-20. **`filepath` is empirically empty in delete events**, and **our own CGI writes
-    (upload/rename/move/delete) produce no sync log events** → change discovery must
-    **treat baseline reconciliation as the main path**, with events serving only as a fast path.
-    The P0 probe corrected the attribution: the cause is **not** "this machine has not done device
-    pairing" (the NAS had long since had devices registered by the official client), but rather that
-    for this account `qbox_get_syncing_folder_list` is `total:0` (**no sync folder was ever
-    registered**); the real gate is "the path falls inside a registered sync folder", and the
-    existing endpoint inventory **has no endpoint that registers a sync folder** → that road is a
-    dead end, so **the conclusion that baseline reconciliation is the main path stands, and with
-    stronger evidence than before**.
-21. `qbox_write_log` makes `max_log` grow while no events can be fetched in the range → the cursor
-    **advances only by the events actually returned**, and on `-17` it does not advance but merely
-    records the fact, avoiding "the cursor advanced but the events were lost".
-
-**Dehydration**
-
-22. ★ **The iron rule of ordering**: `Notifier::inval_inode(ino, 0, 0)` must come **before** the
-    content is wiped — otherwise stale pages in the kernel page cache make applications read old
-    data. How it is accepted: after dehydrating, change the remote to **the same length with
-    different content** and `cat` it; you must get the new content.
-23. **mmap cannot be blocked**: Linux's `flock` does not stop mmap → you have to scan
-    `/proc/*/maps` yourself. Measured addendum: mmap keeps a `struct file` alive for the mapping, and
-    a process's `close(fd)` does not trigger the FUSE `release` either, so the "open fd" count is
-    itself the first line of defence (the `/proc` scan is the backstop).
-24. Locally written ranges must be recorded in the range table (`chunks_done`), otherwise a locally
-    created or modified file is judged "has no cached content" (measured: a 16 MiB local file was
-    reported as "it was a placeholder all along" when dehydrated).
-25. Don't measure sparse-cache usage with `du -sb` (apparent size) — a 128 MiB sparse file comes out
-    as 128 MiB; use `du -s --block-size=1` (allocated).
-
-**State store & delta**
-
-26. **When switching persistence, always make sure no old process is running**: while debugging we saw
-    "`cursors.json` reappeared after the migration archived it", and it turned out that an **old
-    binary daemon** left over from a previous session was still polling every 30s and writing JSON
-    with the old code (its mtime landing exactly on the polling beat was the discriminator). That is
-    why the acceptance matrix uses **a brand-new state directory** — to isolate pollution like this.
-27. **`rusqlite` with `bundled`**: it ships the SQLite source, so no system `libsqlite3-dev` is needed;
-    WAL leaves `-wal`/`-shm` files in the state directory, which is normal — don't clear them out as junk.
-28. **Every delta format detail is a default that "must be overridden explicitly"**: librsync defaults
-    to block 2048 / strong 8, whereas Qsync uses **1 MiB / 16-byte MD4**; the magics are
-    `0x72730136`(sig) / `0x72730236`(delta), all **big-endian**. Get the weak checksum's
-    `CHAR_OFFSET=31` slightly wrong and nothing matches.
-29. **Capability probing must not mean "an endpoint exists, therefore it is supported"**: on this NAS
-    all three enable bits of `versioning_probe` are 1 and `versioning_lock` even hands out a lockid,
-    yet `versioning_stat_delta` always returns `exist:0` and `versioning_support` is all 0 — the real
-    discriminator is "**are there historical versions**", and looking only at endpoint existence
-    leads to a completely wrong conclusion.
-
-**Shared folders & NAS folders**
-
-30. **Whether a shared folder is writable is decided by the NAS**: as long as the account has read
-    permission, a plain `sid` is enough to list / stat / download (`/Public` and `/Multimedia` both
-    passed on a real NAS), and `auth_data` AES is **not** needed; but an upload requires a folder
-    **registered as a Qsync sync folder**, otherwise the server answers with a vague `status:20`.
-    The test is "is it in `qbox_get_syncing_folder_list`", **not** "is it the home directory" —
-    registered folders outside home are writable too. So the client **does not pre-judge**: tick
-    read-write and it mounts read-write; if the server refuses, its own message lands in the error
-    list.
-31. **The top-level share list cannot be enumerated**: `get_list /` returns `status:5` for a regular
-    user; the only enumerable source is `qbox_get_syncing_folder_list` (folders registered for sync
-    on the NAS) → the "NAS folder" must be **chosen by the user** (dropdown + level-by-level `ls`
-    browsing + manual entry), never auto-discovered. An endpoint returning 200 with an empty array
-    is not an error.
-32. **One-to-one**: one mount point = one NAS folder. "One-to-many" was **removed entirely** on
-    2026-10-02 (the `roots` config, the multi-root virtual root, the legacy multi-root array in task
-    files); see the CHANGELOG for why and what it affects.
-33. **Parse real-NAS fields as they really are**: `qbox_get_syncing_folder_list` returns
-    `name` / `path` / `privilege`, not the imagined `folder` / `permission` the early parser read —
-    reading the wrong fields turns "listable" into "cannot list", leaving a working feature unused.
-
-## Two iron rules
-
-The whole project **must not violate** these two:
-
-1. **Every `read()` must return real data or an explicit `EIO` — never a short read.**
-   A short read = the kernel zero-fills → silent data corruption. Measured: a failed or timed-out
-   hydration makes `cat` get `EIO` and **output 0 bytes** — it does not hang and it does not emit
-   fake data.
-2. **Every dehydration must first `inval_inode` to invalidate the kernel cache, and only then wipe
-   the content.** Reverse that order = data corruption.
-
-## Acceptance & testing
-
-Every criterion was produced against a real NAS and a real mount, the scripts live in `xtask/tests/`,
-and **each one can be re-run on your own NAS**. Milestone-level results are in
-[`docs/验收记录.md`](docs/验收记录.md).
-
-```bash
-cargo test --workspace                                   # unit tests + doc tests (no NAS needed)
-
-xtask/tests/fuse-matrix.sh            # 68 items: range hydration / write path / change discovery / dehydration / state store (~12min)
-xtask/tests/fuse-matrix.sh --big      #    adds a 128 MiB full read + concurrent dedup
-xtask/tests/m5-matrix.sh              # 30 items
-xtask/tests/m7-matrix.sh              # 60 items (rules / FUSE filtering / LAN pairing·events·direct transfer)
-xtask/tests/m7-matrix.sh --no-nas     #    no NAS needed: unit tests + loopback between two real daemons
-xtask/tests/m82-matrix.sh             # 37 items (task registration / restart recovery)
-xtask/tests/pair-1to1.sh              # 17 items (one-to-one pairing + destination conflicts; no NAS needed)
-xtask/tests/m83-matrix.sh             # 27 items (journal schema migration / filtering / rotation)
-xtask/tests/m84-matrix.sh             # 92 items (settings / proxy / tray / free up space / conflict policy)
-xtask/tests/gui-matrix.sh             # 148 items (real-window screenshots of 9 destinations + ui_spec static self-check)
-xtask/tests/gui-matrix.sh --no-window #    machines without DISPLAY run the self-check only
-```
-
-**Most recent full run: all 491 items pass** (fuse 68 · gui 148 · m5 30 · m6 29 · m7 60 · m82 37 · m83 27 · m84 92).
-
-Real-NAS integration tests (`#[ignore]`, needing your own NAS credentials):
-
-```bash
-export QXNYC_TEST_HOST=... QXNYC_TEST_PORT=9834
-export QXNYC_TEST_USER=... QXNYC_TEST_PASSWORD='...'
-export QXNYC_TEST_FIXTURE=/home/qxync-test
-export QXNYC_TEST_TOTP_SECRET='...'   # TOTP secret when the account has 2SV enabled
-cargo test -p qxync-proto-test -- --ignored --test-threads=1 --nocapture  # 5 protocol items + 1 IPC end-to-end item
-cargo test -p qxync-proto-test --test two_step -- --ignored --nocapture  # M17: TOTP login round trip / missing second factor
-cargo test -p qxync-daemon -- --ignored --test-threads=1 --nocapture     # M2c engine (conflicted copy / delete protection)
-```
-
-> **Restricted environments**: if `~/.cargo` / `~/.config` are not writable, use paths inside the workspace:
-> `CARGO_HOME=$PWD/.cargo-home cargo build --workspace`,
-> `XDG_CONFIG_HOME=$PWD/.local-run/config XDG_DATA_HOME=$PWD/.local-run/data`.
-
-## Documentation index
-
-| Document | Contents |
-|---|---|
-| [`docs/开发规划.md`](docs/开发规划.md) | First (MVP) plan |
-| [`docs/执行方案-M0M1.md`](docs/执行方案-M0M1.md) | Revised after real-NAS verification: measured facts + corrections + execution order + risk gates |
-| [`docs/M1.5-设计.md`](docs/M1.5-设计.md) | daemon / IPC contract, lifecycle, pin semantics, acceptance criteria |
-| [`docs/M2b-写路径.md`](docs/M2b-写路径.md) | Write path: real-NAS write API contract, the read-modify-write iron rule, upload queue |
-| [`docs/M2c-变更发现.md`](docs/M2c-变更发现.md) | Three-cursor/event contract, three-way decision table, conflicted copy, delete protection |
-| [`docs/M3-脱水.md`](docs/M3-脱水.md) | Safety-check chain, the `inval_inode` ordering iron rule, idle/quota, cache-mode |
-| [`docs/M9-缓存优先与映射.md`](docs/M9-缓存优先与映射.md) | the NAS → cache → mapping model, the persisted hydration bitmap and cache adoption, directory-listing snapshots, remote-change semantics and the on-device latency comparison |
-| [`docs/M10-会话热更新.md`](docs/M10-会话热更新.md) | sid hot-update, in-place retry on auth failure, pushing re-logins to mounts, session keepalive, and the on-device logout reproduction |
-| [`docs/M4-GUI.md`](docs/M4-GUI.md) | GUI boundaries, command surface, page structure, acceptance and pitfalls |
-| [`docs/M5-SQLite与delta.md`](docs/M5-SQLite与delta.md) | State-store schema/migration/single transaction, real-NAS versioning probing, delta capability gating |
-| [`docs/M6-多根与共享文件夹.md`](docs/M6-多根与共享文件夹.md) | **Historical**: multi-root layout (removed), read-only rules, real-NAS shared-folder probing |
-| [`docs/M7-选择性同步与LAN直连.md`](docs/M7-选择性同步与LAN直连.md) | exclude rule engine, peer protocol wire format, event fast path, direct transfer |
-| [`docs/M8-向Qsync-Client-6靠拢.md`](docs/M8-向Qsync-Client-6靠拢.md) | GUI rework research + M8.1–M8.6 execution plan and decision log |
-| [`docs/M16-多NAS连接.md`](docs/M16-多NAS连接.md) | Multiple NAS connections: one daemon per connection, namespacing and storage layout, legacy migration, CLI/GUI entry points, safety boundaries and acceptance |
-| [`docs/M17-两步验证.md`](docs/M17-两步验证.md) | Two-step verification (2SV): the measured `security_code` contract of `authLogin.cgi`, the built-in TOTP, `otp_secret` storage, CLI/GUI usage, fresh codes on daemon re-login, security boundaries |
-| [`docs/验收记录.md`](docs/验收记录.md) | Milestone-level acceptance conclusions (what was run, what the result was) |
-| [`docs/发布清单-v0.1.0.md`](docs/发布清单-v0.1.0.md) | Pre-release checklist (for maintainers) |
-| [`CHANGELOG.md`](CHANGELOG.md) | Changelog |
+- **Linux only**: depends on FUSE and `/proc` semantics; no Windows / macOS support.
+- **Limited real-hardware verification**: fully verified only on
+  **QNAP TS-464C / QTS 5.2.9 / Qsync QPKG 5.0.0.7**; other models / firmware may behave differently.
+- **Local-account login only**: no QID / myQNAPcloud cloud-account login.
+- **One mount point = one NAS folder**: use several tasks for several folders.
+- **Multiple NAS boxes**: do not bidirectionally sync the same remote directory through two
+  connections to the same NAS (each connection has its own baseline, so they read each other's
+  changes as their own).
+- **Two-step verification covers TOTP only** (authenticator apps): security questions, email codes
+  and QR-code / device approval are not implemented; the TOTP secret is stored in plaintext in the
+  `0600` credentials file, same as the password (keyring support is future work).
+- **The tray icon needs an SNI-capable desktop environment**: Plasma, Xfce (statusnotifier plugin),
+  waybar, polybar, LXQt, Cinnamon and GNOME + AppIndicator all work; IceWM / Fluxbox / Openbox+tray /
+  bare GNOME / old Xfce·MATE panels (XEmbed only) do not show a tray icon (install
+  [`snixembed`](https://sr.ht/~steef/snixembed/) to bridge an old-style tray). When the tray is not
+  visible, closing the window really closes it — it is never hidden in a tray nobody draws.
+- **The GUI is currently Chinese-only**: the `en` string table covers only a few
+  two-step-verification messages; every other UI string is Chinese.
+- **No trash bin on the mount point**: moving files to the trash is rejected, so deleting really
+  deletes (the remote delete is pushed by a background queue and guarded by a bulk-delete circuit
+  breaker).
+- **No interoperability with the official client**: its binary WebSocket channel was not recovered;
+  LAN acceleration is qxync's own protocol and silently falls back to the NAS.
 
 ## Security & privacy
 
-- **Credentials**: `~/.config/qxync/credentials.json` (`0600`); the IPC socket directory is `0700` and the socket is `0600`.
-- **This project collects and reports no telemetry whatsoever**, and connects to no host other than the NAS you configured and (optionally) LAN peers.
-- **LAN peering is plaintext TCP**, so enable it only on a trusted LAN; the token authorizes only "read already-hydrated files + submit events" and has **no ability whatsoever to write to or delete from the remote**.
-- **This project contains and distributes no third-party client credentials.** The protocol probe
-  tools ([`xtask/probe/`](xtask/probe/)) use **your own** NAS account only, and raw responses land in
-  `xtask/probe/probe-out/` (gitignored — **they contain sids and account names, never commit them**).
-- **The repository contains no real host names, accounts or device fingerprints** (a unified scrub was done before release, see
-  [`docs/发布清单-v0.1.0.md`](docs/发布清单-v0.1.0.md)).
-
-If you find a security problem, please **do not open a public Issue** — see [`SECURITY.md`](SECURITY.md).
+- **No telemetry is collected or reported**; qxync connects only to the NAS you configure and
+  (optionally) LAN peers.
+- **It does not write the NAS device list, does no device registration, and modifies no NAS-side
+  configuration.**
+- Credentials live in `~/.config/qxync/credentials.json` (`0600`; non-`default` connections use
+  `links/<id>.credentials.json`); the IPC socket directory is `0700`.
+  Config, state store, cache and logs live under `~/.config/qxync`, `~/.local/share/qxync` and
+  `~/.local/state/qxync`; `qxync purge --all` removes all local data (it never touches the NAS or
+  files inside the mount point).
+- LAN peering is **plaintext TCP on the local network** — enable it only on a trusted network.
+- If you find a security problem, please **do not open a public Issue** — see
+  [SECURITY.md](SECURITY.md).
 
 ## Contributing
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md). One special reminder: this project has **two iron rules** (above),
-so when you change the FUSE read path or the dehydration path, always include the corresponding matrix re-run results.
+Bug reports, measured protocol corrections, code PRs and UI translations are all welcome — see
+[CONTRIBUTING.md](CONTRIBUTING.md). Before you start, read the
+[two hard rules](CONTRIBUTING.md#4-the-two-hard-rules-reviewers-check-these) there: they are about
+data integrity, and no change may break them.
 
 ## License
 
 The **original code** of this project is released under **MIT OR Apache-2.0**, at your option:
+[LICENSE-MIT](LICENSE-MIT) / [LICENSE-APACHE](LICENSE-APACHE).
 
-- [`LICENSE-MIT`](LICENSE-MIT)
-- [`LICENSE-APACHE`](LICENSE-APACHE)
+That license covers only the original parts of this repository; QNAP, Qsync, myQNAPcloud, QID and
+other names and marks are trademarks or registered trademarks of QNAP Systems, Inc. — see
+[DISCLAIMER.md](DISCLAIMER.md) for details.
 
-**That license covers only the original parts of this repository.** QNAP, Qsync, myQNAPcloud, QID and
-other names and marks are trademarks or registered trademarks of QNAP Systems, Inc.; all rights in the
-analysed software belong to it and its licensors — see [`DISCLAIMER.md`](DISCLAIMER.md)
-for details.
-
-Third-party dependencies follow their own licenses (inspectable with `cargo metadata` / `cargo deny`).
+Design and acceptance records live in [`docs/`](docs/).

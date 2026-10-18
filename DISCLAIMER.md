@@ -62,7 +62,7 @@ NAS 账号口令写在 `~/.config/qxync/credentials.json`（权限 `0600`），
 **任何人依据本项目所作的任何决定与行为的风险，由其自行承担。**
 
 > ⚠️ 这是一个会**读写你 NAS 上真实文件**的工具。作者已尽最大努力保证数据安全
-> （见 README 的[两条铁则](README.md#两条铁则)，以及 [`docs/验收记录.md`](docs/验收记录.md) 中的真机验收），
+> （见 [`CONTRIBUTING.md` 的「两条铁则」](CONTRIBUTING.md#4-两条铁则复审必查)，以及 [`docs/验收记录.md`](docs/验收记录.md) 中的真机验收），
 > 但**请务必先在测试账号/测试目录上跑通再用于重要数据**。
 
 ### 7. 使用者的责任
@@ -148,7 +148,7 @@ limited to accuracy, completeness, merchantability, fitness for a particular pur
 non-infringement. **You bear all risk for any decision or action taken based on this project.**
 
 > ⚠️ This tool **reads and writes real files on your NAS**. The author has gone to considerable
-> lengths to protect your data (see the [two iron rules](README.en.md#two-iron-rules) in the README
+> lengths to protect your data (see the [two hard rules](CONTRIBUTING.md#4-the-two-hard-rules-reviewers-check-these)
 > and the real-hardware acceptance results in [`docs/验收记录.md`](docs/验收记录.md)), but
 > **please try it on a test account/directory before trusting it with important data**.
 

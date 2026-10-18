@@ -188,7 +188,7 @@ python3 upload_chunk_probe.py --host nas.example.com --port 9834 \
 
 ## 相关文档
 
-- 实测出来的协议结论汇总在 [`README.md` 的「协议要点」](../../README.md#协议要点踩过的坑)
+- 实测出来的协议结论汇总在 [`docs/协议要点.md`](../../docs/协议要点.md)
 - 真机验证的执行记录见 [`docs/执行方案-M0M1.md`](../../docs/执行方案-M0M1.md)
 - 各里程碑的设计与决策见 [`docs/`](../../docs/)
 - 法律边界与使用者责任见 [`DISCLAIMER.md`](../../DISCLAIMER.md)

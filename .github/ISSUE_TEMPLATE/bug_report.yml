@@ -12,7 +12,7 @@ body:
         2. **安全问题请走私密渠道**：见 [SECURITY.md](https://github.com/mlzxgzy/qxync/blob/master/SECURITY.md)，
            不要在公开 Issue 里写细节。
 
-        如果你还没读过 README 的[「两条铁则」](https://github.com/mlzxgzy/qxync/blob/master/README.md#两条铁则)，
+        如果你还没读过[「两条铁则」](https://github.com/mlzxgzy/qxync/blob/master/CONTRIBUTING.md#4-两条铁则复审必查)，
         请先读一下 —— 涉及数据损坏的报告会被最高优先级处理。
   - type: checkboxes
     id: preflight

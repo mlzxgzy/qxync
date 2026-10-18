@@ -29,7 +29,8 @@
 ### 什么算安全问题
 
 - **数据完整性 / 数据丢失**（最高优先级）：短读、写回把远端内容清零、脱水顺序错误导致读到旧数据、
-  冲突处理把两边改动都丢掉 —— 也就是 README 里**两条铁则**的任何一条失守。
+  冲突处理把两边改动都丢掉 —— 也就是 [`CONTRIBUTING.md` 的**两条铁则**](CONTRIBUTING.md#4-两条铁则复审必查)
+  任何一条失守。
 - **凭据泄漏**：口令落进日志 / 进程参数 / shell 历史；`credentials.json` 权限不对；
   IPC socket 可被其它用户连接。
 - **越权**：非家目录根被写出、`exclude` 规则被绕过、LAN 对端 token 获得了写 / 删远端的能力。
@@ -76,7 +77,7 @@ this project rests on not silently corrupting your data.
 
 - **Data integrity / data loss** (highest priority): short reads, a write-back that zeroes remote
   content, out-of-order dehydration causing stale reads, conflict handling that loses both sides —
-  i.e. any breach of the **two hard rules** in the README.
+  i.e. any breach of the [**two hard rules**](CONTRIBUTING.md#4-the-two-hard-rules-reviewers-check-these).
 - **Credential exposure**: passwords in logs / argv / shell history, wrong
   `credentials.json` permissions, an IPC socket other users can connect to.
 - **Privilege escalation**: writes into a non-home root, an `exclude` rule being bypassed, a LAN

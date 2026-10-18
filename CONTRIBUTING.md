@@ -4,7 +4,7 @@
 
 先读这两个：
 
-- **[`README.md`](README.md) 的「两条铁则」** —— 整个项目不许违反，改动 FUSE 读路径或脱水路径时尤其注意。
+- **[本文件的「两条铁则」](#4-两条铁则复审必查)** —— 整个项目不许违反，改动 FUSE 读路径或脱水路径时尤其注意。
 - **[`DISCLAIMER.md`](DISCLAIMER.md)** —— 本项目的性质与法律边界。
 
 ---
@@ -16,8 +16,8 @@
 **欢迎**：
 
 - 🐛 **Bug 报告**：请用 [Bug 报告模板](.github/ISSUE_TEMPLATE/bug_report.yml)，把复现步骤、日志、环境写全。
-- 📄 **协议事实更正**：你在**你自己拥有或已获授权**的 NAS 上实测出与 README 或代码注释
-  不符的行为 —— 这类 Issue 价值最高，请附上**原始响应**（记得先掩码你的域名 / 账号 / sid）。
+- 📄 **协议事实更正**：你在**你自己拥有或已获授权**的 NAS 上实测出与 [`docs/协议要点.md`](docs/协议要点.md)、
+  README 或代码注释不符的行为 —— 这类 Issue 价值最高，请附上**原始响应**（记得先掩码你的域名 / 账号 / sid）。
 - 🔧 **代码 PR**：修 bug、补测试、改进文档、增加发行版适配。
 - 🌍 **翻译**：`ui/i18n.js` 里预留了 `en` 空表；把界面文案补齐是很好的切入点。
 
@@ -116,8 +116,9 @@ CI 里的 `fmt` 任务是**非阻断**的。我们**不希望**在一个功能 P
 - 🐛 **Bug reports** — use the [Bug report template](.github/ISSUE_TEMPLATE/bug_report.yml)
   and include reproduction steps, logs, and environment.
 - 📄 **Protocol corrections** — a behaviour you measured on a NAS **you own or are authorized to
-  administer** that differs from the README or the code comments. These are the most valuable issues:
-  attach the **raw response** (mask your hostname / account / sid first).
+  administer** that differs from [`docs/协议要点.md`](docs/协议要点.md), the README or the code
+  comments. These are the most valuable issues: attach the **raw response** (mask your hostname /
+  account / sid first).
 - 🔧 **Code PRs** — bug fixes, tests, docs, distro packaging.
 - 🌍 **Translations** — `ui/i18n.js` ships an empty `en` table; filling in the UI strings is a
   great first contribution.
