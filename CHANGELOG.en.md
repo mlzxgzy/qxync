@@ -5,6 +5,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [中文](CHANGELOG.md) · [README](README.en.md) · [Acceptance log](docs/验收记录.md)
 
+## [0.6.4] - 2026-10-18
+
+### Fixed
+
+- **Deletion verdicts were postponed forever once the directory count exceeded the
+  per-poll limit**: the daemon kept repeating "228 directories exceed the per-poll limit of
+  200… skipping the deletion verdict this round" for 87 consecutive rounds. The cause: each
+  reconciliation listed only the first 200 directories in sorted order, so the trailing ones
+  were **never** reached; the safety valve "incomplete remote view → never delete locals by
+  absence" therefore stayed on permanently, and remote deletions (plus upload/refresh
+  decisions for those directories) never ran. Data safety was intact, but the delete half of
+  sync stalled. Now reconciliation uses a **rotating scan window + per-directory verdicts**:
+  - when the directory count exceeds the limit, each round resumes after the directory where
+    the previous round stopped and wraps around (the remote root is always listed); the cursor
+    is stored in the `meta` table of `sync.db`, so `qxync sync --once` keeps rotating across
+    processes;
+  - "incomplete view" is narrowed from the whole view to **per directory**: only candidates
+    whose parent directory was actually listed this round (a successful list, or 4/5/6
+    confirmed by `stat` with `exist=0`) may be decided. Candidates under directories that were
+    not listed are deferred (never deleted by absence), while the other fully-listed
+    directories in the same view are **not held back**;
+  - rename pairing likewise only uses removed-side candidates whose parent was listed this
+    round — "not seen" is never paired into a rename;
+  - coverage: unit tests for the rotation window plus a no-real-NAS mock `reconcile_view`
+    regression over two rounds (228 directories with one remote deletion in each of d000 and
+    d210: round 1 deletes only inside its window, round 2 rotates to the trailing directories,
+    nothing outside the window is deleted, and the two windows cover every directory), plus a
+    "one failing directory only defers itself" test.
+- **`status 4/5` is no longer treated as "the remote deleted it"**: 4/5 are also the
+  permission-denied / session-expired codes (on real hardware `/Download` returns 5 and
+  `/homes` returns 4 even though they exist). The old code treated 4/5 as a definite
+  "not found", so a permission/ACL change or a mid-round sid expiry would turn every
+  candidate under that directory into `DeleteLocal` (local node + cache + baseline removed)
+  without triggering a re-login. Now a 4/5/6 listing is **confirmed with `stat` first**: only
+  `exist=0` allows the "remote deleted" verdict; if `stat` says it still exists the
+  **directory entry itself** is inserted into the remote view (so a parent listing that
+  omitted it cannot get the whole subtree + cache deleted) while its contents are not decided
+  this round; if `stat` also fails the directory is presence-unknown and neither it nor its
+  contents are decided. A successful `stat` proves the session is alive, so `auth_failed` is
+  **not** set (otherwise a permanently ACL-hidden directory would re-login and warn every
+  round); only a failing-`stat` auth error or a root 4/5 does. The mount root is the
+  exception: it cannot vanish, so 4/5/6 there is always treated as a
+  permission/session/unmount problem (no `stat`, no deletion).
+  Regression: `listing_status_4_or_5_never_deletes_without_stat_confirmation`,
+  `listing_root_status_4_or_5_defers_instead_of_deleting`,
+  `directory_missing_from_parent_listing_but_stat_exists_is_not_deleted`,
+  `stat_failure_keeps_directory_and_subtree`.
+- **HTTP-layer failures are no longer read as "empty directory / missing path"**:
+  `get_list` / `stat` now check the HTTP status first — a reverse-proxy 502/504 JSON error
+  body (`{"error":…}`) used to pass `Listing`'s all-defaults deserialization and be read as
+  "0 entries", which the reconciler then used to delete locals. Even with HTTP 200, a JSON
+  body that does not look like a listing (none of `status`/`datas`/`total`/`real_total`/
+  `exist`) is now a parse failure. `list_limit` also no longer treats a missing `total` as
+  `total=0` and stops after the first page (directories with >200 entries were silently
+  truncated); without a trustworthy `total` it converges through pagination instead.
+
 ## [0.6.3] - 2026-10-18
 
 ### Added
@@ -1206,6 +1262,7 @@ Verified on **QNAP TS-464C / QTS 5.2.9 / Qsync QPKG 5.0.0.7 (build 20260723)**.
 - Acceptance results were split out of the README into [`docs/验收记录.md`](docs/验收记录.md).
 - Dual-licensed under **MIT OR Apache-2.0** (`LICENSE-MIT` / `LICENSE-APACHE`).
 
+[0.6.4]: https://github.com/mlzxgzy/qxync/compare/v0.6.3...v0.6.4
 [0.6.3]: https://github.com/mlzxgzy/qxync/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/mlzxgzy/qxync/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/mlzxgzy/qxync/compare/v0.6.0...v0.6.1

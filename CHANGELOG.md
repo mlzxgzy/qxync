@@ -5,6 +5,46 @@
 
 [English](CHANGELOG.en.md) · [README](README.md) · [验收记录](docs/验收记录.md)
 
+## [0.6.4] - 2026-10-18
+
+### 修复
+
+- **目录数超过单轮上限时，删除判定被永久推迟**：真机反馈「目录数 228 超过单轮上限 200…
+  本轮跳过删除判定」每轮重复出现（连续 87 轮）。根因是对账每轮都从排序开头只列前 200 个
+  目录，排序在后的目录**永远**轮不到；而「远端视图不完整就不按缺失删本地」这条安全阀
+  因此永久生效 —— 那些目录里的远端删除、上传、刷新判定永远不会执行（数据安全没有被破坏，
+  但同步的「删」这一半等于停摆）。现在改为**轮转扫描 + 按目录判定**：
+  - 目录数超上限时每轮从上一轮停下的位置接着列、到尾回绕（远端根恒定每轮都列）；
+    轮转游标落在 `sync.db` 的 `meta` 表，`qxync sync --once` 跨进程也接得上；
+  - 「视图不完整」从整视图收窄到**按目录**：只有本轮真正列过（列举成功，或 4/5/6 经
+    `stat` 确认 `exist=0`）的目录里的候选才允许判定，没列到的目录里的条目一律暂不判定
+    （不按缺失删本地），同一视图里其它已列全的目录**不陪绑**；
+  - 改名配对也只用「父目录本轮列过」的已删侧候选 —— 不把「没看到」配成一次改名；
+  - 覆盖：纯函数轮转窗口单测 + 无真机 mock NAS 的 `reconcile_view` 两轮回归
+    （228 个目录，d000 / d210 各有一条远端删除：第 1 轮只删窗口内、第 2 轮轮转到
+    排序在后的目录，未扫目录零误删，两轮窗口覆盖全部目录），以及「单个目录失败
+    只推迟它自己」单测。
+- **`status 4/5` 不再直接当成「远端已删」**：4/5 同时是权限拒绝 / 会话失效的码
+  （真机 `/Download` 回 5、`/homes` 回 4，但路径其实存在）。旧实现把 4/5 当「确定
+  不存在」，权限 / ACL 变更或 sid 中途失效时会把该目录所有候选判 `DeleteLocal`
+  （本地节点 + 缓存 + baseline 清掉）且不重登。现在列举返回 4/5/6 时**先用 `stat`
+  正向确认**：只有 `exist=0` 才允许按「远端已删」处理；stat 说仍存在 → 目录条目记进
+  远端视图（防止「父目录列举漏掉它」时目录自身被判删、连整棵子树 + 缓存一起清），
+  其内容本轮不判定；stat 也失败 → 目录存在性未知，目录自身与内容都不判定。stat 成功
+  本身证明会话有效，所以**不**置 `auth_failed`（否则永久 ACL 隐藏的目录会每轮重登 +
+  刷 WARN）；只有 stat 也 auth 失败或远端根 4/5 才触发重登。远端根例外：挂载根不可能
+  凭空消失，4/5/6 一律按权限 / 会话 / 卸载处理（不 stat、不删）。新增 mock NAS 回归
+  `listing_status_4_or_5_never_deletes_without_stat_confirmation`、
+  `listing_root_status_4_or_5_defers_instead_of_deleting`、
+  `directory_missing_from_parent_listing_but_stat_exists_is_not_deleted`、
+  `stat_failure_keeps_directory_and_subtree`。
+- **HTTP 层失败不再被读成「空目录 / 不存在」**：`get_list` / `stat` 先检查 HTTP 状态码
+  —— 反代 502/504 的 JSON 错误体（`{"error":…}`）以前能通过 `Listing` 的全默认反序列化
+  被当成「0 项」，对账据此删本地；即使 HTTP 200，非列表形状的 JSON（缺 `status`/`datas`/
+  `total`/`real_total`/`exist`）现在也按解析失败处理。`list_limit` 也不再拿缺省的
+  `total=0` 在第一页就 break（服务端不给 `total` 时 >200 项的目录会被静默截断）；
+  无可信 `total` 时按分页自然收敛。
+
 ## [0.6.3] - 2026-10-18
 
 ### 新增
@@ -987,6 +1027,7 @@ NAS 设置名 `QSYNC_FOLDERPAIR_USE_SPACE_SAVING`、Windows 客户端注册表�
 - 验收结论从 README 抽出为 [`docs/验收记录.md`](docs/验收记录.md)。
 - 采用 **MIT OR Apache-2.0** 双许可（`LICENSE-MIT` / `LICENSE-APACHE`）。
 
+[0.6.4]: https://github.com/mlzxgzy/qxync/compare/v0.6.3...v0.6.4
 [0.6.3]: https://github.com/mlzxgzy/qxync/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/mlzxgzy/qxync/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/mlzxgzy/qxync/compare/v0.6.0...v0.6.1
