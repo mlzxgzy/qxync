@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-10-18
+
 ### 新增
 
 - **「添加连接」不再只有一个入口**：顶栏「当前连接」右边的「＋」、主页连接卡片的
@@ -899,6 +901,7 @@ NAS 设置名 `QSYNC_FOLDERPAIR_USE_SPACE_SAVING`、Windows 客户端注册表�
 - 验收结论从 README 抽出为 [`docs/验收记录.md`](docs/验收记录.md)。
 - 采用 **MIT OR Apache-2.0** 双许可（`LICENSE-MIT` / `LICENSE-APACHE`）。
 
+[0.6.1]: https://github.com/mlzxgzy/qxync/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/mlzxgzy/qxync/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/mlzxgzy/qxync/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/mlzxgzy/qxync/compare/v0.4.3...v0.5.0
