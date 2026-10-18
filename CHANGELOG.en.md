@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **"Add connection" is no longer one hidden button**: the "＋" next to the current-connection
+  picker in the top bar, "＋ 添加连接" on the home connection card, and "＋ 新建连接…" at the
+  end of the task form's "NAS connection" dropdown all jump straight to the new-connection
+  form under Settings → Connections (switch to that section, scroll the form into view,
+  focus "host / NAS address", and leave a line in the log). Previously the only entry was
+  "＋ 添加 NAS" in the Settings → Connections card; neither the home page nor the task page
+  had one, and the task form's dropdown lists **existing** connections only — so "connect a
+  NAS that is not configured yet" had nowhere to click. See [M16 §7.1](docs/M16-多NAS连接.md).
+
+### Fixed
+
+- **Renaming/deleting no longer "drains the entire upload queue first"** (saving a large
+  file / text in an editor drops from 1–2 s back to tens of milliseconds). Previously FUSE
+  `rename`/`unlink` called `drain()` and waited for the **whole** upload queue to empty (up
+  to 60 s / 30 s) before talking to the server whenever the target had local changes; an
+  editor's atomic save (KIO/Kate: write `.part` → rename) hits exactly that path and had to
+  wait for `.part`, swap files and every other upload in the same directory (measured
+  1.5–1.9 s per save). Now:
+  - only jobs on the **relevant paths** are frozen and awaited; queued jobs are retargeted to
+    the new name (`UploadQueue::retarget_pending_under`, state-store primary key rekeyed)
+    instead of uploading the old name first;
+  - nodes gain `remote_known` (whether the remote actually has this copy): renaming/deleting
+    a locally created file (KIO's `.part`, temp files) **never hits the server** — it is
+    handled purely locally and the upload lands under the final name; when the remote has an
+    older copy, behaviour is unchanged (rename on the remote first, then update the local
+    view; on failure EIO and the queue stays intact);
+  - the upload queue gains a 250 ms enqueue debounce: consecutive writes to the same path
+    collapse into one upload, so an editor's temp-file-then-rename does not push 0-byte or
+    intermediate versions to the NAS;
+  - deleting a file that was never uploaded (closing a document deletes its swap file) no
+    longer "uploads first, then deletes" either.
+  - Regression: 6 new unit tests (path-level wait / retarget / debounce / pause-resume /
+    `remote_known` lifecycle); `cargo test --workspace` is green.
+- **The new-connection form is no longer filled in by the current connection's async reply**:
+  after "＋ 添加 NAS" cleared the form, the `loadConnect()` reply (which reads the **current**
+  connection) put the previous NAS's host / path back into the form — the title said "Add NAS
+  connection" while the address belonged to someone else, and saving it would have created a
+  wrong connection. A `creatingLink` flag now distinguishes "showing the current connection"
+  from "creating a new one"; in the creating state that reply leaves the form alone.
+- **"Connection settings" on the home page no longer lands on the last settings tab**: if you
+  last looked at "About", clicking it dropped you on the About page and the connection list
+  never showed. It is now pinned to "Connections".
+
 ## [0.6.0] - 2026-10-18
 
 ### Added
