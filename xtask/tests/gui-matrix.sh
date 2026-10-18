@@ -209,6 +209,25 @@ else
   skip "M18 无头集成（没有 chromium，跳过）"
 fi
 
+# ------------------------------------------------------------------ 2c-4. ★ M19 删除相关数据
+# 用户反馈：「再添加一个删除所有相关数据的功能」。三处入口（任务卡 / 连接行 /
+# 设置→高级危险区）共用同一个确认弹窗；这里验接线 + 真 app.js 无头集成 + CLI e2e。
+echo "== 2c-4. M19 删除相关数据（任务 / 连接 / 全局） =="
+check "$([ "$(jqs .ui_spec.purge.ok)" = "true" ] && echo 0 || echo 1)" \
+  "purge 接线：弹窗=$(jqs .ui_spec.purge.modal) / 清单=$(jqs .ui_spec.purge.items_slot) / 预览=$(jqs .ui_spec.purge.plan_call) / 任务=$(jqs .ui_spec.purge.task_exec) / 连接=$(jqs .ui_spec.purge.link_purge_flag) / 全局=$(jqs .ui_spec.purge.all_exec)"
+if command -v chromium >/dev/null; then
+  bash "$REPO/xtask/tests/gui-purge.sh" >"$RUNDIR/gui-purge.log" 2>&1
+  check $? "M19 无头集成（真 app.js + 打桩后端）：$(tail -2 "$RUNDIR/gui-purge.log" 2>/dev/null | head -1)"
+else
+  skip "M19 无头集成（没有 chromium，跳过）"
+fi
+if [ -x "$QS" ]; then
+  bash "$REPO/xtask/tests/m19-purge.sh" >"$RUNDIR/m19-purge.log" 2>&1
+  check $? "M19 CLI 隔离 e2e（任务/连接/daemon/全局）：$(tail -2 "$RUNDIR/m19-purge.log" 2>/dev/null | head -1)"
+else
+  skip "M19 CLI 隔离 e2e（没有 target/debug/qxync，先 cargo build --workspace）"
+fi
+
 # 负向对照：daemon 停了必须以非 0 退出（否则自检没有意义）
 kill "$DAEMON_PID" 2>/dev/null; DAEMON_PID=""; rm -f "$SOCK"; sleep 0.8
 "$GUI" --self-test >/dev/null 2>&1

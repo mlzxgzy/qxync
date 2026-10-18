@@ -76,6 +76,12 @@ jobs:
       - name: node 前端纯函数单测（task-defaults）
         run: node xtask/tests/task-defaults.test.mjs
 
+      # ★ M19：删除相关数据（purge）的隔离 e2e —— 不需要 NAS / 不需要真窗口。
+      # 覆盖任务级 / 连接级 / daemon 在跑（IPC）/ 全局四条路径，并断言
+      # 「挂载点里的用户文件不会被动」这条安全底线。缺 sqlite3 时脚本会跳过行数断言。
+      - name: M19 删除相关数据 e2e（隔离 XDG）
+        run: bash xtask/tests/m19-purge.sh
+
   # ---------------------------------------------------------------- MSRV
   msrv:
     name: MSRV check (rust 1.90)
