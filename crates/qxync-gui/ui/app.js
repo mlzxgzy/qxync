@@ -826,7 +826,9 @@
     dl.appendChild(dd);
   }
 
-  function kvText(dl, key, value) { kvRow(dl, key, value); }
+  // ★ M22：补上第 4 参（cls）—— 之前 kvText 把调用方传的 val-dim / val-ok /
+  // val-warn / val-err 静默丢掉，诊断页这些行的颜色标注从来没生效过。
+  function kvText(dl, key, value, cls) { kvRow(dl, key, value, cls); }
 
   function kvBool(dl, key, on, onText, offText) {
     kvRow(dl, key, on ? (onText || '是') : (offText || '否'), on ? 'val-ok' : 'val-dim');
@@ -1071,7 +1073,12 @@
     var s = isObj(st.status) ? st.status : null;
     var sess = (s && isObj(s.session)) ? s.session : null;
     setText('meta-session', sess
-      ? T('top.session_meta', { sid: str(sess.sid_masked), state: (sess.alive ? 'alive' : 'dead') })
+      ? T('top.session_meta', {
+          sid: str(sess.sid_masked),
+          // ★ M22：alive=false 且 alive_known=false 是「不知道」（离线未探测），
+          // 不是「失活」；alive=true 只可能来自真探测。
+          state: (sess.alive ? 'alive' : (sess.alive_known === false ? 'unknown' : 'dead'))
+        })
       : T('top.session_dash'));
   }
   // ============================================================ 主页 / 任务卡片（★ M16 按连接聚合）
@@ -2600,7 +2607,13 @@
     kvBool(sess, 'logged_in', s.logged_in === true, '已登录', '未登录');
     if (isObj(s.session)) {
       kvText(sess, 'sid', optText(s.session.sid_masked));
-      kvBool(sess, 'session alive', s.session.alive === true, '存活', '失活');
+      // ★ M22：离线时 daemon 不发 check_alive —— alive=false 且 alive_known=false
+      // 是「不知道」，显示「未知」而不是「失活」（后者会误导用户去重登，其实只是网断了）。
+      if (!s.session.alive && s.session.alive_known === false) {
+        kvText(sess, 'session alive', '未知（离线未探测）', 'val-dim');
+      } else {
+        kvBool(sess, 'session alive', s.session.alive === true, '存活', '失活');
+      }
     } else {
       kvText(sess, 'session', '—');
     }

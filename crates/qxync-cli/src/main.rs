@@ -2657,7 +2657,17 @@ fn print_status(st: &StatusData) {
         }
     );
     if let Some(s) = &st.session {
-        println!("会话      : sid={} 存活={}", s.sid_masked, s.alive);
+        // ★ M22：离线时 daemon 不发 check_alive（M20 的卡顿修复），alive=false
+        //   只是「不知道」—— 按 alive_known 区分，别把断网误导成会话失效。
+        //   （alive=true 只可能来自真探测，老 daemon 没有新字段时也按存活展示。）
+        let alive_text = if !s.alive && !s.alive_known {
+            "未知（离线未探测）"
+        } else if s.alive {
+            "存活"
+        } else {
+            "失活"
+        };
+        println!("会话      : sid={} 存活={}", s.sid_masked, alive_text);
     }
     // ★ M20：连通性 + 离线缓冲区。离线时 `status` 不再发网络请求，这一段就是
     // 用户排查「怎么不同步了」时最该看到的答案。

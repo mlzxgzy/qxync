@@ -1935,7 +1935,11 @@ async fn status(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
     // `nas_uid` / `max_log` / `check_alive`，每个都要等 20s connect timeout ——
     // `qxync status` 离线时能卡一分钟。正好这个命令是用户排查「怎么不动了」
     // 时最想跑的那一条。
-    let (server, cursors, alive) = if logged_in && state.connectivity.is_online() {
+    //
+    // ★ M22：跳过探测时 `alive` 只是保守默认值 —— 配 `alive_known` 告诉
+    // 界面「这是不知道，不是失活」，别误导用户去重登。
+    let probe_session = logged_in && state.connectivity.is_online();
+    let (server, cursors, alive) = if probe_session {
         let nas = with_client!(state, |c| c.nas_uid()).ok();
         let max_log = with_client!(state, |c| c.max_log()).ok();
         let alive = with_client!(state, |c| c.check_alive()).unwrap_or(false);
@@ -1981,6 +1985,8 @@ async fn status(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
         session: session.map(|s| SessionInfo {
             sid_masked: mask_sid(&s.sid),
             alive,
+            // ★ M22：离线跳过探测时 alive 是「不知道」不是「失活」
+            alive_known: probe_session,
         }),
         server,
         cursors,

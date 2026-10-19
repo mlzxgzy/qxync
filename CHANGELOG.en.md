@@ -86,7 +86,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Creating files directly under the mount root failed after going offline** (when the root
   had never been `ls`ed in that mount): the mount root listing is now **preheated** right
   after a successful mount. The preheat uses `seed_listing` (only fills in when no snapshot
-  exists yet) so a late-landing stale listing can never wipe files the user just created
+  exists yet) so a late-landing stale listing can never wipe files the user just created.
+- **`daemon stop` / `umount` stalled for two minutes when the network dropped mid-queue**
+  (M22): with offline already *known*, M20 skipped draining; but in the window right after
+  the link dies (before the state machine has judged offline), `drain` waited out the full
+  120s timeout even though the queue could not progress behind the gate. The upload and
+  delete queues' `drain` now **returns early** once the gate (offline / replay pending)
+  falls — jobs stay in the durable store and resume when online; worst case is one
+  in-flight connect timeout.
+- **`status` reported the session as dead while offline** (M22): skipping `check_alive`
+  offline left `alive=false`, which really means "unknown". `SessionInfo` now carries
+  `alive_known` (serde default, old-daemon compatible); CLI and GUI show
+  **"unknown (not probed, offline)"** instead of "dead", so a broken link is no longer
+  mistaken for an expired session.
+- **GUI diagnostics color coding never rendered** (M22, pre-existing bug found along the
+  way): `kvText` silently dropped its 4th argument (`val-dim` / `val-ok` / `val-warn` /
+  `val-err`), so about 8 call sites lost their color classification.
   (this race was reproduced on the real device too).
 
 ### Verification
