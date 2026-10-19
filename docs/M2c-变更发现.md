@@ -16,7 +16,7 @@
 | 事件结构 | `{log_id,user,old_filepath,filepath,action,isfolder,device,device_uid,exist,mtime,size}` | 直接反序列化；`size` 是字符串 |
 | `isfolder` | `1`=目录、`2`=文件、`0`=删除项（不是布尔 0/1！） | 按值判断，别当 bool |
 | 删除事件 | `filepath` 实测**为空字符串**，`exist=0` | 删除**不能靠事件**，只能靠对账差集 |
-| 事件路径 | 真实路径 `/share/homes/<user>/...`，需映射到视图 `/home/...` | `map_event_path()` + 归属校验 |
+| 事件路径 | 真实路径 `/share/homes/<user>/...`，需映射到视图 `/home/...`。视图根是家目录**子目录**时尤其注意：事件路径先换算到 `/home` 命名空间、再按视图根收窄（见 §10.1） | `map_event_path()` + 归属校验 |
 | 我们自己的写操作 | `upload.php` / `rename` / `move` / `delete` **不产生** sync log 事件 | **对账是主路径，事件只是快路径** |
 | 事件可用性 | 同一个 sid 下时好时坏（`lower=0` 有时返回 32 条，有时 `-17`） | 两种都按正常处理，绝不因 `-17` 报错 |
 | `max_log` | 我们调 `qbox_write_log` 后会涨（44），但区间内取不到事件 | 游标按 `max_log` 观测、按事件实际推进 |
@@ -310,3 +310,131 @@ cargo test -p qxync-proto-test -- --ignored --test-threads=1 --nocapture  # 协�
 * baseline 是 JSON 文件（原子 rename），不是规划里的 SQLite；文件数极大时应迁移到 SQLite
   （M3 一起做元数据持久化时）。
 * 冲突只做「远端占原名 + 本地存副本」，不做三方内容合并；目录级冲突按存在性处理。
+
+---
+
+## 10. 修正（2026-10-19，真机事故复盘）
+
+一次真机操作把**三个互相独立**的问题同时暴露出来：08:05–08:06 用户连续保存
+`…/28-比赛项目/01配置备份/防火墙配置.txt`（事件里可见编辑器交换文件
+`.防火墙配置.txt.kate-swp`），08:06:47 该文件被判冲突并生成了副本；删掉副本之后，
+后续事件仍每轮报 `事件 stat … 失败: status=5 (路径不存在 / 无权限)`。
+取证来源：daemon 日志（`$XDG_STATE_HOME/qxync/log/qxyncd.log.2026-10-18` / `…-10-19`）、
+`sync.db` 的 `journal` 表（`$XDG_DATA_HOME/qxync/sync/<host>/sync.db`）、
+`mounts.json` 与任务配置（`root=/home/.Qsync`，任务写 `conflict=ask`）。
+
+### 10.1 事件路径双写：`/home/.Qsync/.Qsync/…`（事件快路径整体失效）
+
+* **症状**：每条事件 stat 都 `status=5`（journal 每轮最多保留 20 条，看到的全是它）；
+  事件快路径等于不存在，远端变更只能等 baseline 对账。真机取证两条：`journal` 里
+  2026-10-18 17:31 那一轮**拉到 87 580 条事件、跳过 8 017 条**（`remote_change` 条目
+  原文）；当天 daemon 日志（80 479 行）里 `事件 stat` 共 **79 670 条，100% 命中双写
+  前缀** `/home/.Qsync/.Qsync/`，其中 79 667 条 `status=5`、3 条网络错误。
+* **根因**：`map_event_path(real, user, view_root)` 把「剥掉 `/share/homes/<user>` 后
+  剩下的部分」直接拼到 `view_root` 上。视图根**就是**家目录（`/home`）时这个巧合成立；
+  视图根是子目录时（`/home/.Qsync`，NAS 上就是 `~/.Qsync`），剩下的部分本身以
+  `/.Qsync` 开头 → 拼出 `/home/.Qsync/.Qsync/2026/…`（`.Qsync` 两遍），NAS 上当然没有
+  这个路径。
+* **修法**：先按 `qxync_core::roots::client_path_from_share` 把真实路径换算到客户端
+  命名空间（前缀恒为 `HOME_ROOT` = `/home`，同时认 `/homes/<user>` 与卷内
+  `realpath` 形态、拒绝他人路径），再要求结果落在本视图根之下；视图外/归属不符 → `None`
+  （交对账兜底）。**不要**在事件侧另造一套前缀逻辑，两处前缀规则分叉就是这次 bug 的来源。
+* **顺带**：事件 `stat` 的 4/5/6 改为 debug + `events_skipped`，不再 `report.error` ——
+  这三个码同时是权限拒绝/会话失效，真机上不该按硬错误刷屏；并且**不置 `auth_failed`**
+  （`is_auth()` 把 4/5 当会话失效，给已删文件的事件置它会每轮重登，真机会撞 NAS 的
+  失败登录封锁）。跳过事件现在按原因计数，写进 `remote_change` 的 journal 详情
+  （删除事件无路径 / 本机回声 / 非本账号 / 被规则隐藏 / 远端不可见 / 映射失败）——
+  4/5/6 降级后 `events_skipped` 是唯一痕迹，不归因的话「事件快路径整体失效」会变成
+  无声故障。
+* **回归**：`qxync-core` 单测 `event_path_under_home_subdir_is_not_double_prefixed`
+  （真机原样中文路径、视图根自身、视图外路径、realpath/短形态、他人路径、空 user、
+  `/share/Public` 共享路径、`/home/.Qsync` vs `/home/.Qsync2` 前缀撞车）+
+  `qxync-daemon` 的事件级端到端测试
+  `apply_event_stats_single_prefixed_path_for_home_subdir_view`（真 `Client` + 真 HTTP +
+  mock NAS：断言实际请求是单前缀 `stat:/home/.Qsync/…`、永不出现双写路径、三方一致
+  时 Noop 且节点仍是文件、4/5 只跳过不记错误不重登、跳过归因到
+  `events_skipped_reasons["远端不可见(4/5/6)"]`）。注意这个测试覆盖的是**本节**的
+  路径映射与 4/5/6 降级；hook 推进时序的回归见 §10.2。
+
+### 10.2 凭空冲突副本：本轮上传 hook 推进了 baseline，判定却用开轮快照
+
+* **症状**：连续保存（每次保存都触发一次上传落地）之后凭空出现
+  `防火墙配置 (conflicted copy from devhost 2026-10-19).txt`，且**与原文件字节完全相同**
+  （12218 = 12218）。副本名里的 `devhost` 是本机 hostname —— 是自己跟自己打出冲突。
+* **根因**：`poll_once` 开轮时克隆 baseline 快照，整轮（几十秒、要列几百个目录）都用它
+  判定；上传成功 hook 却在**本轮进行中**就把权威 baseline 推进到刚落上去的签名
+  （`SyncState::note_uploaded`）并 `clear_dirty`。于是判这个文件时：
+  * 快照 base = 上一版（旧 mtime）；
+  * remote = 自己刚传的新版（与本地相同）；
+  * local = 新版、`dirty=false`（hook 已清）；
+  → `remote != base` 成立、`local != base` 也成立 → `decide` 的 `(false, true)` 分支判
+  **Conflict**。旧修复（`note_uploaded` 推进 baseline + `merge_round_baseline` 落盘合并）
+  只堵了「上传落地 → 下一轮开始」这个窗口，**漏了一轮进行中**这个窗口；而且它自己的
+  落盘合并也有洞（见下面「复审修正」第一条）。
+* **修法**：`SyncState` 新增本轮覆盖表 `round_hook_advances`
+  （路径 → **本轮按时间顺序的全部推进签名**，同签名去重，每路径封顶 16 个 ——
+  `QXNYC_POLL_INTERVAL=0` 禁用轮询时表永不清，不设上限会无界增长），
+  `begin_round()` 在**取快照的同一把锁**里清空它；对账、事件、冲突重判统一走
+  `decide_with_state()/base_for()`：base 规则如下（窗口都要照顾）：
+  1. 远端列到的 == 开轮快照，或 == 本轮任一推进 → `base = remote`（`rc = false`）。
+     目录列举可能落在本轮两次上传**之间**，所以必须匹配整张列表，不能只比最新那次；
+  2. 远端比本轮最后一次推进还旧（mtime 更小 / 不存在）→ 也是陈旧列表，`base = remote`
+     （本轮 `Noop`，下一轮用权威 baseline 收敛），**不能**拿来 `RefreshRemote` 把本地
+     元数据/内容刷回旧版；
+  3. 「远端比最后一次推进还旧」这条捷径**只在本地干净时生效**（真机事故就是
+     clean）：本地带未上传改动时退回 `base = 最新推进`，让 `(true, true)` 走
+     Conflict —— 否则别处设备「mtime 偏小的新写入」（时钟慢 / `rsync -t` /
+     备份恢复）会被 `UploadLocal` 直接覆盖，丢数据；
+  4. 其余（别处设备改的新版）→ `base = 本轮最后一次推进`（没有推进就是快照），
+     正常 `RefreshRemote`。
+
+  另有**两处复审修正**（第一版修法自己的洞）：
+  * `merge_round_baseline` 不再在第一次合并后清 `hook_touched`：一轮内 persist 会发生
+    多次（事件阶段每批一次 + 轮末一次），清掉后第二次走整份替换，用「hook 推进前
+    克隆的旧快照」把刚写上去的签名在盘上抹掉 —— 本轮内存里看着修好了，下一轮开轮
+    快照又回到旧签名，**同一个凭空冲突晚一轮重现**。现在标记只在 `begin_round`
+    复位（本轮有 hook 写入时删除/改名迁移晚一轮落盘，取舍已在 persist 文档声明）。
+  * 上传 success hook 的顺序改为**先 `note_uploaded` 再 `clear_dirty`**：反过来的话
+    中间有个窗口（local 已 clean、base 还是旧快照、覆盖表还没记），对账恰好判到
+    就是凭空 Conflict；先推进则窗口内是 `dirty=true + base=新签名` → AdoptBaseline，
+    安全。
+* **回归**：`hook_advance_during_round_prevents_phantom_conflict`（复刻真机时序：
+  旧逻辑必现 Conflict、新逻辑 Noop；并逐条锁住上面的窗口 1/2/3/4 —— 只认最新推进
+  会误判 `RefreshRemote`、陈旧列表不能回刷、**本地脏 + 远端旧钟新写入必须判
+  Conflict**、别处设备的新版必须照常刷新）、
+  `reconcile_uses_in_round_hook_advance_not_the_stale_snapshot`（穿透真
+  `reconcile_view`：不出冲突、不入待裁决队列、权威 baseline 不回退）、
+  `persist_keeps_hook_advances_across_repeated_persists_in_one_round`（同轮多次
+  persist + 重新 load 仍是 hook 的值）、
+  `begin_round_folds_previous_advances_into_snapshot_and_resets_table`（生命周期 +
+  多次推进去重）、`round_hook_advances_are_capped_per_path`（封顶）。
+
+### 10.3 冲突策略与实际不符：任务写 `ask`，实际一直按 `rename_local` 走
+
+* **症状**：`decisions` 表是空的、也没有「等待裁决」日志，但副本确实生成了 ——
+  说明生效策略不是任务里的 `ask`。
+* **根因**：冲突策略由同步引擎按 **`MountEntry.conflict`** 分派（`build_views` 直接取
+  mount 的 `conflict`，视图不读任务文件），来源有两处：
+  * 任务挂载时 `mount_task` 传的是 `t.conflict`；
+  * daemon 启动恢复时 `restore_mounts_on_start` 传的是 **`mounts.json` 里的记录值**
+    （设计上「现场优先」）。
+  而保存任务（`tasks_cmd` 的 `save`）**不回写已挂载视图、也不更新记录**。真机现场因此是：
+  任务 10-18 17:27 改成 `ask`，`mounts.json` 仍是更早的 `rename_local`；daemon 10-19
+  00:05 重启后按记录恢复 → 08:06:47 的冲突落 `match policy` 的 `_` 兜底分支
+  `rename_local_copy`，生成了副本（`08:06:46.970` 的 WARN 与 `rename_local_copy`
+  的唯一格式串逐字一致；副本上传在 `08:06:47.662`，距冲突 0.69s）。
+* **修法**：① `tasks_cmd` 保存任务后，若同路径已挂载，立刻把新策略写进
+  `MountEntry.conflict` 与 `rec.conflict` 并落盘（免重启生效、重启后不回退）；
+  ② `restore_mounts_on_start` 的**冲突策略例外**：任务表里有同名任务就用任务里的值
+  （其余挂载参数保持「现场优先」不变）——兜住「直接改任务文件 / 保存时没挂载」的情况。
+* **未改的边界**：若用户手工 `qxync mount --conflict X` 挂在一个**已登记任务**的
+  挂载点上，下次重启会按任务里的策略恢复（任务 = 意图）；不想要这个行为就先改任务。
+
+### 10.4 仍保留的相关限制（未在本次修改）
+
+* 副本名里的设备名是**本机 hostname**，不是「文件来自哪台设备」；多端同名时无法区分。
+* 编辑器临时文件（`.kate-swp` / `*.swp` 等）是否进同步由 `filter_temp` 规则决定，
+  本次未改（双写路径修好后它们不再刷错误，但仍会被当成普通文件同步一次）。
+* 共享文件夹（`root=/Public`）的事件仍映射为 `None`（`client_path_from_share` 只认
+  `/homes/<user>` 标记；旧实现同样 `None`，不是本次回归）。NAS 对共享文件夹事件发
+  `/share/Public/…` 还是 `/Public/…` 尚未实测，确认后补映射与测试。

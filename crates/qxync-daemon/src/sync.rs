@@ -33,6 +33,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// `round_hook_advances` 每路径最多保留的推进签名数（见 [`SyncState::round_hook_advances`]）。
+///
+/// 正常一轮（约 30s）一个文件也就推进几次；这个上限是给
+/// `QXNYC_POLL_INTERVAL=0`（禁用轮询 → 表永不清）兜底的，防止无界增长。
+/// 保留的是**最近**的（旧的从头丢弃）：`base_for` 关心的是「远端这次列到的
+/// 是不是我们自己传上去的某一版」，越新的越可能被列到。
+const MAX_ADVANCES_PER_PATH: usize = 16;
+
 /// 一个挂载视图（引擎的操作对象）。
 pub struct MountView {
     pub mountpoint: PathBuf,
@@ -118,6 +126,14 @@ pub struct SyncReport {
     pub global_notify: u64,
     pub events: u64,
     pub events_skipped: u64,
+    /// ★ 跳过事件的**原因分布**（`只有对账/事件两条路都说不清时才需要`）。
+    ///
+    /// 用途：事件快路径整体失效时（真机 2026-10-18：79 670 条事件 stat 全部
+    /// `status=5`，因为路径被拼成 `/home/.Qsync/.Qsync/…`），以前症状是刷屏 error；
+    /// 4/5/6 降级成 debug 之后，`events_skipped` 是唯一痕迹 —— 光看总数分不清
+    /// 「路径映射错了」还是「事件都属于别的任务 / 自己的回声」。这张表跟着
+    /// `remote_change` 的 journal 详情一起落库，事后能直接归因。
+    pub events_skipped_reasons: BTreeMap<String, u64>,
     pub refreshed: u64,
     /// ★ M9：本地有水、正在后台更新内容（baseline 等刷新落地再推进）的项数。
     pub content_updating: u64,
@@ -166,6 +182,14 @@ impl SyncReport {
         if self.errors.len() < 20 {
             self.errors.push(s);
         }
+    }
+    /// 记一条「跳过一个事件」并归类原因（见 `events_skipped_reasons`）。
+    fn skip(&mut self, reason: &'static str) {
+        self.events_skipped += 1;
+        *self
+            .events_skipped_reasons
+            .entry(reason.to_string())
+            .or_insert(0) += 1;
     }
 }
 
@@ -251,6 +275,26 @@ pub struct SyncState {
     /// 才能真正落盘）；有并发写入时退回逐条合并（宁可删除晚一轮落盘，也不能把
     /// hook 刚推进的新签名抹掉）。
     pub hook_touched: bool,
+    /// ★ 2026-10-19：本轮轮询开始后，上传 success hook **推进过的** baseline 签名
+    /// （路径 → 本轮内按时间顺序的签名列表）。判定时用它覆盖开轮快照（见 [`base_for`]）。
+    ///
+    /// 为什么需要：`poll_once` 开轮时克隆一份 baseline 快照，整轮（几十秒、要列几百个
+    /// 目录）都用它判定；而上传成功 hook 在**本轮进行中**就把权威 baseline 推进了。
+    /// 于是判某个文件时：快照里还是旧签名、远端已经是「我们自己刚传上去的新版」→
+    /// `remote != base`，节点又被 hook 的 `clear_dirty` 标干净（`dirty == false`）→
+    /// 走进 `decide` 的 `(false, true)` 分支，且本地签名 ≠ 旧 base → 判 **Conflict**。
+    /// 真机 2026-10-19 08:06 就是这样凭空生成了一个字节完全相同的冲突副本
+    /// （`防火墙配置 (conflicted copy from devhost 2026-10-19).txt`）。
+    ///
+    /// ★ 为什么是**列表**而不是单个签名：一轮 20–30 秒，用户可能保存两次（真机那轮
+    /// 08:06:23 与 08:06:44 各上传一次），而目录列举完全可能落在两次推进**之间** ——
+    /// 此时本轮 `remote_map` 里是**较早**的那版。只记最新签名会让 base 比 remote 新，
+    /// 判成 `RefreshRemote` 把本地元数据（乃至内容）刷回旧版。`base_for` 因此要求：
+    /// 远端这次列到的只要命中「快照 ∪ 本轮任一推进」就以远端为准（`rc = false`）。
+    ///
+    /// 生命周期：`begin_round` 在**取快照的同一把锁**里清空 —— 清空之前发生的推进
+    /// 已经包含在快照里，清空之后发生的推进记进本表。
+    pub round_hook_advances: BTreeMap<String, Vec<Sig>>,
 }
 
 impl SyncState {
@@ -281,7 +325,24 @@ impl SyncState {
             cursors,
             baseline,
             hook_touched: false,
+            round_hook_advances: BTreeMap::new(),
         })
+    }
+
+    /// **开轮**：取「游标 + baseline」快照，并复位本轮的两个 hook 标记。
+    ///
+    /// 三件事必须在**同一把锁**里做，否则会有竞态窗口：
+    /// * 快照 —— 本轮判定用的 baseline；
+    /// * `hook_touched = false` —— 本轮结束 `persist` 要不要退回落盘合并；
+    /// * `round_hook_advances.clear()` —— 清空「本轮 hook 推进」覆盖表。
+    ///
+    /// 清空之前发生的 hook 推进已经包含在快照里（同一个锁里先进 `note_uploaded` 才会被
+    /// 清掉）；清空之后发生的推进记进新表，`base_for` 会优先用它。
+    pub fn begin_round(&mut self) -> (Cursors, Baseline) {
+        let snapshot = (self.cursors, self.baseline.clone());
+        self.hook_touched = false;
+        self.round_hook_advances.clear();
+        snapshot
     }
 
     /// 状态库路径（诊断 / 验收用）。
@@ -314,6 +375,23 @@ impl SyncState {
             return Ok(());
         }
         self.baseline.put(path, sig);
+        // ★ 记进「本轮 hook 推进」覆盖表：正在跑的那一轮判定这个路径时，快照里还是
+        //   旧签名，必须用这里的新签名当 base，否则会凭空判成双方都改（见字段注释）。
+        //   同一签名重复推进（幂等调用）只记一次；不同签名按时间顺序追加。
+        //   每路径保留最近 [`MAX_ADVANCES_PER_PATH`] 个：正常一轮就几次，但
+        //   `QXNYC_POLL_INTERVAL=0`（禁用轮询）时上传照常推进、表永不清空，
+        //   不设上限就是无界增长。
+        let advances = self
+            .round_hook_advances
+            .entry(path.to_string())
+            .or_default();
+        if !advances.iter().any(|a| a.same_as(&sig)) {
+            advances.push(sig);
+            let overflow = advances.len().saturating_sub(MAX_ADVANCES_PER_PATH);
+            for _ in 0..overflow {
+                advances.remove(0);
+            }
+        }
         // ★ 告诉正在跑的那一轮「baseline 有并发写入」：它会退回落盘合并，
         //   不把我们刚写的签名覆盖回旧快照（见 [`persist`]）。
         self.hook_touched = true;
@@ -336,11 +414,10 @@ pub async fn poll_once(
     // ★ 克隆快照的同时复位「hook 改过 baseline」标记（同一把锁，没有竞态窗口）：
     //   本轮期间 hook 若再写，标记会重新置起，persist 就退回逐条合并。
     //   本轮之前残留的标记直接忽略 —— hook 那些写入已经包含在这份快照里了。
+    //   `begin_round` 同时清空「本轮 hook 推进」覆盖表，理由同上。
     let (mut cursors, mut baseline) = {
         let mut g = store.lock().unwrap();
-        let snapshot = (g.cursors, g.baseline.clone());
-        g.hook_touched = false;
-        snapshot
+        g.begin_round()
     };
     let mut report = SyncReport {
         baseline_entries: baseline.len(),
@@ -698,11 +775,18 @@ fn persist(store: &Mutex<SyncState>, cursors: &Cursors, baseline: &Baseline) {
 ///   刚推进的签名覆盖回旧快照（那会让连续两次保存凭空变成冲突副本）。
 ///
 /// mtime 相等时保留内存里那份：epoch 秒粒度下同秒连改两次很常见，快照没有
-/// 更权威的理由。合并完成后清掉标记，让下一次 persist 回到整份替换。
+/// 更权威的理由。
+///
+/// ★ 2026-10-19 修正：`hook_touched` **只由 `begin_round` 复位**，persist 消费后
+/// 不再清零。旧实现在第一次 merge 后清标记 → 本轮**下一次** persist 走整份替换，
+/// 用「hook 推进之前克隆的旧快照」把 hook 刚写上去的签名在盘上抹掉（事件阶段每批
+/// persist 一次 + 轮末再 persist 一次，上传落在事件阶段就必然命中）→ 本轮内存里
+/// 看起来修好了，下一轮开轮快照又回到旧签名 → **同一个凭空冲突晚一轮重现**。
+/// 代价是「本轮有 hook 写入」时删除/改名迁移晚一轮落盘 —— 注释开头已经声明
+/// 接受这个取舍（宁可晚一轮，不能回退）。
 fn merge_round_baseline(g: &mut SyncState, baseline: &Baseline, hook_touched: bool) {
     if !hook_touched {
         g.baseline = baseline.clone();
-        g.hook_touched = false;
         return;
     }
     for (p, sig) in baseline.entries.iter() {
@@ -711,8 +795,6 @@ fn merge_round_baseline(g: &mut SyncState, baseline: &Baseline, hook_touched: bo
             g.baseline.put(p.clone(), *sig);
         }
     }
-    // 合并完就把标记清掉：本轮更早的 persist 已经消费过它，后续 persist 可以整份替换。
-    g.hook_touched = false;
 }
 
 // ---------------------------------------------------------------- 事件
@@ -729,19 +811,19 @@ async fn apply_event(
 ) {
     if !ev.has_usable_path() {
         // 真机实测：删除事件的 filepath 是空的 → 只能靠对账发现
-        report.events_skipped += 1;
+        report.skip("删除事件无路径");
         return;
     }
     if let Some(uid) = &ev.device_uid {
         if cfg.own_devices.iter().any(|u| u == uid) {
-            report.events_skipped += 1;
+            report.skip("本机设备回声");
             return;
         }
     }
     // 归属校验：事件带了 user 就必须和本会话一致（报告 11 §5.3）
     if let Some(u) = &ev.user {
         if !u.is_empty() && u != user {
-            report.events_skipped += 1;
+            report.skip("非本账号");
             return;
         }
     }
@@ -754,19 +836,39 @@ async fn apply_event(
         }
         // ★ M7：被选择性同步排除的路径连事件都不看（它不在挂载点里，也没有 baseline）
         if view.hidden(&path, false).is_some() {
-            report.events_skipped += 1;
+            report.skip("被规则隐藏");
             continue;
         }
         let remote = match stat_path(client, &path).await {
             Ok(s) => s,
             Err(e) => {
-                report.error(format!("事件 stat {path} 失败: {e}"));
+                if is_not_found(&e) {
+                    // ★ 4/5/6 同时是「权限拒绝 / 会话失效」的码，**不是**硬错误：事件指向
+                    //   的路径此刻看不到就先跳过，真要删/改由下一轮对账按目录判定（对账侧
+                    //   有 stat 正向确认）。以前这里把每条都记成 error：真机 2026-10-18
+                    //   有一轮拉到 87 580 条事件，当天日志里 79 670 条 `事件 stat` 失败
+                    //   **全部**是双写路径（79 667 条 status=5）——「最近错误」被刷满，
+                    //   真正的问题反而被掩盖。
+                    //
+                    //   ⚠️ 这里**不能**顺手置 `auth_failed`：`status=5` 也是「路径不存在」
+                    //   的常规出口，给一个已删文件的 upsert 事件置 auth_failed 会让轮询
+                    //   循环每轮重登一次（`is_auth()` 把 4/5 当会话失效），真机会撞上 NAS
+                    //   的失败登录封锁。会话真失效时 `max_log` / 对账那条路会报出来。
+                    tracing::debug!("事件 stat {path} 返回不存在/不可见（{e}）→ 跳过，等对账兜底");
+                    report.skip("远端不可见(4/5/6)");
+                } else {
+                    if e.is_auth() {
+                        report.auth_failed = true;
+                    }
+                    report.error(format!("事件 stat {path} 失败: {e}"));
+                }
                 return;
             }
         };
         let local = local_sig(view, &path);
-        let base = baseline.get(&path);
-        let d = decide(&local, &base, &remote);
+        // ★ 用「开轮快照 ∪ 本轮上传 hook 推进」当 base：本轮进行中自己刚上传成功的文件，
+        //   快照里还是旧签名，直接用快照会凭空判成双方都改（真机 2026-10-19 的冲突副本）。
+        let d = decide_with_state(state_store, baseline, &path, &local, &remote);
         apply_decision(
             client,
             view,
@@ -780,7 +882,9 @@ async fn apply_event(
         .await;
         return;
     }
-    report.events_skipped += 1;
+    // 所有视图都映射不上：路径不在任何挂载根之下（别的任务 / 别人的家目录），
+    // 或者 `map_event_path` 不认识的形态。这条计数是「事件快路径是否在干活」的哨兵。
+    report.skip("不在本视图/映射失败");
 }
 
 /// `stat` 一个完整远端路径 → 签名（不存在 → `Sig::MISSING`）。
@@ -1115,8 +1219,16 @@ async fn reconcile_view(
         }
         let remote = remote_map.get(path).copied().unwrap_or(Sig::MISSING);
         let local = local_sig(view, path);
-        let base = baseline.get(path);
+        // ★ 统一走 `decide_with_state`（快照 ∪ 本轮 hook 推进当 base）：
+        //   否则「自己刚传上去的新版」会被开轮快照误判成双方都改（凭空冲突副本）。
+        //   这里单独取一次 base 只是为了 debug 日志能打出三方签名。
+        let base = base_for(state_store, baseline, path, &remote, local.dirty);
         let d = decide(&local, &base, &remote);
+        debug_assert_eq!(
+            d,
+            decide_with_state(state_store, baseline, path, &local, &remote),
+            "对账判定必须与 decide_with_state 一致（防止有人改回 baseline.get）"
+        );
         if d != Decision::Noop {
             tracing::debug!(
                 "决策 {path}: local={:?} base={base:?} remote={remote:?} → {d:?}",
@@ -1463,8 +1575,9 @@ async fn resolve_conflict(
                 }
             };
             let local2 = local_sig(view, path);
-            let base2 = baseline.get(path);
-            let d2 = decide(&local2, &base2, &r2);
+            // ★ 重判同样统一走 `decide_with_state`：这里的场景正是「在途上传刚落地」，
+            //   权威 baseline 刚被 hook 推进，用旧快照重判会二次误判成冲突。
+            let d2 = decide_with_state(state_store, baseline, path, &local2, &r2);
             if d2 != Decision::Conflict {
                 report.note(format!(
                     "{path}: 在途上传已落地/远端又变 → 冲突消解（{d2:?}）"
@@ -2097,6 +2210,88 @@ fn local_sig(view: &MountView, path: &str) -> LocalSig {
     }
 }
 
+/// 判定用的 base：**本轮上传 hook 推进过的路径**以 hook 的签名优先，否则用开轮快照。
+///
+/// 快照落后于权威 baseline 的唯一窗口就是「本轮进行中上传成功」——
+/// [`SyncState::round_hook_advances`] 里存着 hook 刚推进的签名。不用它当 base，
+/// 就会出现真机那个凭空冲突：远端是自己刚传上去的新版、base 还是开轮前的旧版、
+/// 本地已被 `clear_dirty` 标干净 → `decide` 判 `Conflict`。
+///
+/// 但有一个**反向**的窗口必须让快照赢：本轮列目录可能发生在上传落地**之前**
+/// （`remote_map` 是本轮列举结果快照），这时 `remote == 开轮快照里的旧签名`，
+/// 若仍用 hook 的新签名当 base，`(lc=false, rc=true)` 会判 `RefreshRemote` 把本地
+/// 元数据刷新回**旧版**（内容其实已经是新版）—— 所以「远端这次列到的就是快照里的
+/// 那一版」时以快照为准，`Noop`，下一轮再按权威 baseline 收敛。
+///
+/// ⚠️ `snapshot` 实参是**本轮可变的 baseline 工作副本**（轮内决策会 `put`，如改名迁移 /
+/// AdoptBaseline / RefreshRemote 落地），不是冻结的开轮快照。同一路径每轮只判一次，
+/// 所以对本函数语义等价；但它不是「历史快照」，别拿它当跨路径/跨时点的一致性基准。
+///
+/// `local_dirty`：本地节点此刻是否带未上传改动。**「远端比本轮最后一次推进还旧」
+/// 这条捷径只在本地干净时才允许**（真机事故正是 clean 场景）：本地一脏，`base=remote`
+/// 会把 `decide` 推进 `(lc=true, rc=false) => UploadLocal` —— 别处设备写回的旧版
+/// （时钟偏斜 / `rsync -t` / 备份恢复都会造成 mtime 偏小的**新写入**）会被本地覆盖，
+/// 既不生成冲突副本也不进待裁决队列，是丢数据。脏时退回 `last` 当 base，让
+/// `(true, true)` 走 Conflict 把双方都保下来。
+fn base_for(
+    state_store: &Mutex<SyncState>,
+    snapshot: &Baseline,
+    path: &str,
+    remote: &Sig,
+    local_dirty: bool,
+) -> Sig {
+    let snap = snapshot.get(path);
+    let g = state_store.lock().unwrap();
+    let Some(advances) = g.round_hook_advances.get(path) else {
+        return snap;
+    };
+    // 远端这次列到的就是「开轮快照」或「本轮我们自己传上去的某一版」→ 用它当 base：
+    // `rc = false`，剩下的只看本地脏不脏。列举可能发生在本轮多次上传之间的任意时刻，
+    // 所以这里要匹配**整张列表**，不能只比最新那次（否则会把较早的 in-round 版本
+    // 判成 `RefreshRemote`，把本地元数据/内容刷回旧版）。
+    if snap.same_as(remote) || advances.iter().any(|a| a.same_as(remote)) {
+        return *remote;
+    }
+    let last = match advances.last() {
+        Some(sig) => *sig,
+        None => return snap,
+    };
+    // 列举比「我们本轮最后一次推进」还旧（mtime 更小），说明 `remote_map` 是在那次
+    // 上传落地之前列的（别处设备的版本或旧版快照都可能这样进来）—— 拿它刷新本地同样
+    // 是回刷旧版，本轮 Noop，下一轮用权威 baseline 收敛。
+    //
+    // ★ 但这条捷径**只在本地干净时成立**（Noop 的前提就是 local 没有要保的改动）；
+    //   本地脏时必须退回 `last`，把判定交给 `(lc=true, rc=true)` 的 Conflict ——
+    //   「mtime 更小的远端」也可能是别处设备**刚写**的旧钟版本，覆盖它就是丢数据。
+    if !local_dirty
+        && !remote.is_dir
+        && !last.is_dir
+        && (!remote.exists || remote.mtime <= last.mtime)
+    {
+        return *remote;
+    }
+    last
+}
+
+/// `decide` + 「本轮 hook 推进覆盖开轮快照」的统一入口。
+///
+/// 对账、事件、冲突重判**都必须**走这里，不要直接 `decide(local, snapshot.get(path), remote)`
+/// —— 三个调用点（`apply_event` / `reconcile_view` / `resolve_conflict` 重判）共用
+/// 同一套 base 规则，任何一处绕开都会重新引入「快照 vs 权威 baseline」的时序分叉。
+fn decide_with_state(
+    state_store: &Mutex<SyncState>,
+    snapshot: &Baseline,
+    path: &str,
+    local: &LocalSig,
+    remote: &Sig,
+) -> Decision {
+    decide(
+        local,
+        &base_for(state_store, snapshot, path, remote, local.dirty),
+        remote,
+    )
+}
+
 /// 服务端「这个路径看不到 / 不存在」的 status：4（权限拒绝）、5（路径不存在/无权限）、
 /// 6（不存在）。**它只是候选**，不能单独当删除依据 —— 4/5 同时用于「会话失效」，所以
 /// 调用方必须再用 `stat` 正向确认 `exist=0` 才允许按「远端已删」处理（见 `reconcile_view`）。
@@ -2542,6 +2737,222 @@ mod tests {
         );
     }
 
+    /// ★ 回归（真机 2026-10-19 08:06 的凭空冲突副本）：
+    /// **一轮进行中**上传成功、hook 把 baseline 推进到新签名，而本轮判定还拿着开轮快照。
+    ///
+    /// 真实时序（`防火墙配置.txt`，12218 字节，任务 `root=/home/.Qsync`；时间取自
+    /// 10-19 daemon 日志 + sync.db 的 baseline）：
+    ///   08:05:56.2  上传 12218 落地 → hook 推进 base=(12218, 1792368356)〔推断：DB 无历史〕
+    ///   08:06:21.7  开轮：快照 base = (12218, 1792368356)〔推断〕
+    ///   08:06:23.6  本轮内再保存 → 上传落地 → hook 推进〔实测有这次上传，签名推断〕
+    ///   08:06:44.6  本轮内再保存 → 上传落地 → hook 推进 (12218, 1792368403)〔实测：DB 终值〕
+    ///   08:06:46.9  reconcile 判这个文件：快照 base 还是旧的、远端是刚落的新版、
+    ///               本地已干净 → `remote != base`、`local != base` → **Conflict**
+    ///
+    /// 修法：判定用 `base_for`（快照 ∪ 本轮 hook 推进的**全部**签名），不应再用纯快照。
+    #[test]
+    fn hook_advance_during_round_prevents_phantom_conflict() {
+        let d = tmpdir("round-hook-advance");
+        let path = "/home/.Qsync/2026/28-比赛项目/01配置备份/防火墙配置.txt";
+        let store = Mutex::new(SyncState::load(&d).unwrap());
+        // 开轮前最后一次推进（实测 DB 终值之前的版本；具体 mtime 是推断值）
+        let snap_base = Sig::file(12218, 1792368356);
+        // 本轮两次保存各自的落点：a2 = DB 实测终值（1792368403 = 08:06:43）；
+        // a1 是**合成值**，只用来构造「列举落在两次推进之间」这个窗口
+        // （真机那次 remote 到底是哪一版无法从日志反推，日志只证明 08:06:23 有上传）。
+        let a1 = Sig::file(12218, 1792368381);
+        let a2 = Sig::file(12218, 1792368403);
+
+        // 开轮：快照里是上一版的合法 base
+        {
+            let mut g = store.lock().unwrap();
+            g.baseline.put(path, snap_base);
+            g.save_all().unwrap();
+        }
+        let snapshot = {
+            let g = store.lock().unwrap();
+            g.baseline.clone()
+        };
+
+        // 本轮进行中：两次上传成功 → hook 推进权威 baseline（并记进本轮覆盖表）
+        {
+            let mut g = store.lock().unwrap();
+            g.note_uploaded(path, a1.size, a1.mtime).unwrap();
+            g.note_uploaded(path, a2.size, a2.mtime).unwrap();
+        }
+
+        // 本地节点此刻是最后一次上传的版本、dirty 已被 hook 清掉
+        let local = LocalSig {
+            sig: a2,
+            dirty: false,
+        };
+
+        // ---- ① 远端列表看到最新那版（列举在第二次上传之后）
+        assert_eq!(
+            decide_with_state(&store, &snapshot, path, &local, &a2),
+            Decision::Noop,
+            "本轮 hook 已推进到 (12218, {}) 时不能再判冲突",
+            a2.mtime
+        );
+        // 对照：只拿开轮快照判（修复前的行为）就是那次真机冲突
+        assert_eq!(
+            decide(&local, &snapshot.get(path), &a2),
+            Decision::Conflict,
+            "旧快照 + 自己刚上传落地的新版 = 凭空冲突副本"
+        );
+
+        // ---- ② 远端列表看到**较早**的那次本轮上传（列举落在两次上传之间）
+        assert_eq!(
+            decide_with_state(&store, &snapshot, path, &local, &a1),
+            Decision::Noop,
+            "远端是本轮自己传过的某一版 → rc 必须为 false（不能回刷）"
+        );
+        // 对照：只认「最新一次推进」当 base 就会 RefreshRemote，把本地刷回 a1
+        assert_eq!(decide(&local, &a2, &a1), Decision::RefreshRemote);
+
+        // ---- ③ 远端列表还停在开轮前的快照（列举早于本轮第一次上传落地）
+        assert_eq!(
+            decide_with_state(&store, &snapshot, path, &local, &snap_base),
+            Decision::Noop,
+            "列举早于上传落地 → 本轮 Noop，下一轮按权威 baseline 收敛"
+        );
+        assert_eq!(decide(&local, &a2, &snap_base), Decision::RefreshRemote);
+
+        // ---- ④ 远端列表比「本轮最后一次推进」还旧（别处设备写回旧版 / 陈旧列表）
+        let older = Sig::file(12218, 1792368340);
+        assert_eq!(
+            decide_with_state(&store, &snapshot, path, &local, &older),
+            Decision::Noop,
+            "比本轮推进还旧的远端版本不能拿来刷新本地"
+        );
+        assert_eq!(decide(&local, &a2, &older), Decision::RefreshRemote);
+
+        // ---- ⑤ 远端确实是别的设备改的新版（mtime 更新）→ 正常刷新
+        let other = Sig::file(12218, 1792368500);
+        assert_eq!(
+            decide_with_state(&store, &snapshot, path, &local, &other),
+            Decision::RefreshRemote,
+            "别处设备的新版本必须照常刷新"
+        );
+
+        // ---- ⑥ ★ 复审补的丢数据用例：本地**脏** + 远端是「mtime 偏小的新写入」
+        //   （别处设备时钟慢 / `rsync -t` / 备份恢复）。这条捷径若不限制
+        //   `local_dirty`，base=older → `(lc=true, rc=false)` → UploadLocal，
+        //   本地直接覆盖别处设备的写入、不出冲突副本 —— 丢数据。
+        //   期望：退回 last 当 base → `(true, true)` → Conflict（双方都保留）。
+        let dirty_local = LocalSig {
+            sig: Sig::file(12218, 1792368410),
+            dirty: true,
+        };
+        assert_eq!(
+            decide_with_state(&store, &snapshot, path, &dirty_local, &older),
+            Decision::Conflict,
+            "本地脏 + 远端旧钟新写入 → 必须判冲突，不能 UploadLocal 覆盖"
+        );
+        // 对照：本地干净时同一条 remote 仍走 Noop（④ 已锁），说明限制条件只收窄了
+        // dirty 场景、没有破坏真机事故（clean）的修复。
+        assert_eq!(
+            decide_with_state(&store, &snapshot, path, &local, &older),
+            Decision::Noop
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `begin_round` 的生命周期：**清空**本轮覆盖表，但上一轮的推进已经折进快照。
+    ///
+    /// 竞态窗口由「同一把锁」消除：清空前发生的推进在快照里可见；清空后发生的推进
+    /// 记进新表，`base_for` 优先用它。列表语义也在这里一起锁住：同一轮多次推进
+    /// 按顺序保留、同一签名去重。
+    #[test]
+    fn begin_round_folds_previous_advances_into_snapshot_and_resets_table() {
+        let d = tmpdir("begin-round");
+        let path = "/home/a.txt";
+        let store = Mutex::new(SyncState::load(&d).unwrap());
+        let v1 = Sig::file(1, 100);
+        let v2 = Sig::file(2, 200);
+        let v3 = Sig::file(3, 300);
+        let v4 = Sig::file(4, 400);
+        {
+            let mut g = store.lock().unwrap();
+            g.baseline.put(path, v1);
+        }
+        // 上一轮进行中 hook 推进 v2（还留在覆盖表里）
+        store
+            .lock()
+            .unwrap()
+            .note_uploaded(path, v2.size, v2.mtime)
+            .unwrap();
+
+        let (_, snapshot) = store.lock().unwrap().begin_round();
+        assert!(
+            store.lock().unwrap().round_hook_advances.is_empty(),
+            "开轮必须清空覆盖表"
+        );
+        assert_eq!(snapshot.get(path), v2, "上一轮的推进已经折进快照");
+        assert_eq!(base_for(&store, &snapshot, path, &v2, false), v2);
+
+        // 本轮进行中又推进 v3、v4（v3 重复调用幂等）→ 列表按顺序保留
+        {
+            let mut g = store.lock().unwrap();
+            g.note_uploaded(path, v3.size, v3.mtime).unwrap();
+            // 第二次推 v3：baseline 已等于它 → `note_uploaded` 的幂等早退分支，
+            // 连覆盖表都不进（早退 = 这次没有推进，v3 已在表里）。
+            g.note_uploaded(path, v3.size, v3.mtime).unwrap();
+            g.note_uploaded(path, v4.size, v4.mtime).unwrap();
+            // 再推一次 v3（非最新）：走 Vec 的去重分支（`any(same_as)` 命中），
+            // 不追加 —— 这是「同一签名去重」真正生效的唯一路径。
+            g.note_uploaded(path, v3.size, v3.mtime).unwrap();
+            assert_eq!(
+                g.round_hook_advances.get(path).map(Vec::len),
+                Some(2),
+                "同一签名去重（幂等早退 + Vec 去重两条路都不多记）"
+            );
+        }
+        // 远端列到 v3（两次推进之间）→ base=v3；列到 v4 → base=v4
+        assert_eq!(base_for(&store, &snapshot, path, &v3, false), v3);
+        assert_eq!(base_for(&store, &snapshot, path, &v4, false), v4);
+        // 没被推进过的路径仍然用快照
+        assert_eq!(
+            base_for(&store, &snapshot, "/home/other.txt", &Sig::MISSING, false),
+            Sig::MISSING
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `MAX_ADVANCES_PER_PATH`：`QXNYC_POLL_INTERVAL=0`（禁用轮询 → 覆盖表永不清空）
+    /// 时每路径的推进列表不能无界增长 —— 超过上限丢**最旧**的，最新的（最可能被
+    /// 下一轮列举看到）保留。
+    #[test]
+    fn round_hook_advances_are_capped_per_path() {
+        let d = tmpdir("advances-cap");
+        let mut st = SyncState::load(&d).unwrap();
+        let path = "/home/a.txt";
+        for i in 0..(MAX_ADVANCES_PER_PATH + 8) {
+            st.note_uploaded(path, 10 + i as u64, 1000 + i as i64)
+                .unwrap();
+        }
+        let advances = st.round_hook_advances.get(path).unwrap();
+        assert_eq!(
+            advances.len(),
+            MAX_ADVANCES_PER_PATH,
+            "每路径推进列表必须封顶"
+        );
+        assert_eq!(
+            advances.last(),
+            Some(&Sig::file(
+                10 + (MAX_ADVANCES_PER_PATH + 7) as u64,
+                1000 + (MAX_ADVANCES_PER_PATH + 7) as i64
+            )),
+            "最新的推进必须保留"
+        );
+        assert_eq!(
+            advances.first(),
+            Some(&Sig::file(10 + 8_u64, 1008)),
+            "超限丢的是最旧的"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     /// `note_uploaded` 幂等：同一签名重复推进不报错、不变状态。
     #[test]
     fn note_uploaded_is_idempotent() {
@@ -2586,6 +2997,47 @@ mod tests {
             st.baseline.get(path),
             Sig::file(90, 2000),
             "落盘旧快照不能把 hook 刚推进的签名倒退回去"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// ★ 回归（2026-10-19 复审发现的「晚一轮重现」）：一轮里 persist 会发生**多次**
+    /// （事件阶段每批一次 + 轮末一次）。旧实现第一次 merge 后把 `hook_touched` 清零，
+    /// 第二次 persist 就走整份替换，用「hook 推进之前克隆的旧快照」把 hook 刚写上去的
+    /// 签名在盘上抹掉 —— 本轮内存里看着修好了，下一轮开轮快照又回到旧签名，
+    /// 同一个凭空冲突晚一轮重现。
+    ///
+    /// 期望：同一轮内**任意多次** persist 都不能让签名回退；重新 load 后仍是 hook 的值。
+    #[test]
+    fn persist_keeps_hook_advances_across_repeated_persists_in_one_round() {
+        let d = tmpdir("persist-twice");
+        let mut st = SyncState::load(&d).unwrap();
+        let path = "/home/a.txt";
+
+        // 开轮快照（陈旧）+ 权威 baseline 同步播种
+        let mut snapshot = st.baseline.clone();
+        snapshot.put(path, Sig::file(100, 1000));
+        st.baseline.put(path, Sig::file(100, 1000));
+
+        // 本轮进行中：上传成功 → hook 推进（并置起 hook_touched）
+        st.note_uploaded(path, 90, 2000).unwrap();
+
+        // ① 事件阶段的 persist（merge 模式）
+        persist_test(&mut st, &snapshot);
+        // ② 轮末的 persist —— 旧实现这里 hook_touched 已被 ① 清零 → 整份替换 → 回退
+        persist_test(&mut st, &snapshot);
+        assert_eq!(
+            st.baseline.get(path),
+            Sig::file(90, 2000),
+            "同一轮第二次 persist 不能把 hook 推进抹回去"
+        );
+        // ③ 盘上也要是 hook 的值：下一轮开轮快照才不会回到旧签名
+        st.save_all().unwrap();
+        let re = SyncState::load(&d).unwrap();
+        assert_eq!(
+            re.baseline.get(path),
+            Sig::file(90, 2000),
+            "★ 重新 load 后必须仍是 hook 推进的签名（否则冲突晚一轮重现）"
         );
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -3356,8 +3808,9 @@ mod tests {
         soft_fail: BTreeSet<String>,
         /// `get_list` 这些路径 → JSON `status`（模拟 QTS 的 4/5/6 错误出口）
         force_status: BTreeMap<String, i64>,
-        /// `stat` 认为存在的完整路径；不在集合里 → 占位条目 `exist=0`
-        existing: BTreeSet<String>,
+        /// `stat` 认为存在的完整路径 → 返回的条目（文件/目录、大小、mtime 由用例定）；
+        /// 不在表里 → 占位条目 `exist=0`
+        existing_entries: BTreeMap<String, qxync_core::DirEntry>,
         /// `stat` 这些完整路径 → HTTP 500
         stat_fail: BTreeSet<String>,
         /// `stat` 这些完整路径 → JSON `status`
@@ -3401,7 +3854,7 @@ mod tests {
             fail,
             soft_fail,
             force_status,
-            existing,
+            existing_entries,
             stat_fail,
             stat_status,
         } = spec;
@@ -3413,7 +3866,7 @@ mod tests {
         let fail = Arc::new(fail);
         let soft_fail = Arc::new(soft_fail);
         let force_status = Arc::new(force_status);
-        let existing = Arc::new(existing);
+        let existing_entries = Arc::new(existing_entries);
         let stat_fail = Arc::new(stat_fail);
         let stat_status = Arc::new(stat_status);
         let handle = tokio::spawn(async move {
@@ -3426,7 +3879,7 @@ mod tests {
                 let fail = fail.clone();
                 let soft_fail = soft_fail.clone();
                 let force_status = force_status.clone();
-                let existing = existing.clone();
+                let existing_entries = existing_entries.clone();
                 let stat_fail = stat_fail.clone();
                 let stat_status = stat_status.clone();
                 tokio::spawn(async move {
@@ -3455,6 +3908,8 @@ mod tests {
                         let parent = params.get("path").cloned().unwrap_or_default();
                         let name = params.get("file_name").cloned().unwrap_or_default();
                         let full = format!("{parent}/{name}");
+                        // `stat:` 前缀只用于事件路径回归断言（列目录的断言只比对目录本身）。
+                        seen.lock().unwrap().push(format!("stat:{full}"));
                         if stat_fail.contains(&full) {
                             (
                                 "500 Internal Server Error",
@@ -3465,8 +3920,7 @@ mod tests {
                                 "200 OK",
                                 serde_json::json!({"status": status, "msg": "forced"}).to_string(),
                             )
-                        } else if existing.contains(&full) {
-                            let entry = qxync_core::DirEntry::local(name, true, 0, 0);
+                        } else if let Some(entry) = existing_entries.get(&full) {
                             (
                                 "200 OK",
                                 serde_json::json!({
@@ -3548,6 +4002,221 @@ mod tests {
             i += 1;
         }
         String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// ★ 端到端回归（真 `Client` + 真 HTTP + mock NAS）：任务选的 NAS 文件夹是**家目录的
+    /// 子目录**（真机 `root=/home/.Qsync`，NAS 上 `~/.Qsync`）时，事件里的真实路径
+    /// `/share/homes/<user>/.Qsync/…` 必须映射成**一个**前缀的客户端路径再去 stat。
+    ///
+    /// 旧实现会拼出 `/home/.Qsync/.Qsync/…` → 真机每条事件 `status=5`（事件快路径失效）。
+    /// 同时回归「事件 stat 的 4/5/6 不再记成硬错误」：指向看不到的路径时只跳过、交对账兜底。
+    #[tokio::test]
+    async fn apply_event_stats_single_prefixed_path_for_home_subdir_view() {
+        let home_view = "/home/.Qsync";
+        let path = "/home/.Qsync/2026/28-比赛项目/01配置备份/防火墙配置.txt";
+        let ghost = "/home/.Qsync/2026/已删除.txt";
+        let (host, port, seen, _srv) = spawn_nas_server(MockNasSpec {
+            // ★ stat 必须回**文件**条目（12218 / 1792368403）：旧 mock 一律回目录条目，
+            //   「三方一致 → Noop」实际测成的是 RefreshRemote（节点被改成目录）。
+            existing_entries: [(
+                path.to_string(),
+                qxync_core::DirEntry::local(
+                    path.rsplit('/').next().unwrap_or(""),
+                    false,
+                    12218,
+                    1792368403,
+                ),
+            )]
+            .into_iter()
+            .collect(),
+            // 这个路径「看不到」：QTS 用 5（路径不存在 / 无权限）表达
+            stat_status: [(ghost.to_string(), 5)].into_iter().collect(),
+            ..Default::default()
+        })
+        .await;
+
+        let work = tmpdir("event-path-subdir");
+        let view = FakeLocal::new(home_view, work.join("stash"));
+        view.add_file(path, 12218, 1792368403, false, None);
+        let mv = mount_view(view.clone(), home_view, "/tmp/event-path-subdir");
+        let store = Mutex::new(SyncState::load(work.join("state")).unwrap());
+        let mut baseline = Baseline::default();
+        baseline.put(path, Sig::file(12218, 1792368403));
+        let cfg = SyncConfig::default();
+        let client = client_for(&host, port);
+        let mk_event = |filepath: &str| qxync_core::sync::SyncEvent {
+            log_id: 1,
+            action: qxync_core::sync::ACTION_UPSERT_FILE,
+            isfolder: 2,
+            filepath: filepath.to_string(),
+            old_filepath: String::new(),
+            exist: true,
+            mtime: 1792368403,
+            size: 12218,
+            device: Some("win-pc".into()),
+            device_uid: None,
+            user: Some("test1".into()),
+        };
+
+        // ---- ① 正常事件：路径映射正确、三方一致 → Noop，且请求里是单前缀路径
+        let mut r1 = SyncReport::default();
+        let ev = mk_event("/share/homes/test1/.Qsync/2026/28-比赛项目/01配置备份/防火墙配置.txt");
+        apply_event(
+            &client,
+            std::slice::from_ref(&mv),
+            &ev,
+            &cfg,
+            "test1",
+            &mut baseline,
+            &mut r1,
+            &store,
+        )
+        .await;
+        assert!(r1.errors.is_empty(), "不该有错误: {:?}", r1.errors);
+        assert_eq!(
+            r1.refreshed + r1.conflicts + r1.uploaded + r1.content_updating,
+            0,
+            "三方一致（local=base=remote）必须是 Noop，不能刷新/冲突/上传: {r1:?}"
+        );
+        // 节点仍是文件、签名没被动过（旧 mock 回目录条目时这里会被改成目录）
+        let node = view.node(path).expect("节点还在");
+        assert!(!node.is_dir, "stat 回文件条目，节点不能被改成目录");
+        assert_eq!((node.size, node.mtime), (12218, 1792368403));
+        let asked = seen.lock().unwrap().clone();
+        assert!(
+            asked.iter().any(|p| p == &format!("stat:{path}")),
+            "必须按客户端路径（单前缀）stat，实际请求: {asked:?}"
+        );
+        assert!(
+            !asked.iter().any(|p| p.contains("/.Qsync/.Qsync/")),
+            "★ 绝不能再出现双写路径（真机 status=5 的根因）: {asked:?}"
+        );
+
+        // ---- ② 事件指向「看不到」的路径：跳过、不记错误（旧实现会刷一条 error）
+        let mut r2 = SyncReport::default();
+        let ev2 = mk_event("/share/homes/test1/.Qsync/2026/已删除.txt");
+        apply_event(
+            &client,
+            std::slice::from_ref(&mv),
+            &ev2,
+            &cfg,
+            "test1",
+            &mut baseline,
+            &mut r2,
+            &store,
+        )
+        .await;
+        assert_eq!(r2.events_skipped, 1, "看不到的路径只跳过: {r2:?}");
+        assert_eq!(
+            r2.events_skipped_reasons.get("远端不可见(4/5/6)"),
+            Some(&1),
+            "跳过必须归因到 4/5/6（journal 的 remote_change 详情靠它）: {:?}",
+            r2.events_skipped_reasons
+        );
+        assert!(
+            r2.errors.is_empty(),
+            "4/5/6 不该记成硬错误（交对账兜底）: {:?}",
+            r2.errors
+        );
+        assert!(
+            !r2.auth_failed,
+            "status=5 是「路径不存在」的常规出口，不能因此重登（否则真机撞失败登录封锁）"
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// ★ 复审要求的「穿透 reconcile_view」回归：hook 在**本轮进行中**推进 baseline
+    /// （真机 08:06 的事发形态），对账判定必须用「快照 ∪ 本轮推进」—— 只测纯函数
+    /// `decide_with_state` 守不住三个调用点，这里直接跑真 `reconcile_view`。
+    ///
+    /// 时序：开轮快照 base=旧版 → 本轮内上传落地（hook 推进 + 清 dirty）→
+    /// 远端列举看到新版 → 旧逻辑判 Conflict（rename_local 出副本 / ask 入队）。
+    /// 期望：Noop —— 不出冲突、不进待裁决队列、baseline 不被旧快照回退。
+    #[tokio::test]
+    async fn reconcile_uses_in_round_hook_advance_not_the_stale_snapshot() {
+        use qxync_core::DirEntry;
+        let home = "/home/.Qsync";
+        let path = "/home/.Qsync/2026/28-比赛项目/01配置备份/防火墙配置.txt";
+        let old = Sig::file(12218, 1792368356);
+        let new = Sig::file(12218, 1792368403);
+
+        // mock NAS：根下就这一个文件，且就是新版
+        let listings: BTreeMap<String, Vec<DirEntry>> = BTreeMap::from([
+            (home.to_string(), vec![DirEntry::local("2026", true, 0, 0)]),
+            (
+                "/home/.Qsync/2026".to_string(),
+                vec![DirEntry::local("28-比赛项目", true, 0, 0)],
+            ),
+            (
+                "/home/.Qsync/2026/28-比赛项目".to_string(),
+                vec![DirEntry::local("01配置备份", true, 0, 0)],
+            ),
+            (
+                "/home/.Qsync/2026/28-比赛项目/01配置备份".to_string(),
+                vec![DirEntry::local(
+                    "防火墙配置.txt",
+                    false,
+                    new.size,
+                    new.mtime,
+                )],
+            ),
+        ]);
+        let (host, port, _seen, _srv) = spawn_listing_server(listings, BTreeSet::new()).await;
+
+        let work = tmpdir("reconcile-hook-advance");
+        let view = FakeLocal::new(home, work.join("stash"));
+        // 本地节点 = 新版、干净（hook 的 clear_dirty 已跑过）
+        view.add_file(path, new.size, new.mtime, false, None);
+        let store = Mutex::new(SyncState::load(work.join("state")).unwrap());
+
+        // 开轮：快照里还是旧版（真机 08:06:21 的形态）
+        let mut baseline = Baseline::default();
+        baseline.put(path, old);
+        {
+            let mut g = store.lock().unwrap();
+            g.baseline.put(path, old);
+            g.save_all().unwrap();
+        }
+        // 本轮进行中：上传落地 → hook 推进权威 baseline + 记进覆盖表
+        store
+            .lock()
+            .unwrap()
+            .note_uploaded(path, new.size, new.mtime)
+            .unwrap();
+
+        let mv = mount_view(view.clone(), home, "/tmp/reconcile-hook-advance");
+        let client = client_for(&host, port);
+        let cfg = SyncConfig::default();
+        let mut report = SyncReport::default();
+        reconcile_view(&client, &mv, &cfg, &mut baseline, &mut report, &store).await;
+
+        assert_eq!(
+            report.conflicts, 0,
+            "本轮 hook 已推进到刚落地的签名 → 对账必须 Noop，不能凭空冲突: {report:?}"
+        );
+        assert_eq!(
+            report.refreshed + report.uploaded + report.content_updating,
+            0,
+            "也不能刷新/上传（三方一致）: {report:?}"
+        );
+        // 待裁决队列为空（ask 策略下旧 bug 会入队；这里 mount_view 用默认 rename_local，
+        // 旧 bug 会直接出副本 —— 两种策略都不该发生，用 decisions 表兜底断言）
+        {
+            let g = store.lock().unwrap();
+            let rows = g.store.decisions().unwrap_or_default();
+            assert!(
+                rows.iter().all(|r| r.path != path),
+                "不能因为这个路径入待裁决队列: {rows:?}"
+            );
+        }
+        // 权威 baseline 仍是 hook 的值（reconcile 不写权威副本；轮末 persist 由
+        // poll_once 负责，且 P1-1 修复后 merge 不会把它抹回旧快照 —— 见
+        // `persist_keeps_hook_advances_across_repeated_persists_in_one_round`）。
+        assert_eq!(store.lock().unwrap().baseline.get(path), new);
+        // 判定用的 baseline 工作副本：Noop 路径不 put，仍是开轮的旧值 —— 这是
+        // 预期行为（下一轮 begin_round 会用权威值重新克隆），不是污染。
+        assert_eq!(baseline.get(path), old);
+        let _ = std::fs::remove_dir_all(&work);
     }
 
     /// ★ 真机症状的回归：228 个目录 > 单轮上限 200。
@@ -3738,12 +4407,15 @@ mod tests {
         let mut force: BTreeMap<String, i64> = BTreeMap::new();
         force.insert(sec.clone(), 5);
         force.insert(gone.clone(), 6);
-        let mut existing: BTreeSet<String> = BTreeSet::new();
-        existing.insert(sec.clone());
+        let mut existing: BTreeMap<String, qxync_core::DirEntry> = BTreeMap::new();
+        existing.insert(
+            sec.clone(),
+            qxync_core::DirEntry::local(sec.rsplit('/').next().unwrap_or(""), true, 0, 0),
+        );
         let (host, port, _seen, srv) = spawn_nas_server(MockNasSpec {
             listings,
             force_status: force,
-            existing,
+            existing_entries: existing,
             ..Default::default()
         })
         .await;
@@ -3844,12 +4516,15 @@ mod tests {
         // list(hidden) 回 status 5（存在但不可见）；stat(hidden) 说存在
         let mut force: BTreeMap<String, i64> = BTreeMap::new();
         force.insert(hidden.clone(), 5);
-        let mut existing: BTreeSet<String> = BTreeSet::new();
-        existing.insert(hidden.clone());
+        let mut existing: BTreeMap<String, qxync_core::DirEntry> = BTreeMap::new();
+        existing.insert(
+            hidden.clone(),
+            qxync_core::DirEntry::local(hidden.rsplit('/').next().unwrap_or(""), true, 0, 0),
+        );
         let (host, port, _seen, srv) = spawn_nas_server(MockNasSpec {
             listings,
             force_status: force,
-            existing,
+            existing_entries: existing,
             ..Default::default()
         })
         .await;

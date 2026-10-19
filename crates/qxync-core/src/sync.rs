@@ -202,38 +202,47 @@ fn as_u64(v: &serde_json::Value) -> Option<u64> {
 /// 真实路径 → **这个挂载视图**的远端路径。
 ///
 /// 真机事件里是 `/share/homes/<user>/qxync-test/a.txt`（NAS 侧真实路径），而挂载视图用的是
-/// Qsync 命名空间的路径（家目录挂载就是 `/home`，共享文件夹挂载就是 `/Public`…）。
+/// Qsync 命名空间的路径：家目录在协议里固定叫 [`crate::HOME_ROOT`]（`/home`），
+/// 共享文件夹则是它自己的名字（`/Public`…）。⚠️ 事件 `filepath` 里出现的
+/// `/share/Public/…` 这类共享真实路径**映射不了**（`client_path_from_share` 只认
+/// `/homes/<user>` 标记）→ 返回 `None` 交对账兜底，与 M6 §7 的已知限制一致。
 /// 已经是视图内路径的原样通过；别的用户 / 归属不明的路径一律丢弃 —— 报告 11 §5.3 明确要求
 /// 校验归属，避免处理他人的事件。
 ///
 /// `view_root` 是**调用方的挂载根**（`MountView::remote_root`），不是「家目录」：
-/// 挂 `/Public` 时就传 `/Public`。
+/// 挂 `/Public` 时就传 `/Public`，挂 `~/.Qsync` 时就传 `/home/.Qsync`。
+///
+/// ★ 2026-10-19 修正（真机 bug）：旧实现是「剥掉 `/share/homes/<user>` 后，把剩下的
+/// 部分直接拼到 `view_root` 后面」。视图根**就是**家目录（`/home`）时这个巧合恰好成立；
+/// 但视图根是家目录的**子目录**时（真机任务 `root=/home/.Qsync`，对应 NAS 的 `~/.Qsync`），
+/// 剩下的部分本身就以 `/.Qsync` 开头 → 拼出 `/home/.Qsync/.Qsync/2026/…`
+/// （`.Qsync` 两遍），每个事件都 `status=5 路径不存在`，事件快路径整体失效
+/// （真机 journal：2026-10-18 单轮 87 580 条事件，剩下的几乎全砸在这个错上）。
+/// 现在先按 [`crate::roots::client_path_from_share`] 换算到客户端命名空间
+/// （前缀恒为 [`crate::HOME_ROOT`]），再要求结果落在本视图根之下 —— 不属于这个视图的
+/// 事件（别的任务 / 家目录其它子树）返回 `None`，交给对账兜底。
 pub fn map_event_path(real: &str, user: &str, view_root: &str) -> Option<String> {
     let real = real.trim();
     if real.is_empty() {
         return None;
     }
     let view_root = view_root.trim_end_matches('/');
-    if let Some(rest) = real.strip_prefix(view_root) {
-        // 视图根自身或它下面；注意别把 /homebrew 当成 /home
-        if rest.is_empty() || rest.starts_with('/') {
-            return Some(if rest.is_empty() {
-                view_root.to_string()
-            } else {
-                format!("{view_root}{rest}")
-            });
-        }
+    // 视图根自身或它下面；注意别把 /homebrew 当成 /home
+    let in_view = |p: &str| p == view_root || p.starts_with(&format!("{view_root}/"));
+    // ① 事件本来就给的是客户端路径（个别固件 / 我们自己写的 log）：落在视图内就原样用。
+    if in_view(real) {
+        return Some(real.to_string());
     }
-    let user_home = format!("/share/homes/{user}");
-    if let Some(rest) = real.strip_prefix(&user_home) {
-        if rest.is_empty() {
-            return Some(view_root.to_string());
-        }
-        if rest.starts_with('/') {
-            return Some(format!("{view_root}{rest}"));
-        }
+    // ② NAS 共享真实路径 → 客户端路径（`/share/homes/<user>/x` ⇒ `/home/x`），
+    //    再按视图根收窄。`client_path_from_share` 同时认卷内 `realpath` 形态与
+    //    `/homes/<user>` 短形态，并拒绝「别人家目录」，这里不另造一套前缀逻辑。
+    let client = crate::roots::client_path_from_share(real, None, crate::HOME_ROOT, user)?;
+    let client = client.trim_end_matches('/');
+    if in_view(client) {
+        Some(client.to_string())
+    } else {
+        None
     }
-    None
 }
 
 // ---------------------------------------------------------------- 三向比较
@@ -888,6 +897,75 @@ mod tests {
         );
         assert_eq!(map_event_path("/homebrew/a.txt", "test1", "/home"), None);
         assert_eq!(map_event_path("", "test1", "/home"), None);
+    }
+
+    /// ★ 回归（2026-10-19 真机）：视图根是**家目录的子目录**时不能把该子目录拼两遍。
+    ///
+    /// 真机任务 `root=/home/.Qsync`（NAS 上就是 `~/.Qsync`）。旧实现把
+    /// `/share/homes/test1/.Qsync/2026/x.txt` 映射成 `/home/.Qsync/.Qsync/2026/x.txt`，
+    /// 每个事件 `stat` 都回 `status=5 (路径不存在 / 无权限)` —— 事件快路径整体失效，
+    /// 全靠对账兜底（真机 2026-10-18：单轮 87 580 条事件；当天 daemon 日志里 79 670 条
+    /// `事件 stat` 失败，100% 命中双写前缀）。
+    #[test]
+    fn event_path_under_home_subdir_is_not_double_prefixed() {
+        // 真机原样路径（含中文目录与空格）
+        assert_eq!(
+            map_event_path(
+                "/share/homes/test1/.Qsync/2026/28-比赛项目/01配置备份/防火墙配置.txt",
+                "test1",
+                "/home/.Qsync"
+            )
+            .as_deref(),
+            Some("/home/.Qsync/2026/28-比赛项目/01配置备份/防火墙配置.txt")
+        );
+        // 视图根自身 → 原样（调用方会跳过根事件，见 `apply_event`）
+        assert_eq!(
+            map_event_path("/share/homes/test1/.Qsync", "test1", "/home/.Qsync").as_deref(),
+            Some("/home/.Qsync")
+        );
+        // 家目录里**这个视图之外**的路径不属于本任务 → None（不能拼进视图）
+        assert_eq!(
+            map_event_path(
+                "/share/homes/test1/2026/别的任务.txt",
+                "test1",
+                "/home/.Qsync"
+            ),
+            None
+        );
+        // 卷内真实路径 / `/homes/<user>` 短形态也要认（与 client_path_from_share 同口径）
+        assert_eq!(
+            map_event_path(
+                "/share/CACHEDEV1_DATA/homes/test1/.Qsync/a.txt",
+                "test1",
+                "/home/.Qsync"
+            )
+            .as_deref(),
+            Some("/home/.Qsync/a.txt")
+        );
+        assert_eq!(
+            map_event_path("/homes/test1/.Qsync/a.txt", "test1", "/home/.Qsync").as_deref(),
+            Some("/home/.Qsync/a.txt")
+        );
+        // 共享文件夹真实路径 → None（client_path_from_share 只认 /homes/<user>；
+        // 与 M6 §7 已知限制一致，不是回归）
+        assert_eq!(
+            map_event_path("/share/Public/a.txt", "test1", "/Public"),
+            None
+        );
+        // 视图根前缀撞车（/home/.Qsync vs /home/.Qsync2）→ None
+        assert_eq!(
+            map_event_path("/share/homes/test1/.Qsync2/a.txt", "test1", "/home/.Qsync"),
+            None
+        );
+        // 别人的家目录 / 没有用户名 → 一律不猜
+        assert_eq!(
+            map_event_path("/share/homes/other/.Qsync/a.txt", "test1", "/home/.Qsync"),
+            None
+        );
+        assert_eq!(
+            map_event_path("/share/homes/test1/.Qsync/a.txt", "", "/home/.Qsync"),
+            None
+        );
     }
 
     /// 决策表逐条覆盖（M2c 的正确性核心）。

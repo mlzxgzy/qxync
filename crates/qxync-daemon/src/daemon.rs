@@ -2445,16 +2445,23 @@ async fn mount(
                 }
                 None => return,
             };
-            // 本地改动已经落到 NAS → 清 dirty，并让对端走事件快路径
-            h.clear_dirty(remote);
+            // ★ 顺序（2026-10-19 复审修正）：**先推进 baseline，再清 dirty**。
+            //   反过来的话，中间存在一个窗口：local 已 clean、base 还是旧快照、
+            //   覆盖表也还没记 —— 对账恰好判到这个文件就是 `(false, true)` + 本地≠base
+            //   → 凭空 Conflict（大多被 resolve_conflict 的在途上传检查兜住，但
+            //   「决策算出 Conflict」到「进入 resolve_conflict」之间 hook 整段完成的
+            //   话就漏）。先 note_uploaded：窗口内是 dirty=true + base=新签名 →
+            //   `(true, true)` 且 local==remote → AdoptBaseline，安全。
             // ★ 同时把 baseline 推进到刚写上去的签名：否则「上传落地 → 下轮轮询」
-            // 这段窗口里，用户再保存一次会被判成双方都改 → 凭空多一个冲突副本。
+            //   这段窗口里，用户再保存一次会被判成双方都改 → 凭空多一个冲突副本。
             {
                 let mut g = st.sync_store.lock().unwrap();
                 if let Err(e) = g.note_uploaded(remote, size, mtime) {
                     tracing::warn!("上传后推进 baseline 失败 {remote}: {e}");
                 }
             }
+            // 本地改动已经落到 NAS → 清 dirty，并让对端走事件快路径
+            h.clear_dirty(remote);
             if let (Some(host), Some((size, mtime))) = (peer.as_ref(), Some((size, mtime))) {
                 host.notify_async(remote.to_string(), size, mtime, "modified");
             }
@@ -3951,6 +3958,41 @@ async fn tasks_cmd(
                 .collect();
             let (_, warnings) = t.conflict_report(&same_link);
             let p = t.save(&paths).map_err(core_err)?;
+            // ★ 2026-10-19：任务保存后，让**已挂载**的同路径视图立刻用上新配置。
+            //
+            // 冲突策略是同步引擎按 `MountEntry.conflict` 分派的（视图不查任务文件），
+            // 而 `mounts.json` 的语义是「上一次实际挂了什么」、重启时现场优先（见
+            // [`restore_mounts_on_start`] 的文档）。不在这里把任务里的值同步过去，就会：
+            // ① 任务页改了策略**当场不生效**；② 重启后又被 `mounts.json` 的旧值盖回来。
+            // 真机 2026-10-19 的现场：任务写 `ask`、`mounts.json` 还是 `rename_local`，
+            // 于是本该进「待裁决队列」的冲突直接按 rename_local 生成了冲突副本
+            // （`防火墙配置 (conflicted copy from devhost 2026-10-19).txt`）。
+            let canon =
+                std::fs::canonicalize(&t.mountpoint).unwrap_or_else(|_| t.mountpoint.clone());
+            let applied = {
+                let mut g = state.mounts.lock().unwrap();
+                match g.get_mut(&canon) {
+                    Some(m) if m.conflict != t.conflict => {
+                        let old = m.conflict.clone();
+                        m.conflict = t.conflict.clone();
+                        // 记录也一起改，否则下次启动又回到旧策略（现场优先）。
+                        m.rec.conflict = t.conflict.clone();
+                        Some(old)
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(old) = applied {
+                tracing::info!(
+                    "任务 {} 保存：冲突策略 {} → {} 已应用到已挂载视图（{}）",
+                    t.id,
+                    conflict_label(&old),
+                    conflict_label(&t.conflict),
+                    canon.display()
+                );
+                // 写盘失败只 WARN（`mounts_persist` 内部处理），不影响「任务已保存」。
+                mounts_persist(state);
+            }
             to_value(serde_json::json!({
                 "saved": true,
                 "path": p.display().to_string(),
@@ -4095,6 +4137,13 @@ async fn tasks_cmd(
 /// 两份都读、现场优先。`mounts.json` 里的挂载点先占位，任务表里同名的跳过
 /// （用户可能已经改过任务里的参数，让现场那份赢更贴近「重启前是什么样」）。
 ///
+/// **唯一的例外是冲突策略**（★ 2026-10-19）：它本质是「用户意图」，任务表里同名
+/// 任务存在时以任务里的 `conflict` 为准。原因：真机现场出现过任务写 `ask`、
+/// `mounts.json` 还是旧的 `rename_local`，重启后继续按旧策略走 —— 本该进待裁决
+/// 队列的冲突直接生成了冲突副本。`tasks_cmd` 的 `save` 分支也会把新策略同步到
+/// 已挂载视图与记录（覆盖「GUI 改完不重启」的场景），这里兜住「直接改任务文件 /
+/// 上次保存时没挂载」的情况。其余挂载参数（线程 / cache_mode / 超时…）仍现场优先。
+///
 /// ## 三个不变量（M15/T5 改动点 3）
 ///
 /// 1. **必须已登录** —— 调用方 [`run`] 那边已等过 `sid`，这里 `mount()` 自己
@@ -4118,6 +4167,18 @@ pub(crate) async fn restore_mounts_on_start(state: &Arc<State>, link_id: &str) {
     // 排序：挂载恢复是「一个一个挂」，顺序影响谁先占用连接/线程；按挂载点排
     // 让行为可复现（不然 HashMap 顺序会让日志每次都不一样）。
     todo.sort_by(|a, b| a.mountpoint.cmp(&b.mountpoint));
+
+    // ★ 冲突策略：任务表里有同名挂载点时用任务里的（见上面的「唯一例外」）。
+    let ids = all_link_ids(&paths, link_id);
+    let (tasks, _bad) = Task::list_for_link(&paths, link_id, &ids);
+    let task_conflict: std::collections::HashMap<PathBuf, String> = tasks
+        .iter()
+        .map(|t| {
+            let canon =
+                std::fs::canonicalize(&t.mountpoint).unwrap_or_else(|_| t.mountpoint.clone());
+            (canon, t.conflict.clone())
+        })
+        .collect();
 
     if !todo.is_empty() {
         tracing::info!("恢复挂载：{} 个挂载点待恢复（link={link_id}）", todo.len());
@@ -4179,6 +4240,20 @@ pub(crate) async fn restore_mounts_on_start(state: &Arc<State>, link_id: &str) {
             );
             continue;
         }
+        // 冲突策略例外：任务表里有同名任务就用任务的（其余参数保持现场优先）。
+        let conflict = match task_conflict.get(mp) {
+            Some(c) if c != &rec.conflict => {
+                tracing::info!(
+                    "恢复挂载：{} 的冲突策略用任务表里的「{}」（记录里是「{}」）",
+                    mp.display(),
+                    conflict_label(c),
+                    conflict_label(&rec.conflict)
+                );
+                c.clone()
+            }
+            Some(c) => c.clone(),
+            None => rec.conflict.clone(),
+        };
         match mount(
             state,
             mp.clone(),
@@ -4191,7 +4266,7 @@ pub(crate) async fn restore_mounts_on_start(state: &Arc<State>, link_id: &str) {
             rec.read_write,
             rec.delete_limit,
             Some(rec.cache_mode.clone()),
-            Some(rec.conflict.clone()),
+            Some(conflict),
         )
         .await
         {
@@ -4284,14 +4359,20 @@ fn journal_log(state: &Arc<State>, e: JournalEntry) {
 fn journal_record_sync(state: &Arc<State>, r: &sync::SyncReport) {
     let mut n = 0usize;
     if r.events > 0 {
-        journal_log(
-            state,
-            JournalEntry::ok(
-                "remote_change",
-                "",
-                format!("拉到 {} 条事件（跳过 {} 条）", r.events, r.events_skipped),
-            ),
-        );
+        // 跳过数带上**原因分布**：事件快路径整体失效时（真机 2026-10-18：79 670 条
+        // 事件 stat 全部 status=5，路径被拼成 `/home/.Qsync/.Qsync/…`），4/5/6 降级成
+        // debug 后 `events_skipped` 是唯一痕迹；只报总数分不清「路径映射坏了」还是
+        // 「事件本来就都属于别的任务 / 自己的回声」，归因要多跑一轮取证。
+        let mut detail = format!("拉到 {} 条事件（跳过 {} 条）", r.events, r.events_skipped);
+        if !r.events_skipped_reasons.is_empty() {
+            let parts: Vec<String> = r
+                .events_skipped_reasons
+                .iter()
+                .map(|(why, k)| format!("{why} {k}"))
+                .collect();
+            detail.push_str(&format!("：{}", parts.join(" / ")));
+        }
+        journal_log(state, JournalEntry::ok("remote_change", "", detail));
         n += 1;
     }
     if r.refreshed > 0 {

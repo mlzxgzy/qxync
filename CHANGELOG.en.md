@@ -5,6 +5,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [中文](CHANGELOG.md) · [README](README.en.md) · [Acceptance log](docs/验收记录.md)
 
+## [Unreleased]
+
+### Fixed
+
+- **The event fast path broke entirely when the view root is a subdirectory of home
+  (every event returned `status=5`)**: with a task pointing at a folder inside the home
+  directory (`root=/home/.Qsync` on a real machine, i.e. NAS `~/.Qsync`), `map_event_path`
+  stripped `/share/homes/<user>` from the real path and then appended the remainder
+  (`/.Qsync/…`) to the view root `/home/.Qsync` again → `/home/.Qsync/.Qsync/…`
+  (`.Qsync` twice). Every event's `stat` therefore returned `status=5 (no such path / no
+  permission)`: the fast path did nothing (all remote changes had to wait for a baseline
+  reconcile round) and the "recent errors" list drowned in the same message (real-machine
+  log: the 2026-10-18 17:31 round **pulled 87,580 events and skipped 8,017**; that day's
+  daemon log has **79,670 `stat` failures for events, 100% of them with the doubled
+  `/home/.Qsync/.Qsync/...` prefix** (79,667 `status=5`, 3 network errors). Event paths now
+  go through `client_path_from_share` into the client
+  namespace (always rooted at `/home`) and are then narrowed to the view root — events
+  outside this view return `None` and are left to the reconciler instead of being turned
+  into non-existent paths. Also: `stat` 4/5/6 on an event is no longer reported as a hard
+  error (those codes also mean "permission denied / session lost", so they never were
+  errors in themselves).
+- **Phantom conflict copies: an upload of our own that landed mid-round was judged against
+  the round-start baseline snapshot**: `poll_once` clones the baseline at the start of a
+  round and uses it for the whole round (tens of seconds); the upload-success hook, however,
+  advances the authoritative baseline *during* that round and calls `clear_dirty`. So when
+  judging a file the user had just saved: the snapshot still had the old signature, the
+  remote already had our own freshly uploaded version and the local node was clean →
+  `decide` took the `(dirty=false, remote≠base)` branch and, because the local signature ≠
+  the stale base, returned **Conflict** - and the then-effective conflict policy produced a
+  copy that was **byte-for-byte identical** to the original (2026-10-19 08:06:
+  `防火墙配置 (conflicted copy from devhost 2026-10-19).txt`, 12,218 = 12,218 bytes). The round
+  now also clears a "hook advances seen this round" table, and every decision (reconcile /
+  events / conflict re-judgement) uses "snapshot ∪ this round's hook advances" as the base;
+  multiple uploads within one round are matched as a **list** (a directory listing can fall
+  between two of them); when the round's listing happened before the upload landed (remote
+  still matches the snapshot), the snapshot wins so local metadata is not refreshed back to
+  the old version. Two more fixes came out of review: (1) `persist` runs several times per
+  round (once per event batch plus once at the end) - it no longer clears `hook_touched`
+  after the first merge, otherwise the second full-replace persist wiped the hook's advance
+  on disk and the same phantom conflict reappeared one round later; (2) the "remote is older
+  than this round's last advance" shortcut now only applies when the local node is clean -
+  with unuploaded local changes it falls back to the normal decision, otherwise a
+  freshly-written-but-old-mtime remote (slow clock / `rsync -t` / backup restore) would be
+  overwritten by the local copy, losing data. Covered by a regression test reproducing the
+  real timeline (old logic always says Conflict, new logic says Noop), a repeated-persist
+  regression, an end-to-end test through `reconcile_view`, and a round-lifecycle test.
+- **A conflict policy changed on the task page never reached the mounted view, and was
+  overwritten by `mounts.json` after a restart**: the sync engine dispatches conflicts from
+  `MountEntry.conflict` (the view does not read the task file), while `mounts.json` records
+  "what was actually mounted" and wins on restore. On a real machine this meant the task said
+  `ask` while the engine kept using `rename_local` - so a conflict that should have queued
+  for a decision produced a conflict copy instead. Now: (1) saving a task pushes the new
+  policy to the mounted view with the same mountpoint and persists it into the record;
+  (2) on startup restore, a task with the same mountpoint wins for the conflict policy (all
+  other mount parameters still follow the record). Skipped events are now also counted by
+  reason and written into the `remote_change` journal detail (delete event without path /
+  own-device echo / other account / hidden by rules / not visible remotely / mapping failed)
+  so "the event fast path died" does not silently disappear again.
+
 ## [0.6.5] - 2026-10-18
 
 ### Added
