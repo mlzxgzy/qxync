@@ -3216,8 +3216,33 @@ fn build_views(state: &Arc<State>) -> Vec<MountView> {
     out
 }
 
+/// 本轮对账的时间预算（见 [`sync::SyncConfig::scan_time_budget`]）。
+///
+/// * `QXNYC_SCAN_BUDGET_SECS` 显式指定（`0` = 不限，只受目录数硬顶约束）；
+/// * 手动一轮（`sync --once` / GUI「立即同步」）→ [`sync::SCAN_BUDGET_ONCE`]
+///   （手动场景就是想全量，给足但不无限）；
+/// * 后台轮询 → 间隔 × [`sync::SCAN_BUDGET_RATIO_OF_INTERVAL`]（默认 50%）。
+///   间隔运行时可调（`sync --interval`），所以**每轮**推导而不是启动时算死。
+fn scan_budget_for(state: &State, manual: bool) -> Duration {
+    if let Ok(v) = std::env::var("QXNYC_SCAN_BUDGET_SECS") {
+        if let Ok(secs) = v.trim().parse::<u64>() {
+            return Duration::from_secs(secs);
+        }
+        tracing::warn!("QXNYC_SCAN_BUDGET_SECS 无法解析（{v:?}），按默认推导");
+    }
+    if manual {
+        return sync::SCAN_BUDGET_ONCE;
+    }
+    let interval = *state.sync_interval.lock().unwrap();
+    if interval == 0 {
+        // 轮询已禁用：只剩手动触发，给手动档的预算。
+        return sync::SCAN_BUDGET_ONCE;
+    }
+    Duration::from_secs_f64(interval as f64 * sync::SCAN_BUDGET_RATIO_OF_INTERVAL)
+}
+
 /// 跑一轮同步（拉事件 + baseline 对账）。
-async fn run_sync_once(state: &Arc<State>) -> Result<sync::SyncReport, IpcError> {
+async fn run_sync_once(state: &Arc<State>, manual: bool) -> Result<sync::SyncReport, IpcError> {
     // ★ 串行化「一整轮」：见 [`State::sync_run`] 的字段注释。
     //
     //   `persist` 在「本轮没有 hook 并发写」时会整份替换 baseline，这个写语义要求
@@ -3230,7 +3255,9 @@ async fn run_sync_once(state: &Arc<State>) -> Result<sync::SyncReport, IpcError>
     let _run = state.sync_run.lock().await;
     let client = engine_client(state).await?;
     let views = build_views(state);
-    let cfg = state.sync_cfg.lock().unwrap().clone();
+    let mut cfg = state.sync_cfg.lock().unwrap().clone();
+    // ★ 时间预算每轮推导（间隔可运行时调；手动一轮给足预算想全量）。
+    cfg.scan_time_budget = scan_budget_for(state, manual);
     let user = state.link.user.clone();
     let link_id = state.link.id.clone();
     let report = sync::poll_once(
@@ -3292,7 +3319,7 @@ async fn sync_cmd(
         tracing::warn!("删除保护已解除（--force-deletes，仅放行一轮）");
     }
     if once {
-        let report = run_sync_once(state).await?;
+        let report = run_sync_once(state, true).await?;
         tracing::info!(
             "sync --once: events={} refreshed={} updating={} uploaded={} conflicts={} deleted={} blocked={}",
             report.events,
@@ -3360,7 +3387,7 @@ fn spawn_poller(state: Arc<State>, mut gen: EngineGen) -> tokio::task::JoinHandl
                 }
             }
             last_run = Instant::now();
-            match run_sync_once(&state).await {
+            match run_sync_once(&state, false).await {
                 Ok(r) => {
                     // ★ 会话失效自愈：`poll_once` 把错误塞进 report.errors 后仍返回 Ok，
                     //   所以下面 Err 分支的 `is_auth` 重登永远等不到。真机实测：

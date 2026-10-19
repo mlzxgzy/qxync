@@ -1411,6 +1411,15 @@ impl Store {
             .optional()
             .map_err(Error::from)
     }
+
+    /// 删一条 meta（对账轮转游标「本轮已列全 → 下轮从头开始」要用它清状态；
+    /// 没有它只能写空串冒充，读侧还得记得把空串当 None）。
+    pub fn delete_meta(&self, key: &str) -> Result<()> {
+        self.conn()
+            .execute("DELETE FROM meta WHERE key = ?1", params![key])
+            .map_err(Error::from)?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------- SQL 小工具

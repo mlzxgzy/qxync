@@ -5,6 +5,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [中文](CHANGELOG.md) · [README](README.en.md) · [Acceptance log](docs/验收记录.md)
 
+## [0.6.8] - 2026-10-19
+
+### Redesigned
+
+- **Reconcile scanning is now time-budget driven**: how many directories one round
+  can list is decided by how much time that round has, instead of a hardcoded 200.
+  Motivation (real device, 2026-10-19): 1439 directories × 600s poll interval — a
+  full listing pass takes only 1–5 minutes, yet the old count-based rotation split
+  it into 8 rounds, so a remote deletion could take **80 minutes** to land. The
+  event fast path on that account is dead (`qbox_get_sync_log` returns nothing new,
+  no syncing folder ever registered), making baseline reconciliation the main
+  change-discovery path. Now:
+  * budget = poll interval × 50% (re-derived every round; the interval is
+    runtime-tunable); `QXNYC_SCAN_BUDGET_SECS` overrides explicitly (`0` =
+    unlimited); `sync --once` / GUI "sync now" gets a generous 600s — manual runs
+    want a full pass;
+  * budget not exhausted → one **full** round (deletion latency = one interval);
+    exhausted → stop at the mark, resume from the cursor next round (degrades to
+    rotation with bounded per-round cost);
+  * **progress guarantee**: at least one rotating directory is listed per round,
+    ruling out a new starvation where the root alone eats the whole budget and no
+    cursor can even be saved;
+  * a cursor present always selects rotation mode (no longer requires the
+    directory count to exceed the hard cap); a fully covered round **clears** the
+    cursor; wrap-around never exceeds the full set (no duplicate listings when the
+    budget covers everything);
+  * `max_dirs_per_poll` demoted to a hard-cap backstop, default 200 → 2000;
+  * notes now say "listed X/Y directories this round, resuming from the cursor
+    next round" when the budget runs out.
+  Covered by `generous_time_budget_scans_everything_in_one_round` and
+  `tiny_time_budget_still_makes_progress` (1ns budget still advances every round).
+
 ## [0.6.7] - 2026-10-19
 
 ### Fixed

@@ -31,7 +31,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// `round_hook_advances` 每路径最多保留的推进签名数（见 [`SyncState::round_hook_advances`]）。
 ///
@@ -103,9 +103,28 @@ pub struct SyncConfig {
     pub force_deletes: bool,
     /// 自己的设备 uid（事件回声过滤）；本机未做设备配对时为空。
     pub own_devices: Vec<String>,
-    /// 单轮最多对账多少个目录（防止一次扫太多）。
+    /// 单轮对账的**时间预算**（目录列举阶段的墙钟上限）。
+    ///
+    /// ★ 时间预算驱动（v0.6.8）：一轮能列多少目录由「这轮有多少时间」决定，而不是
+    ///   写死的目录数。预算没用完 → 自然列全（每轮全量，删除判定延迟 = 一个间隔）；
+    ///   预算耗尽 → 到点即收，游标续扫（退化为按目录数轮转，但每轮耗时可控）。
+    ///   * `Duration::ZERO` = 不限时间（只受 `max_dirs_per_poll` 硬顶约束）。
+    ///   * daemon 默认按轮询间隔推导（间隔 × [`SCAN_BUDGET_RATIO_OF_INTERVAL`]）；
+    ///     `sync --once` 手动跑一轮给足 [`SCAN_BUDGET_ONCE`]——手动场景就是想全量。
+    pub scan_time_budget: Duration,
+    /// 单轮最多对账多少个目录（**硬顶**：防目录数爆炸把单轮拖死；时间预算先到就按时间走）。
+    ///
+    /// `0` = 不限。默认 2000：真机 1439 目录在 600s 间隔下时间预算内就能全量，
+    /// 硬顶只是兜底；旧默认 200 会把这种场景硬掰成 8 轮轮转（删除延迟 80 分钟）。
     pub max_dirs_per_poll: usize,
 }
+
+/// 时间预算占轮询间隔的比例（daemon 默认推导用）。
+///
+/// 留一半给本轮其它阶段（事件快路径 / 上传 / 巡检）和喘息，列举不至于背靠背。
+pub const SCAN_BUDGET_RATIO_OF_INTERVAL: f64 = 0.5;
+/// `sync --once` / GUI「立即同步」的时间预算（手动场景就是想全量，给足但不无限）。
+pub const SCAN_BUDGET_ONCE: Duration = Duration::from_secs(600);
 
 impl Default for SyncConfig {
     fn default() -> Self {
@@ -114,7 +133,8 @@ impl Default for SyncConfig {
             delete_protection: DeleteProtection::default(),
             force_deletes: false,
             own_devices: Vec::new(),
-            max_dirs_per_poll: 200,
+            scan_time_budget: Duration::ZERO,
+            max_dirs_per_poll: 2000,
         }
     }
 }
@@ -950,28 +970,25 @@ async fn reconcile_view(
     }
     dirs.insert(root.clone());
 
-    // ★ 大目录轮转：目录数超过单轮上限时，**不能每轮都从排序开头扫**。
-    //   旧实现 `dirs.iter().take(max)` 顺序固定 → 排序在后的目录每轮都轮不到，
-    //   于是「远端视图不完整 → 本轮暂缓删除判定」变成**永久**：删除永远不执行
-    //   （真机原话：「目录数 228 超过单轮上限 200…本轮跳过删除判定」每轮重复）。
-    //   现在把「上轮扫到哪」落进状态库的 `meta`（`sync --once` 也接得上）：每轮从
-    //   游标之后接着列、到尾回绕，扫满一圈内每个目录都会轮到。
+    // ★ 大目录轮转 + 时间预算（v0.6.8）：一轮能列多少目录由「这轮有多少时间」决定。
+    //   * 预算没用完 → 窗口列完即全量（删除判定延迟 = 一个间隔）；
+    //   * 预算耗尽 / 目录数超硬顶 → 到点即收，游标 = 最后一个列过的目录，下轮续扫。
+    //   旧坑（v0.6.4 修）：每轮 `take(max)` 从排序开头取，排序在后的目录**永远**
+    //   轮不到 → 「本轮暂缓删除判定」永久化。游标轮转保证每个目录一个周期内
+    //   至少轮到一次；时间预算让「间隔够长」的场景直接退化成每轮全量。
     //   远端根恒定参与 —— 顶层变化与根下的文件必须每轮都看得见。
     let total_dirs = dirs.len();
-    let rotating = rotation_active(total_dirs, cfg.max_dirs_per_poll);
     let cursor_key = format!("reconcile_scan_cursor:{}", view.mountpoint.display());
-    let start_after = if rotating {
-        match state_store.lock().unwrap().store.meta(&cursor_key) {
-            Ok(v) => v,
-            Err(e) => {
-                report.error(format!("读取对账轮转游标失败: {e}"));
-                None
-            }
+    // ★ 游标**恒定读**（一次 meta 查表，便宜）：游标存在 ⟺ 上轮没列全 —— 可能是
+    //   目录数超硬顶，也可能是时间预算耗尽。读不到（含首次）就从头开始。
+    let start_after = match state_store.lock().unwrap().store.meta(&cursor_key) {
+        Ok(v) => v,
+        Err(e) => {
+            report.error(format!("读取对账轮转游标失败: {e}"));
+            None
         }
-    } else {
-        None
     };
-    let (scan_window, next_cursor) =
+    let (scan_window, _planned_next) =
         dirs_for_round(&dirs, &root, cfg.max_dirs_per_poll, start_after.as_deref());
 
     // 列每个目录 → 远端子项签名表
@@ -987,7 +1004,34 @@ async fn reconcile_view(
     // ★ 存在性**未知**的目录（列举 4/5/6 且 stat 也失败）：目录条目自身本轮也不能判，
     //   否则「父目录列举漏了它 + stat 抖动」会把整棵子树连缓存一起删。
     let mut unresolved_dirs: BTreeSet<String> = BTreeSet::new();
+    // ★ 时间预算驱动的列举：预算耗尽即收（远端根除外——顶层变化必须每轮可见，
+    //   根是窗口第一项，正常情况下预算开始时必然还没耗）。
+    //
+    //   ★ 进度保证：**每轮至少列一个轮转目录**（预算检查从第二个轮转目录开始）。
+    //   否则「预算 < 一次列举耗时」的极端配置（间隔 1s → 预算 0.5s，单次列举
+    //   600ms）会让根吃光预算、轮转目录一个都列不到、游标也存不下 —— v0.6.4
+    //   修过的饿死换个马甲回来。至少推进一个 = 游标每轮前进，最慢也能转完一圈。
+    let scan_started = Instant::now();
+    // 本轮**尝试过**的最后一个轮转目录（游标按它推进；列举失败的目录也算
+    // 「到过这里」——下轮从它之后续扫，回绕一圈后自然会再试它）。
+    let mut last_listed: Option<String> = None;
+    let mut rotating_listed = 0usize;
+    let mut budget_exhausted = false;
+    let mut attempted = 0usize;
     for dir in &scan_window {
+        if dir != &root
+            && rotating_listed >= 1
+            && cfg.scan_time_budget > Duration::ZERO
+            && scan_started.elapsed() >= cfg.scan_time_budget
+        {
+            budget_exhausted = true;
+            tracing::debug!(
+                "对账时间预算 {:?} 耗尽：本轮列了 {attempted}/{total_dirs} 个目录，下轮从游标续扫",
+                cfg.scan_time_budget
+            );
+            break;
+        }
+        attempted += 1;
         match client.list(dir).await {
             Ok(entries) => {
                 scanned += 1;
@@ -1064,28 +1108,48 @@ async fn reconcile_view(
                 report.error(format!("对账列举 {dir} 失败: {e}"));
             }
         }
+        if dir != &root {
+            rotating_listed += 1;
+            last_listed = Some(dir.clone());
+        }
     }
     report.dirs_scanned += scanned;
-    if let Some(next) = next_cursor {
+    // ★ 游标维护（时间预算版）：
+    //   本轮把计划窗口列完、且窗口覆盖全部目录 → **清游标**（下轮从头全量）；
+    //   否则（硬顶截断 / 预算耗尽）→ 游标 = 本轮尝试过的最后一个目录。
+    //   「列完全部」时必须清掉旧游标：不清的话下轮带着游标进轮转模式，白转一圈。
+    //   进度保证（每轮至少列一个轮转目录）确保没列全时 `last_listed` 必然有值。
+    let covered_all = !budget_exhausted && scan_window.len() >= total_dirs;
+    if covered_all {
+        if let Err(e) = state_store.lock().unwrap().store.delete_meta(&cursor_key) {
+            report.error(format!("清除对账轮转游标失败: {e}"));
+        }
+    } else if let Some(last) = &last_listed {
         if let Err(e) = state_store
             .lock()
             .unwrap()
             .store
-            .set_meta(&cursor_key, &next)
+            .set_meta(&cursor_key, last)
         {
             report.error(format!("保存对账轮转游标失败: {e}"));
         }
     }
-    // 本轮视图不完整的两个来源（用于下面「哪些条目本轮暂不判定」的说明）。
+    // 本轮视图不完整的来源（用于下面「哪些条目本轮暂不判定」的说明）。
     let mut partial_why: Vec<String> = Vec::new();
     if list_failures > 0 {
         partial_why.push(format!(
             "{list_failures} 个目录本轮没列成（失败/不可见/存在性未确认）"
         ));
     }
-    if rotating {
+    if budget_exhausted {
         partial_why.push(format!(
-            "目录数 {total_dirs} 超过单轮上限 {}（本轮按轮转列了 {} 个）",
+            "对账时间预算 {:?} 耗尽：本轮列了 {attempted}/{total_dirs} 个目录，下轮从游标续扫",
+            cfg.scan_time_budget
+        ));
+    }
+    if scan_window.len() < total_dirs {
+        partial_why.push(format!(
+            "目录数 {total_dirs} 超过单轮硬顶 {}（本轮按轮转列了 {} 个）",
             cfg.max_dirs_per_poll,
             scan_window.len()
         ));
@@ -1290,20 +1354,19 @@ async fn reconcile_view(
     }
 }
 
-/// 本轮是否启用轮转窗口（`max == 0` 视为不限，永不轮转）。
-fn rotation_active(total_dirs: usize, max: usize) -> bool {
-    max > 0 && total_dirs > max
-}
-
 /// 一轮对账要列的目录（**大目录轮转**的核心，纯函数便于单测）。
 ///
-/// * `max == 0` → 视为**不限**，全列（0 是「没配上限」的直觉含义；不能让它退化成
-///   「一轮什么都不列」—— 那就是本次修复要消灭的「永久暂不判定」）。
-/// * `dirs.len() <= max` → 全列（常规情况，与旧行为完全一致；返回的游标为 `None`）。
-/// * 否则 → 只列一个窗口：**远端根恒定参与**（顶层变化 / 根下文件必须每轮可见），
-///   其余目录从 `start_after` 严格之后按排序取 `max-1` 个，到尾再从头回绕。
-///   返回的第二个值是下一轮的起点（本轮窗口的最后一个目录）。
+/// * 无游标 且（`max == 0` 或 `dirs.len() <= max`）→ **全列**（0 是「没配上限」的
+///   直觉含义；不能让它退化成「一轮什么都不列」——那就是要消灭的「永久暂不判定」）。
+///   返回的游标为 `None`。
+/// * 否则 → 轮转模式：**远端根恒定参与**（顶层变化 / 根下文件必须每轮可见），
+///   其余目录从 `start_after` 严格之后按排序取（`max-1` 个，`max == 0` 不限），
+///   到尾再从头回绕。返回的第二个值是窗口的最后一个目录（计划中的下一轮起点）。
 ///   `max == 1` 是退化配置：根 + 1 个轮转目录（超上限 1 个）也要保证轮转不饿死。
+///
+/// ★ 游标存在就进轮转（v0.6.8 起不再要求「目录数 > max」）：时间预算耗尽同样会留
+///   游标，那时目录数可能远没超硬顶 —— 若忽略游标从头开始，排序在后的目录在时间
+///   预算下永远轮不到（v0.6.4 修过的饿死，换个马甲回来）。
 ///
 /// 为什么必须轮转：旧实现每轮都 `take(max)` 排序最前的目录，目录数一旦超过上限，
 /// 排序在后的目录**永远**轮不到；而「未扫到的目录里的条目本轮不判定」这条安全阀
@@ -1315,14 +1378,18 @@ fn dirs_for_round(
     start_after: Option<&str>,
 ) -> (Vec<String>, Option<String>) {
     let all: Vec<String> = dirs.iter().cloned().collect();
-    if max == 0 || all.len() <= max {
+    if start_after.is_none() && (max == 0 || all.len() <= max) {
         // 常规路径：一轮列全（注：root 必然在 dirs 里）；max=0 视为不限。
         return (all, None);
     }
     let mut out: Vec<String> = Vec::with_capacity(max.max(2));
     out.push(root.to_string());
     let rotating: Vec<String> = all.into_iter().filter(|d| d != root).collect();
-    let budget = max.saturating_sub(1).max(1);
+    let budget = if max == 0 {
+        usize::MAX
+    } else {
+        max.saturating_sub(1).max(1)
+    };
     let (mut window, next) = pick_scan_window(&rotating, start_after, budget);
     out.append(&mut window);
     (out, next)
@@ -1332,6 +1399,8 @@ fn dirs_for_round(
 ///
 /// 返回（窗口，下一轮起点 = 窗口最后一项）。`start_after` 指向的目录可能已经不存在
 /// （用户在两次轮询之间删了它）—— 按字符串序定位仍然有效，不会丢一个周期。
+/// ★ 回绕补齐**不超过全集**（`max ≥ items.len()` 时窗口 = 全集本身的旋转序）：
+///   v0.6.8 起游标存在就进轮转，预算可能大于全集 —— 重复塞目录纯属浪费一轮。
 fn pick_scan_window(
     items: &[String],
     start_after: Option<&str>,
@@ -1346,7 +1415,8 @@ fn pick_scan_window(
     };
     let mut out: Vec<String> = items[start..].iter().take(max).cloned().collect();
     if out.len() < max {
-        out.extend(items.iter().take(max - out.len()).cloned());
+        let need = (max - out.len()).min(items.len() - out.len());
+        out.extend(items.iter().take(need).cloned());
     }
     let next = out.last().cloned();
     (out, next)
@@ -3670,10 +3740,17 @@ mod tests {
             dirs.len()
         );
 
-        // 常规情况（没超上限）：一轮全列、游标为空 —— 与旧行为逐字一致
-        let (all, none) = dirs_for_round(&dirs, root, 1000, Some(c1.as_str()));
-        assert_eq!(all.len(), dirs.len());
-        assert_eq!(none, None, "没超上限不需要轮转游标");
+        // ★ 游标存在（上轮时间预算耗尽 / 硬顶截断留下的）→ 即使目录数没超硬顶也按
+        //   游标续扫：预算够大时窗口回绕列全（顺序从游标之后开始），返回下一轮起点。
+        //   忽略游标从头开始的话，排序在后的目录在时间预算下永远轮不到。
+        let (all, next) = dirs_for_round(&dirs, root, 1000, Some(c1.as_str()));
+        assert_eq!(all.len(), dirs.len(), "预算够大时窗口回绕列全");
+        assert!(next.is_some(), "带着游标进轮转模式，要返回下一轮起点");
+
+        // 没有游标 + 没超硬顶 → 一轮全列、游标为空（与旧行为一致）
+        let (all2, none2) = dirs_for_round(&dirs, root, 1000, None);
+        assert_eq!(all2.len(), dirs.len());
+        assert_eq!(none2, None, "没游标没超上限就不需要轮转");
 
         // max=0 = 不限（全列）；不能让退化配置变成「一轮什么目录都不列」
         let (all0, next0) = dirs_for_round(&dirs, root, 0, None);
@@ -4262,7 +4339,11 @@ mod tests {
         let store = Mutex::new(SyncState::load(work.join("state")).unwrap());
         let mv = mount_view(view.clone(), home, "/tmp/reconcile-rotate");
         let client = client_for(&host, port);
-        let cfg = SyncConfig::default(); // max_dirs_per_poll = 200
+        // 硬顶 200（默认已提到 2000，这里显式压回 200 复刻「目录数超硬顶」场景）
+        let cfg = SyncConfig {
+            max_dirs_per_poll: 200,
+            ..Default::default()
+        };
 
         // ---- 第 1 轮：窗口从排序开头开始
         let mut r1 = SyncReport::default();
@@ -4300,6 +4381,149 @@ mod tests {
         for d in &remote_dirs {
             assert!(seen.iter().any(|p| p == d), "第 1/2 轮合起来必须列过 {d}");
         }
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// 时间预算充足 → **一轮全量**：排序在后的目录当轮就判定，删除延迟 = 一个间隔。
+    ///
+    /// 真机场景（v0.6.8 的动机）：1439 目录 × 600s 间隔，旧实现按目录数轮转要
+    /// 8 轮 = 80 分钟才轮完一圈；预算内全量后，远端删除最迟一个间隔就落地。
+    #[tokio::test]
+    async fn generous_time_budget_scans_everything_in_one_round() {
+        use qxync_core::DirEntry;
+        let home = HOME_ROOT;
+        let n = 228usize;
+        let remote_dirs: Vec<String> = (0..n).map(|i| format!("{home}/d{i:03}")).collect();
+        let mut listings: BTreeMap<String, Vec<DirEntry>> = BTreeMap::new();
+        listings.insert(
+            home.to_string(),
+            remote_dirs
+                .iter()
+                .map(|d| DirEntry::local(d.rsplit('/').next().unwrap(), true, 0, 0))
+                .collect(),
+        );
+        // d000 / d210 的远端文件已被删（目录还在、清单为空）
+        for (i, d) in remote_dirs.iter().enumerate() {
+            let mut entries = Vec::new();
+            if i != 0 && i != 210 {
+                entries.push(DirEntry::local("f.txt", false, 10, 100));
+            }
+            listings.insert(d.clone(), entries);
+        }
+        let (host, port, _seen, srv) = spawn_listing_server(listings, BTreeSet::new()).await;
+
+        let work = tmpdir("reconcile-budget-full");
+        let view = FakeLocal::new(home, work.join("stash"));
+        let mut baseline = Baseline::default();
+        for d in &remote_dirs {
+            let p = format!("{d}/f.txt");
+            view.add_file(&p, 10, 100, false, None);
+            baseline.put(p, Sig::file(10, 100));
+        }
+        let store = Mutex::new(SyncState::load(work.join("state")).unwrap());
+        let mv = mount_view(view.clone(), home, "/tmp/reconcile-budget-full");
+        let client = client_for(&host, port);
+        // 默认硬顶 2000（目录数不超）+ 充足时间预算 → 全量
+        let cfg = SyncConfig {
+            scan_time_budget: Duration::from_secs(60),
+            ..Default::default()
+        };
+
+        let mut r1 = SyncReport::default();
+        reconcile_view(&client, &mv, &cfg, &mut baseline, &mut r1, &store).await;
+        assert_eq!(
+            r1.dirs_scanned, 229,
+            "预算充足：根 + 228 个目录一轮列完: {r1:?}"
+        );
+        assert_eq!(
+            r1.deleted, 2,
+            "d000 和 d210（排序一头一尾）的删除**当轮**都执行: {r1:?}"
+        );
+        // 全量后游标必须清掉：下轮从头开始（不清的话下轮带着游标白转一圈）
+        let cursor_key = format!("reconcile_scan_cursor:{}", mv.mountpoint.display());
+        let cursor = store.lock().unwrap().store.meta(&cursor_key).unwrap();
+        assert_eq!(cursor, None, "列全了就不该留轮转游标");
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// 时间预算极小（1ns）→ **进度保证**：每轮至少列一个轮转目录、游标每轮前进，
+    /// 不许「根吃光预算 → 轮转目录永远列不到、游标也存不下」——那是时间预算版的
+    /// 饿死（v0.6.4 修过的坑换个马甲回来）。
+    #[tokio::test]
+    async fn tiny_time_budget_still_makes_progress() {
+        use qxync_core::DirEntry;
+        let home = HOME_ROOT;
+        let n = 228usize;
+        let remote_dirs: Vec<String> = (0..n).map(|i| format!("{home}/d{i:03}")).collect();
+        let mut listings: BTreeMap<String, Vec<DirEntry>> = BTreeMap::new();
+        listings.insert(
+            home.to_string(),
+            remote_dirs
+                .iter()
+                .map(|d| DirEntry::local(d.rsplit('/').next().unwrap(), true, 0, 0))
+                .collect(),
+        );
+        for (i, d) in remote_dirs.iter().enumerate() {
+            let mut entries = Vec::new();
+            if i != 0 && i != 210 {
+                entries.push(DirEntry::local("f.txt", false, 10, 100));
+            }
+            listings.insert(d.clone(), entries);
+        }
+        let (host, port, _seen, srv) = spawn_listing_server(listings, BTreeSet::new()).await;
+
+        let work = tmpdir("reconcile-budget-tiny");
+        let view = FakeLocal::new(home, work.join("stash"));
+        let mut baseline = Baseline::default();
+        for d in &remote_dirs {
+            let p = format!("{d}/f.txt");
+            view.add_file(&p, 10, 100, false, None);
+            baseline.put(p, Sig::file(10, 100));
+        }
+        let store = Mutex::new(SyncState::load(work.join("state")).unwrap());
+        let mv = mount_view(view.clone(), home, "/tmp/reconcile-budget-tiny");
+        let client = client_for(&host, port);
+        // 硬顶 2000（目录数不超，全靠时间预算截断）+ 1ns 预算
+        let cfg = SyncConfig {
+            scan_time_budget: Duration::from_nanos(1),
+            ..Default::default()
+        };
+        let cursor_key = format!("reconcile_scan_cursor:{}", mv.mountpoint.display());
+
+        // 第 1 轮：根 + d000（进度保证至少列一个），预算在 d001 前耗尽
+        let mut r1 = SyncReport::default();
+        reconcile_view(&client, &mv, &cfg, &mut baseline, &mut r1, &store).await;
+        assert_eq!(r1.dirs_scanned, 2, "根 + 1 个轮转目录: {r1:?}");
+        assert_eq!(
+            r1.deleted, 1,
+            "d000（第一个轮转目录）的删除当轮执行: {r1:?}"
+        );
+        let cursor = store.lock().unwrap().store.meta(&cursor_key).unwrap();
+        assert_eq!(
+            cursor.as_deref(),
+            Some(format!("{home}/d000").as_str()),
+            "游标 = 本轮列过的最后一个目录"
+        );
+
+        // 第 2/3 轮：游标每轮前进一格（饿死的反面：永远在推进）
+        for expect in [1usize, 2] {
+            let mut r = SyncReport::default();
+            reconcile_view(&client, &mv, &cfg, &mut baseline, &mut r, &store).await;
+            assert_eq!(r.dirs_scanned, 2, "每轮固定推进一个目录: {r:?}");
+            let cursor = store.lock().unwrap().store.meta(&cursor_key).unwrap();
+            assert_eq!(
+                cursor.as_deref(),
+                Some(format!("{home}/d{expect:03}").as_str()),
+                "游标必须逐轮前进到 d{expect:03}"
+            );
+        }
+        // d210 还没轮到：不许因为「没看到」被当成远端已删
+        assert!(
+            view.node(&format!("{home}/d210/f.txt")).is_some(),
+            "未轮到的目录里的文件不许被误删"
+        );
         srv.abort();
         let _ = std::fs::remove_dir_all(&work);
     }

@@ -198,15 +198,31 @@ GUI：三处「有删除被熔断挡住」告警一直亮着（问题恢复/放�
   * 「视图完整」按**目录**成立：只有本轮列过（列举成功或确定 404）的目录里的候选才判定，
     其余一律暂不判定 —— 不再「一个目录抖动挡住整个视图的删除」；
   * 改名配对的已删侧同样过滤「父目录本轮列过」，不把「没看到」配成一次改名；
-  * **固有代价**：目录树远超单轮上限时，每个目录要隔若干轮才轮到一次（上限越小 / 目录
-    越多，删除与上传/刷新判定的延迟越大）；轮转只保证「最终会轮到、不会永久漏」。要更快
-    就提高上限（`SyncConfig::max_dirs_per_poll`）或缩小同步范围；note 里会写明本轮轮转
-    覆盖了多少个目录。
   * 覆盖测试：`scan_window_rotates_and_covers_every_directory`、
     `scan_window_survives_a_deleted_cursor_directory`、
     `reconcile_rotates_scan_window_instead_of_starving_deletions`、
     `listing_failure_only_defers_its_own_directory`、
     `listing_status_4_or_5_never_deletes_without_stat_confirmation`。
+* **时间预算驱动对账扫描**（v0.6.8，2026-10-19 真机反馈后重设计）：轮转只保证「最终
+  会轮到」，但**一轮该列多少目录**以前写死成 200（`max_dirs_per_poll`），跟轮询间隔
+  完全脱钩 —— 真机 1439 目录 × 600s 间隔，全量列举只要 1~5 分钟，却硬掰成 8 轮轮转，
+  远端删除最坏要 **80 分钟**才落地（而该账号事件快路径是死的：`qbox_get_sync_log`
+  无新事件，对账就是主路径）。现在一轮能列多少由「这轮有多少时间」决定：
+  * **预算** = 轮询间隔 × 50%（`SCAN_BUDGET_RATIO_OF_INTERVAL`），每轮推导（间隔
+    运行时可调）；`QXNYC_SCAN_BUDGET_SECS` 可显式覆盖（`0` = 不限）；
+    `sync --once` / GUI「立即同步」给足 600s（`SCAN_BUDGET_ONCE`）—— 手动场景就是想全量；
+  * 预算没用完 → 窗口列完即**全量**（删除判定延迟 = 一个间隔）；预算耗尽 → 到点即收，
+    游标 = 最后一个列过的目录，下轮续扫（退化为轮转，但每轮耗时可控）；
+  * **进度保证**：每轮至少列一个轮转目录（预算检查从第二个开始）—— 否则「预算 <
+    一次列举耗时」的极端配置会让根吃光预算、游标存不下，饿死换个马甲回来；
+  * 游标存在就进轮转（不再要求「目录数 > 硬顶」）：时间预算耗尽留下的游标若被忽略，
+  排序在后的目录在时间预算下永远轮不到；列完全部时**清游标**（不清的话下轮带着游标
+    白转一圈）；
+  * `max_dirs_per_poll` 降级为**硬顶兜底**（防目录数爆炸拖死单轮），默认 200 → 2000；
+  * 回绕补齐不超过全集（预算 ≥ 全集时窗口 = 全集的旋转序，不重复列目录）；
+  * 覆盖测试：`generous_time_budget_scans_everything_in_one_round`（预算充足一轮
+    全量、游标清空）、`tiny_time_budget_still_makes_progress`（1ns 预算下每轮推进
+    一个、游标逐轮前进、未轮到的不误删）。
 * **baseline 的删除/改名永远落不了盘**（pre-existing）：`persist()` 只按 mtime 取较新
   签名做增量合并，从**本轮快照**里删掉的条目会被内存里旧 `g.baseline` 复活 → 下一轮
   又写回库。于是「规则排除清理」「回收站清理」「已执行删除的 baseline」「改名迁移的
