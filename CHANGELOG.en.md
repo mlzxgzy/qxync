@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Offline-restartable daemon (M21)**: restarting the daemon while offline (or booting
+  after a power cut) restores the mount **immediately** (measured 1s on real hardware)
+  and it stays usable offline — no more "wait for the network before the mount comes
+  back".
+  * Session-less mounting: `mount()` no longer requires a login. Mounting itself does
+    not need the NAS (hydration and uploads already have honest offline behaviour);
+    when offline is known the login attempt is skipped entirely. Once a login succeeds
+    the sid is hot-pushed to the restored mount, no remount needed.
+  * Persisted directory listings (new `listings` table, `sync.db` schema v5 → v6): the
+    M9 in-memory listing snapshots are now written through to the state store and
+    reloaded on mount — after an offline restart `ls` serves the persisted listings,
+    already-hydrated files are re-claimed from the cache + `.qxstate` bitmap, and writes
+    keep buffering. Listings are "last known content": polls replace them once online,
+    a lost row means less visibility, never data loss.
+  * Listing signature consistency: the `size=0` placeholder entry from `create` is
+    refreshed on release/setattr with the final signature; the upload-success hook
+    writes the just-uploaded signature back (closing the create-vs-prewarm race); the
+    cache claim tolerates a 1-second listing mtime skew (the NAS-side `set_mtime`
+    visibility window) when the baseline proves the `.qxstate` is exactly the last
+    uploaded version — otherwise the claim is still rejected, keeping the
+    "never serve wrong content" guarantee.
+  * `mounts.json` now records `cache_dir` (the parent directory; the namespace is
+    re-joined per link on restore): mounts with a custom `--cache-dir` can re-claim
+    their old cache after a restart — previously they silently re-hydrated (online) or
+    failed to read (offline).
+  * Directory renames (local and remote) now move listing snapshots for the **whole
+    subtree** (previously only the directory itself, leaving subdirectories without a
+    snapshot at the new path → offline `ls` EIO); remote subtree deletions invalidate
+    the listings as well (no ghost directories).
+
 - **Offline availability + cumulative buffer (M20)**: being disconnected no longer means
   "local changes are dropped after 10 seconds". While offline the mount keeps serving:
   already-cached content stays readable and writable, and local changes (writes, create,

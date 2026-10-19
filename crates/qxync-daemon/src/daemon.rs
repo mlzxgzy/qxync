@@ -1033,13 +1033,10 @@ pub async fn run(opts: Options) -> Result<()> {
         let st = state.clone();
         let lid = opts.link_id.clone();
         tokio::spawn(async move {
-            // 给 socket/会话一点时间就绪：恢复要挂载，需要已登录
-            for _ in 0..40 {
-                if st.client.lock().await.sid().is_some() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
+            // ★ M21：**不再等 sid** —— mount() 已支持无会话挂载（清单从 listings 表
+            //   装回、缓存可读、写进 outbox），登录成功后 sid 由 push_sid_to_mounts
+            //   热推。旧实现离线时这里要白等 10s、然后整批挂载失败 —— 挂载点
+            //   直到联网才恢复，正是 M21 要修的「急用出问题」。
             restore_mounts_on_start(&st, &lid).await;
         });
     }
@@ -2359,9 +2356,43 @@ async fn mount(
     cache_mode: Option<String>,
     conflict: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    ensure_session(state).await?;
-    let sid = require_sid(state).await?;
-    // ★ M10：记下这个挂载点用的是哪个账号（换账号时靠它决定推不推新 sid）
+    // ★ M21：**无会话挂载** —— 登录不再挡住挂载。
+    //
+    // 旧实现 `ensure_session()?` + `require_sid()?`：离线时（或凭据坏了）挂载直接
+    // 失败，daemon 重启后 `restore_mounts_on_start` 整批失败 —— 挂载点要等联网
+    // 登录成功才恢复，急用文件时干等。但挂载本身其实不需要 NAS：
+    // * 目录清单从 `listings` 表装回（M21），离线能 `ls`；
+    // * 已水合内容靠缓存文件 + `.qxstate` 位图认领，离线可读；
+    // * 写操作进 outbox / 上传队列（M20），联网后回放。
+    //
+    // 会话怎么补上：登录成功（自动登录 / 轮询器懒登录 / 会话保活重登）都会走
+    // `login_internal` → `push_sid_to_mounts`，`mount_user` 为空的挂载点按
+    // 「同账号」处理、直接热推 sid —— 不需要重新挂载。
+    //
+    // 已知离线时**连试都不试**：客户端 connect timeout 20s，白等一轮只会把
+    // 「离线重启后挂载点秒回」拖成 20 秒。Unknown / Online 时保持旧语义
+    // （ensure_session 在线登录 ~1-2s，挂载完成时 sid 已就位）。
+    let sid = if state.connectivity.is_known() && !state.connectivity.is_online() {
+        tracing::warn!(
+            "已知离线：跳过登录，以离线模式挂载 {}（缓存可读、写入进缓冲区，联网后自动补登）",
+            mountpoint.display()
+        );
+        None
+    } else {
+        match ensure_session(state).await {
+            Ok(()) => require_sid(state).await.ok(),
+            Err(e) => {
+                tracing::warn!(
+                    "登录不可用，仍继续挂载 {}（离线模式：缓存可读、写入进缓冲区，联网后自动补登）: {}",
+                    mountpoint.display(),
+                    e.message
+                );
+                None
+            }
+        }
+    };
+    // ★ M10：记下这个挂载点用的是哪个账号（换账号时靠它决定推不推新 sid）。
+    // 没登录时是空串 —— `push_sid_to_mounts` 对空串按「同账号」热推（见其文档）。
     let mount_user = current_session(state)
         .await
         .map(|s| s.username)
@@ -2391,15 +2422,19 @@ async fn mount(
     let paths = ConfigPaths::discover().map_err(|e| IpcError::new(ErrorKind::Io, e.to_string()))?;
     let ns = qxync_core::config::link_namespace(&state.link);
     let cache = cache_dir
+        .as_ref()
         .map(|parent| parent.join(&ns))
         .unwrap_or_else(|| paths.cache_dir_for(&state.link));
 
     // 给 FUSE 一个独立 Client（只带 sid），避免和 daemon 主体抢同一把锁
     // ★ M8.4：FUSE 的客户端也要走设置里的代理（否则挂载后水合直连、绕开代理）
+    // ★ M21：sid 可能是 None（离线挂载）—— 登录成功后由 push_sid_to_mounts 热推。
     let fuse_client =
         Client::new_with_proxy(&state.link, Some(&state.settings.lock().unwrap().proxy))
             .map_err(map_err)?;
-    fuse_client.set_sid(sid);
+    if let Some(sid) = sid {
+        fuse_client.set_sid(sid);
+    }
     let counters = Arc::new(HydroCounters::default());
     let fuse_client = Arc::new(fuse_client);
     let mut fs = QxyncFs::new(fuse_client.clone(), remote.clone(), cache.clone())
@@ -2486,6 +2521,10 @@ async fn mount(
         // 回调里现取锁 —— 上传 worker 线程只在这一小段持锁。
         let st = state.clone();
         q.set_success_hook(Arc::new(move |remote: &str, sig: (u64, i64)| {
+            // ★ M21：上传落地 → 清单条目刷成这版签名。create 的 upsert 可能输给
+            //   挂载预热的 seed（文件暂时不在清单里），这里补上 —— 否则断网重启后
+            //   文件在挂载点上不可见，直到下一轮轮询（真机 M21 验收抓到过）。
+            h.note_uploaded_listing(remote, sig.0, sig.1);
             // ★ M17：上传成功 = NAS 上**一定**已经有这个路径了。哪怕下面因为
             // 「上传期间本地又变了」不推进 baseline，也必须把这个事实记进节点，
             // 否则紧接着的改名会误判成「远端没有老副本」而漏掉远端改名。
@@ -2588,6 +2627,9 @@ async fn mount(
         hydrate_timeout_secs: hydrate_timeout.as_secs(),
         delete_limit,
         auto_unmount,
+        // ★ M21：自定义缓存目录的父目录原样入记录（恢复时按当前 link 重拼命名空间；
+        //   None = 默认目录，与老文件缺这一栏的行为一致）
+        cache_dir: cache_dir.clone(),
     };
     state.mounts.lock().unwrap().insert(
         mp.clone(),
@@ -4651,10 +4693,11 @@ async fn tasks_cmd(
 /// 已挂载视图与记录（覆盖「GUI 改完不重启」的场景），这里兜住「直接改任务文件 /
 /// 上次保存时没挂载」的情况。其余挂载参数（线程 / cache_mode / 超时…）仍现场优先。
 ///
-/// ## 三个不变量（M15/T5 改动点 3）
+/// ## 三个不变量（M15/T5 改动点 3；★ M21 修订第 1 条）
 ///
-/// 1. **必须已登录** —— 调用方 [`run`] 那边已等过 `sid`，这里 `mount()` 自己
-///    还有 `ensure_session` + `require_sid` 兜底，登录不上只会这批失败；
+/// 1. **不再要求已登录**（M21）—— `mount()` 支持无会话挂载：清单从 `listings`
+///    表装回、已水合内容可读、写操作进 outbox；登录成功后 sid 热推
+///    （`push_sid_to_mounts`）。离线重启 daemon 时挂载点**立即**恢复，不等网络；
 /// 2. **幂等** —— 已被别处挂上（或已经是挂载点）的跳过，不重复挂；
 /// 3. **失败不阻塞** —— 单个失败只 WARN，继续恢复下一个，绝不让 daemon 起不来。
 pub(crate) async fn restore_mounts_on_start(state: &Arc<State>, link_id: &str) {
@@ -4765,8 +4808,9 @@ pub(crate) async fn restore_mounts_on_start(state: &Arc<State>, link_id: &str) {
             state,
             mp.clone(),
             Some(rec.remote.clone()),
-            // 记录里刻意不存 cache_dir（见 mounts.rs 模块文档）→ None = 默认目录
-            None,
+            // ★ M21：自定义缓存目录的父目录（记录里存的就是父目录，mount() 会按
+            //   当前 link 重拼命名空间）。老记录没有这一栏 → None = 默认目录。
+            rec.cache_dir.clone(),
             rec.threads.max(1),
             rec.auto_unmount,
             Duration::from_secs(rec.hydrate_timeout_secs),
@@ -6459,6 +6503,7 @@ mod tests {
             hydrate_timeout_secs: 60,
             delete_limit: None,
             auto_unmount: true,
+            cache_dir: None,
         }
     }
 

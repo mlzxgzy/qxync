@@ -123,10 +123,13 @@ path, port, user = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 json.dump({"id":"default","host":"127.0.0.1","port":port,"https":True,"insecure":True,
            "user":user,"ipv4_only":True}, open(path, "w"))
 PYjson
-python3 - "$ROOT/config/qxync/credentials.json" "$REAL_USER" "$REAL_PASSWORD" <<'PYjson'
+python3 - "$ROOT/config/qxync/credentials.json" "$REAL_USER" "$REAL_PASSWORD" "${QXNYC_REAL_OTP_SECRET:-}" <<'PYjson'
 import json, sys
-path, user, password = sys.argv[1], sys.argv[2], sys.argv[3]
-json.dump({"host":"127.0.0.1","user":user,"password":password}, open(path, "w"))
+path, user, password, otp = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+creds = {"host":"127.0.0.1","user":user,"password":password}
+if otp:
+    creds["otp_secret"] = otp   # ★ M21：账号开了 2SV 时必须带上（与 m21-real-nas.sh 同源）
+json.dump(creds, open(path, "w"))
 PYjson
 chmod 600 "$ROOT/config/qxync/credentials.json"
 

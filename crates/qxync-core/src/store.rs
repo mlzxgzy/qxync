@@ -22,6 +22,7 @@
 
 use crate::error::{Error, Result};
 use crate::file_id::FileId;
+use crate::model::DirEntry;
 use crate::sync::{Baseline, Cursors, Sig, BASELINE_FILE, CURSORS_FILE};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::collections::BTreeMap;
@@ -32,11 +33,12 @@ use std::sync::{Arc, Mutex};
 pub const DB_FILE: &str = "sync.db";
 
 /// schema 版本（写进 `PRAGMA user_version`；将来加表要迁移时用它判断）。
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 // ★ M8.3：v1 → v2 只是**新增 journal 表与索引**。
 // ★ M8.4：v2 → v3 只是**新增 decisions 表（冲突待裁决队列）**。
 // ★ M15/T9：v3 → v4 只是**新增 nodes 表（稳定文件身份 file_id → path 的索引）**。
 // ★ M20：v4 → v5 只是**新增 outbox 表（离线期间做不成的结构操作）**。
+// ★ M21：v5 → v6 只是**新增 listings 表（目录清单快照的持久化）**。
 // 因为整份 SCHEMA_SQL 都是
 // `CREATE TABLE/INDEX IF NOT EXISTS`，老库在下次 `Store::open()` 时会被自动补齐，
 // **不需要写迁移代码、也不会碰已有表里的数据**（迁移幂等由 m5-matrix 断言覆盖）。
@@ -163,6 +165,25 @@ CREATE TABLE IF NOT EXISTS nodes (
 );
 -- path 侧查询（上传队列落地时按 file_id 反查最新名字、对账时按 path 取身份）
 CREATE UNIQUE INDEX IF NOT EXISTS nodes_path ON nodes(path);
+-- ★ M21：目录清单快照（FUSE「映射」的持久化形态）。
+--
+-- 为什么需要：M9 的清单快照让 `readdir`/`lookup` 不必每次问 NAS，但它只在内存里
+-- —— daemon 重启后节点表与快照全空，离线时挂载点连根目录都 `ls` 不了（M20 的
+-- 已知限制：「离线重启 daemon，挂载点要等联网才恢复」）。把快照写穿到状态库、
+-- 挂载时整份装回，离线重启后挂载点立刻可用：已列过的目录能 `ls`、已水合的文件
+-- 能读（缓存文件 + `.qxstate` 位图本来就在盘上）、写操作照旧进 outbox。
+--
+-- 语义：**快照 = 最后一次已知的目录内容**，不是权威状态。行丢了/旧了都只是
+-- 「离线重启后少看见一些东西」，联网后轮询的 apply_listing 会整份换新 ——
+-- 这与 nodes 表「可重建的派生索引」是同一条设计线。
+--
+-- entries 是 `Vec<DirEntry>` 的 JSON（模型本身 Serialize/Deserialize，含 file_id）。
+-- 一个目录一行；目录改名时整棵子树的行按前缀改写（与 outbox_rewrite_prefix 同一套段级规则）。
+CREATE TABLE IF NOT EXISTS listings (
+  dir          TEXT PRIMARY KEY,
+  entries      TEXT    NOT NULL,
+  updated_unix INTEGER NOT NULL DEFAULT 0
+);
 "#;
 
 /// ★ M15/T9：`nodes` 表的一行 —— 一个稳定文件身份当前对应的路径。
@@ -590,6 +611,27 @@ impl Store {
             .query_row("SELECT COUNT(*) FROM baseline", [], |r| r.get(0))
             .map_err(Error::from)?;
         Ok(n as u64)
+    }
+
+    /// ★ M21：取**单个路径**的 baseline 签名（不存在 = `Sig::MISSING`）。
+    ///
+    /// 给 FUSE 的缓存认领用（mtime 偏斜容差，见 `cache_file_for`）：整份 `baseline()`
+    /// 在认领热路径上太重，这里只查一行。语义与 `Baseline::get` 一致。
+    pub fn baseline_get(&self, path: &str) -> Sig {
+        self.conn()
+            .query_row(
+                "SELECT present, is_dir, size, mtime FROM baseline WHERE path = ?1",
+                params![path],
+                |r| {
+                    Ok(Sig {
+                        exists: r.get::<_, i64>(0)? != 0,
+                        is_dir: r.get::<_, i64>(1)? != 0,
+                        size: r.get::<_, i64>(2)? as u64,
+                        mtime: r.get(3)?,
+                    })
+                },
+            )
+            .unwrap_or(Sig::MISSING)
     }
 
     pub fn save_baseline(&self, b: &Baseline) -> Result<()> {
@@ -1550,6 +1592,114 @@ impl Store {
         Ok(n)
     }
 
+    // ------------------------------------------------------------ ★ M21：目录清单持久化
+
+    /// ★ M21：写穿一份目录清单快照（upsert；`entries` 是 JSON 化的 `Vec<DirEntry>`）。
+    ///
+    /// 调用方是 FUSE 侧的各清单变更点（apply_listing / mkdir / rename / unlink …），
+    /// 失败由调用方 WARN —— 内存仍是本次会话的真相，落库只服务「离线重启后还能 ls」。
+    pub fn listing_save(&self, dir: &str, entries: &[DirEntry]) -> Result<()> {
+        let json = serde_json::to_string(entries).map_err(Error::from)?;
+        self.conn()
+            .execute(
+                "INSERT INTO listings(dir, entries, updated_unix) VALUES(?1, ?2, ?3)
+                 ON CONFLICT(dir) DO UPDATE SET entries = ?2, updated_unix = ?3",
+                params![dir, json, now_unix()],
+            )
+            .map_err(Error::from)?;
+        Ok(())
+    }
+
+    /// ★ M21：删掉一份清单快照（远端目录没了 / 本地刚改过名字空间）。
+    pub fn listing_delete(&self, dir: &str) -> Result<()> {
+        self.conn()
+            .execute("DELETE FROM listings WHERE dir = ?1", params![dir])
+            .map_err(Error::from)?;
+        Ok(())
+    }
+
+    /// ★ M21：目录改名 → 把 `old` 子树（含自身）的清单行改写到 `new` 前缀下。
+    ///
+    /// 与 [`Self::outbox_rewrite_prefix`] 同一套**段级前缀**规则（`/a` 不命中 `/ab`）。
+    /// 返回改写的行数。
+    pub fn listing_move_prefix(&self, old: &str, new: &str) -> Result<usize> {
+        let old = old.trim_end_matches('/');
+        let new = new.trim_end_matches('/');
+        if old.is_empty() || new.is_empty() || old == new {
+            return Ok(0);
+        }
+        fn under(path: &str, root: &str) -> bool {
+            path == root
+                || (path.len() > root.len()
+                    && path.starts_with(root)
+                    && path.as_bytes()[root.len()] == b'/')
+        }
+        let dirs: Vec<String> = {
+            let conn = self.conn();
+            let mut stmt = conn
+                .prepare("SELECT dir FROM listings")
+                .map_err(Error::from)?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(Error::from)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::from)?
+        };
+        let mut n = 0usize;
+        for dir in dirs {
+            if !under(&dir, old) {
+                continue;
+            }
+            let to = if dir == old {
+                new.to_string()
+            } else {
+                format!("{new}{}", &dir[old.len()..])
+            };
+            self.conn()
+                .execute(
+                    "UPDATE listings SET dir = ?2, updated_unix = ?3 WHERE dir = ?1",
+                    params![dir, to, now_unix()],
+                )
+                .map_err(Error::from)?;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    /// ★ M21：装回全部持久化清单（挂载时一次性；空表返回空 Vec）。
+    ///
+    /// 返回 `(装回的 (目录, 条目), 损坏被跳过的目录)`。单行 JSON 损坏只跳过该行 ——
+    /// 一份旧/坏的清单不该挡住其它目录的恢复，更不该挡住挂载；损坏目录名交给
+    /// 调用方 WARN（本 crate 刻意不依赖日志门面），联网后 `apply_listing` 会整份换新。
+    pub fn listing_load_all(&self) -> Result<(Vec<(String, Vec<DirEntry>)>, Vec<String>)> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT dir, entries FROM listings")
+            .map_err(Error::from)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(Error::from)?;
+        let mut out = Vec::new();
+        let mut corrupt = Vec::new();
+        for row in rows {
+            let (dir, json) = row.map_err(Error::from)?;
+            match serde_json::from_str::<Vec<DirEntry>>(&json) {
+                Ok(entries) => out.push((dir, entries)),
+                Err(_) => corrupt.push(dir),
+            }
+        }
+        Ok((out, corrupt))
+    }
+
+    /// ★ M21：清单行数（观测 / 单测用）。
+    pub fn listing_len(&self) -> Result<u64> {
+        let n: i64 = self
+            .conn()
+            .query_row("SELECT COUNT(*) FROM listings", [], |r| r.get(0))
+            .map_err(Error::from)?;
+        Ok(n.max(0) as u64)
+    }
+
     // ------------------------------------------------------------ ★ M19：按路径子树清理
 
     /// `table` 只允许这张白名单：它们都有 `path` 列、且路径都是**远端绝对路径**。
@@ -2288,6 +2438,122 @@ mod tests {
         assert!(s.outbox_pending().unwrap().is_empty());
     }
 
+    /// ★ M21：目录清单持久化 —— 存取往返（含 file_id）、upsert 覆盖、删行。
+    #[test]
+    fn listings_roundtrip_upsert_and_delete() {
+        let s = Store::open_in_memory().unwrap();
+        assert_eq!(s.listing_len().unwrap(), 0);
+        assert!(s.listing_load_all().unwrap().0.is_empty());
+
+        let e1 = DirEntry::local("a.txt", false, 12, 34).with_file_id("/home");
+        let e2 = DirEntry::local("sub", true, 0, 56).with_file_id("/home");
+        s.listing_save("/home", &[e1.clone(), e2.clone()]).unwrap();
+        assert_eq!(s.listing_len().unwrap(), 1);
+
+        // 往返：字段（含 file_id）必须逐项一致
+        let back = s.listing_load_all().unwrap().0;
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].0, "/home");
+        assert_eq!(back[0].1, vec![e1, e2]);
+
+        // upsert：同目录再写一份 → 一行、内容换新
+        let e3 = DirEntry::local("b.txt", false, 78, 90);
+        s.listing_save("/home", &[e3.clone()]).unwrap();
+        assert_eq!(s.listing_len().unwrap(), 1);
+        let back = s.listing_load_all().unwrap().0;
+        assert_eq!(back[0].1, vec![e3]);
+
+        // 删行
+        s.listing_delete("/home").unwrap();
+        assert_eq!(s.listing_len().unwrap(), 0);
+        assert!(s.listing_load_all().unwrap().0.is_empty());
+        // 删不存在的行不是错误
+        s.listing_delete("/nope").unwrap();
+    }
+
+    /// ★ M21：目录改名 → 清单行整棵子树按段级前缀改写（`/a` 不误伤 `/ab`）。
+    #[test]
+    fn listings_move_prefix_rewrites_subtree_only() {
+        let s = Store::open_in_memory().unwrap();
+        let ent = |n: &str| DirEntry::local(n, false, 1, 1);
+        s.listing_save("/home/old", &[ent("f.txt")]).unwrap();
+        s.listing_save("/home/old/sub", &[ent("g.txt")]).unwrap();
+        s.listing_save("/home/old/sub/deep", &[ent("h.txt")])
+            .unwrap();
+        // 前缀相似但不该命中的
+        s.listing_save("/home/older", &[ent("x.txt")]).unwrap();
+        s.listing_save("/home", &[ent("old"), ent("older")])
+            .unwrap();
+
+        assert_eq!(
+            s.listing_move_prefix("/home/old", "/home/new").unwrap(),
+            3,
+            "自身 + 两层子目录共 3 行"
+        );
+        let all = s.listing_load_all().unwrap().0;
+        let dirs: Vec<&str> = all.iter().map(|(d, _)| d.as_str()).collect();
+        assert!(dirs.contains(&"/home/new"));
+        assert!(dirs.contains(&"/home/new/sub"));
+        assert!(dirs.contains(&"/home/new/sub/deep"));
+        assert!(
+            dirs.contains(&"/home/older"),
+            "段级前缀：/home/older 不能被改写"
+        );
+        assert!(dirs.contains(&"/home"));
+        assert!(!dirs.contains(&"/home/old"));
+        assert!(!dirs.contains(&"/home/old/sub"));
+
+        // 幂等：再改一次没有命中行
+        assert_eq!(s.listing_move_prefix("/home/old", "/home/new").unwrap(), 0);
+    }
+
+    /// ★ M21：v5 老库打开后自动补 listings 表（不写迁移代码），旧数据原样保留。
+    #[test]
+    fn listings_table_added_to_v5_db() {
+        let dir = tmpdir("v5-listings");
+        let db = dir.join("sync.db");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS pins (path TEXT PRIMARY KEY, state TEXT NOT NULL);
+                 INSERT INTO pins (path, state) VALUES ('/home/x', 'pinned');",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 5i64).unwrap();
+        }
+        let s = Store::open(&db).unwrap();
+        assert_eq!(s.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(s.pin("/home/x").unwrap().as_deref(), Some("pinned"));
+        assert_eq!(s.listing_len().unwrap(), 0, "新表为空、可查询");
+        s.listing_save("/home", &[DirEntry::local("a", false, 1, 1)])
+            .unwrap();
+        assert_eq!(s.listing_len().unwrap(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M21：损坏的清单行（JSON 不合法）只跳过该行，不挡住其它目录、不报错。
+    #[test]
+    fn listings_corrupt_row_is_skipped() {
+        let s = Store::open_in_memory().unwrap();
+        s.listing_save("/home/good", &[DirEntry::local("a", false, 1, 1)])
+            .unwrap();
+        // 直接塞一行坏 JSON（模拟位翻转 / 半截写）
+        s.conn()
+            .execute(
+                "INSERT INTO listings(dir, entries, updated_unix) VALUES('/home/bad', '{not json', 1)",
+                [],
+            )
+            .unwrap();
+        let (all, corrupt) = s.listing_load_all().unwrap();
+        assert_eq!(all.len(), 1, "坏行跳过、好行照常回来");
+        assert_eq!(all[0].0, "/home/good");
+        assert_eq!(
+            corrupt,
+            vec!["/home/bad".to_string()],
+            "损坏目录名要报给调用方"
+        );
+    }
+
     #[test]
     fn sig_exists_is_dir_helpers_are_consistent() {
         // 保证 store 里用的 Sig 构造器与 sync.rs 的语义一致
@@ -2535,7 +2801,11 @@ mod tests {
             conn.pragma_update(None, "user_version", 3i64).unwrap();
         }
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 5, "打开时应升到 v5");
+        assert_eq!(
+            s.schema_version().unwrap(),
+            SCHEMA_VERSION,
+            "打开时应升到最新"
+        );
         assert_eq!(s.integrity_check().unwrap(), "ok");
 
         // 五张老表的数据一条不丢
@@ -2574,10 +2844,10 @@ mod tests {
         assert_eq!(s.node_by_path("/home/a.txt").unwrap().unwrap().file_id, id);
         assert_eq!(s.integrity_check().unwrap(), "ok");
 
-        // 再打开一次仍幂等（v5 → v5 不重复建表、不报错）
+        // 再打开一次仍幂等（v6 → v6 不重复建表、不报错）
         drop(s);
         let s2 = Store::open(&db).unwrap();
-        assert_eq!(s2.schema_version().unwrap(), 5);
+        assert_eq!(s2.schema_version().unwrap(), SCHEMA_VERSION);
         assert_eq!(s2.nodes_len().unwrap(), 1);
         assert_eq!(s2.baseline().unwrap().len(), 2, "二次打开数据仍在");
         assert_eq!(s2.outbox_len().unwrap(), 1, "outbox 行跨重启保留");

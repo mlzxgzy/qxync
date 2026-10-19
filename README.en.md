@@ -33,6 +33,10 @@ and `qxync-gui` (desktop GUI).
 - **Offline usable**: cached content stays readable and writable while the network is down; local
   changes (including `mkdir`, rename, delete and `touch`) go into a durable buffer and are replayed
   in order once the NAS is reachable again — instead of being dropped after 10 seconds of retries
+- **Offline restartable**: restarting the daemon while offline (or booting after a power cut)
+  restores the mount within seconds and it stays usable — `ls` serves persisted directory
+  listings, hydrated files read from the local cache, writes keep buffering; the session is
+  hot-pushed and the buffer replayed once the network returns
 - **Read-write mount**: with `--rw`, local changes are pushed back through an upload queue;
   writes are read-modify-write, so un-fetched ranges are never uploaded as zeros
 - **Free up space**: automatic dehydration by idle time / cache quota, or manually with

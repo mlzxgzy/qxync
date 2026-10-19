@@ -859,20 +859,50 @@ fn listing_get(inner: &Arc<Mutex<Inner>>, dir: &str) -> Option<DirListing> {
 }
 
 /// 写入/替换一个目录的清单快照（定时刷新与冷路径加载共用）。
-fn listing_put(inner: &Arc<Mutex<Inner>>, dir: &str, entries: Arc<Vec<DirEntry>>) {
+///
+/// ★ M21：返回写入的条目 —— 调用方拿去写穿 `sync.db`（`listings` 表），
+/// 离线重启后挂载点才能凭持久化清单继续 `ls`。
+fn listing_put(
+    inner: &Arc<Mutex<Inner>>,
+    dir: &str,
+    entries: Arc<Vec<DirEntry>>,
+) -> Arc<Vec<DirEntry>> {
     let mut g = inner.lock().unwrap();
     g.dirs.insert(
         dir.to_string(),
         DirListing {
-            entries,
+            entries: entries.clone(),
             fetched: Instant::now(),
         },
     );
+    entries
 }
 
 /// 丢掉一个目录的清单快照（远端目录没了 / 本地刚改过名字空间）。
-fn listing_drop(inner: &Arc<Mutex<Inner>>, dir: &str) {
-    inner.lock().unwrap().dirs.remove(dir);
+///
+/// ★ M21：返回「原本有没有」—— 有才需要同步删掉持久化行。
+fn listing_drop(inner: &Arc<Mutex<Inner>>, dir: &str) -> bool {
+    inner.lock().unwrap().dirs.remove(dir).is_some()
+}
+
+/// ★ M21：丢掉 `root` 子树（含自身）的全部清单快照，返回被丢掉的目录路径。
+///
+/// 远端删掉一个目录时用：目录没了，它和它下面的清单全部作废 —— 留着的话
+/// 离线重启后 `ls` 会把已删除的子树又「复活」出来（幽灵目录）。
+fn listing_drop_subtree(inner: &Arc<Mutex<Inner>>, root: &str) -> Vec<String> {
+    let root = root.trim_end_matches('/');
+    let prefix = format!("{root}/");
+    let mut g = inner.lock().unwrap();
+    let victims: Vec<String> = g
+        .dirs
+        .keys()
+        .filter(|d| d.as_str() == root || d.starts_with(&prefix))
+        .cloned()
+        .collect();
+    for d in &victims {
+        g.dirs.remove(d);
+    }
+    victims
 }
 
 /// ★ M20：目录改名后，把清单快照从旧路径搬到新路径。
@@ -883,47 +913,88 @@ fn listing_drop(inner: &Arc<Mutex<Inner>>, dir: &str) {
 ///
 /// 快照描述的是「这个目录里有什么」，目录改名不改变其内容，所以整体搬过去。
 /// 目标路径若已有快照（极少见：改名覆盖），以搬过来的这份为准。
-fn listing_move(inner: &Arc<Mutex<Inner>>, old: &str, new: &str) {
+///
+/// ★ M21：**整棵子树一起搬**（`/a` → `/b` 时 `/a/x` 的快照也搬到 `/b/x`），
+/// 并返回搬走的 `(新路径, 条目)` 列表。只搬自身的话，改名前已列过的子目录
+/// 在新路径下会退回「无快照」—— 在线时只是多一次 NAS 往返，离线时 `ls`
+/// 直接 EIO；持久化之后这条路径还会跨重启存在，必须一并改对。
+fn listing_move(
+    inner: &Arc<Mutex<Inner>>,
+    old: &str,
+    new: &str,
+) -> Vec<(String, Arc<Vec<DirEntry>>)> {
     if old == new {
-        return;
+        return Vec::new();
     }
     let mut g = inner.lock().unwrap();
-    if let Some(list) = g.dirs.remove(old) {
-        g.dirs.insert(new.to_string(), list);
+    // 段级前缀：old 自身 + old/... 子树（old_len 边界必须是 '/'，/a 不命中 /ab）
+    let mut moved: Vec<(String, Arc<Vec<DirEntry>>)> = Vec::new();
+    let victims: Vec<String> = g
+        .dirs
+        .keys()
+        .filter(|d| {
+            d.as_str() == old
+                || (d.len() > old.len() && d.starts_with(old) && d.as_bytes()[old.len()] == b'/')
+        })
+        .cloned()
+        .collect();
+    for d in victims {
+        if let Some(list) = g.dirs.remove(&d) {
+            let to = if d == old {
+                new.to_string()
+            } else {
+                format!("{new}{}", &d[old.len()..])
+            };
+            g.dirs.insert(to.clone(), list.clone());
+            moved.push((to, list.entries));
+        }
     }
+    moved
 }
 
 /// 从目录清单快照里摘掉一个名字（本地删除后立刻生效，不用等下一轮轮询）。
 ///
 /// 不做这一步的话：`rm a` 之后 `ls` 会把快照里还在的 `a` 重新物化成幽灵节点。
-fn listing_remove(inner: &Arc<Mutex<Inner>>, dir: &str, name: &str) {
+///
+/// ★ M21：返回改后的条目（该目录**有**快照时才 `Some`）—— 调用方写穿持久化。
+fn listing_remove(inner: &Arc<Mutex<Inner>>, dir: &str, name: &str) -> Option<Arc<Vec<DirEntry>>> {
     let mut g = inner.lock().unwrap();
-    if let Some(list) = g.dirs.get_mut(dir) {
-        if list.entries.iter().any(|e| e.filename == name) {
-            let kept: Vec<DirEntry> = list
-                .entries
-                .iter()
-                .filter(|e| e.filename != name)
-                .cloned()
-                .collect();
-            list.entries = Arc::new(kept);
-        }
+    let list = g.dirs.get_mut(dir)?;
+    if !list.entries.iter().any(|e| e.filename == name) {
+        // 名字本来就不在快照里 → 没有变化，调用方不必写穿
+        return None;
     }
+    let kept: Vec<DirEntry> = list
+        .entries
+        .iter()
+        .filter(|e| e.filename != name)
+        .cloned()
+        .collect();
+    list.entries = Arc::new(kept);
+    Some(list.entries.clone())
 }
 
 /// 把一个条目写进目录清单快照（本地新建 / 改名后立刻可见）。
-fn listing_upsert(inner: &Arc<Mutex<Inner>>, dir: &str, entry: &DirEntry) {
+///
+/// ★ M21：返回改后的条目（该目录**有**快照时才 `Some`）—— 调用方写穿持久化。
+/// 没有快照时是 no-op：这个目录还没被列过，凭空造一份「只有这一个名字」的
+/// 快照会把「其它名字不存在」也一并断言掉（`listing_lookup` 的 `Some(None)` 语义）。
+fn listing_upsert(
+    inner: &Arc<Mutex<Inner>>,
+    dir: &str,
+    entry: &DirEntry,
+) -> Option<Arc<Vec<DirEntry>>> {
     let mut g = inner.lock().unwrap();
-    if let Some(list) = g.dirs.get_mut(dir) {
-        let mut kept: Vec<DirEntry> = list
-            .entries
-            .iter()
-            .filter(|e| e.filename != entry.filename)
-            .cloned()
-            .collect();
-        kept.push(entry.clone());
-        list.entries = Arc::new(kept);
-    }
+    let list = g.dirs.get_mut(dir)?;
+    let mut kept: Vec<DirEntry> = list
+        .entries
+        .iter()
+        .filter(|e| e.filename != entry.filename)
+        .cloned()
+        .collect();
+    kept.push(entry.clone());
+    list.entries = Arc::new(kept);
+    Some(list.entries.clone())
 }
 
 /// 在目录清单里查一个名字。
@@ -945,15 +1016,56 @@ fn begin_listing_refresh(inner: &Arc<Mutex<Inner>>, dir: &str) -> bool {
         .insert(dir.to_string())
 }
 
-async fn run_listing_refresh(inner: Arc<Mutex<Inner>>, client: Arc<Client>, dir: String) {
+async fn run_listing_refresh(
+    inner: Arc<Mutex<Inner>>,
+    client: Arc<Client>,
+    store: Option<Arc<Store>>,
+    dir: String,
+) {
     match client.list(&dir).await {
         Ok(entries) => {
             tracing::debug!("后台刷新目录清单 {dir}（{} 项）", entries.len());
-            listing_put(&inner, &dir, Arc::new(entries));
+            let saved = listing_put(&inner, &dir, Arc::new(entries));
+            persist_listing(store.as_ref(), &dir, &saved);
         }
         Err(e) => tracing::debug!("后台刷新目录清单失败 {dir}: {e}"),
     }
     inner.lock().unwrap().listing_inflight.remove(&dir);
+}
+
+// ---------------------------------------------------------------- ★ M21：清单持久化（写穿 sync.db）
+
+/// ★ M21：把一份清单快照写穿到状态库（`listings` 表）。
+///
+/// 失败只 WARN：内存仍是本次会话的真相，落库只服务「离线重启后还能 `ls`」——
+/// 丢一次写影响的是重启后的可见性，不影响当前会话的正确性，不该让 FUSE 操作失败。
+/// （与 outbox 的「落库失败必须回 EIO」刻意不同：outbox 丢行 = 丢操作，清单丢行 = 旧视图。）
+fn persist_listing(store: Option<&Arc<Store>>, dir: &str, entries: &[DirEntry]) {
+    let Some(store) = store else { return };
+    if let Err(e) = store.listing_save(dir, entries) {
+        tracing::warn!(
+            "清单落库失败 {dir}（{} 项，离线重启后该目录将不可见）: {e}",
+            entries.len()
+        );
+    }
+}
+
+/// ★ M21：删掉一份持久化清单（远端目录没了）。
+fn persist_listing_drop(store: Option<&Arc<Store>>, dir: &str) {
+    let Some(store) = store else { return };
+    if let Err(e) = store.listing_delete(dir) {
+        tracing::warn!("清单行删除失败 {dir}: {e}");
+    }
+}
+
+/// ★ M21：目录改名 → 持久化清单整棵子树改写前缀（内存侧由 [`listing_move`] 搬）。
+fn persist_listing_move(store: Option<&Arc<Store>>, old: &str, new: &str) {
+    let Some(store) = store else { return };
+    match store.listing_move_prefix(old, new) {
+        Ok(0) => {}
+        Ok(n) => tracing::debug!("清单持久化：{old} → {new} 子树 {n} 行已改写"),
+        Err(e) => tracing::warn!("清单子树改写失败 {old} -> {new}: {e}"),
+    }
 }
 
 // ---------------------------------------------------------------- 区间下载（前台 / 后台共用）
@@ -1743,6 +1855,26 @@ impl FsHandle {
         *self.hooks.sid_refresher.lock().unwrap() = Some(f);
     }
 
+    /// ★ M21：上传落地后把清单条目刷成**已上传的那版**签名（daemon 的上传成功
+    /// 钩子调用，跑在 worker 线程上）。
+    ///
+    /// 为什么在钩子里刷：create 的清单 upsert 可能输给挂载预热的 seed（预热落地
+    /// 前 create，upsert 是 no-op）—— 文件从此不在清单里，直到下一轮轮询。若
+    /// 这中间断网重启，文件在挂载点上**不可见**（真机 M21 验收：hello.txt）。
+    /// 上传成功 = 文件确实在远端、签名就是刚传的这版 —— 在这里补一笔，竞态窗口
+    /// 从「30 秒轮询间隔」缩到「上传完成的一瞬」。
+    pub fn note_uploaded_listing(&self, remote: &str, size: u64, mtime: i64) {
+        let Some((dir, name)) = remote.rsplit_once('/') else {
+            return;
+        };
+        let mut e = DirEntry::local(name, false, size, mtime);
+        // 身份按 (size, mtime, name, parent) 现算 —— 与节点物化时同一套输入
+        e.file_id = qxync_core::file_id::file_id_for_entry(dir, &e);
+        if let Some(entries) = listing_upsert(&self.inner, dir, &e) {
+            persist_listing(self.nodes.as_ref(), dir, &entries);
+        }
+    }
+
     /// ★ M9：当前缓存了几份目录清单（观测 / 单测用）。
     pub fn listing_count(&self) -> usize {
         self.inner.lock().unwrap().dirs.len()
@@ -2287,6 +2419,11 @@ impl LocalView for FsHandle {
                 tracing::warn!("清理 nodes 身份失败 {remote}: {e}");
             }
         }
+        // ★ M21：远端删掉的子树，清单快照一并作废（内存 + 持久化）。
+        //   不清的话离线重启后 `ls` 会把已删除的子树复活成幽灵目录。
+        for dir in listing_drop_subtree(&self.inner, remote) {
+            persist_listing_drop(self.nodes.as_ref(), &dir);
+        }
         true
     }
 
@@ -2303,7 +2440,7 @@ impl LocalView for FsHandle {
         // 与 FUSE `rename` 回调的差别：那边是**用户在本机改名**（本地文件真的动了，
         // 要迁缓存文件）；这边是**远端改了名**（本地文件没动，只是不再叫旧名字）。
         // 所以这里不碰 `n.cache` 的物理路径，只更新索引。
-        {
+        let is_dir = {
             let mut g = self.inner.lock().unwrap();
             let Some(ino) = g.by_remote.get(old_remote).copied() else {
                 return false;
@@ -2333,15 +2470,26 @@ impl LocalView for FsHandle {
                 .unwrap_or(ino);
             g.by_remote.remove(old_remote);
             g.by_remote.insert(new_remote.to_string(), ino);
+            let mut is_dir = false;
             if let Some(n) = g.nodes.get_mut(&ino) {
+                is_dir = n.attr.kind == FileType::Directory;
                 n.name = new_name;
                 n.remote = new_remote.to_string();
                 n.parent = new_parent;
             }
+            is_dir
+        };
+        // ★ M21：远端改名的是目录 → 它自己的清单快照（含子树）跟着搬到新路径。
+        //   不搬的话：在线时只是多一次 NAS 往返，离线重启后 `ls` 新路径直接 EIO。
+        if is_dir {
+            listing_move(&self.inner, old_remote, new_remote);
+            persist_listing_move(self.nodes.as_ref(), old_remote, new_remote);
         }
         // 「映射」快照同步换名，否则 readdir 还会露出旧名字
         if let Some((od, on)) = old_remote.rsplit_once('/') {
-            listing_remove(&self.inner, od, on);
+            if let Some(entries) = listing_remove(&self.inner, od, on) {
+                persist_listing(self.nodes.as_ref(), od, &entries);
+            }
         }
         if let Some((nd, nn)) = new_remote.rsplit_once('/') {
             let entry = {
@@ -2361,7 +2509,9 @@ impl LocalView for FsHandle {
                 })
             };
             if let Some(e) = entry {
-                listing_upsert(&self.inner, nd, &e);
+                if let Some(entries) = listing_upsert(&self.inner, nd, &e) {
+                    persist_listing(self.nodes.as_ref(), nd, &entries);
+                }
             }
         }
         // ★ T9：`nodes` 索引行的 path 也要跟着搬（`file_id` 不动）。
@@ -2501,7 +2651,9 @@ impl LocalView for FsHandle {
     }
 
     fn apply_listing(&self, dir: &str, entries: &[DirEntry]) {
-        listing_put(&self.inner, dir, Arc::new(entries.to_vec()));
+        let saved = listing_put(&self.inner, dir, Arc::new(entries.to_vec()));
+        // ★ M21：daemon 轮询推来的清单 = 最新真相，写穿（离线重启后凭它恢复视图）
+        persist_listing(self.nodes.as_ref(), dir, &saved);
     }
 
     fn seed_listing(&self, dir: &str, entries: &[DirEntry]) {
@@ -2519,10 +2671,15 @@ impl LocalView for FsHandle {
                 fetched: Instant::now(),
             },
         );
+        drop(g);
+        // ★ M21：预热清单也写穿（只在真的灌入时 —— 已有快照的分支上面 return 了）
+        persist_listing(self.nodes.as_ref(), dir, entries);
     }
 
     fn drop_listing(&self, dir: &str) {
-        listing_drop(&self.inner, dir);
+        if listing_drop(&self.inner, dir) {
+            persist_listing_drop(self.nodes.as_ref(), dir);
+        }
     }
 
     /// ★ M9：该路径是否在等后台把远端的新内容换上。
@@ -3205,7 +3362,39 @@ impl QxyncFs {
     /// 不注入时这三件事都跳过 —— T9 退化成「身份只在内存/`.qxstate` 里」，
     /// 对账按身份配对 rename 的收益拿不到，但**行为退化方向是保守的**
     /// （退回旧的增删判定，只是可能多出冲突副本，不会错配或丢数据）。
+    ///
+    /// ★ M21：注入的同时**装回持久化的目录清单**（`listings` 表）。
+    /// 这是「离线重启 daemon 后挂载点立刻可用」的视图来源：
+    /// * `readdir`/`lookup` 吃装回的快照，离线也能 `ls`；
+    /// * 已水合的文件靠缓存文件 + `.qxstate` 位图认领（`cache_file_for`），离线可读；
+    /// * 快照按「刚抓的」计龄（`fetched=now`）—— TTL 过期后后台补拉，
+    ///   离线时补拉失败、快照照常服务；在线时轮询的 `apply_listing` 会整份换新。
+    ///
+    /// 装载失败只 WARN（挂载照常，只是离线重启后回到 M20 的行为）；
+    /// 单行损坏只跳过该行（见 `Store::listing_load_all`）。
     pub fn with_nodes_store(mut self, store: Arc<Store>) -> Self {
+        match store.listing_load_all() {
+            Ok((rows, corrupt)) => {
+                for dir in &corrupt {
+                    tracing::warn!("持久化清单行损坏，跳过 {dir}（联网后轮询会重建）");
+                }
+                if !rows.is_empty() {
+                    let n = rows.len();
+                    let mut g = self.inner.lock().unwrap();
+                    let now = Instant::now();
+                    for (dir, entries) in rows {
+                        // 已在内存里的（理论上不会：这是构造期）不覆盖
+                        g.dirs.entry(dir).or_insert(DirListing {
+                            entries: Arc::new(entries),
+                            fetched: now,
+                        });
+                    }
+                    drop(g);
+                    tracing::info!("从状态库装回 {n} 份目录清单（离线重启后挂载点可 ls）");
+                }
+            }
+            Err(e) => tracing::warn!("读取持久化目录清单失败（不影响挂载）: {e}"),
+        }
         self.nodes = Some(store);
         self
     }
@@ -3616,10 +3805,19 @@ impl QxyncFs {
             self.insert_node(parent, name, remote, &entry)
         };
         // ★ M9：本地新建目录立刻进「映射」
-        listing_upsert(&self.inner, parent_remote, &entry);
-        if offline {
-            listing_put(&self.inner, remote, Arc::new(Vec::new()));
+        if let Some(entries) = listing_upsert(&self.inner, parent_remote, &entry) {
+            persist_listing(self.nodes.as_ref(), parent_remote, &entries);
         }
+        // ★ M21：**总是**给新目录放一份空清单（在线 mkdir 也是）。
+        //
+        // 旧实现只在离线时放：在线 mkdir 的清单「等按需列举」。但「刚建的目录就是
+        // 空的」在线时同样成立 —— 不放的话，在线建目录后没 `ls` 过它、也没等到
+        // 轮询列到它，这期间断网重启 → 新目录「无快照 + 离线」→ `ls` EIO、往里
+        // `lookup` 也 EIO（真机 M21 验收：keepdir 里 cached.txt 明明有缓存却读不了，
+        // 根因就是 keepdir 没有清单）。空清单与快照模型的语义一致（TTL 后台补拉
+        // 会换成远端真实列表），风险不高于任何一份过期快照。
+        let saved = listing_put(&self.inner, remote, Arc::new(Vec::new()));
+        persist_listing(self.nodes.as_ref(), remote, &saved);
         node
     }
 
@@ -3673,6 +3871,7 @@ impl QxyncFs {
                 self.rt.spawn(run_listing_refresh(
                     self.inner.clone(),
                     self.client.clone(),
+                    self.nodes.clone(),
                     remote.to_string(),
                 ));
             }
@@ -3692,7 +3891,8 @@ impl QxyncFs {
             }
         };
         let arc = Arc::new(entries);
-        listing_put(&self.inner, remote, arc.clone());
+        let saved = listing_put(&self.inner, remote, arc.clone());
+        persist_listing(self.nodes.as_ref(), remote, &saved);
         Ok(arc)
     }
 
@@ -3992,7 +4192,9 @@ impl QxyncFs {
             }
         }
         // ★ M9：本地删除立刻从「映射」里摘掉，否则旧快照会把删掉的名字复活成幽灵节点
-        listing_remove(&self.inner, &parent_remote, name);
+        if let Some(entries) = listing_remove(&self.inner, &parent_remote, name) {
+            persist_listing(self.nodes.as_ref(), &parent_remote, &entries);
+        }
         tracing::debug!("{} {}", if is_dir { "rmdir" } else { "unlink" }, remote);
         reply.ok();
     }
@@ -4131,6 +4333,48 @@ impl QxyncFs {
         g.nodes.get(&ino).map(|n| n.op_lock.clone())
     }
 
+    /// ★ M21：把节点**当前**签名刷进父目录的清单快照（内存 + 持久化）。
+    ///
+    /// 为什么需要：create 时刻的清单条目是 `size=0` 的占位；写完 / 截断 / touch
+    /// 之后签名变了，清单里却还是旧值 —— 离线重启后按清单物化的节点与 `.qxstate`
+    /// 对不上，认领失败，**明明缓存就在盘上却 EIO**（真机 M21 验收：cached.txt
+    /// 的清单条目停在 size=0）。在 release / setattr 两个时点刷新，加上 daemon
+    /// 侧上传成功钩子的 [`FsHandle::note_uploaded_listing`]，覆盖「本地写完」
+    /// 「截断/touch」「上传落地」三类签名变化。
+    ///
+    /// `force`：touch（只改 mtime）不置 dirty，但签名确实变了 —— setattr 里用
+    /// `force=true` 刷。release 走 `force=false`（只读打开的关文件不必写库）。
+    ///
+    /// 父目录还没有清单时是 no-op（与 [`listing_upsert`] 同语义：不凭空断言
+    /// 「其它名字都不存在」—— 那个空缺由预热/轮询补上）。
+    fn refresh_listing_entry(&self, ino: INodeNo, force: bool) {
+        let (remote, name, size, mtime, is_dir, file_id, dirty) = {
+            let g = self.inner.lock().unwrap();
+            let Some(n) = g.nodes.get(&ino) else { return };
+            (
+                n.remote.clone(),
+                n.name.clone(),
+                n.attr.size,
+                epoch_secs(n.attr.mtime),
+                n.attr.kind == FileType::Directory,
+                n.file_id,
+                n.dirty,
+            )
+        };
+        if !dirty && !force {
+            return;
+        }
+        let Some((dir, _)) = remote.rsplit_once('/') else {
+            return;
+        };
+        let mut e = DirEntry::local(&name, is_dir, size, mtime);
+        // ★ 沿用节点身份（不重算）—— 清单里的 file_id 与节点表保持同一来源
+        e.file_id = file_id;
+        if let Some(entries) = listing_upsert(&self.inner, dir, &e) {
+            persist_listing(self.nodes.as_ref(), dir, &entries);
+        }
+    }
+
     /// 缓存文件（懒创建）：**apparent size = 文件大小**，用 `set_len` 造稀疏文件。
     ///
     /// ★ M9：**先认领磁盘上已有的缓存**。节点表是内存态，重建节点后 `chunks_done`
@@ -4166,13 +4410,49 @@ impl QxyncFs {
         };
 
         // ① 认领：位图签名与节点一致 + 内容文件长度对得上，才敢信。
+        //
+        // ★ M21：**mtime 偏斜容差**。上传成功后 `set_mtime` 把远端 mtime 对齐到本地，
+        // 但服务端对 get_list 的可见性有延迟 —— 轮询可能在这个窗口里把「服务端时间」
+        // 抓进清单。在线时 M9 的内容刷新会自愈这个瞬态；**离线重启卡在窗口内**时，
+        // 按清单物化的节点 mtime 与 `.qxstate` 差 1 秒 → 认领被拒 → 明明缓存就在
+        // 盘上却 EIO（真机 M21 验收抓到的）。
+        //
+        // 容差判据（保守）：baseline 里记录的「我们最后传上去的签名」与 `.qxstate`
+        // **完全一致**（size + mtime）→ 盘上这份就是远端现在的那份（set_mtime 已
+        // 成功，清单只是还没看到）→ 按 `.qxstate` 认领，并把节点签名对齐到真值。
+        // baseline 不认识这份签名（如「删了重建」留下的旧缓存）→ 仍走严格路径，
+        // 绝不认领 —— 「绝不返回错误内容」的红线不动。
         let adopted = if path.is_file() {
             state_load(&path).and_then(|st| {
                 let len_ok = std::fs::metadata(&path)
                     .map(|m| m.len() == size)
                     .unwrap_or(false);
-                if st.chunk_size != chunk_size || st.size != size || st.mtime != mtime || !len_ok {
+                if st.chunk_size != chunk_size || st.size != size || !len_ok {
                     return None;
+                }
+                // 偏斜容差：mtime 不匹配时查 baseline（见上面的判据说明）
+                let mut skew_fix = None;
+                if st.mtime != mtime {
+                    let trusted = self
+                        .nodes
+                        .as_ref()
+                        .map(|store| {
+                            let sig = store.baseline_get(&remote);
+                            sig.exists
+                                && !sig.is_dir
+                                && sig.size == st.size
+                                && sig.mtime == st.mtime
+                        })
+                        .unwrap_or(false);
+                    if !trusted {
+                        return None;
+                    }
+                    skew_fix = Some((st.mtime, st.file_id));
+                    tracing::debug!(
+                        "认领容差 {remote}：清单 mtime={mtime} 与位图 mtime={} 偏斜 \
+                         （baseline 证实这就是最后上传的那版），按位图签名认领",
+                        st.mtime
+                    );
                 }
                 // ★ T9：签名过了，再比**身份**。这一栏挡的是「另一个文件认领了这份缓存」——
                 // 典型场景：同一路径删了重建、或改名后旧缓存文件被留在盘上。
@@ -4181,7 +4461,9 @@ impl QxyncFs {
                 // 这一栏是 T3 序列上的**新增一道**，不是替代：T3 的「先比签名、
                 // 签名过了再逐区间核 xxhash、坏区间清未就绪」顺序原样保留，
                 // file_id 只是把签名比对的判据补全。
-                if st.file_id != want_id {
+                // ★ M21 偏斜场景例外：want_id 是按（偏斜的）清单 mtime 算的，
+                // 此刻以 `.qxstate` 里的身份为准（它对应 baseline 记录的那一版）。
+                if st.file_id != want_id && skew_fix.is_none() {
                     tracing::debug!(
                         "认领作废 {remote}：位图身份 {} 与当前身份 {} 不符",
                         qxync_core::file_id::file_id_hex(&st.file_id),
@@ -4202,7 +4484,7 @@ impl QxyncFs {
                         done[*idx as usize] = false;
                     }
                 }
-                Some((done, st.whole_xxhash))
+                Some((done, st.whole_xxhash, skew_fix))
             })
         } else {
             None
@@ -4215,9 +4497,18 @@ impl QxyncFs {
             return Ok(p.clone());
         }
         let want = n.chunk_count(chunk_size);
-        if let Some((mut done, whole)) = adopted {
+        if let Some((mut done, whole, skew_fix)) = adopted {
             // size 在拿锁期间变了 → 认领作废
             if n.attr.size == size {
+                // ★ M21：偏斜容差认领 → 节点签名对齐到 `.qxstate` 的真值
+                // （mtime + 身份）。对齐之后节点/缓存/baseline 三方一致，
+                // 后续的 persist_chunk_state 也不会把旧签名写回去。
+                if let Some((true_mtime, true_id)) = skew_fix {
+                    let t = UNIX_EPOCH + Duration::from_secs(true_mtime.max(0) as u64);
+                    n.attr.mtime = t;
+                    n.attr.ctime = t;
+                    n.file_id = true_id;
+                }
                 done.resize(want, false);
                 tracing::debug!(
                     "认领已有缓存 {remote}（{}/{} 区间已就绪）",
@@ -4944,6 +5235,10 @@ impl Filesystem for QxyncFs {
                 return reply.error(e);
             }
         }
+        // ★ M21：截断 / touch 之后清单条目刷到新签名（touch 不置 dirty，用 force）。
+        if size_changed || mtime.is_some() {
+            self.refresh_listing_entry(ino, true);
+        }
 
         let attr = {
             let g = self.inner.lock().unwrap();
@@ -4992,7 +5287,9 @@ impl Filesystem for QxyncFs {
         //   在它传上去之前如果被改名/删除，远端根本没有老名字，不必先传一版再改。
         let node = self.insert_node_with(parent, name, &remote, &entry, false);
         // ★ M9：本地新建立刻进「映射」，不然下一次 readdir/lookup 又从旧快照里看不到它
-        listing_upsert(&self.inner, &parent_remote, &entry);
+        if let Some(entries) = listing_upsert(&self.inner, &parent_remote, &entry) {
+            persist_listing(self.nodes.as_ref(), &parent_remote, &entries);
+        }
         if let Err(e) = self.cache_file_for(node.ino) {
             return reply.error(e);
         }
@@ -5354,11 +5651,15 @@ impl Filesystem for QxyncFs {
         // ★ M20 修复：目录改名 → 它自己的清单快照跟着搬到新路径。
         //   不搬的话，离线改名后的目录在新路径下「没有快照 + 离线」→ `ls`/写入 EIO
         //   （与 `mkdir` 离线分支创建空快照是同一个坑的两条入口）。
+        //   ★ M21：整棵子树搬（改名前已列过的子目录也要跟着走），并写穿持久化。
         if is_dir {
             listing_move(&self.inner, &old_remote, &new_remote);
+            persist_listing_move(self.nodes.as_ref(), &old_remote, &new_remote);
         }
         // ★ M9：改名同步到「映射」：旧名字摘掉、新名字补上
-        listing_remove(&self.inner, &parent_remote, name);
+        if let Some(entries) = listing_remove(&self.inner, &parent_remote, name) {
+            persist_listing(self.nodes.as_ref(), &parent_remote, &entries);
+        }
         if let Some(node) = self.node_by_remote(&new_remote) {
             let mut e = DirEntry::local(
                 newname,
@@ -5369,7 +5670,9 @@ impl Filesystem for QxyncFs {
             // ★ T9：直接沿用节点的身份，**不重算** —— 改名之后身份必须还是它自己
             // （重算在 mtime<=0 的退化路径下会算出新 id，那就等于「改名变了身份」）。
             e.file_id = node.file_id;
-            listing_upsert(&self.inner, &newparent_remote, &e);
+            if let Some(entries) = listing_upsert(&self.inner, &newparent_remote, &e) {
+                persist_listing(self.nodes.as_ref(), &newparent_remote, &entries);
+            }
         }
         // ★ M17：本地名字/缓存都搬完了 → 把队列里还指着老名字的作业改写到新名字
         // （内容源换成改名后的缓存路径），再放开队列。顺序不能反：先 resume 的话
@@ -5553,6 +5856,9 @@ impl Filesystem for QxyncFs {
         // ★ M9：关文件时把位图按**最终**的 size/mtime 落一次盘 ——
         //   本地改写过的文件在下次挂载时也能直接认领，不必重新拉一遍。
         persist_chunk_state(&self.inner, self.chunk_size, ino);
+        // ★ M21：本地写过的文件，清单条目也刷到**最终**签名（create 时的 size=0
+        //   占位会让离线重启后的认领失败）。dirty 的文件才刷（只读打开不必写库）。
+        self.refresh_listing_entry(ino, false);
         reply.ok();
     }
 
@@ -8510,6 +8816,345 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ================================================================ ★ M21：离线可重启
+
+    /// ★ M21：**离线重启 daemon 后挂载点可用** —— 本测试的核心链路。
+    ///
+    /// 会话 1（在线）：轮询推来根清单、水合一个文件、离线建一个目录（进 outbox）。
+    /// 会话 2（离线重启）：全新的 `QxyncFs` + 同一个状态库 →
+    /// * 根目录能 `ls`（清单从 `listings` 表装回，不是从 NAS 拿的）；
+    /// * 离线重启前建的目录也能 `ls`（空清单被持久化了）；
+    /// * 已水合的文件能读（lookup 从清单物化节点 → `cache_file_for` 认领磁盘缓存）；
+    /// * 没列过的深层目录离线仍然诚实 EIO（不撒谎）。
+    #[test]
+    fn m21_offline_restart_restores_view_from_persisted_listings() {
+        use qxync_core::store::OUTBOX_MKDIR;
+        let dir = m7_tmpdir("m21-restart");
+        let db = dir.join("sync.db");
+        let payload = vec![7u8; 300 * 1024];
+
+        // ---- 会话 1：在线列根目录 + 水合 a.bin + 离线建 offline-dir
+        {
+            let fs = test_fs(&dir, true);
+            let store = Arc::new(Store::open(&db).unwrap());
+            let c = Connectivity::shared();
+            let fs = fs.with_nodes_store(store).with_connectivity(c.clone());
+            let h = fs.handle();
+            // daemon 轮询推来的根清单（apply_listing 现在会写穿 listings 表）
+            h.apply_listing(
+                "/home",
+                &[
+                    DirEntry::local("a.bin", false, payload.len() as u64, 1000),
+                    DirEntry::local("docs", true, 0, 1000),
+                ],
+            );
+            // 水合 a.bin：缓存文件 + `.qxstate` 位图落盘
+            let (ino, _cache) = hydrated_node(&fs, "a.bin", "/home/a.bin", &payload, 1000);
+            let _ = ino;
+            // docs 目录也列过一次（子目录清单持久化）
+            h.apply_listing(
+                "/home/docs",
+                &[DirEntry::local("readme.txt", false, 5, 100)],
+            );
+            // 离线：建目录（outbox + 本地视图 + 空清单，全部持久化）
+            c.mark_offline("连接超时");
+            fs.enqueue_outbox(OUTBOX_MKDIR, "/home/docs/offline-dir", "", true)
+                .unwrap();
+            let docs = fs
+                .lookup_child(INodeNo::ROOT, "docs")
+                .expect("docs 在根清单里，lookup 必须命中");
+            fs.materialize_local_dir(
+                docs.ino,
+                "/home/docs",
+                "offline-dir",
+                "/home/docs/offline-dir",
+                true,
+            );
+        }
+        // （fs drop = daemon 退出：节点表、清单快照、会话全部消失）
+
+        // ---- 会话 2：离线重启，全新 fs + 同一个状态库
+        let fs2 = test_fs(&dir, true);
+        let store2 = Arc::new(Store::open(&db).unwrap());
+        let c2 = Connectivity::shared();
+        c2.mark_offline("连接超时");
+        let fs2 = fs2.with_nodes_store(store2).with_connectivity(c2);
+
+        // ① 根目录能 ls：条目来自持久化清单（test_link 指向 nas.invalid，问 NAS 必失败）
+        let entries = fs2
+            .dir_entries("/home")
+            .expect("离线重启后根目录必须能 ls（清单从状态库装回）");
+        let names: Vec<&str> = entries.iter().map(|e| e.filename.as_str()).collect();
+        assert!(
+            names.contains(&"a.bin") && names.contains(&"docs"),
+            "根清单必须含 a.bin / docs，实际 {names:?}"
+        );
+
+        // ② 离线重启前建的目录能 ls（空清单跨重启保留了）
+        let docs2 = fs2
+            .lookup_child(INodeNo::ROOT, "docs")
+            .expect("lookup docs 必须从装回的清单物化节点");
+        let sub = fs2
+            .dir_entries("/home/docs")
+            .expect("docs 的清单也必须装回");
+        let sub_names: Vec<&str> = sub.iter().map(|e| e.filename.as_str()).collect();
+        assert!(
+            sub_names.contains(&"readme.txt") && sub_names.contains(&"offline-dir"),
+            "docs 清单必须含重启前在线看到的 readme.txt 与离线建的 offline-dir，实际 {sub_names:?}"
+        );
+        let _ = docs2;
+        let od = fs2
+            .dir_entries("/home/docs/offline-dir")
+            .expect("离线建的目录在重启后必须仍能 ls（空清单被持久化）");
+        assert!(od.is_empty());
+
+        // ③ 已水合的文件能读：lookup 物化 → cache_file_for 认领磁盘缓存 → 读内容
+        let a = fs2
+            .lookup_child(INodeNo::ROOT, "a.bin")
+            .expect("lookup a.bin 必须从装回的清单物化节点");
+        let got = std::fs::read(
+            fs2.ensure_range(a.ino, 0, payload.len() as u64)
+                .expect("离线重启后读已水合文件不能 EIO（缓存认领 + 位图都在盘上）"),
+        )
+        .unwrap();
+        assert_eq!(got, payload, "读出来的必须是重启前水合的那份内容");
+
+        // ④ 诚实边界：从没列过的目录离线仍然 EIO（不是 ENOENT —— 「不知道」≠「没有」）
+        assert_eq!(
+            fs2.dir_entries("/home/never-listed")
+                .err()
+                .map(|e| e.code()),
+            Some(libc::EIO),
+            "没列过的目录离线必须诚实 EIO"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M21：清单变更点全部写穿 —— apply / seed / drop / 本地 mkdir / 远端删除 / 远端改名。
+    #[test]
+    fn m21_listing_mutations_persist_to_store() {
+        use qxync_core::store::OUTBOX_MKDIR;
+        let dir = m7_tmpdir("m21-persist");
+        let db = dir.join("sync.db");
+        let fs = test_fs(&dir, true);
+        let store = Arc::new(Store::open(&db).unwrap());
+        let c = Connectivity::shared();
+        let fs = fs
+            .with_nodes_store(store.clone())
+            .with_connectivity(c.clone());
+        let h = fs.handle();
+
+        // apply_listing → 落库
+        h.apply_listing("/home", &[DirEntry::local("a.txt", false, 1, 1)]);
+        assert_eq!(store.listing_len().unwrap(), 1);
+        let (rows, _) = store.listing_load_all().unwrap();
+        assert_eq!(rows[0].0, "/home");
+        assert_eq!(rows[0].1.len(), 1);
+
+        // seed_listing（还没有快照时）→ 落库
+        h.seed_listing("/home/seed", &[DirEntry::local("b.txt", false, 2, 2)]);
+        assert_eq!(store.listing_len().unwrap(), 2);
+
+        // 离线 mkdir → 父清单 upsert + 新目录空清单，都落库
+        c.mark_offline("连接超时");
+        fs.enqueue_outbox(OUTBOX_MKDIR, "/home/newdir", "", true)
+            .unwrap();
+        fs.materialize_local_dir(INodeNo::ROOT, "/home", "newdir", "/home/newdir", true);
+        let (rows, _) = store.listing_load_all().unwrap();
+        let home = rows.iter().find(|(d, _)| d == "/home").unwrap();
+        assert!(
+            home.1.iter().any(|e| e.filename == "newdir"),
+            "离线建的目录必须出现在持久化的父清单里"
+        );
+        assert!(
+            rows.iter()
+                .any(|(d, e)| d == "/home/newdir" && e.is_empty()),
+            "新目录的空清单必须持久化（重启后离线可 ls）"
+        );
+
+        // 远端删除子树 → 清单行作废
+        h.apply_listing("/home/newdir/sub", &[DirEntry::local("x", false, 1, 1)]);
+        assert_eq!(store.listing_len().unwrap(), 4);
+        h.remove_remote("/home/newdir");
+        let (rows, _) = store.listing_load_all().unwrap();
+        assert!(
+            !rows
+                .iter()
+                .any(|(d, _)| d == "/home/newdir" || d == "/home/newdir/sub"),
+            "远端删除的子树清单行必须一并删掉（否则离线重启后复活幽灵目录）"
+        );
+
+        // 远端改名目录 → 子树清单行前缀改写（rename_remote 需要节点在表里）
+        let docs_entry = DirEntry::local("docs", true, 0, 1);
+        fs.insert_node(INodeNo::ROOT, "docs", "/home/docs", &docs_entry);
+        h.apply_listing("/home/docs", &[DirEntry::local("keep.txt", false, 1, 1)]);
+        h.apply_listing("/home/docs/deep", &[DirEntry::local("y", false, 1, 1)]);
+        assert!(h.rename_remote("/home/docs", "/home/manuals"));
+        let (rows, _) = store.listing_load_all().unwrap();
+        let dirs: Vec<&str> = rows.iter().map(|(d, _)| d.as_str()).collect();
+        assert!(
+            dirs.contains(&"/home/manuals"),
+            "改名后的目录清单行要搬到新路径"
+        );
+        assert!(
+            dirs.contains(&"/home/manuals/deep"),
+            "子目录清单行也要搬（M21 子树改写）"
+        );
+        assert!(!dirs.contains(&"/home/docs") && !dirs.contains(&"/home/docs/deep"));
+
+        // drop_listing → 行删除
+        h.drop_listing("/home/seed");
+        let (rows, _) = store.listing_load_all().unwrap();
+        assert!(!rows.iter().any(|(d, _)| d == "/home/seed"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M21：`rename_remote`（对账认定的远端改名）搬子树清单 —— 内存 + 持久化一起验。
+    ///
+    /// 这是 M20 遗留的缺口：只搬节点不搬清单的话，改名前已列过的子目录在新路径下
+    /// 「无快照」—— 在线时多一次 NAS 往返，**离线重启后 `ls` 直接 EIO**。
+    #[test]
+    fn m21_remote_rename_moves_subtree_listings() {
+        let dir = m7_tmpdir("m21-remote-rename");
+        let db = dir.join("sync.db");
+        let fs = test_fs(&dir, true);
+        let store = Arc::new(Store::open(&db).unwrap());
+        let fs = fs.with_nodes_store(store.clone());
+        let h = fs.handle();
+
+        // 造一个有内容快照的目录树（节点 + 两层清单）
+        let docs = DirEntry::local("docs", true, 0, 1);
+        let node = fs.insert_node(INodeNo::ROOT, "docs", "/home/docs", &docs);
+        let _ = node;
+        h.apply_listing("/home/docs", &[DirEntry::local("f.txt", false, 1, 1)]);
+        h.apply_listing("/home/docs/sub", &[DirEntry::local("g.txt", false, 2, 2)]);
+
+        assert!(h.rename_remote("/home/docs", "/home/manuals"));
+        // 内存：子树清单都搬到新路径
+        assert!(listing_get(&fs.inner, "/home/manuals").is_some());
+        assert!(listing_get(&fs.inner, "/home/manuals/sub").is_some());
+        assert!(listing_get(&fs.inner, "/home/docs").is_none());
+        assert!(listing_get(&fs.inner, "/home/docs/sub").is_none());
+        // 持久化：行前缀已改写
+        let (rows, _) = store.listing_load_all().unwrap();
+        let dirs: Vec<&str> = rows.iter().map(|(d, _)| d.as_str()).collect();
+        assert!(dirs.contains(&"/home/manuals") && dirs.contains(&"/home/manuals/sub"));
+        assert!(!dirs.contains(&"/home/docs") && !dirs.contains(&"/home/docs/sub"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M21：认领的 **mtime 偏斜容差**（真机验收抓到的）。
+    ///
+    /// 场景：上传成功 → `set_mtime` 已把远端对齐到本地签名，但轮询在服务端可见性
+    /// 窗口里抓到了「上传时刻」的 mtime → 清单比真值偏 1 秒。离线重启后按清单
+    /// 物化的节点与 `.qxstate` 签名不符 → 认领被拒 → 缓存明明在盘上却 EIO。
+    ///
+    /// 容差判据：baseline 记录的「最后上传的那版」与 `.qxstate` 完全一致 → 认领，
+    /// 且节点签名对齐到真值。baseline 不认识 → 仍拒绝（「删了重建」的旧缓存）。
+    #[test]
+    fn m21_claim_tolerates_listing_mtime_skew_via_baseline() {
+        use qxync_core::sync::Sig;
+
+        let dir = m7_tmpdir("m21-skew");
+        let db = dir.join("sync.db");
+        let payload = vec![9u8; 200 * 1024];
+        let true_mtime = 1792417725i64;
+
+        // 会话 1：水合文件（.qxstate 落盘，签名 = (size, true_mtime)）+ baseline 记录同一签名
+        {
+            let fs = test_fs(&dir, false);
+            let store = Arc::new(Store::open(&db).unwrap());
+            let fs = fs.with_nodes_store(store.clone());
+            let (ino, _cache) = hydrated_node(&fs, "a.bin", "/home/a.bin", &payload, true_mtime);
+            let _ = ino;
+            let mut b = qxync_core::sync::Baseline::default();
+            b.put("/home/a.bin", Sig::file(payload.len() as u64, true_mtime));
+            store.save_baseline(&b).unwrap();
+        }
+
+        // 会话 2：清单里的 mtime 偏了 1 秒（服务端可见性窗口内抓到的）
+        let skewed = true_mtime + 1;
+        let fs2 = test_fs(&dir, false);
+        let store2 = Arc::new(Store::open(&db).unwrap());
+        let fs2 = fs2.with_nodes_store(store2);
+        // 节点从「偏斜的清单条目」物化（lookup 的清单命中路径）
+        let mut g = fs2.inner.lock().unwrap();
+        g.dirs.insert(
+            "/home".to_string(),
+            DirListing {
+                entries: Arc::new(vec![DirEntry::local(
+                    "a.bin",
+                    false,
+                    payload.len() as u64,
+                    skewed,
+                )]),
+                fetched: std::time::Instant::now(),
+            },
+        );
+        drop(g);
+        let node = fs2
+            .lookup_child(INodeNo::ROOT, "a.bin")
+            .expect("清单命中必须物化节点");
+        assert_eq!(
+            epoch_secs(node.attr.mtime),
+            skewed,
+            "前置：节点签名来自（偏斜的）清单"
+        );
+
+        // 认领 + 读：容差生效（baseline 证实 .qxstate 就是最后上传的那版）
+        let got = std::fs::read(
+            fs2.ensure_range(node.ino, 0, payload.len() as u64)
+                .expect("偏斜容差：认领必须成功（修复前这里 EIO）"),
+        )
+        .unwrap();
+        assert_eq!(got, payload, "读到的必须是缓存里的那份内容");
+        // 节点签名已对齐到真值（后续 persist 不会把偏斜值写回 .qxstate）
+        let n = fs2.node_by_remote("/home/a.bin").unwrap();
+        assert_eq!(
+            epoch_secs(n.attr.mtime),
+            true_mtime,
+            "节点 mtime 对齐到真值"
+        );
+
+        // 反例：baseline 不认识这份签名（如「删了重建」留下的旧缓存）→ 仍拒绝认领。
+        // 换一个 baseline 不认识的 mtime 偏斜（模拟旧缓存），节点重新物化后认领必须失败。
+        let dir2 = m7_tmpdir("m21-skew-unknown");
+        {
+            let fs = test_fs(&dir2, false);
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            let fs = fs.with_nodes_store(store);
+            let (ino, _cache) = hydrated_node(&fs, "b.bin", "/home/b.bin", &payload, 1000);
+            let _ = ino;
+            // baseline 为空（从未上传过 / 被清掉）→ 偏斜不获信任
+            let mut g = fs.inner.lock().unwrap();
+            let n = g.nodes.get_mut(&ino).unwrap();
+            let t = UNIX_EPOCH + Duration::from_secs(1001);
+            n.attr.mtime = t; // 制造 1 秒偏斜
+            drop(g);
+            // 抹掉内存认领状态，逼下一次 read 重新走 cache_file_for
+            let n2 = fs.node_by_remote("/home/b.bin").unwrap();
+            {
+                let mut g = fs.inner.lock().unwrap();
+                let n = g.nodes.get_mut(&n2.ino).unwrap();
+                n.cache.take();
+                n.chunks_done = Vec::new();
+            }
+            let _claimed = fs.cache_file_for(n2.ino).unwrap();
+            // 断言看**节点**的区间表（拒绝认领 = 全部未就绪；磁盘上的旧 .qxstate
+            // 不会被删，但节点绝不采信它）
+            let done = {
+                let g = fs.inner.lock().unwrap();
+                g.nodes.get(&n2.ino).unwrap().chunks_done.clone()
+            };
+            assert!(
+                !done.iter().any(|d| *d),
+                "baseline 不认识 → 偏斜不获信任，节点不得采信旧缓存位图"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
     /// ★ M20 真机 FUSE 验收回归：目录改名后，本地清单快照要跟着搬。
     ///
     /// 不搬的话，离线改名后的目录在新路径下「没有快照 + 离线」→ `ls`/写入 EIO
@@ -8518,8 +9163,10 @@ mod tests {
     fn m20_listing_snapshot_follows_dir_rename() {
         let dir = m7_tmpdir("m20-listing-rename");
         let fs = test_fs(&dir, true);
-        listing_put(&fs.inner, "/home/old", Arc::new(Vec::new()));
-        listing_move(&fs.inner, "/home/old", "/home/new");
+        let _ = listing_put(&fs.inner, "/home/old", Arc::new(Vec::new()));
+        // ★ M21：子目录的快照也要跟着搬（改名前已列过的子目录，新路径下离线可 ls）
+        let _ = listing_put(&fs.inner, "/home/old/sub", Arc::new(Vec::new()));
+        let _ = listing_move(&fs.inner, "/home/old", "/home/new");
         assert!(
             listing_get(&fs.inner, "/home/old").is_none(),
             "旧路径不能再留着快照（否则旧名字复活）"
@@ -8527,6 +9174,14 @@ mod tests {
         assert!(
             listing_get(&fs.inner, "/home/new").is_some(),
             "改名后的目录必须保住本地清单，否则离线时 ls/写入 EIO"
+        );
+        assert!(
+            listing_get(&fs.inner, "/home/new/sub").is_some(),
+            "子目录快照必须跟着搬到新路径（M21：只搬自身会让深层目录离线 EIO）"
+        );
+        assert!(
+            listing_get(&fs.inner, "/home/old/sub").is_none(),
+            "子目录快照不能留在旧路径"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8546,8 +9201,8 @@ mod tests {
         h.seed_listing("/home", &[]);
         assert!(listing_get(&fs.inner, "/home").is_some());
 
-        // 本地新建文件 → 快照 updated
-        listing_upsert(
+        // 本地新建文件 → 快照 updated（M21 起返回新内容；测试里只关心内存态）
+        let _ = listing_upsert(
             &fs.inner,
             "/home",
             &DirEntry::local("a.txt", false, 3, 1000),
