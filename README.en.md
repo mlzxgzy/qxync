@@ -30,6 +30,9 @@ and `qxync-gui` (desktop GUI).
   snapshot, so `ls` does not wait on the network every time
 - **Mounts survive session expiry**: an expired login is renewed automatically and the operation is
   retried in place — no manual remount
+- **Offline usable**: cached content stays readable and writable while the network is down; local
+  changes (including `mkdir`, rename, delete and `touch`) go into a durable buffer and are replayed
+  in order once the NAS is reachable again — instead of being dropped after 10 seconds of retries
 - **Read-write mount**: with `--rw`, local changes are pushed back through an upload queue;
   writes are read-modify-write, so un-fetched ranges are never uploaded as zeros
 - **Free up space**: automatic dehydration by idle time / cache quota, or manually with

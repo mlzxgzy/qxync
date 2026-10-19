@@ -14,8 +14,13 @@
 //!   而是打 warn 退化成「无持久化」队列：内存语义照旧，但崩溃会丢未完成作业。
 //! * 上传成功后必须 `stat&settime=1&mtime=` 对齐时间戳（否则服务端判定「未同步」）。
 //! * `qbox_write_log` 尽力而为（服务端不校验 action；未注册同步对时不会落盘，见 client 注释）。
+//! * ★ M20：**离线时作业不消耗重试次数、也不被放弃**。注入 [`Connectivity`] 后，
+//!   网络错误（[`CoreError::is_offline`]）只把队列切到「等联网」，作业原样留在库里；
+//!   daemon 恢复网络后 `wake()` 它，统一往下推。这样「离线攒的改动」不会在
+//!   5 次退避（约 10 秒）后被静默丢掉。
 
 use qxync_client::{write_action, Client};
+use qxync_core::connectivity::Connectivity;
 use qxync_core::file_id::{FileId, ZERO_FILE_ID};
 use qxync_core::store::{Store, UploadRow};
 use qxync_core::Error as CoreError;
@@ -261,6 +266,19 @@ pub struct UploadQueue {
     inflight: Mutex<std::collections::HashMap<String, (u64, u64)>>,
     /// ★ M15/T9：按 `file_id` 反查「这个东西现在叫什么」；`None` = 没注入。
     name_resolver: Mutex<Option<NameResolver>>,
+    /// ★ M20：连通性状态（daemon 注入）。`None` = 没注入 → 行为与 M20 之前一致
+    /// （网络错误照常计数），只影响测试/独立使用场景。
+    connectivity: Mutex<Option<Arc<Connectivity>>>,
+    /// ★ M20：**离线结构操作还没回放完** → 先别上传。
+    ///
+    /// 场景：离线时把 `a/` 改名成 `b/`，队列里的作业已经改写到 `b/`；如果恢复网络的
+    /// 瞬间上传先跑，远端 `b/` 还不存在（改名操作还没回放），上传要么失败、要么
+    /// 在 NAS 上凭空造出 `b/`，把随后要执行的「改名」变成冲突。daemon 在回放
+    /// outbox 之前置位、回放完成后清零；FUSE 在往 outbox 里写入时也会置位。
+    ///
+    /// 与 [`State::paused`]（M17 改名临界区）**分开**：那个是短暂暂停且成对
+    /// resume，这个是跨网络的「缓冲未清」状态，混用会让改名提前放行上传。
+    backlog_blocked: AtomicBool,
 }
 
 /// ★ M15/T9：身份 → 当前远端路径的解析器（由 FUSE 侧注入，内部查 `nodes` 表）。
@@ -305,6 +323,17 @@ enum Hold {
     Requeue,
     /// 队列里已有更新的一版同路径作业 → 这一版直接丢弃。
     Superseded,
+}
+
+/// ★ M20：一次上传失败的处置（见 [`UploadQueue::failure_action`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureAction {
+    /// 网络断了：**不计次数、不落库、不放弃**，等联网后原样再试。
+    Offline,
+    /// 可重试的业务错误：计数 + 退避。
+    Retry,
+    /// 重试超限：放弃（删库行，计入 `failed`）。
+    GiveUp,
 }
 
 impl UploadQueue {
@@ -393,11 +422,69 @@ impl UploadQueue {
             progress_hook: Mutex::new(None),
             inflight: Mutex::new(std::collections::HashMap::new()),
             name_resolver: Mutex::new(None),
+            // ★ M20：默认不注入 = 行为与 M20 之前一致；daemon 在 spawn_worker 前注入。
+            connectivity: Mutex::new(None),
+            backlog_blocked: AtomicBool::new(false),
             stats: UploadStats {
                 pending: AtomicU64::new(n),
                 ..Default::default()
             },
         }))
+    }
+
+    /// ★ M20：注入连通性状态（daemon 在启动 worker 之前调）。
+    pub fn set_connectivity(&self, c: Arc<Connectivity>) {
+        *self.connectivity.lock().unwrap() = Some(c);
+    }
+
+    /// ★ M20：现在是不是「已知离线」。
+    pub fn is_offline(&self) -> bool {
+        self.connectivity
+            .lock()
+            .ok()
+            .and_then(|c| c.clone())
+            .map(|c| !c.is_online())
+            .unwrap_or(false)
+    }
+
+    /// ★ M20：置/清「离线结构缓冲未清」闸门。
+    ///
+    /// 置位期间 worker **不取新作业**（作业留在库里，不丢、不计数）；
+    /// 清零后调用方应顺手 [`Self::wake`]。
+    pub fn set_backlog_blocked(&self, blocked: bool) {
+        self.backlog_blocked.store(blocked, Ordering::Relaxed);
+        if !blocked {
+            self.cv.notify_all();
+        }
+    }
+
+    pub fn backlog_blocked(&self) -> bool {
+        self.backlog_blocked.load(Ordering::Relaxed)
+    }
+
+    /// ★ M20：唤醒 worker（联网恢复 / 离线缓冲回放完成 / 退出时用）。
+    pub fn wake(&self) {
+        self.cv.notify_all();
+    }
+
+    /// ★ M20：worker 是否应该停下来等（离线，或离线结构缓冲未回放完）。
+    fn should_hold(&self) -> bool {
+        self.backlog_blocked() || self.is_offline()
+    }
+
+    /// ★ M20：按错误类型决定「这次失败怎么处置」。
+    ///
+    /// 单独抽成纯函数是为了**不联网也能单测**：网络错误绝不能计入放弃阈值，
+    /// 这是离线缓冲区的正确性红线（真机断网 40 秒后，旧实现会把作业删掉）。
+    fn failure_action(&self, e: &CoreError, next_attempts: u32) -> FailureAction {
+        if e.is_offline() {
+            return FailureAction::Offline;
+        }
+        if next_attempts >= self.max_attempts {
+            FailureAction::GiveUp
+        } else {
+            FailureAction::Retry
+        }
     }
 
     /// 注册「上传成功」回调（按远端路径调用）。daemon 用它把节点 `dirty` 清掉。
@@ -620,6 +707,36 @@ impl UploadQueue {
             .any(|j| Self::path_under(&j.remote_path(), root))
     }
 
+    /// ★ M20：离线 `touch`（只改 mtime）时，把排队中**同一路径**的上传作业的
+    /// mtime 一并更新。
+    ///
+    /// 为什么需要：上传成功后会 `set_mtime(job.mtime)` 对齐时间戳。如果 `touch`
+    /// 发生在文件已被标脏入队之后（常见：离线时先编辑保存、再 `touch`/`cp -p`），
+    /// 作业里还是旧 mtime → 联网后上传会把用户刚设的时间戳又覆盖回去。
+    /// 返回是否真的找到并更新了作业。
+    pub fn update_pending_mtime(&self, remote_path: &str, mtime: i64) -> bool {
+        let updated = {
+            let mut st = self.state.lock().unwrap();
+            let mut found: Option<UploadJob> = None;
+            for job in st.pending.iter_mut() {
+                if job.remote_path() == remote_path {
+                    job.mtime = mtime;
+                    found = Some(job.clone());
+                }
+            }
+            found
+        };
+        match updated {
+            Some(job) => {
+                // 先写库再算成功：重启后恢复出来的作业也带着新 mtime。
+                self.persist_put(&job);
+                tracing::debug!("离线 touch：排队上传作业的 mtime 已更新 {remote_path} → {mtime}");
+                true
+            }
+            None => false,
+        }
+    }
+
     /// ★ M17：把排队中的、发往 `old_path`（含子树）的作业改写到 `new_path`。
     ///
     /// - `local`：作业目标就是 `old_path` 本身时要换的内容源（改名会把缓存文件也搬走，
@@ -838,7 +955,9 @@ impl UploadQueue {
                 let mut st = self.state.lock().unwrap();
                 loop {
                     // ★ M17：暂停期间不取新作业（在途作业照常跑完）。
-                    if !st.paused {
+                    // ★ M20：离线 / 离线结构缓冲未回放完 → 也不取。作业留在库里
+                    //   （`pending` 计数照常显示），联网后统一推 —— 这就是「累计缓冲区」。
+                    if !st.paused && !self.should_hold() {
                         if let Some(j) = st.pending.pop_front() {
                             st.active = true;
                             st.active_path = Some(j.remote_path());
@@ -876,6 +995,12 @@ impl UploadQueue {
                     self.release_popped(job, false);
                     continue;
                 }
+            }
+            // ★ M20：安静期里去抖期间可能刚断网 / 刚有离线结构操作入队 →
+            // 把作业原样放回（**不消耗尝试次数**），回到等联网状态。
+            if self.should_hold() {
+                self.release_popped(job, true);
+                continue;
             }
 
             // ★ M8.4：**仅验收用**的注入点 —— 取到作业后先等一会儿再发。
@@ -960,6 +1085,11 @@ impl UploadQueue {
                     self.note_progress(&job.remote_path(), None);
                     self.stats.done.fetch_add(1, Ordering::Relaxed);
                     self.stats.bytes.fetch_add(n, Ordering::Relaxed);
+                    // ★ M20：一次成功 = 网络是通的。把「已知离线」翻回在线；
+                    // 轮询器下一轮会继续补对账，这里只负责别让队列自己卡在离线态。
+                    if let Some(c) = self.connectivity.lock().ok().and_then(|c| c.clone()) {
+                        c.mark_online();
+                    }
                     tracing::info!("已上传 {} ({} 字节)", job.remote_path(), n);
                 }
                 Err(e) => {
@@ -968,26 +1098,52 @@ impl UploadQueue {
                     // 不在这里假装还在传。
                     self.note_progress(&job.remote_path(), None);
                     let attempts = job.attempts + 1;
-                    if attempts >= self.max_attempts {
-                        self.stats.failed.fetch_add(1, Ordering::Relaxed);
-                        tracing::error!(
-                            "上传失败（放弃，已试 {attempts} 次）: {}: {e}",
-                            job.remote_path()
-                        );
-                        // M5：库 = 未完成作业 —— 放弃的作业把行删掉（等价于当年删 `.dirty`），
-                        // 否则每次重启都会把注定失败的作业再捞起来。失败计数由 stats/日志留痕。
-                        self.persist_delete(&job.remote_path());
-                    } else {
-                        self.stats.retries.fetch_add(1, Ordering::Relaxed);
-                        tracing::warn!("上传失败（第 {attempts} 次）: {}: {e}", job.remote_path());
-                        // 先写库再改内存：重启后重试计数不倒退
-                        self.persist_bump(&job.remote_path(), attempts);
-                        let backoff = Duration::from_millis(300 * (1 << attempts.min(4)));
-                        std::thread::sleep(backoff);
-                        let mut retry = job.clone();
-                        retry.attempts = attempts;
-                        let mut st = self.state.lock().unwrap();
-                        st.pending.push_back(retry);
+                    match self.failure_action(&e, attempts) {
+                        // ★ M20：网络断了 —— **不是一次失败**。
+                        //
+                        // 旧行为：断网 40 秒（5 次指数退避）后作业被当成「失败」删库，
+                        // 用户的改动就再也不会同步上去了（本地缓存文件还在，但远端
+                        // 永远停在旧版）。现在原样放回队尾、attempts 不变、库也不写，
+                        // worker 下一圈会停在「等联网」闸门上；联网后 daemon `wake()`。
+                        FailureAction::Offline => {
+                            if let Some(c) = self.connectivity.lock().ok().and_then(|c| c.clone()) {
+                                c.mark_error(&e);
+                            }
+                            tracing::warn!(
+                                "上传因网络不可用暂停（不计失败次数，联网后自动继续）: {}: {e}",
+                                job.remote_path()
+                            );
+                            // 没注入 connectivity 的独立用法没有「等联网」闸门，
+                            // 这里退避一下避免忙等；注入了也只是一次 500ms 的让路。
+                            std::thread::sleep(Duration::from_millis(500));
+                            let mut st = self.state.lock().unwrap();
+                            st.pending.push_back(job);
+                        }
+                        FailureAction::GiveUp => {
+                            self.stats.failed.fetch_add(1, Ordering::Relaxed);
+                            tracing::error!(
+                                "上传失败（放弃，已试 {attempts} 次）: {}: {e}",
+                                job.remote_path()
+                            );
+                            // M5：库 = 未完成作业 —— 放弃的作业把行删掉（等价于当年删 `.dirty`），
+                            // 否则每次重启都会把注定失败的作业再捞起来。失败计数由 stats/日志留痕。
+                            self.persist_delete(&job.remote_path());
+                        }
+                        FailureAction::Retry => {
+                            self.stats.retries.fetch_add(1, Ordering::Relaxed);
+                            tracing::warn!(
+                                "上传失败（第 {attempts} 次）: {}: {e}",
+                                job.remote_path()
+                            );
+                            // 先写库再改内存：重启后重试计数不倒退
+                            self.persist_bump(&job.remote_path(), attempts);
+                            let backoff = Duration::from_millis(300 * (1 << attempts.min(4)));
+                            std::thread::sleep(backoff);
+                            let mut retry = job.clone();
+                            retry.attempts = attempts;
+                            let mut st = self.state.lock().unwrap();
+                            st.pending.push_back(retry);
+                        }
                     }
                 }
             }
@@ -1216,6 +1372,34 @@ mod tests {
         );
     }
 
+    /// ★ M20：离线 `touch` 后，排队作业的 mtime 必须跟上（否则联网上传会覆盖回去）。
+    #[test]
+    fn offline_touch_updates_pending_job_mtime_and_persists() {
+        let dir = tmpdir("offline-touch");
+        let marker = dir.join("queue");
+        let (q, _rt) = test_queue(&marker);
+        let j = job(&dir, "doc.txt");
+        q.enqueue(j.clone()).unwrap();
+
+        assert!(q.update_pending_mtime(&j.remote_path(), 9999));
+        // 内存队列已更新
+        assert_eq!(
+            q.state.lock().unwrap().pending[0].mtime,
+            9999,
+            "排队作业的 mtime 必须随之更新"
+        );
+        // 状态库也已更新（重启恢复后仍然正确）
+        let rows = Store::open(marker.join(QUEUE_DB_FILE))
+            .unwrap()
+            .uploads()
+            .unwrap();
+        assert_eq!(rows[0].mtime, 9999, "mtime 必须落库");
+
+        // 不存在的路径：什么都不做，返回 false
+        assert!(!q.update_pending_mtime("/home/qxync-test/nope.txt", 1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn tmpdir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(
             "qxync-upload-{tag}-{}-{}",
@@ -1269,6 +1453,59 @@ mod tests {
             bytes_sent: 0,
             bytes_total: 0,
         }
+    }
+
+    /// ★ M20：网络错误**永远**不算「失败」—— 这是离线缓冲区不丢改动的前提。
+    #[test]
+    fn offline_failures_never_count_toward_give_up() {
+        let dir = tmpdir("offline-classify");
+        let (q, _rt) = test_queue(&dir.join("queue"));
+        // 网络错误：不管「已经试过几次」（哪怕远超 max_attempts），都是离线等待
+        for n in 0..10 {
+            assert_eq!(
+                q.failure_action(&CoreError::Transport("连接超时".into()), n),
+                FailureAction::Offline,
+                "第 {n} 次尝试遇网络错误不能计入放弃阈值"
+            );
+        }
+        // 业务错误：保持 M20 之前的语义（重试到 5 次放弃）
+        assert_eq!(
+            q.failure_action(&CoreError::status(5, "stat"), 1),
+            FailureAction::Retry
+        );
+        assert_eq!(
+            q.failure_action(&CoreError::status(5, "stat"), 5),
+            FailureAction::GiveUp
+        );
+        assert_eq!(
+            q.failure_action(&CoreError::Auth("口令不对".into()), 2),
+            FailureAction::Retry
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M20：注入连通性后，队列能感知离线/离线缓冲闸门。
+    #[test]
+    fn injected_connectivity_controls_offline_hold() {
+        use qxync_core::connectivity::Connectivity;
+        let dir = tmpdir("offline-hold");
+        let (q, _rt) = test_queue(&dir.join("queue"));
+        assert!(!q.is_offline(), "没注入时行为与 M20 之前一致（永远在线）");
+
+        let c = Connectivity::shared();
+        q.set_connectivity(c.clone());
+        assert!(!q.is_offline());
+        c.mark_offline("连接被拒绝");
+        assert!(q.is_offline(), "注入后跟随连通性状态");
+        c.mark_online();
+        assert!(!q.is_offline());
+
+        assert!(!q.backlog_blocked());
+        q.set_backlog_blocked(true);
+        assert!(q.backlog_blocked(), "离线结构缓冲未回放完 → 上传闸门");
+        q.set_backlog_blocked(false);
+        assert!(!q.backlog_blocked());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

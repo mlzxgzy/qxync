@@ -355,6 +355,8 @@
     'home.sync_err_link': '同步错误（{label}）：{msg}',
     'home.sync_blocked_link': '删除被熔断挡住（{label}）：{reason}（这轮没有真的删除任何文件；确认这些删除确实需要，再放行）',
     'home.sync_note_link': '说明（{label}）：{note}',
+    'home.offline_link': '离线（{label}）：{since} {state}',
+    'home.offline_pending_link': '离线缓冲区（{label}）：待上传 {up} · 待删除 {del} · 待建目录 {mkdir} · 待改名 {rename} · 待改 mtime {setmtime}',
     'task.group_error': '连接 {label} 读取失败：{msg}',
     'task.link_badge': '连接 {label}',
     'task.link_daemon_down': '该连接的 daemon 未运行',

@@ -2659,6 +2659,46 @@ fn print_status(st: &StatusData) {
     if let Some(s) = &st.session {
         println!("会话      : sid={} 存活={}", s.sid_masked, s.alive);
     }
+    // ★ M20：连通性 + 离线缓冲区。离线时 `status` 不再发网络请求，这一段就是
+    // 用户排查「怎么不同步了」时最该看到的答案。
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if let Some(c) = &st.connectivity {
+        if !c.known {
+            println!("连通性    : 未检测（daemon 还没发过网络请求）");
+        } else if c.online {
+            println!("连通性    : 在线");
+        } else {
+            let dur = (now_unix - c.since_unix).max(0);
+            println!(
+                "连通性    : 离线（已 {dur} 秒）{}",
+                c.last_error
+                    .as_deref()
+                    .map(|e| format!("｜最近错误: {e}"))
+                    .unwrap_or_default()
+            );
+        }
+    }
+    if let Some(o) = &st.offline {
+        println!(
+            "离线缓冲  : 待上传 {}｜待删除 {}｜待建目录 {}｜待改名 {}｜待改 mtime {}{}",
+            o.pending_upload,
+            o.pending_delete,
+            o.pending_mkdir,
+            o.pending_rename,
+            o.pending_set_mtime,
+            if o.replaying {
+                "｜结构操作待回放/回放中（上传/删除暂时冻结）"
+            } else {
+                ""
+            }
+        );
+        if let Some(n) = &o.last_note {
+            println!("            : {n}");
+        }
+    }
     if let Some(s) = &st.server {
         println!(
             "服务端    : Qsync {} / QPKG {} / build {}  qbox_cgi={} fcgi={}",

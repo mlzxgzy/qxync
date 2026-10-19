@@ -5,6 +5,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [中文](CHANGELOG.md) · [README](README.en.md) · [Acceptance log](docs/验收记录.md)
 
+## [0.7.0] - 2026-10-19
+
+### Added
+
+- **Offline availability + cumulative buffer (M20)**: being disconnected no longer means
+  "local changes are dropped after 10 seconds". While offline the mount keeps serving:
+  already-cached content stays readable and writable, and local changes (writes, create,
+  delete, rename, `touch`) go into a **durable buffer** that is replayed in order once the
+  NAS is reachable again.
+  * A single connectivity state machine (`qxync-core::connectivity`) shared by the daemon,
+    the FUSE mount and both queues. Only `Error::Transport` counts as offline; business
+    errors keep the old retry/give-up semantics.
+  * A durable `outbox` table (`sync.db` schema v4 → v5) for structural operations
+    (`mkdir`, `rename`, mtime-only `touch`), ordered by `seq` and surviving daemon restarts.
+  * Upload and delete queues no longer treat network errors as attempts: they keep the job,
+    do not increment retry counters and wait for connectivity instead of giving up after
+    roughly ten seconds (the old behaviour silently stopped syncing offline edits forever).
+  * A local rename rewrites the buffered paths too: offline-created directory prefixes are
+    updated in the outbox and delete jobs are re-keyed (`a/x` → `b/x`), so files deleted
+    while offline do not reappear after reconnecting.
+  * FUSE write paths buffer offline operations locally instead of blocking for the 20s
+    connect timeout; uncached ranges fail fast with EIO while cached content keeps working.
+    New `user.qxync.offline` xattr.
+  * On reconnect the poller probes every 3 seconds, then replays the outbox **before**
+    unblocking the upload/delete queues, and finally runs a reconcile round. Replay is
+    idempotent and never overwrites the NAS: a conflicting rename target is preserved as a
+    conflicted copy. Expired sessions are re-logged-in and retried; network errors and a
+    busy NAS never consume retry attempts.
+  * `status` / CLI / GUI report the offline state, how long it has been offline, buffered
+    item counts and replay state.
+
+### Fixed
+
+- Upload/delete jobs were dropped after repeated network failures, so offline edits could
+  never reach the NAS.
+- `mkdir` / `rename` failed with EIO while offline.
+- `qxync status` could block for up to a minute when offline (three 20s connect timeouts);
+  it now skips network probes when the state machine says offline.
+- Uncached reads waited for the connect timeout before EIO; `readdir` still uses the local
+  listing snapshot.
+- Offline `touch` followed by a queued upload restored the stale mtime; the queued job's
+  mtime is now updated as well.
+
+### Verification
+
+`cargo build --workspace` and `cargo test --workspace` pass (core 230 / daemon 68 /
+fuse 98 / client 32), `cargo fmt --all --check` is clean, and the new isolated e2e
+script `xtask/tests/m20-offline.sh` passes 9/9 (offline `status` in 6ms, buffered counts
+visible, rows survive a daemon restart with `attempts = 0`).
+
+Real-mount verification is still pending: this machine has no `/dev/fuse`, so the offline
+`mkdir`/`rename` paths are covered by unit tests plus logic-level e2e only.
+
 ## [0.6.8] - 2026-10-19
 
 ### Redesigned

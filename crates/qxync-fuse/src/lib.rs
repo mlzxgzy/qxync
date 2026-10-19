@@ -29,6 +29,7 @@ pub use fuser::{BackgroundSession, Notifier};
 use crate::delete::DeleteJob;
 use qxync_client::peer::{self, ContentSource, PeerConfig, PeerHead};
 use qxync_client::Client;
+use qxync_core::connectivity::Connectivity;
 use qxync_core::dehydrate::{Block, Candidate, Policy};
 use qxync_core::file_id::{compute_file_id, FileId, ZERO_FILE_ID};
 use qxync_core::rules::{HideReason, Rules};
@@ -1065,11 +1066,13 @@ fn note_node_progress(inner: &Arc<Mutex<Inner>>, remote: &str, p: Option<(u64, u
     }
 }
 
-/// 区间下载失败的形态（日志要分得清「超时」「会话失效」还是「NAS 报错」）。
+/// 区间下载失败的形态（日志要分得清「超时」「会话失效」「网络断了」还是「NAS 报错」）。
 enum ChunkFetchError {
     Timeout,
     /// ★ M10：鉴权失败 —— 调用方会重登一次、热更新 sid，再重试一次。
     Auth(String),
+    /// ★ M20：网络层失败 —— 回写连通性状态机，并让这次读**立刻** EIO 而不是白等。
+    Offline(String),
     Nas(String),
 }
 
@@ -1078,6 +1081,7 @@ impl std::fmt::Display for ChunkFetchError {
         match self {
             Self::Timeout => write!(f, "超时"),
             Self::Auth(e) => write!(f, "会话失效: {e}"),
+            Self::Offline(e) => write!(f, "网络不可用: {e}"),
             Self::Nas(e) => write!(f, "{e}"),
         }
     }
@@ -1136,6 +1140,8 @@ async fn fetch_chunk_bytes(
     .await
     {
         Err(_) => Err(ChunkFetchError::Timeout),
+        // ★ M20：先判离线再判鉴权 —— 两者互斥，但顺序固定便于日志口径一致
+        Ok(Err(e)) if e.is_offline() => Err(ChunkFetchError::Offline(e.to_string())),
         Ok(Err(e)) if e.is_auth() => Err(ChunkFetchError::Auth(e.to_string())),
         Ok(Err(e)) => Err(ChunkFetchError::Nas(e.to_string())),
         Ok(Ok(d)) => {
@@ -2859,6 +2865,12 @@ pub struct QxyncFs {
     /// 「`file_id` 只在内存与 `.qxstate` 里用」——改名配对退化成旧的增删判定
     /// （保守，仍然不丢数据）。用 [`Self::with_nodes_store`] 注入。
     nodes: Option<Arc<Store>>,
+    /// ★ M20：连通性状态（daemon 注入）。`None` = 没注入 → 行为与 M20 之前一致。
+    ///
+    /// 离线时写路径**不再打 NAS 再等 20 秒 connect timeout**，而是直接落本地视图
+    /// + outbox；读路径对未水合区间立即 EIO（读缓存内容照常）。见
+    /// [`Self::is_offline`] / [`Self::enqueue_outbox`]。
+    connectivity: Option<Arc<Connectivity>>,
 }
 
 /// ★ M7：LAN 快路径计数（`status` 里能看到省了多少次 NAS 请求）。
@@ -2978,7 +2990,87 @@ impl QxyncFs {
             trash_uid: unsafe { libc::getuid() },
             delete_queue: None,
             nodes: None,
+            // ★ M20：默认不注入 = 永远「在线」，行为与 M20 之前一致。
+            connectivity: None,
         })
+    }
+
+    /// ★ M20：注入连通性状态（daemon 在挂载前调）。
+    ///
+    /// 注入之后：离线时写路径直接进 outbox、读未水合区间立即 EIO，不再白等
+    /// connect timeout；网络错误也会回写状态机（`mark_error`）。
+    pub fn with_connectivity(mut self, c: Arc<Connectivity>) -> Self {
+        self.connectivity = Some(c);
+        self
+    }
+
+    /// ★ M20：现在是不是「已知离线」。
+    pub fn is_offline(&self) -> bool {
+        self.connectivity
+            .as_ref()
+            .map(|c| !c.is_online())
+            .unwrap_or(false)
+    }
+
+    /// ★ M20：把一次网络错误的结论回写状态机（只认 [`qxync_core::Error::is_offline`]）。
+    fn note_network_error(&self, e: &qxync_core::Error) {
+        if let Some(c) = &self.connectivity {
+            c.mark_error(e);
+        }
+    }
+
+    /// ★ M20：把一条「离线时做不成的结构操作」落进 outbox，并**先冻结**上传/删除队列。
+    ///
+    /// 为什么冻结要在这里做（而不是等 daemon 恢复）：写入 outbox 的那一刻起，
+    /// 队列里可能已经有指向「新名字 / 新目录」的作业；如果它们抢在回放前面发出去，
+    /// 远端的状态就和本地视图分叉了。冻结是幂等的，daemon 回放完统一解开。
+    ///
+    /// **返回 Err 时调用方必须回 EIO**：没有持久化就不算「离线可用」，
+    /// 宁可让用户看到失败，也不能假装成功却丢操作。
+    fn enqueue_outbox(
+        &self,
+        kind: &str,
+        path: &str,
+        target: &str,
+        is_dir: bool,
+    ) -> std::io::Result<()> {
+        let store = self.nodes.as_ref().ok_or_else(|| {
+            std::io::Error::other("离线缓冲区不可用：没有注入状态库（无法持久化离线操作）")
+        })?;
+        // 先落库、再冻结队列：顺序反了的话，队列可能在落库前就发出去一个
+        // 依赖这个结构操作的作业。
+        store
+            .outbox_add(kind, path, target, is_dir)
+            .map_err(std::io::Error::other)?;
+        if let Some(q) = &self.upload {
+            q.set_backlog_blocked(true);
+        }
+        if let Some(q) = &self.delete_queue {
+            q.set_backlog_blocked(true);
+        }
+        tracing::info!("离线操作已进入缓冲区（待联网回放）: {kind} {path} -> {target}");
+        Ok(())
+    }
+
+    /// ★ M20：本地改名后，把 outbox 里落在旧路径下的结构操作回写到新路径。
+    ///
+    /// 必须做的场景：**离线新建的目录又被改名** —— 它的 `remote_known=false`，
+    /// FUSE 不会发远端 rename（远端本来就没有），所以 outbox 里只有 `mkdir /a`。
+    /// 不回写的话，回放只能把 `/a` 建出来，而本地视图与上传作业都指向 `/b`：
+    /// 父目录不存在 → 上传重试几次后放弃，内容只剩在本地缓存里。
+    fn rewrite_outbox_prefix(&self, old_remote: &str, new_remote: &str) {
+        let Some(store) = &self.nodes else {
+            return;
+        };
+        match store.outbox_rewrite_prefix(old_remote, new_remote) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(
+                "本地改名后同步回写离线缓冲区：{n} 条结构操作 {old_remote} -> {new_remote}"
+            ),
+            Err(e) => {
+                tracing::warn!("本地改名后回写离线缓冲区失败（{old_remote} -> {new_remote}）: {e}")
+            }
+        }
     }
 
     /// ★ M9：目录清单快照保鲜期（默认 30s；过期只在后台补拉）。
@@ -3342,6 +3434,11 @@ impl QxyncFs {
             }
             return Ok(self.insert_node(parent, name, &remote, &entry));
         }
+        // ★ M20：冷路径 + 已知离线 → 立刻 EIO。回 ENOENT 是撒谎（「没有」≠「不知道」），
+        // 上层可能据此做删除/覆盖判断；EIO 才是诚实的「现在答不了」。
+        if self.is_offline() {
+            return Err(fuser::Errno::EIO);
+        }
         // 冷路径（这个目录还从没列过）：问一次 NAS stat，答案只影响这一个名字。
         let entry = match self
             .with_session_retry(|| self.rt.block_on(self.client.stat(&parent_remote, name)))
@@ -3502,6 +3599,11 @@ impl QxyncFs {
                 ));
             }
             return Ok(list.entries);
+        }
+        // ★ M20：从没列过这个目录 + 已知离线 → 立即 EIO，不白等 connect timeout。
+        // 列过一次的目录走上面的「本地快照」，离线照样能 `ls`。
+        if self.is_offline() {
+            return Err(fuser::Errno::EIO);
         }
         // ★ M10：会话失效 → 重登一次再重试（否则整个挂载点会一直 EIO 到重挂）
         let entries = match self.with_session_retry(|| self.rt.block_on(self.client.list(remote))) {
@@ -4114,6 +4216,12 @@ impl QxyncFs {
         if self.chunk_ready(ino, idx) {
             return Ok(());
         }
+        // ★ M20：已知离线 → 未水合区间立刻 EIO。
+        // 读**已缓存**的内容不受影响（`chunk_ready` 在上面就返回了）；这里只是
+        // 不再为不可能成功的下载白等 20 秒 connect timeout。
+        if self.is_offline() {
+            return Err(fuser::Errno::EIO);
+        }
 
         let (remote, total, dest, mtime, start_done) = {
             let g = self.inner.lock().unwrap();
@@ -4162,6 +4270,18 @@ impl QxyncFs {
                 }
                 Err(ChunkFetchError::Timeout) => {
                     tracing::warn!("区间水合超时({timeout:?}): {remote} [{start}..={end}]");
+                    self.inner.lock().unwrap().inflight_chunks.remove(&key);
+                    self.clear_node_progress(ino);
+                    return Err(fuser::Errno::EIO);
+                }
+                // ★ M20：网络断了 → 回写状态机（其它组件据此进入离线模式），EIO 收尾
+                Err(ChunkFetchError::Offline(msg)) => {
+                    tracing::warn!(
+                        "区间水合遇网络不可用（进入离线模式）: {remote} [{start}..={end}]: {msg}"
+                    );
+                    if let Some(c) = &self.connectivity {
+                        c.mark_offline(msg);
+                    }
                     self.inner.lock().unwrap().inflight_chunks.remove(&key);
                     self.clear_node_progress(ino);
                     return Err(fuser::Errno::EIO);
@@ -4692,14 +4812,51 @@ impl Filesystem for QxyncFs {
                         None => return reply.error(fuser::Errno::ENOENT),
                     }
                 };
-                let res = self.with_session_retry(|| {
-                    let client = self.client.clone();
-                    let (d, n) = (dir.clone(), name.clone());
-                    self.rt
-                        .block_on(async move { client.set_mtime(&d, &n, epoch).await })
-                });
-                if let Err(e) = res {
-                    tracing::warn!("set_mtime 远端失败 {remote}: {e}");
+                // ★ M20：离线时 mtime 只能进缓冲区（本地视图已经改过了）。
+                // 不排这一条的话，`touch` 出来的时间戳在联网后**永远**不会推上去：
+                // 它不是 dirty、上传不会顺带对齐，下一轮对账也只会判 Noop。
+                let mut queued = false;
+                if self.is_offline() {
+                    if let Err(qe) = self.enqueue_outbox(
+                        qxync_core::store::OUTBOX_SET_MTIME,
+                        &remote,
+                        &epoch.to_string(),
+                        false,
+                    ) {
+                        tracing::warn!("离线改 mtime 入缓冲区失败（本地已改，联网后不同步）: {qe}");
+                    }
+                    // 同一路径若还有排队中的上传作业，它的 mtime 也要跟上 ——
+                    // 否则联网后上传会把这次 touch 又覆盖回去。
+                    if let Some(uq) = &self.upload {
+                        uq.update_pending_mtime(&remote, epoch);
+                    }
+                    queued = true;
+                }
+                if !queued {
+                    let res = self.with_session_retry(|| {
+                        let client = self.client.clone();
+                        let (d, n) = (dir.clone(), name.clone());
+                        self.rt
+                            .block_on(async move { client.set_mtime(&d, &n, epoch).await })
+                    });
+                    if let Err(e) = res {
+                        if e.is_offline() {
+                            self.note_network_error(&e);
+                            if let Err(qe) = self.enqueue_outbox(
+                                qxync_core::store::OUTBOX_SET_MTIME,
+                                &remote,
+                                &epoch.to_string(),
+                                false,
+                            ) {
+                                tracing::warn!("离线改 mtime 入缓冲区失败: {qe}");
+                            }
+                            if let Some(uq) = &self.upload {
+                                uq.update_pending_mtime(&remote, epoch);
+                            }
+                        } else {
+                            tracing::warn!("set_mtime 远端失败 {remote}: {e}");
+                        }
+                    }
                 }
             }
         }
@@ -4806,18 +4963,54 @@ impl Filesystem for QxyncFs {
         if let Err(e) = self.deny_trash(&remote, "创建目录") {
             return reply.error(e);
         }
-        // ★ M10：会话失效 → 重登一次再重试
-        let res = self.with_session_retry(|| {
-            let client = self.client.clone();
-            let (p, n) = (parent_remote.clone(), name.to_string());
-            self.rt.block_on(async move { client.mkdir(&p, &n).await })
-        });
+        // ★ M20：**已知离线就不再打 NAS**（否则要白等 20s connect timeout），
+        // 直接进离线缓冲区：本地视图先行，联网后由 daemon 按 seq 统一回放。
+        let mut offline_queued = false;
+        let res = if self.is_offline() {
+            // ★ M20：**已知离线时也要落 outbox**（别只改本地视图）——
+            //   否则本地建了目录、远端永远没有，联网后也不会回放。
+            if let Err(qe) = self.enqueue_outbox(qxync_core::store::OUTBOX_MKDIR, &remote, "", true)
+            {
+                tracing::warn!("目录 {remote} 离线入队失败，无法保证离线可用: {qe}");
+                return reply.error(fuser::Errno::EIO);
+            }
+            offline_queued = true;
+            Ok(())
+        } else {
+            // ★ M10：会话失效 → 重登一次再重试
+            self.with_session_retry(|| {
+                let client = self.client.clone();
+                let (p, n) = (parent_remote.clone(), name.to_string());
+                self.rt.block_on(async move { client.mkdir(&p, &n).await })
+            })
+        };
         if let Err(e) = res {
-            tracing::warn!("mkdir 失败 {parent_remote}/{name}: {e}");
-            return reply.error(fuser::Errno::EIO);
+            if e.is_offline() {
+                // ★ M20：第一次网络失败才发现的离线 → 记进状态机，再落 outbox。
+                self.note_network_error(&e);
+                if let Err(qe) =
+                    self.enqueue_outbox(qxync_core::store::OUTBOX_MKDIR, &remote, "", true)
+                {
+                    tracing::warn!("目录 {remote} 离线入队失败，无法保证离线可用: {qe}");
+                    return reply.error(fuser::Errno::EIO);
+                }
+                offline_queued = true;
+            } else {
+                tracing::warn!("mkdir 失败 {parent_remote}/{name}: {e}");
+                return reply.error(fuser::Errno::EIO);
+            }
+        }
+        if offline_queued {
+            tracing::info!("离线创建目录: {remote}（已进缓冲区，联网后回放）");
         }
         let entry = DirEntry::local(name, true, 0, Self::epoch_of(SystemTime::now()));
-        let node = self.insert_node(parent, name, &remote, &entry);
+        // ★ M20：离线建出来的目录远端**还没有** → remote_known=false，语义与
+        // `create()` 的本地新建一致（后续改名/删除不会误以为远端有老副本）。
+        let node = if offline_queued {
+            self.insert_node_with(parent, name, &remote, &entry, false)
+        } else {
+            self.insert_node(parent, name, &remote, &entry)
+        };
         // ★ M9：本地新建目录立刻进「映射」
         listing_upsert(&self.inner, &parent_remote, &entry);
         reply.entry(&ENTRY_TTL, &node.attr, Generation(0));
@@ -4847,7 +5040,7 @@ impl Filesystem for QxyncFs {
         let (Some(name), Some(newname)) = (name.to_str(), newname.to_str()) else {
             return reply.error(fuser::Errno::EINVAL);
         };
-        let (old_remote, new_remote, parent_remote, newparent_remote, ino, dirty) = {
+        let (old_remote, new_remote, parent_remote, newparent_remote, ino, dirty, is_dir) = {
             let g = self.inner.lock().unwrap();
             let (Some(p), Some(np)) = (g.nodes.get(&parent), g.nodes.get(&newparent)) else {
                 return reply.error(fuser::Errno::ENOENT);
@@ -4855,11 +5048,21 @@ impl Filesystem for QxyncFs {
             let old = join_path(&p.remote, name);
             let new = join_path(&np.remote, newname);
             let ino = g.by_remote.get(&old).copied();
-            let dirty = ino
-                .and_then(|i| g.nodes.get(&i))
-                .map(|n| n.dirty)
+            let node = ino.and_then(|i| g.nodes.get(&i));
+            let dirty = node.map(|n| n.dirty).unwrap_or(false);
+            // ★ M20：离线改名要记「源是文件还是目录」（回放日志 / 冲突处理要用）。
+            let is_dir = node
+                .map(|n| n.attr.kind == FileType::Directory)
                 .unwrap_or(false);
-            (old, new, p.remote.clone(), np.remote.clone(), ino, dirty)
+            (
+                old,
+                new,
+                p.remote.clone(),
+                np.remote.clone(),
+                ino,
+                dirty,
+                is_dir,
+            )
         };
 
         // ★ M7：改名的两端都不能落在被排除的路径上（挪进去/挪出来都算写）
@@ -4909,6 +5112,18 @@ impl Filesystem for QxyncFs {
                 return reply.error(fuser::Errno::EBUSY);
             }
         }
+        // ★ M20：删除队列也要冻结 + 改写路径（否则「离线先删子项、再改父目录名」
+        // 的删除作业会一直指着旧路径，回放改名后必然失败 → 删掉的文件复活）。
+        let delete_queue = self.delete_queue.clone();
+        let mut delete_paused = false;
+        if let Some(dq) = &delete_queue {
+            dq.pause();
+            delete_paused = true;
+            if !dq.wait_active(Duration::from_secs(30)) {
+                // 在途批次用的是**改名前的旧路径**，正好该删 —— 超时不阻塞改名。
+                tracing::warn!("改名前等待删除队列在途批次超时（继续改名）: {old_remote}");
+            }
+        }
         // 远端到底有没有老副本？有本地改动时以节点的 `remote_known` 为准（它来自
         // 远端清单 / 上传成功回调，不是猜的）；没有本地改动时老节点必然来自远端。
         // 在途作业刚落地的话，上面的等待期间 hook 已经把 `remote_known` 置 true。
@@ -4919,12 +5134,40 @@ impl Filesystem for QxyncFs {
                 .unwrap_or(!dirty)
         };
 
+        // ★ M20：已知离线 → 不试网络，远端改名操作进离线缓冲区；本地视图照常推进。
+        // 回放顺序由 outbox 的 seq 保证（离线期间改名的链条按用户操作顺序重放）。
+        let mut offline_queued = false;
         // ★ M10：会话失效 → 重登一次再重试（rename/move 都要）
         let res = if !on_remote {
             tracing::info!(
                 "改名: 远端没有老副本（本地新建后未上传），只做本地改名: \
                  {old_remote} -> {new_remote}"
             );
+            Ok(())
+        } else if self.is_offline() {
+            // ★ M20：已知离线时也必须落 outbox（本地视图已改，远端还没改）。
+            if let Err(qe) = self.enqueue_outbox(
+                qxync_core::store::OUTBOX_RENAME,
+                &old_remote,
+                &new_remote,
+                is_dir,
+            ) {
+                if paused {
+                    if let Some(q) = &upload {
+                        q.resume();
+                    }
+                }
+                if delete_paused {
+                    if let Some(dq) = &delete_queue {
+                        dq.resume();
+                    }
+                }
+                tracing::warn!(
+                    "改名 {old_remote} -> {new_remote} 离线入队失败，无法保证离线可用: {qe}"
+                );
+                return reply.error(fuser::Errno::EIO);
+            }
+            offline_queued = true;
             Ok(())
         } else {
             self.with_session_retry(|| {
@@ -4959,13 +5202,48 @@ impl Filesystem for QxyncFs {
             })
         };
         if let Err(e) = res {
-            if paused {
-                if let Some(q) = &upload {
-                    q.resume();
+            if e.is_offline() {
+                // ★ M20：第一次网络失败才发现的离线 → 落 outbox，本地视图继续推进。
+                self.note_network_error(&e);
+                if let Err(qe) = self.enqueue_outbox(
+                    qxync_core::store::OUTBOX_RENAME,
+                    &old_remote,
+                    &new_remote,
+                    is_dir,
+                ) {
+                    if paused {
+                        if let Some(q) = &upload {
+                            q.resume();
+                        }
+                    }
+                    if delete_paused {
+                        if let Some(dq) = &delete_queue {
+                            dq.resume();
+                        }
+                    }
+                    tracing::warn!(
+                        "改名 {old_remote} -> {new_remote} 离线入队失败，无法保证离线可用: {qe}"
+                    );
+                    return reply.error(fuser::Errno::EIO);
                 }
+                offline_queued = true;
+            } else {
+                if paused {
+                    if let Some(q) = &upload {
+                        q.resume();
+                    }
+                }
+                if delete_paused {
+                    if let Some(dq) = &delete_queue {
+                        dq.resume();
+                    }
+                }
+                tracing::warn!("rename 失败 {old_remote} -> {new_remote}: {e}");
+                return reply.error(fuser::Errno::EIO);
             }
-            tracing::warn!("rename 失败 {old_remote} -> {new_remote}: {e}");
-            return reply.error(fuser::Errno::EIO);
+        }
+        if offline_queued {
+            tracing::info!("离线改名: {old_remote} -> {new_remote}（已进缓冲区，联网后回放）");
         }
 
         if let Some(ino) = ino {
@@ -5023,8 +5301,25 @@ impl Filesystem for QxyncFs {
         if let Some(q) = &upload {
             let new_cache = self.node_by_remote(&new_remote).and_then(|n| n.cache);
             q.retarget_pending_under(&old_remote, &new_remote, new_cache.as_deref());
+        }
+        // ★ M20：删除作业同样改写到新路径（离线删了子项再改父目录名的场景）。
+        if let Some(dq) = &delete_queue {
+            dq.retarget_pending_under(&old_remote, &new_remote);
+        }
+        // ★ M20：本地新建（远端没有老副本）的目录/文件改名 → outbox 里的 mkdir 路径
+        // 必须回写，否则回放只会把老路径建出来，新路径的父目录不存在。
+        if !on_remote {
+            self.rewrite_outbox_prefix(&old_remote, &new_remote);
+        }
+        // 最后才放开队列（顺序不能反：先 resume 的话 worker 会立刻取走老名字的作业）。
+        if let Some(q) = &upload {
             if paused {
                 q.resume();
+            }
+        }
+        if let Some(dq) = &delete_queue {
+            if delete_paused {
+                dq.resume();
             }
         }
         tracing::debug!("rename {old_remote} -> {new_remote}");
@@ -5097,6 +5392,9 @@ impl Filesystem for QxyncFs {
             "user.qxync.chunks" => Some(chunks),
             "user.qxync.remote" => Some(remote),
             "user.qxync.vsize" => Some(fsize.to_string()),
+            // ★ M20：脚本 / 桌面能直接判断「现在这个挂载点能不能指望联网」。
+            // 只在**已知离线**时是 "1"；刚启动还没试过网络时是 "0"（乐观，与内部一致）。
+            "user.qxync.offline" => Some(if self.is_offline() { "1" } else { "0" }.to_string()),
             "user.qxync.pin" => Some(
                 self.pins
                     .lock()
@@ -5123,7 +5421,7 @@ impl Filesystem for QxyncFs {
         // ★ 末尾必须留一个 NUL：内核 fuse_verify_xattr_list() 会逐项 strnlen，
         // 最后一项没有终止符就直接对整个 listxattr 回 -EIO（实测过：size<66 回 ERANGE，
         // size>=66 反而回 EIO，就是这个校验触发的）。
-        let names = "user.qxync.state\0user.qxync.pin\0user.qxync.remote\0user.qxync.vsize\0user.qxync.chunks\0";
+        let names = "user.qxync.state\0user.qxync.pin\0user.qxync.remote\0user.qxync.vsize\0user.qxync.chunks\0user.qxync.offline\0";
         let exists = { self.inner.lock().unwrap().nodes.contains_key(&ino) };
         if !exists {
             return reply.error(fuser::Errno::ENOENT);
@@ -7993,6 +8291,98 @@ mod tests {
         assert_eq!(s.progress, None, "作业结束后不能留着进度");
         assert_eq!(s.label(), "已同步");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M20：离线结构操作进 outbox + 冻结队列；没有状态库时**必须报错**而不是假装成功。
+    #[test]
+    fn m20_offline_outbox_persists_and_freezes_queues() {
+        use qxync_core::store::{OUTBOX_MKDIR, OUTBOX_RENAME};
+        let dir = m7_tmpdir("m20-outbox");
+        let fs = test_fs(&dir, true);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let q = UploadQueue::new(
+            Arc::new(Client::new(&test_link()).unwrap()),
+            fs.rt.handle(),
+            dir.join("queue"),
+        )
+        .unwrap();
+        let c = Connectivity::shared();
+        let fs = fs
+            .with_upload_queue(q.clone())
+            .with_nodes_store(store.clone())
+            .with_connectivity(c.clone());
+        assert!(!fs.is_offline(), "没投递离线状态时应视为在线");
+
+        // 没注入状态库的挂载点：离线操作无法持久化 → 必须报错（宁可 EIO 也不假装成功）
+        let bare = test_fs(&dir, true);
+        assert!(bare
+            .enqueue_outbox(OUTBOX_MKDIR, "/home/x", "", true)
+            .is_err());
+
+        c.mark_offline("连接超时");
+        assert!(fs.is_offline());
+        fs.enqueue_outbox(OUTBOX_MKDIR, "/home/offline-dir", "", true)
+            .unwrap();
+        fs.enqueue_outbox(OUTBOX_RENAME, "/home/a.txt", "/home/b.txt", false)
+            .unwrap();
+        let rows = store.outbox_pending().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].is_mkdir(), "顺序 = 入队顺序（先建目录，再改名）");
+        assert_eq!(rows[0].path, "/home/offline-dir");
+        assert!(rows[1].is_rename());
+        assert_eq!(rows[1].path, "/home/a.txt");
+        assert_eq!(rows[1].target, "/home/b.txt");
+        assert!(
+            q.backlog_blocked(),
+            "写入离线缓冲区后必须冻结上传队列，否则上传会抢在结构操作回放之前"
+        );
+
+        // 联网恢复：解开闸门，队列可继续
+        c.mark_online();
+        q.set_backlog_blocked(false);
+        assert!(!fs.is_offline());
+        assert!(!q.backlog_blocked());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M20：本地改名（远端没有老副本，例如离线新建的目录）必须回写 outbox 路径。
+    ///
+    /// 不回写的后果：outbox 只有 `mkdir /a`，回放把 `/a` 建出来，但本地视图和
+    /// 上传作业都指向 `/b` —— 父目录不存在，上传 5 次后放弃。
+    #[test]
+    fn m20_local_rename_rewrites_pending_outbox_prefix() {
+        use qxync_core::store::OUTBOX_MKDIR;
+        let dir = m7_tmpdir("m20-rewrite");
+        let fs = test_fs(&dir, true);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let q = UploadQueue::new(
+            Arc::new(Client::new(&test_link()).unwrap()),
+            fs.rt.handle(),
+            dir.join("queue"),
+        )
+        .unwrap();
+        let fs = fs
+            .with_upload_queue(q)
+            .with_nodes_store(store.clone())
+            .with_connectivity(Connectivity::shared());
+
+        store
+            .outbox_add(OUTBOX_MKDIR, "/home/old", "", true)
+            .unwrap();
+        store
+            .outbox_add(OUTBOX_MKDIR, "/home/old/sub", "", true)
+            .unwrap();
+        fs.rewrite_outbox_prefix("/home/old", "/home/new");
+        let paths: Vec<String> = store
+            .outbox_pending()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.path)
+            .collect();
+        assert!(paths.contains(&"/home/new".to_string()));
+        assert!(paths.contains(&"/home/new/sub".to_string()));
+        assert!(!paths.iter().any(|p| p.starts_with("/home/old")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

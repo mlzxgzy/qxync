@@ -779,7 +779,59 @@ pub struct StatusData {
     /// 而「现在一共有几个文件在传」是首页最想知道的一句话。
     #[serde(default)]
     pub transfers: Option<TransferInfo>,
+    /// ★ M20：连通性状态（在线 / 离线 / 还没试过网络）。
+    ///
+    /// 界面据此显示「离线」与离线时长；老 daemon 不给这个字段（`None`）时
+    /// 前端必须按「正常」处理，不能把缺字段当成离线。
+    #[serde(default)]
+    pub connectivity: Option<crate::connectivity::ConnectivitySnapshot>,
+    /// ★ M20：离线缓冲区汇总（**只有真的有待同步内容时才出现**，避免首页常驻一行 0）。
+    #[serde(default)]
+    pub offline: Option<OfflineInfo>,
     pub mounts: Vec<MountInfo>,
+}
+
+/// ★ M20：离线缓冲区汇总 —— 「离线期间攒了多少改动、联网后要推多久」。
+///
+/// 三个来源合并展示：上传队列（文件内容）/ 删除队列 / 结构操作 outbox（建目录、改名、
+/// 只改 mtime）。分开给计数是为了让用户能判断「只是几个文件没传」还是
+/// 「离线时组织过目录」—— 后者恢复时要先回放结构操作，会有可见的先后顺序。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OfflineInfo {
+    /// 待上传的文件数。
+    pub pending_upload: u64,
+    /// 待删除的条目数。
+    pub pending_delete: u64,
+    /// 待回放的「新建目录」数。
+    pub pending_mkdir: u64,
+    /// 待回放的「改名 / 移动」数。
+    pub pending_rename: u64,
+    /// 待回放的「只改 mtime」数。
+    pub pending_set_mtime: u64,
+    /// 是否还有结构操作待回放 / 正在回放（`true` 时上传/删除队列被冻结）。
+    ///
+    /// 离线时是「排队等联网」，联网后是「正在回放」—— 对界面来说都是
+    /// 「先等这些结构操作落地，文件内容才会开始传」。
+    pub replaying: bool,
+    /// 最近一次回放的结论 / 错误（人话，直接展示）。
+    pub last_note: Option<String>,
+}
+
+impl OfflineInfo {
+    /// 一共压着多少项（含上传/删除/结构操作）。
+    pub fn total(&self) -> u64 {
+        self.pending_upload
+            + self.pending_delete
+            + self.pending_mkdir
+            + self.pending_rename
+            + self.pending_set_mtime
+    }
+
+    /// 是否有任何待同步内容。
+    pub fn is_empty(&self) -> bool {
+        self.total() == 0 && !self.replaying
+    }
 }
 
 /// ★ M15/T8：传输进度汇总（`status` 的增量字段）。
@@ -1781,6 +1833,8 @@ mod tests {
             sync: None,
             cache: None,
             transfers: Some(t),
+            connectivity: None,
+            offline: None,
             mounts: vec![],
         })
         .unwrap();

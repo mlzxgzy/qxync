@@ -5,6 +5,73 @@
 
 [English](CHANGELOG.en.md) · [README](README.md) · [验收记录](docs/验收记录.md)
 
+## [0.7.0] - 2026-10-19
+
+### 新增
+
+- **离线可用 + 累计缓冲区（M20）**：断网不再等于「本地改动等 10 秒后丢失」。
+  离线时挂载点继续提供服务：已缓存内容照常读写；本地改动（写文件、新建、删除、改名、
+  `touch`）落进**持久化缓冲区**，联网后按用户操作顺序统一回放。分六块：
+  * **连通性状态机**（`qxync-core::connectivity`）：全进程唯一判定「现在连不连得上」，
+    三态（未检测 / 在线 / 离线），只有 `Error::Transport` 才算离线 —— 业务错误
+    （不存在 / 无权限 / 会话失效 / 服务端忙）继续走原来的重试/放弃逻辑；
+  * **离线结构操作 outbox**（`sync.db` schema v4 → v5，新增 `outbox` 表）：离线期间的
+    `mkdir` / `rename` / 只改 mtime 按 `seq` 持久化，daemon 跨重启不丢；
+  * **上传 / 删除队列离线感知**：网络错误**不计重试次数、不删作业、不放弃**，
+    worker 停在「等联网」闸门上；daemon 恢复后统一唤醒。旧实现断网约 10 秒就会把
+    作业当失败删库 —— 本地文件还在，但远端永远停在旧版（删除则会在联网后「复活」）；
+  * **本地改名会带着缓冲区一起走**：离线新建的目录再改名时回写 outbox 里的路径前缀；
+    删除队列也按改名 rekey（`a/x` → `b/x`），不会出现「离线删掉的文件联网后复活」；
+  * **FUSE 写路径离线化**：已知离线时不再打 NAS（也就不再白等 20s connect timeout），
+    `mkdir` / `rename` / `touch` 先改本地视图再进 outbox；未水合的区间立即 EIO，
+    已缓存内容不受影响；新增 `user.qxync.offline` xattr，脚本可直接判断当前能不能联网；
+  * **重连统一同步**：轮询器离线时每 3 秒短探活（不再等 30s/600s 的完整间隔）；
+    恢复后**先按 seq 回放 outbox、再解冻上传/删除队列**，最后补一轮对账 —— 顺序反了会
+    让上传抢在「改名 / 建目录」之前落到旧路径上。回放幂等（远端已是目标状态就只删行）；
+    改名目标被占用时把 NAS 上那份改成冲突副本（两边数据都保留，不覆盖）；会话失效会
+    自动重登后继续，网络错误 / 服务端未就绪都不消耗重试次数；
+  * **状态可见**：`status` / CLI / GUI 显示离线（含已离线时长与原因）、缓冲区分类计数
+    （待上传 / 待删除 / 待建目录 / 待改名 / 待改 mtime）与回放状态。
+
+### 修复
+
+- 断网后上传 / 删除作业被误判为「重试超限」并删库 → 离线改动永远不会同步。
+- 离线时 `mkdir` / `rename` 直接 EIO（文件管理器里建文件夹、改名都失败）。
+- **`qxync status` 断网时最长卡一分钟**：旧实现在登录状态下依次请求
+  `nas_uid` / `max_log` / `check_alive`，每个都要等 20s connect timeout。
+  现在已知离线直接跳过网络探测（真机脚本实测 6ms 返回）。
+- 离线读未水合文件要白等 connect timeout 才 EIO；列过目录的 `readdir` 仍吃本地快照。
+- 离线 `touch` 后，排队中的上传会把 mtime 覆盖回旧值（现在同步更新队列作业的 mtime）。
+
+### 验证
+
+```text
+cargo build --workspace                         ✅
+cargo test --workspace                          ✅
+  qxync-core   230 passed（含 connectivity / outbox 新用例）
+  qxync-daemon  68 passed（含回放计划 / 网络错误不丢行 / 不计次数）
+  qxync-fuse    98 passed（含队列离线闸门 / 离线 touch 更新 mtime / outbox 冻结队列）
+  qxync-client   32 passed
+cargo fmt --all --check                         ✅
+node xtask/tests/task-defaults.test.mjs         ✅ 24 passed
+xtask/tests/m20-offline.sh                      ✅ 9 passed（隔离 XDG，NAS 指向 127.0.0.1:9）
+  · 离线时 status 6ms 返回（< 5000ms 断言）
+  · 缓冲区分类计数正确（待建目录 1 / 待改名 1）
+  · 跨 daemon 重启行不丢、attempts 仍为 0
+```
+
+**真挂载段未验**：本机没有 `/dev/fuse`，`mkdir`/`rename` 在真挂载点上的离线行为
+只有逻辑层单测覆盖（与 M15 的说明一致）。建议在有 FUSE 的机器上补一段
+「断网 → 建目录 / 改名 → 恢复 → 远端出现对应变化」的真机验收。
+
+### 已知限制
+
+- 离线新建/改名的文件在同步落地前不会出现在「重新打开挂载点」的目录列表里
+  （本地节点表是进程内状态）；但内容与操作都在持久化队列/outbox 里，不会丢。
+- 回放改名的冲突处理固定走 `rename_remote` 语义（NAS 那份改名成冲突副本），
+  暂不读取任务的 `conflict` 策略（离线时无法保证策略在回放时仍有效）。
+- 任务级 purge 暂不清理 outbox 行（与上传/删除队列一样按连接共享；连接级 purge 会整体删掉 `sync.db`）。
+
 ## [0.6.8] - 2026-10-19
 
 ### 重设计

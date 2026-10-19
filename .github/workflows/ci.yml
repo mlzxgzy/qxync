@@ -82,6 +82,12 @@ jobs:
       - name: M19 删除相关数据 e2e（隔离 XDG）
         run: bash xtask/tests/m19-purge.sh
 
+      # ★ M20：离线缓冲区 / 离线状态的隔离 e2e —— NAS 指向 127.0.0.1:9（必定不可达），
+      # 不需要真实设备。断言：离线时 status 不卡网络、如实显示离线、缓冲区计数可见、
+      # 跨 daemon 重启行不丢且网络错误不消耗重试次数。缺 sqlite3 时跳过行数断言。
+      - name: M20 离线状态 / 缓冲区 e2e（隔离 XDG）
+        run: bash xtask/tests/m20-offline.sh
+
   # ---------------------------------------------------------------- MSRV
   msrv:
     name: MSRV check (rust 1.90)

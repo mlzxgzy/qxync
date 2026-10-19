@@ -2480,6 +2480,35 @@
           return;
         }
         anyRunning = true;
+        // ★ M20：离线横幅必须**先于** sync 判空 —— 离线时 sync 信息也可能缺，
+        // 但用户最想知道的是「我的改动还在不在、什么时候能同步」。
+        var conn = (s && isObj(s.connectivity)) ? s.connectivity : null;
+        if (conn && conn.known === true && conn.online === false) {
+          var off = (s && isObj(s.offline)) ? s.offline : null;
+          var pend = off
+            ? (num(off.pending_upload, 0) + num(off.pending_delete, 0) + num(off.pending_mkdir, 0)
+              + num(off.pending_rename, 0) + num(off.pending_set_mtime, 0))
+            : 0;
+          var durSecs = conn.since_unix ? Math.max(0, Math.floor(Date.now() / 1000) - num(conn.since_unix, 0)) : 0;
+          var sinceTxt = durSecs > 0 ? '已离线 ' + humanDuration(durSecs) : '';
+          addAlert('home-alerts', T('home.offline_link', {
+            label: label,
+            since: sinceTxt,
+            state: pend > 0
+              ? '本地改动已先攒着（' + pend + ' 项），联网后自动同步'
+              : '已下载的内容仍可正常读写'
+          }), 'warn');
+          if (off) {
+            addAlert('home-alerts', T('home.offline_pending_link', {
+              label: label,
+              up: num(off.pending_upload, 0),
+              del: num(off.pending_delete, 0),
+              mkdir: num(off.pending_mkdir, 0),
+              rename: num(off.pending_rename, 0),
+              setmtime: num(off.pending_set_mtime, 0)
+            }), 'warn');
+          }
+        }
         if (!sy) {
           kvText(dl, T('home.sync_link', { label: label }), T('home.sync_missing'), 'val-dim');
           return;
@@ -2577,6 +2606,36 @@
     }
     if (isObj(s.link)) {
       kvText(sess, 'link', str(s.link.id) + ' · ' + str(s.link.user) + '@' + str(s.link.host) + ':' + str(s.link.port));
+    }
+    // ★ M20：连通性 + 离线缓冲区（在线且无积压时 daemon 不给 `offline`）
+    var conn = isObj(s.connectivity) ? s.connectivity : null;
+    if (conn) {
+      if (conn.known !== true) {
+        kvText(sess, '连通性', '未检测（还没发过网络请求）', 'val-dim');
+      } else if (conn.online !== false) {
+        kvText(sess, '连通性', '在线', 'val-ok');
+      } else {
+        var offSecs = conn.since_unix ? Math.max(0, Math.floor(Date.now() / 1000) - num(conn.since_unix, 0)) : 0;
+        kvText(sess, '连通性',
+          '离线' + (offSecs > 0 ? '（已 ' + humanDuration(offSecs) + '）' : '')
+          + (conn.last_error ? '：' + String(conn.last_error) : ''), 'val-warn');
+      }
+    }
+    var offbuf = isObj(s.offline) ? s.offline : null;
+    if (offbuf) {
+      kvText(sess, '离线缓冲区',
+        '待上传 ' + num(offbuf.pending_upload, 0)
+        + ' · 待删除 ' + num(offbuf.pending_delete, 0)
+        + ' · 待建目录 ' + num(offbuf.pending_mkdir, 0)
+        + ' · 待改名 ' + num(offbuf.pending_rename, 0)
+        + ' · 待改 mtime ' + num(offbuf.pending_set_mtime, 0),
+        offbuf.replaying ? 'val-warn' : null);
+      if (offbuf.replaying) {
+        kvText(sess, '结构操作', '待回放 / 正在回放（联网后按顺序推回 NAS；期间上传与删除冻结）', 'val-warn');
+      }
+      if (offbuf.last_note) {
+        kvText(sess, '离线原因', String(offbuf.last_note), 'val-warn');
+      }
     }
 
     // --- 游标

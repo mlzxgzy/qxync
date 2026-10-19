@@ -32,10 +32,11 @@ use std::sync::{Arc, Mutex};
 pub const DB_FILE: &str = "sync.db";
 
 /// schema 版本（写进 `PRAGMA user_version`；将来加表要迁移时用它判断）。
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 // ★ M8.3：v1 → v2 只是**新增 journal 表与索引**。
 // ★ M8.4：v2 → v3 只是**新增 decisions 表（冲突待裁决队列）**。
 // ★ M15/T9：v3 → v4 只是**新增 nodes 表（稳定文件身份 file_id → path 的索引）**。
+// ★ M20：v4 → v5 只是**新增 outbox 表（离线期间做不成的结构操作）**。
 // 因为整份 SCHEMA_SQL 都是
 // `CREATE TABLE/INDEX IF NOT EXISTS`，老库在下次 `Store::open()` 时会被自动补齐，
 // **不需要写迁移代码、也不会碰已有表里的数据**（迁移幂等由 m5-matrix 断言覆盖）。
@@ -84,6 +85,21 @@ CREATE TABLE IF NOT EXISTS deletes (
   attempts    INTEGER NOT NULL DEFAULT 0,
   queued_unix INTEGER NOT NULL DEFAULT 0
 );
+-- ★ M20：离线缓冲区（outbox）。**表 = 未完成的结构操作**（mkdir / rename）。
+-- 离线期间 FUSE 写路径本地视图先行，操作落这张表；联网后由 daemon 严格按 seq
+-- 升序回放。与 uploads / deletes 分开的理由见 OutboxRow 的文档。
+-- target 只有 rename 用；mkdir 为空串。attempts 只在**非网络错误**时增加 ——
+-- 网络错误等联网再试，不计入放弃阈值。
+CREATE TABLE IF NOT EXISTS outbox (
+  seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind         TEXT    NOT NULL,
+  path         TEXT    NOT NULL,
+  target       TEXT    NOT NULL DEFAULT '',
+  is_dir       INTEGER NOT NULL DEFAULT 0,
+  attempts     INTEGER NOT NULL DEFAULT 0,
+  created_unix INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS outbox_seq ON outbox(seq);
 -- ★ M8.3：同步活动日志。GUI 的「文件更新中心 / 错误列表」读的就是它。
 -- 写入侧**必须批量**（见 Store::journal_add_batch）：同步/上传热路径不许逐条事务。
 CREATE TABLE IF NOT EXISTS journal (
@@ -206,6 +222,62 @@ impl DeleteRow {
             self.remote_dir.trim_end_matches('/'),
             self.remote_name
         )
+    }
+}
+
+/// ★ M20：离线缓冲区里「结构操作」的 kind —— 新建目录。
+pub const OUTBOX_MKDIR: &str = "mkdir";
+/// ★ M20：离线缓冲区里「结构操作」的 kind —— 改名 / 移动。
+pub const OUTBOX_RENAME: &str = "rename";
+/// ★ M20：离线期间 `touch` 出来的「只改 mtime」操作。
+///
+/// 它不算结构操作，但同样只能等联网再推（内容没变、不能靠上传顺带对齐），
+/// 而且顺序上必须排在**上传之后**才不会被上传的 mtime 覆盖，所以单独一个 kind。
+pub const OUTBOX_SET_MTIME: &str = "setmtime";
+
+/// ★ M20：离线缓冲区（outbox）里的一行 —— **离线期间做不成的结构操作**。
+///
+/// ## 为什么它不并进 `uploads` / `deletes`
+///
+/// 那两个队列的语义是「内容搬运」：作业内容自足（缓存文件 / 路径），重试幂等。
+/// 结构操作不一样 —— 它有**顺序依赖**（先建父目录再建子目录、先改目录名再往
+/// 新名字里传文件），而且离线时本地视图已经乐观地改过了，恢复时要和 NAS 现状
+/// 对账（源还在不在、目标是不是已经被别的设备占了）。混进上传表会让「表 = 未
+/// 完成作业」这个干净的语义变得含混，也会把上传 worker 的批处理搞复杂。
+///
+/// ## 顺序就是 `seq`
+///
+/// 自增主键 = 入队顺序。回放**严格按 seq 升序**：本地先 `mkdir a` 再 `mkdir a/b`，
+/// 回放顺序必须一致，否则子目录的父目录还不存在。改名链 `a→b`、`b→c` 同理。
+///
+/// ## 「表 = 未完成操作」
+///
+/// 与 `uploads` / `deletes` 一致：回放成功 / 重试超限放弃 / 用户在界面上清掉，
+/// 才删行；daemon 重启后从这张表恢复，所以离线期间断电也不会丢。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboxRow {
+    /// 入队序号（回放顺序）。
+    pub seq: i64,
+    /// [`OUTBOX_MKDIR`] 或 [`OUTBOX_RENAME`]。
+    pub kind: String,
+    /// 目标路径：`mkdir` 是新建目录的远端绝对路径；`rename` 是**源**路径。
+    pub path: String,
+    /// `rename` 的新路径；`mkdir` 为空串。
+    pub target: String,
+    /// 目录标志（`mkdir` 恒真；`rename` 记录源是文件还是目录，仅用于日志/冲突处理）。
+    pub is_dir: bool,
+    /// 已尝试回放次数（**只有非网络错误才计数**）。
+    pub attempts: u32,
+    /// 入队时刻（unix 秒，界面用它显示「离线 3 分钟前创建」）。
+    pub created_unix: i64,
+}
+
+impl OutboxRow {
+    pub fn is_mkdir(&self) -> bool {
+        self.kind == OUTBOX_MKDIR
+    }
+    pub fn is_rename(&self) -> bool {
+        self.kind == OUTBOX_RENAME
     }
 }
 
@@ -1299,6 +1371,185 @@ impl Store {
         Ok(n)
     }
 
+    // ------------------------------------------------------------ ★ M20：离线缓冲区（outbox）
+
+    /// 追加一条结构操作，返回它的 `seq`（回放顺序）。
+    ///
+    /// `mkdir` 是幂等的：同路径重复入队没有意义（回放时也会先 stat 一次），
+    /// 这里做一次去重 —— 但**只在「尚未回放」的同 kind/path 行存在时**跳过，
+    /// 避免用户「建了删、删了又建」把两次意图合并掉。
+    pub fn outbox_add(&self, kind: &str, path: &str, target: &str, is_dir: bool) -> Result<i64> {
+        let conn = self.conn();
+        if kind == OUTBOX_MKDIR {
+            let exists: Option<i64> = conn
+                .query_row(
+                    "SELECT seq FROM outbox WHERE kind = ?1 AND path = ?2 LIMIT 1",
+                    params![kind, path],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(Error::from)?;
+            if let Some(seq) = exists {
+                return Ok(seq);
+            }
+        }
+        conn.execute(
+            "INSERT INTO outbox(kind, path, target, is_dir, attempts, created_unix)
+             VALUES(?1,?2,?3,?4,0,?5)",
+            params![kind, path, target, is_dir as i64, now_unix()],
+        )
+        .map_err(Error::from)?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// 取出全部未完成操作（**严格按 seq 升序** = 入队顺序）。
+    pub fn outbox_pending(&self) -> Result<Vec<OutboxRow>> {
+        self.outbox_pending_limited(usize::MAX)
+    }
+
+    /// 取最多 `limit` 条未完成操作（回放分批用，避免一次把巨量行读进内存）。
+    pub fn outbox_pending_limited(&self, limit: usize) -> Result<Vec<OutboxRow>> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT seq, kind, path, target, is_dir, attempts, created_unix
+                   FROM outbox ORDER BY seq LIMIT ?1",
+            )
+            .map_err(Error::from)?;
+        let rows = stmt
+            .query_map(params![limit as i64], |r| {
+                Ok(OutboxRow {
+                    seq: r.get(0)?,
+                    kind: r.get(1)?,
+                    path: r.get(2)?,
+                    target: r.get(3)?,
+                    is_dir: r.get::<_, i64>(4)? != 0,
+                    attempts: r.get::<_, i64>(5)? as u32,
+                    created_unix: r.get(6)?,
+                })
+            })
+            .map_err(Error::from)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(Error::from)?);
+        }
+        Ok(out)
+    }
+
+    /// 未完成操作条数（`status` / 离线缓冲区摘要用）。
+    pub fn outbox_len(&self) -> Result<u64> {
+        let n: i64 = self
+            .conn()
+            .query_row("SELECT COUNT(*) FROM outbox", [], |r| r.get(0))
+            .map_err(Error::from)?;
+        Ok(n.max(0) as u64)
+    }
+
+    /// 按 kind 统计 `(待建目录, 待改名, 待改 mtime)`（`status` 里分开显示）。
+    pub fn outbox_counts(&self) -> Result<(u64, u64, u64)> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT kind, COUNT(*) FROM outbox GROUP BY kind")
+            .map_err(Error::from)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            .map_err(Error::from)?;
+        let (mut mkdir, mut rename, mut set_mtime) = (0u64, 0u64, 0u64);
+        for row in rows {
+            let (kind, n) = row.map_err(Error::from)?;
+            let n = n.max(0) as u64;
+            match kind.as_str() {
+                OUTBOX_MKDIR => mkdir = n,
+                OUTBOX_RENAME => rename = n,
+                OUTBOX_SET_MTIME => set_mtime = n,
+                _ => {}
+            }
+        }
+        Ok((mkdir, rename, set_mtime))
+    }
+
+    /// ★ M20：把 outbox 里落在 `old` 子树下的路径改写到 `new`（含 `old` 自身）。
+    ///
+    /// 用途：**离线新建的目录又被改名**时，outbox 里只有 `mkdir /a`，没有
+    /// 「改名 a→b」这条远端操作（本地节点 `remote_known=false`，FUSE 走纯本地改名）。
+    /// 不回写的话，回放会把 `/a` 建出来，而本地视图与后续上传都指向 `/b` ——
+    /// 父目录不存在，上传重试几次后被放弃，内容只剩在本地缓存里。
+    ///
+    /// `kind=rename` 行要**同时**改写 `path` 与 `target`（改名链里出现前缀移动）；
+    /// `mkdir` / `setmtime` 只改 `path`。按**段级前缀**匹配，`/home/a` 不会命中
+    /// `/home/ab`。
+    pub fn outbox_rewrite_prefix(&self, old: &str, new: &str) -> Result<usize> {
+        let old = old.trim_end_matches('/');
+        let new = new.trim_end_matches('/');
+        if old.is_empty() || new.is_empty() || old == new {
+            return Ok(0);
+        }
+        fn under(path: &str, root: &str) -> bool {
+            path == root
+                || (path.len() > root.len()
+                    && path.starts_with(root)
+                    && path.as_bytes()[root.len()] == b'/')
+        }
+        fn rewrite(path: &str, old: &str, new: &str) -> String {
+            if path == old {
+                new.to_string()
+            } else if under(path, old) {
+                format!("{new}{}", &path[old.len()..])
+            } else {
+                path.to_string()
+            }
+        }
+        let rows = self.outbox_pending()?;
+        let mut n = 0usize;
+        for row in rows {
+            let path = rewrite(&row.path, old, new);
+            let target = if row.kind == OUTBOX_RENAME {
+                rewrite(&row.target, old, new)
+            } else {
+                row.target.clone()
+            };
+            if path == row.path && target == row.target {
+                continue;
+            }
+            self.conn()
+                .execute(
+                    "UPDATE outbox SET path = ?2, target = ?3 WHERE seq = ?1",
+                    params![row.seq, path, target],
+                )
+                .map_err(Error::from)?;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    /// 回放成功 → 删行。
+    pub fn outbox_done(&self, seq: i64) -> Result<bool> {
+        let n = self
+            .conn()
+            .execute("DELETE FROM outbox WHERE seq = ?1", params![seq])
+            .map_err(Error::from)?;
+        Ok(n > 0)
+    }
+
+    /// 非网络错误 → 重试计数 +1（网络错误**不要**调它：联网后原样再试）。
+    pub fn outbox_bump_attempts(&self, seq: i64, attempts: u32) -> Result<()> {
+        self.conn()
+            .execute(
+                "UPDATE outbox SET attempts = ?2 WHERE seq = ?1",
+                params![seq, attempts as i64],
+            )
+            .map_err(Error::from)?;
+        Ok(())
+    }
+
+    pub fn clear_outbox(&self) -> Result<usize> {
+        let n = self
+            .conn()
+            .execute("DELETE FROM outbox", [])
+            .map_err(Error::from)?;
+        Ok(n)
+    }
+
     // ------------------------------------------------------------ ★ M19：按路径子树清理
 
     /// `table` 只允许这张白名单：它们都有 `path` 列、且路径都是**远端绝对路径**。
@@ -1943,6 +2194,100 @@ mod tests {
         assert_eq!(s.deletes().unwrap().len(), 1);
     }
 
+    /// ★ M20：离线缓冲区（outbox）的持久化语义 —— 顺序、去重、重试计数、删行。
+    #[test]
+    fn outbox_orders_dedups_and_roundtrips() {
+        let s = Store::open_in_memory().unwrap();
+        assert_eq!(s.outbox_len().unwrap(), 0);
+
+        // 顺序 = 入队顺序（父目录先、子目录后）；回放必须照这个顺序
+        let a = s.outbox_add(OUTBOX_MKDIR, "/home/a", "", true).unwrap();
+        let b = s.outbox_add(OUTBOX_MKDIR, "/home/a/b", "", true).unwrap();
+        let r1 = s
+            .outbox_add(OUTBOX_RENAME, "/home/a", "/home/c", true)
+            .unwrap();
+        let rows = s.outbox_pending().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![a, b, r1],
+            "seq 升序 = 入队顺序"
+        );
+        assert!(rows[0].is_mkdir() && rows[0].is_dir);
+        assert!(rows[2].is_rename());
+        assert_eq!(rows[2].target, "/home/c");
+        assert_eq!(rows[2].path, "/home/a");
+
+        // mkdir 幂等：同路径重复入队不新增行（回放也会先 stat，合并掉没损失）
+        assert_eq!(s.outbox_add(OUTBOX_MKDIR, "/home/a", "", true).unwrap(), a);
+        assert_eq!(s.outbox_len().unwrap(), 3);
+
+        // rename **不去重**：a→c、c→d 是两步，合并成 a→d 会改变语义（中间名可能被用）
+        let r2 = s
+            .outbox_add(OUTBOX_RENAME, "/home/c", "/home/d", true)
+            .unwrap();
+        assert!(r2 > r1);
+        assert_eq!(s.outbox_len().unwrap(), 4);
+
+        // 分类计数
+        assert_eq!(s.outbox_counts().unwrap(), (2, 2, 0));
+
+        // 重试计数只增（非网络错误才调）
+        s.outbox_bump_attempts(b, 3).unwrap();
+        let rows = s.outbox_pending().unwrap();
+        assert_eq!(rows.iter().find(|r| r.seq == b).unwrap().attempts, 3);
+
+        // 回放成功 → 删行；删不存在的行返回 false
+        assert!(s.outbox_done(a).unwrap());
+        assert!(!s.outbox_done(a).unwrap());
+        assert_eq!(s.outbox_len().unwrap(), 3);
+
+        // ★ M20：本地改名时前缀回写（离线建目录后再改名 / 子目录里的操作）
+        s.outbox_add(OUTBOX_MKDIR, "/home/old", "", true).unwrap();
+        s.outbox_add(OUTBOX_MKDIR, "/home/old/sub", "", true)
+            .unwrap();
+        s.outbox_add(OUTBOX_RENAME, "/home/old/f.txt", "/home/old/g.txt", false)
+            .unwrap();
+        s.outbox_add(OUTBOX_SET_MTIME, "/home/old/f.txt", "123", false)
+            .unwrap();
+        // 前缀不误伤：/home/older 不该被改
+        s.outbox_add(OUTBOX_MKDIR, "/home/older", "", true).unwrap();
+        assert_eq!(
+            s.outbox_rewrite_prefix("/home/old", "/home/new").unwrap(),
+            4
+        );
+        let rows = s.outbox_pending().unwrap();
+        let paths: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
+        assert!(paths.contains(&"/home/new"));
+        assert!(paths.contains(&"/home/new/sub"));
+        assert!(paths.contains(&"/home/new/f.txt"));
+        assert!(
+            paths.contains(&"/home/older"),
+            "段级前缀：/home/older 不能被改"
+        );
+        let ren = rows
+            .iter()
+            .find(|r| r.is_rename() && r.path == "/home/new/f.txt")
+            .unwrap();
+        assert_eq!(ren.target, "/home/new/g.txt");
+        // 再回写一次是 no-op（幂等）
+        assert_eq!(
+            s.outbox_rewrite_prefix("/home/old", "/home/new").unwrap(),
+            0
+        );
+
+        // 清理
+        s.clear_outbox().unwrap();
+        assert_eq!(s.outbox_len().unwrap(), 0);
+        assert_eq!(
+            s.outbox_add(OUTBOX_MKDIR, "/home/tmp", "", true).is_ok(),
+            true
+        );
+        s.clear_outbox().unwrap();
+        assert_eq!(s.outbox_len().unwrap(), 0);
+        assert!(s.outbox_pending().unwrap().is_empty());
+    }
+
     #[test]
     fn sig_exists_is_dir_helpers_are_consistent() {
         // 保证 store 里用的 Sig 构造器与 sync.rs 的语义一致
@@ -2190,7 +2535,7 @@ mod tests {
             conn.pragma_update(None, "user_version", 3i64).unwrap();
         }
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 4, "打开时应升到 v4");
+        assert_eq!(s.schema_version().unwrap(), 5, "打开时应升到 v5");
         assert_eq!(s.integrity_check().unwrap(), "ok");
 
         // 五张老表的数据一条不丢
@@ -2210,6 +2555,10 @@ mod tests {
 
         // 新表是空的，且可用
         assert_eq!(s.nodes_len().unwrap(), 0);
+        assert_eq!(s.outbox_len().unwrap(), 0, "老库补齐 outbox 表且为空");
+        s.outbox_add(OUTBOX_MKDIR, "/home/offline-dir", "", true)
+            .unwrap();
+        assert_eq!(s.outbox_len().unwrap(), 1);
         let id = crate::file_id::compute_file_id(false, 10, 100, "a.txt", "/home");
         s.node_upsert(&NodeRow {
             file_id: id,
@@ -2225,12 +2574,13 @@ mod tests {
         assert_eq!(s.node_by_path("/home/a.txt").unwrap().unwrap().file_id, id);
         assert_eq!(s.integrity_check().unwrap(), "ok");
 
-        // 再打开一次仍幂等（v4 → v4 不重复建表、不报错）
+        // 再打开一次仍幂等（v5 → v5 不重复建表、不报错）
         drop(s);
         let s2 = Store::open(&db).unwrap();
-        assert_eq!(s2.schema_version().unwrap(), 4);
+        assert_eq!(s2.schema_version().unwrap(), 5);
         assert_eq!(s2.nodes_len().unwrap(), 1);
         assert_eq!(s2.baseline().unwrap().len(), 2, "二次打开数据仍在");
+        assert_eq!(s2.outbox_len().unwrap(), 1, "outbox 行跨重启保留");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

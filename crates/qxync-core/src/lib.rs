@@ -17,6 +17,7 @@
 //!   `versioning_stat_delta` 恒 `exist:0` → **增量链路服务端不可用**（M5 实测，见 `M5-SQLite与delta.md`）。
 
 pub mod config;
+pub mod connectivity;
 pub mod decisions;
 pub mod dehydrate;
 pub mod delta;
@@ -40,6 +41,7 @@ pub mod totp;
 pub mod trash;
 
 pub use config::{ConfigPaths, Credentials, LinkConfig, PeerConfig, PeerRegistry};
+pub use connectivity::{Connectivity, ConnectivitySnapshot};
 pub use decisions::{
     looks_binary, prepare_bytes, sweep_batch, sweep_decision, text_diff, DecisionFacts, DiffLine,
     DiffOutcome, DiffResult, DiffSkip, SweepVerdict, DIFF_MAX_BYTES,

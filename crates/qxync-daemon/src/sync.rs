@@ -182,6 +182,14 @@ pub struct SyncReport {
     pub auth_failed: bool,
     /// ★ M15/T9：按 `file_id` 认出并迁移成功的远端改名次数。
     pub renamed: u64,
+    /// ★ M20：本轮因为「离线缓冲区还没回放完」跳过了对账 —— 轮询器应尽快重试
+    /// （别等一个完整的 30s/600s 间隔：重登成功后通常下一轮就能推进）。
+    pub offline_backlog_pending: bool,
+    /// ★ M20：本轮是否撞上**网络层**错误（不是服务端业务错）。
+    ///
+    /// 轮询循环据此把连通性状态机置为离线、切到「短探活」节奏；上传/删除队列
+    /// 也会同时停在「等联网」。
+    pub transport_offline: bool,
     pub baseline_entries: usize,
     pub dirs_scanned: usize,
     pub devices: Vec<String>,
@@ -202,6 +210,15 @@ impl SyncReport {
         if self.errors.len() < 20 {
             self.errors.push(s);
         }
+    }
+    /// ★ M20：记一条**网络**错误 —— 顺带置离线标志（业务错误不算）。
+    ///
+    /// 判据只留一处：[`CoreError::is_offline`]。
+    pub fn network_error(&mut self, e: &CoreError, msg: impl Into<String>) {
+        if e.is_offline() {
+            self.transport_offline = true;
+        }
+        self.error(msg);
     }
     /// 记一条「跳过一个事件」并归类原因（见 `events_skipped_reasons`）。
     fn skip(&mut self, reason: &'static str) {
@@ -461,7 +478,7 @@ pub async fn poll_once(
             if max_log_failure_is_session_loss(&e) {
                 report.auth_failed = true;
             }
-            report.error(format!("qbox_get_max_log 失败: {e}"));
+            report.network_error(&e, format!("qbox_get_max_log 失败: {e}"));
             // 本轮没跑到对账 → completed=false：只更新「当前错误」，不清任何陈旧告警。
             absorb_round(stats, &mut report, false);
             return report;
@@ -567,7 +584,7 @@ pub async fn poll_once(
                 if e.is_auth() {
                     report.auth_failed = true;
                 }
-                report.error(format!("qbox_get_sync_log lower={lower} 失败: {e}"));
+                report.network_error(&e, format!("qbox_get_sync_log lower={lower} 失败: {e}"));
                 break;
             }
         }
@@ -592,7 +609,7 @@ pub async fn poll_once(
                 if e.is_auth() {
                     report.auth_failed = true;
                 }
-                report.error(format!("qbox_get_device_config_list 失败: {e}"));
+                report.network_error(&e, format!("qbox_get_device_config_list 失败: {e}"));
             }
         }
     }
@@ -614,7 +631,7 @@ pub async fn poll_once(
                 if e.is_auth() {
                     report.auth_failed = true;
                 }
-                report.error(format!("qbox_query_notify 失败: {e}"));
+                report.network_error(&e, format!("qbox_query_notify 失败: {e}"));
             }
         }
     }
@@ -880,7 +897,7 @@ async fn apply_event(
                     if e.is_auth() {
                         report.auth_failed = true;
                     }
-                    report.error(format!("事件 stat {path} 失败: {e}"));
+                    report.network_error(&e, format!("事件 stat {path} 失败: {e}"));
                 }
                 return;
             }
@@ -914,6 +931,473 @@ async fn stat_path(client: &Client, path: &str) -> Result<Sig, CoreError> {
         Some(e) => Ok(Sig::from_entry(&e)),
         None => Ok(Sig::MISSING),
     }
+}
+
+// ---------------------------------------------------------------- ★ M20：离线缓冲区回放
+
+/// 一条 outbox 操作应该怎么处理（**纯函数**，不联网也能单测）。
+///
+/// 回放前先 `stat` 源/目标，用「现在 NAS 上是什么」决定动作 —— 这是幂等的基础：
+/// daemon 可能在回放中途崩溃、或者别的设备在我们离线期间做了同样的操作。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplayPlan {
+    /// 发请求。
+    Apply,
+    /// 远端已经是目标状态（目录已存在 / 改名已落地）→ 只删 outbox 行。
+    AlreadyDone,
+    /// 改名的目标名已被占用 → 先把远端那份改成冲突副本，再落地（**不覆盖、不丢数据**）。
+    ConflictDest,
+    /// 没法自动完成（人话原因写进 note），重试也不会有用。
+    GiveUp(String),
+}
+
+/// `mkdir` 的回放计划。
+///
+/// * 远端不存在 → 建；
+/// * 远端已是目录 → 幂等命中（用户离线建过、或 daemon 上次回放成功但没来得及删行）；
+/// * 远端同名是文件 → 放弃（不能替用户删文件腾位置）。
+pub fn plan_mkdir(remote_exists: bool, remote_is_dir: bool) -> ReplayPlan {
+    match (remote_exists, remote_is_dir) {
+        (false, _) => ReplayPlan::Apply,
+        (true, true) => ReplayPlan::AlreadyDone,
+        (true, false) => ReplayPlan::GiveUp("目标路径已存在且是文件，不能当作目录".into()),
+    }
+}
+
+/// `rename` 的回放计划（源/目标各自只看「在不在」）。
+///
+/// 四种组合里唯一危险的是「两边都在」：绝不能直接 rename（会覆盖远端目标）。
+/// 走 [`ReplayPlan::ConflictDest`] 先把远端目标改名成冲突副本，再落地 ——
+/// 这是 Qsync 的 `rename_remote` 语义，两边数据都保住。
+pub fn plan_rename(src_exists: bool, dst_exists: bool) -> ReplayPlan {
+    match (src_exists, dst_exists) {
+        (true, false) => ReplayPlan::Apply,
+        // 源没了、目标在：大概率就是上次回放已经成功（崩溃在删行之前），
+        // 或者对方设备做了同名操作。按「已落地」处理，不再动远端。
+        (false, true) => ReplayPlan::AlreadyDone,
+        (true, true) => ReplayPlan::ConflictDest,
+        (false, false) => {
+            ReplayPlan::GiveUp("源与目标都不在 NAS 上（离线期间可能被其它设备删除/移动了）".into())
+        }
+    }
+}
+
+/// 一次 outbox 回放的汇总（daemon 用它落 journal / 更新 status）。
+#[derive(Debug, Default)]
+pub struct OutboxFlushReport {
+    /// 真正发出去并成功的操作数。
+    pub applied: u64,
+    /// 幂等命中（远端已经是目标状态）→ 只删行。
+    pub already_done: u64,
+    /// 改名目标被占用 → 远端那份先改名成冲突副本（数据不丢）。
+    pub conflicts: u64,
+    /// 重试超限后放弃的操作数（已删行，`notes` 里有人话原因）。
+    pub gave_up: u64,
+    /// 非网络错误、这轮没成、留待下轮的次数。
+    pub retried: u64,
+    /// 网络断了：本轮**没做完**，剩余行原样保留。
+    pub offline: Option<String>,
+    /// ★ 会话失效 / 服务端未就绪：本轮**没做完**，但网络是通的，不计重试次数。
+    ///
+    /// `auth_failed` = 需要 daemon 立即重登；`waiting` 是给人看的原因。
+    pub auth_failed: bool,
+    pub waiting: Option<String>,
+    /// 逐条结论（daemon 写进 journal，GUI「错误列表」能看到）。
+    pub notes: Vec<String>,
+    /// ★ 回放成功的 mkdir 路径（含「幂等命中」）—— daemon 用它把本地节点的
+    /// `remote_known` 置真。否则「离线建的目录」在后续在线改名时会被误判成
+    /// 「远端没有老副本」，只做本地改名、漏掉远端改名。
+    pub mkdir_paths: Vec<String>,
+    /// ★ 回放成功的 rename `(源, 目标)` —— daemon 用它把目标节点的 `remote_known` 置真。
+    pub rename_paths: Vec<(String, String)>,
+}
+
+impl OutboxFlushReport {
+    /// 这轮是否把 outbox 清空了（网络断了 / 会话失效 / NAS 未就绪都不算）。
+    pub fn drained(&self) -> bool {
+        self.offline.is_none() && self.waiting.is_none()
+    }
+}
+
+/// 回放失败的三类：等联网 / 等重登或 NAS 就绪 / 这条操作本身不行。
+#[derive(Debug)]
+enum ReplayError {
+    Offline(CoreError),
+    /// 会话失效（4/5）—— 重登一次再试，**不计重试次数**。
+    Auth(String),
+    /// 服务端未就绪（status=8，迁移/启动中）—— 等下一轮，不计次数。
+    Transient(String),
+    Fatal(String),
+}
+
+/// 错误分类（顺序是设计的一部分）：
+///
+/// 1. 网络层 → 离线等待；
+/// 2. 服务端未就绪 → 等（重登没用）；
+/// 3. 会话失效 → 重登（daemon 立即登，下一轮再回放）；
+/// 4. 其它 → 真正的业务失败，才计入 5 次放弃阈值。
+fn classify_replay_error(e: CoreError, context: impl Into<String>) -> ReplayError {
+    let context = context.into();
+    if e.is_offline() {
+        ReplayError::Offline(e)
+    } else if e.is_server_busy() {
+        ReplayError::Transient(format!("{context}: {e}"))
+    } else if e.is_auth() {
+        ReplayError::Auth(format!("{context}: {e}"))
+    } else {
+        ReplayError::Fatal(format!("{context}: {e}"))
+    }
+}
+
+/// outbox 一行回放的结论。
+enum ReplayOutcome {
+    Applied,
+    AlreadyDone,
+    ConflictResolved,
+}
+
+/// 回放一条操作（发请求 + 幂等检查）。
+async fn replay_outbox_row(
+    client: &Client,
+    row: &qxync_core::store::OutboxRow,
+) -> Result<ReplayOutcome, ReplayError> {
+    if row.is_mkdir() {
+        replay_mkdir(client, row).await
+    } else if row.is_rename() {
+        replay_rename(client, row).await
+    } else if row.kind == qxync_core::store::OUTBOX_SET_MTIME {
+        replay_set_mtime(client, row).await
+    } else {
+        Err(ReplayError::Fatal(format!(
+            "未知的离线操作类型 {:?}（版本不匹配？）",
+            row.kind
+        )))
+    }
+}
+
+async fn replay_mkdir(
+    client: &Client,
+    row: &qxync_core::store::OutboxRow,
+) -> Result<ReplayOutcome, ReplayError> {
+    let cur = stat_path(client, &row.path)
+        .await
+        .map_err(|e| classify_replay_error(e, format!("回放 mkdir {} 前 stat", row.path)))?;
+    match plan_mkdir(cur.exists, cur.is_dir) {
+        ReplayPlan::Apply => {
+            let (dir, name) = split_path(&row.path);
+            match client.mkdir(&dir, &name).await {
+                Ok(()) => Ok(ReplayOutcome::Applied),
+                Err(e) if e.is_offline() => Err(ReplayError::Offline(e)),
+                Err(e) => {
+                    // 并发创建（别的设备/上一次回放）会报「已存在」—— 再 stat 一次确认。
+                    match stat_path(client, &row.path).await {
+                        Ok(s) if s.exists && s.is_dir => Ok(ReplayOutcome::AlreadyDone),
+                        Ok(_) => Err(ReplayError::Fatal(format!("mkdir {} 失败: {e}", row.path))),
+                        // stat 期间网络断了：按离线处理（不能算成业务失败、消耗次数）。
+                        Err(e2) => Err(classify_replay_error(
+                            e2,
+                            format!("mkdir {} 失败后 stat 确认", row.path),
+                        )),
+                    }
+                }
+            }
+        }
+        ReplayPlan::AlreadyDone => Ok(ReplayOutcome::AlreadyDone),
+        ReplayPlan::ConflictDest => Ok(ReplayOutcome::AlreadyDone), // mkdir 不会走这里
+        ReplayPlan::GiveUp(why) => Err(ReplayError::Fatal(why)),
+    }
+}
+
+async fn replay_rename(
+    client: &Client,
+    row: &qxync_core::store::OutboxRow,
+) -> Result<ReplayOutcome, ReplayError> {
+    let src = stat_path(client, &row.path)
+        .await
+        .map_err(|e| classify_replay_error(e, format!("回放改名 {} 前 stat 源", row.path)))?;
+    let dst = stat_path(client, &row.target)
+        .await
+        .map_err(|e| classify_replay_error(e, format!("回放改名 {} 前 stat 目标", row.target)))?;
+    match plan_rename(src.exists, dst.exists) {
+        ReplayPlan::Apply => {
+            replay_do_rename(client, &row.path, &row.target).await?;
+            Ok(ReplayOutcome::Applied)
+        }
+        ReplayPlan::AlreadyDone => Ok(ReplayOutcome::AlreadyDone),
+        ReplayPlan::ConflictDest => {
+            // 远端目标已存在：先把**NAS 上那份**改成冲突副本，再把源改名过来。
+            // 这是 rename_remote 语义 —— 两边数据都保住，没有覆盖。
+            let (dst_dir, dst_name) = split_path(&row.target);
+            let conflict = pick_replay_conflict_name(client, &dst_dir, &dst_name).await?;
+            client
+                .rename(&dst_dir, &dst_name, &conflict)
+                .await
+                .map_err(|e| {
+                    classify_replay_error(
+                        e,
+                        format!("改名冲突副本 {}/{} -> {conflict}", dst_dir, dst_name),
+                    )
+                })?;
+            replay_do_rename(client, &row.path, &row.target).await?;
+            Ok(ReplayOutcome::ConflictResolved)
+        }
+        ReplayPlan::GiveUp(why) => {
+            // ★ 跨目录「两段式」改名（move_into 成功、随后 rename 失败/进程崩溃）：
+            //   文件已经躺在 `目标目录/源文件名`，此时源/目标都不存在 → 上一版会判
+            //   GiveUp 把改名丢掉。这里补一次中间路径检查并完成第二段。
+            let (src_dir, src_name) = split_path(&row.path);
+            let (dst_dir, dst_name) = split_path(&row.target);
+            if src_dir != dst_dir && src_name != dst_name {
+                let mid = join(&dst_dir, &src_name);
+                let mid_sig = stat_path(client, &mid)
+                    .await
+                    .map_err(|e| classify_replay_error(e, format!("回放改名检查中间路径 {mid}")))?;
+                if mid_sig.exists {
+                    client
+                        .rename(&dst_dir, &src_name, &dst_name)
+                        .await
+                        .map_err(|e| {
+                            classify_replay_error(
+                                e,
+                                format!("回放改名第二段 {mid} -> {dst_dir}/{dst_name}"),
+                            )
+                        })?;
+                    tracing::info!(
+                        "回放追平两段式改名（move 成功、rename 中断的残留）: {mid} -> {dst_dir}/{dst_name}"
+                    );
+                    return Ok(ReplayOutcome::Applied);
+                }
+            }
+            Err(ReplayError::Fatal(why))
+        }
+    }
+}
+
+/// 真正执行改名/移动（同目录 rename；跨目录 move + 必要时再 rename）。
+async fn replay_do_rename(
+    client: &Client,
+    src_path: &str,
+    dst_path: &str,
+) -> Result<(), ReplayError> {
+    let (src_dir, src_name) = split_path(src_path);
+    let (dst_dir, dst_name) = split_path(dst_path);
+    if src_dir == dst_dir {
+        client
+            .rename(&src_dir, &src_name, &dst_name)
+            .await
+            .map_err(|e| classify_replay_error(e, format!("回放改名 {src_path} -> {dst_path}")))?;
+        return Ok(());
+    }
+    // 与 FUSE rename 的在线路径同一套语义：move 会**忽略 dest_file**（保持原名），
+    // 需要改名的话到目标目录里再 rename 一次。
+    client
+        .move_into(&src_dir, &src_name, &dst_dir)
+        .await
+        .map_err(|e| classify_replay_error(e, format!("回放移动 {src_path} -> {dst_dir}/")))?;
+    if dst_name != src_name {
+        client
+            .rename(&dst_dir, &src_name, &dst_name)
+            .await
+            .map_err(|e| {
+                classify_replay_error(
+                    e,
+                    format!("回放移动后改名 {dst_dir}/{src_name} -> {dst_name}"),
+                )
+            })?;
+    }
+    Ok(())
+}
+
+async fn replay_set_mtime(
+    client: &Client,
+    row: &qxync_core::store::OutboxRow,
+) -> Result<ReplayOutcome, ReplayError> {
+    let epoch: i64 = row
+        .target
+        .parse()
+        .map_err(|_| ReplayError::Fatal(format!("mtime 参数损坏: {:?}", row.target)))?;
+    let (dir, name) = split_path(&row.path);
+    client
+        .set_mtime(&dir, &name, epoch)
+        .await
+        .map_err(|e| classify_replay_error(e, format!("回放 set_mtime {}", row.path)))?;
+    Ok(ReplayOutcome::Applied)
+}
+
+/// 回放专用冲突副本取名（与在线冲突路径同一套命名，但错误分类走 outbox 的处理）。
+async fn pick_replay_conflict_name(
+    client: &Client,
+    dir: &str,
+    name: &str,
+) -> Result<String, ReplayError> {
+    let device = hostname();
+    let date = today();
+    let mut chosen = conflict_name(name, &device, &date);
+    for seq in 2..=20u32 {
+        match client.stat(dir, &chosen).await {
+            Ok(None) => return Ok(chosen),
+            Ok(Some(_)) => chosen = conflict_name_with_seq(name, &device, &date, seq),
+            Err(e) => {
+                return Err(classify_replay_error(
+                    e,
+                    format!("冲突副本取名 stat {dir}/{chosen}"),
+                ))
+            }
+        }
+    }
+    Err(ReplayError::Fatal(format!(
+        "冲突副本取名失败：{dir}/{name} 已经连续 20 个候选名都被占用"
+    )))
+}
+
+/// 每条操作最多回放几次（**只有非网络错误才计数**）。
+const OUTBOX_MAX_ATTEMPTS: u32 = 5;
+/// 会话失效的容忍次数：每次都会触发重登，正常一轮就恢复；20 次还不行说明
+/// 账号/2SV 真的坏了，才把这条操作当放弃（否则「5 次」会在网络恢复的几秒内被耗光）。
+const OUTBOX_MAX_AUTH_ATTEMPTS: u32 = 20;
+
+/// 回放离线缓冲区，最多处理 `max_rows` 条。
+///
+/// ## 顺序
+///
+/// 严格按 `seq`（= 入队顺序）。本地「先建父目录、再建子目录」「先改名、再往新名字里
+/// 传文件」，回放必须同序，否则父目录不存在 / 上传落到旧名字。
+///
+/// ## 失败语义
+///
+/// * **网络错误**：立刻停，**不计数**，剩余行原样留在库里等下次（`offline` 有值）；
+/// * 业务错误：计数，到 [`OUTBOX_MAX_ATTEMPTS`] 才放弃并删行（`notes` 留人话原因）。
+///
+/// 调用方（daemon）在回放前必须冻结上传/删除队列 —— 见 `daemon::flush_offline_backlog`。
+pub async fn flush_outbox(client: &Client, store: &Store, max_rows: usize) -> OutboxFlushReport {
+    let mut report = OutboxFlushReport::default();
+    let rows = match store.outbox_pending_limited(max_rows) {
+        Ok(r) => r,
+        Err(e) => {
+            report
+                .notes
+                .push(format!("读取离线缓冲区失败（下一轮再试）: {e}"));
+            return report;
+        }
+    };
+    for row in rows {
+        match replay_outbox_row(client, &row).await {
+            Ok(outcome) => {
+                if let Err(e) = store.outbox_done(row.seq) {
+                    tracing::warn!("删除已回放的 outbox 行失败 seq={}: {e}", row.seq);
+                }
+                match outcome {
+                    ReplayOutcome::Applied => {
+                        report.applied += 1;
+                        tracing::info!(
+                            "离线操作已回放: {} {} -> {}",
+                            row.kind,
+                            row.path,
+                            row.target
+                        );
+                    }
+                    ReplayOutcome::AlreadyDone => {
+                        report.already_done += 1;
+                        tracing::info!(
+                            "离线操作回放命中幂等（远端已是目标状态）: {} {}",
+                            row.kind,
+                            row.path
+                        );
+                    }
+                    ReplayOutcome::ConflictResolved => {
+                        report.conflicts += 1;
+                        let msg = format!(
+                            "离线改名 {:?} -> {:?}：目标已存在，NAS 上那份已改名成冲突副本（两边都保留）",
+                            row.path, row.target
+                        );
+                        tracing::warn!("{msg}");
+                        report.notes.push(msg);
+                    }
+                }
+                // ★ 结构操作在 NAS 上已经成立 → 记下路径，daemon 把本地节点标成
+                // 「远端已知」。幂等命中也要记（同一次回放的第二次尝试）。
+                if row.is_mkdir() {
+                    report.mkdir_paths.push(row.path.clone());
+                } else if row.is_rename() {
+                    report
+                        .rename_paths
+                        .push((row.path.clone(), row.target.clone()));
+                }
+            }
+            Err(ReplayError::Offline(e)) => {
+                report.offline = Some(e.to_string());
+                tracing::warn!(
+                    "离线缓冲回放中断（网络不可用，剩余操作保留）: {} {}: {e}",
+                    row.kind,
+                    row.path
+                );
+                break;
+            }
+            Err(ReplayError::Auth(why)) => {
+                let attempts = row.attempts.saturating_add(1);
+                if attempts >= OUTBOX_MAX_AUTH_ATTEMPTS {
+                    if let Err(e) = store.outbox_done(row.seq) {
+                        tracing::warn!("放弃 outbox 行时删行失败 seq={}: {e}", row.seq);
+                    }
+                    report.gave_up += 1;
+                    let msg = format!(
+                        "离线操作失败（放弃，已重登 {attempts} 次仍无权限）: {} {}: {why}",
+                        row.kind, row.path
+                    );
+                    tracing::error!("{msg}");
+                    report.notes.push(msg);
+                } else {
+                    if let Err(e) = store.outbox_bump_attempts(row.seq, attempts) {
+                        tracing::warn!("outbox 重试计数落库失败 seq={}: {e}", row.seq);
+                    }
+                    report.auth_failed = true;
+                    report.waiting = Some(why.clone());
+                    tracing::warn!(
+                        "离线缓冲回放中断（会话失效，重登后下一轮继续）: {} {}: {why}",
+                        row.kind,
+                        row.path
+                    );
+                    break;
+                }
+            }
+            Err(ReplayError::Transient(why)) => {
+                report.waiting = Some(why.clone());
+                tracing::warn!(
+                    "离线缓冲回放中断（服务端未就绪，稍后继续）: {} {}: {why}",
+                    row.kind,
+                    row.path
+                );
+                break;
+            }
+            Err(ReplayError::Fatal(why)) => {
+                let attempts = row.attempts.saturating_add(1);
+                if attempts >= OUTBOX_MAX_ATTEMPTS {
+                    if let Err(e) = store.outbox_done(row.seq) {
+                        tracing::warn!("放弃 outbox 行时删行失败 seq={}: {e}", row.seq);
+                    }
+                    report.gave_up += 1;
+                    let msg = format!(
+                        "离线操作失败（放弃，已试 {attempts} 次）: {} {} -> {}: {why}",
+                        row.kind, row.path, row.target
+                    );
+                    tracing::error!("{msg}");
+                    report.notes.push(msg);
+                } else {
+                    if let Err(e) = store.outbox_bump_attempts(row.seq, attempts) {
+                        tracing::warn!("outbox 重试计数落库失败 seq={}: {e}", row.seq);
+                    }
+                    report.retried += 1;
+                    let msg = format!(
+                        "离线操作失败（第 {attempts} 次，稍后重试）: {} {}: {why}",
+                        row.kind, row.path
+                    );
+                    tracing::warn!("{msg}");
+                    report.notes.push(msg);
+                }
+            }
+        }
+    }
+    report
 }
 
 // ---------------------------------------------------------------- 对账
@@ -1091,9 +1575,12 @@ async fn reconcile_view(
                                 report.auth_failed = true;
                             }
                             unresolved_dirs.insert(dir.clone());
-                            report.error(format!(
-                                "对账列举 {dir} 失败（{e}），stat 确认也失败（{e2}）→ 本轮不判定该目录及其内容"
-                            ));
+                            report.network_error(
+                                &e2,
+                                format!(
+                                    "对账列举 {dir} 失败（{e}），stat 确认也失败（{e2}）→ 本轮不判定该目录及其内容"
+                                ),
+                            );
                         }
                     }
                 }
@@ -1105,7 +1592,7 @@ async fn reconcile_view(
                 if e.is_auth() {
                     report.auth_failed = true;
                 }
-                report.error(format!("对账列举 {dir} 失败: {e}"));
+                report.network_error(&e, format!("对账列举 {dir} 失败: {e}"));
             }
         }
         if dir != &root {
@@ -1640,7 +2127,7 @@ async fn resolve_conflict(
             let r2 = match stat_path(client, path).await {
                 Ok(s) => s,
                 Err(e) => {
-                    report.error(format!("冲突前重新 stat {path} 失败: {e}"));
+                    report.network_error(&e, format!("冲突前重新 stat {path} 失败: {e}"));
                     return;
                 }
             };
@@ -5076,5 +5563,132 @@ mod tests {
         assert!(!max_log_failure_is_session_loss(&CoreError::Transport(
             "断网".into()
         )));
+    }
+
+    // ------------------------------------------------- ★ M20：离线缓冲区回放计划
+
+    /// `mkdir` 回放：远端没有就建、已是目录就幂等、同名文件就放弃。
+    #[test]
+    fn plan_mkdir_is_idempotent_and_never_overwrites_a_file() {
+        assert_eq!(plan_mkdir(false, false), ReplayPlan::Apply);
+        assert_eq!(plan_mkdir(false, true), ReplayPlan::Apply);
+        assert_eq!(
+            plan_mkdir(true, true),
+            ReplayPlan::AlreadyDone,
+            "上次回放成功但没来得及删行 / 别的设备先建了同名目录 → 幂等命中"
+        );
+        match plan_mkdir(true, false) {
+            ReplayPlan::GiveUp(why) => assert!(why.contains("文件"), "原因要具体: {why}"),
+            other => panic!("同名文件绝不能被当成目录：{other:?}"),
+        }
+    }
+
+    /// `rename` 回放：唯一危险的是「源和目标都在」—— 绝不能直接覆盖远端目标。
+    #[test]
+    fn plan_rename_never_overwrites_the_target() {
+        assert_eq!(plan_rename(true, false), ReplayPlan::Apply);
+        assert_eq!(
+            plan_rename(false, true),
+            ReplayPlan::AlreadyDone,
+            "源没了、目标在 → 改名已经落地（或别的设备做了同名操作），不再动远端"
+        );
+        assert_eq!(
+            plan_rename(true, true),
+            ReplayPlan::ConflictDest,
+            "两边都在时必须先给远端目标改名成冲突副本，数据不能丢"
+        );
+        match plan_rename(false, false) {
+            ReplayPlan::GiveUp(why) => {
+                assert!(why.contains("源与目标"), "原因要能定位到事实: {why}")
+            }
+            other => panic!("源和目标都没了不能瞎猜：{other:?}"),
+        }
+    }
+
+    /// 网络错误 → 等联网；会话失效 → 等重登；服务端忙 → 等下一轮；业务错误才计数。
+    #[test]
+    fn replay_errors_split_offline_auth_busy_from_fatal() {
+        match classify_replay_error(CoreError::Transport("连接被拒绝".into()), "x") {
+            ReplayError::Offline(e) => assert!(e.is_offline()),
+            other => panic!("网络错误不能当业务错误去计数/放弃: {other:?}"),
+        }
+        match classify_replay_error(CoreError::Auth("sid 过期".into()), "x") {
+            ReplayError::Auth(m) => assert!(m.contains("sid 过期"), "{m}"),
+            other => panic!("会话失效要走重登、不计次数: {other:?}"),
+        }
+        match classify_replay_error(
+            CoreError::status_msg(8, "mkdir", "Qsync Central is initializing. Please wait."),
+            "x",
+        ) {
+            ReplayError::Transient(m) => assert!(m.contains("initializing"), "{m}"),
+            other => panic!("服务端未就绪不该消耗重试次数: {other:?}"),
+        }
+        match classify_replay_error(CoreError::Parse("坏 JSON".into()), "x") {
+            ReplayError::Fatal(m) => assert!(m.contains("坏 JSON"), "{m}"),
+            other => panic!("解析错误是真正的业务失败: {other:?}"),
+        }
+    }
+
+    /// 汇总的 `drained()` 只看「网络是否中断」：业务错误放弃/重试后仍算清空。
+    #[test]
+    fn outbox_flush_report_drained_only_by_offline() {
+        let mut r = OutboxFlushReport::default();
+        assert!(r.drained());
+        r.gave_up = 2;
+        r.retried = 1;
+        assert!(
+            r.drained(),
+            "放弃/重试是终态（行已删或留待下轮），不算没跑完"
+        );
+        r.offline = Some("连接超时".into());
+        assert!(!r.drained(), "网络中断 = 剩余行还没回放");
+        r.offline = None;
+        r.waiting = Some("sid 过期".into());
+        assert!(!r.drained(), "会话失效 / 服务端忙同样不算跑完");
+    }
+
+    /// ★ M20：网络错误回放时**一行都不许丢、一次重试都不许计数**。
+    ///
+    /// 这是离线缓冲区的正确性红线：断网时把行删了/计满 5 次放弃，用户的
+    /// 离线改动就永远不会同步上去（旧实现正是这样在断网 10 秒后丢作业的）。
+    #[tokio::test]
+    async fn flush_outbox_keeps_rows_and_attempts_on_network_error() {
+        use qxync_core::store::{Store, OUTBOX_MKDIR};
+        use qxync_core::LinkConfig;
+        let store = Store::open_in_memory().unwrap();
+        store
+            .outbox_add(OUTBOX_MKDIR, "/home/offline-dir", "", true)
+            .unwrap();
+        // 127.0.0.1:1 必然 connection refused → Error::Transport（离线）
+        let link = LinkConfig {
+            id: "test".into(),
+            host: "127.0.0.1".into(),
+            port: 1,
+            https: false,
+            insecure: true,
+            user: "test1".into(),
+            ipv4_only: true,
+            exclude: Vec::new(),
+            filter_temp: true,
+            peer_listen: None,
+            peer_name: None,
+        };
+        let client = Client::new(&link).unwrap();
+        client.set_sid("deadbeef");
+
+        let rep = flush_outbox(&client, &store, 100).await;
+        assert!(
+            rep.offline.is_some(),
+            "网络错误要报离线，交给调用方保持冻结"
+        );
+        assert_eq!(
+            rep.applied + rep.already_done + rep.conflicts + rep.gave_up + rep.retried,
+            0,
+            "网络错误既不是应用、也不是放弃/重试"
+        );
+        let rows = store.outbox_pending().unwrap();
+        assert_eq!(rows.len(), 1, "网络错误绝不能丢 outbox 行");
+        assert_eq!(rows[0].attempts, 0, "网络错误不能消耗重试次数");
+        assert_eq!(rows[0].path, "/home/offline-dir");
     }
 }

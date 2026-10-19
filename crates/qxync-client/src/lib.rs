@@ -394,6 +394,59 @@ impl Client {
         alive_from_max_log(self.max_log().await)
     }
 
+    /// ★ M20：**不依赖会话**的网络探活 —— 对 `base_url` 发一个 GET，任何 HTTP 回应
+    /// 都算「网络是通的」（4xx/5xx 也是服务端在回话）。
+    ///
+    /// 为什么单列一个方法：离线恢复检测不能先登录 —— 断网时登录本身要等
+    /// connect timeout（20s），每 3 秒一轮的探活会被它拖成 20+ 秒一轮，恢复延迟
+    /// 反而比旧版还差。先探网络，通了再登录/flush。
+    pub async fn probe_network(&self, timeout: std::time::Duration) -> bool {
+        matches!(
+            self.http
+                .get(self.link.base_url())
+                .timeout(timeout)
+                .send()
+                .await,
+            Ok(_)
+        )
+    }
+
+    /// ★ M20：**离线时的短探活** —— 用给定的短超时打一次 `qbox_get_max_log`。
+    ///
+    /// 为什么需要它：客户端全局 `connect_timeout` 是 20 秒，而离线恢复检测如果
+    /// 沿用普通请求，网络断着的时候每次都要白等 20 秒；恢复后也要等满一个轮询间隔
+    /// （默认 30s，真机有人设 600s）才会发现。轮询器在离线分支用 5 秒超时探活，
+    /// 恢复延迟就压到了几秒。
+    ///
+    /// 返回 `Ok(true)` = 连上了且拿到合法响应；`Ok(false)` = 连上了但服务端明确
+    /// 不 OK（例如 sid 失效的 4/5）—— 那说明**网络通了**，应该走正常轮询去重登，
+    /// 不该继续当离线；`Err` = 网络层失败（仍是离线）。
+    pub async fn probe_reachable(&self, timeout: std::time::Duration) -> Result<bool> {
+        let sid = self.require_sid()?.to_string();
+        let url = self.url(
+            "cgi-bin/qsync/qsyncsrv.cgi",
+            &[("func", "qbox_get_max_log"), ("sid", sid.as_str())],
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(|e| Error::Transport(format!("探活: {e}")))?;
+        if !resp.status().is_success() {
+            // HTTP 层能回包 = 网络是通的（哪怕 500 也是服务端在回话）
+            return Ok(true);
+        }
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| Error::Transport(format!("探活读响应: {e}")))?;
+        let m = parse_max_log(&body)?;
+        Ok(m.status
+            .is_none_or(|s| ServerStatus(s).is_success() || s == 8))
+    }
+
     // ---------------------------------------------------------- M2c 变更发现
 
     /// `func=qbox_get_sync_log&lower=&number=`：拉一批文件变更事件。

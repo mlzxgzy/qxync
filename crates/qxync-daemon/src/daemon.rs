@@ -9,10 +9,10 @@ use qxync_core::dehydrate::{Block, CacheLimit, Policy};
 use qxync_core::ipc::{
     decode_line, encode_line, mask_sid, mask_token, CacheInfo, CursorInfo, DaemonInfo,
     DecisionInfo, DecisionsData, DehydrateData, DiffData, ErrorKind, FileStateInfo, FileStatesData,
-    GetData, HydroStats, IpcError, JournalData, LinkInfo, LoginData, LsData, MountInfo, PeerData,
-    PingData, PutData, Request, RequestEnvelope, Response, RootsData, RulesData, ServerInfo,
-    SessionInfo, SettingsData, ShutdownData, SpaceData, StatusData, StoreData, SyncCursors,
-    SyncInfo, TaskInfo, TasksData, IPC_VERSION,
+    GetData, HydroStats, IpcError, JournalData, LinkInfo, LoginData, LsData, MountInfo,
+    OfflineInfo, PeerData, PingData, PutData, Request, RequestEnvelope, Response, RootsData,
+    RulesData, ServerInfo, SessionInfo, SettingsData, ShutdownData, SpaceData, StatusData,
+    StoreData, SyncCursors, SyncInfo, TaskInfo, TasksData, IPC_VERSION,
 };
 use qxync_core::mounts::{MountRecord, MountsFile};
 use qxync_core::rules::Rules;
@@ -298,6 +298,11 @@ pub(crate) struct State {
     /// ★ M15/T6：同步引擎的代次令牌。SIGHUP 重载 / SIGTERM 转挂载守护都靠它
     /// 把 poller 等后台任务收干净（详见 [`SyncEpoch`]）。
     sync_epoch: SyncEpoch,
+    /// ★ M20：全进程唯一的连通性状态（注入 FUSE 挂载点 / 上传 / 删除队列）。
+    ///
+    /// 所有组件都只认它：离线时队列停在「等联网」、FUSE 写路径进 outbox、
+    /// 轮询器切到短探活、`status` 显示离线与缓冲区计数。
+    connectivity: Arc<qxync_core::connectivity::Connectivity>,
 }
 
 // ---------------------------------------------------------------- 入口
@@ -808,6 +813,9 @@ fn idle_status(socket: &Path, started: Instant) -> StatusData {
         cache: None,
         // ★ T8：待命状态没有挂载点，也就没有在途传输。
         transfers: None,
+        // ★ M20：待命没有连接 → 连通性「还没试过」，也不会有离线缓冲。
+        connectivity: None,
+        offline: None,
         mounts: Vec::new(),
     }
 }
@@ -920,6 +928,21 @@ pub async fn run(opts: Options) -> Result<()> {
     for bad in &parsed_rules.bad {
         tracing::warn!("排除规则无法解析，已忽略: {bad:?}");
     }
+    // ★ M20：启动时 outbox 还有未回放的结构操作（上次离线 / 回放中途崩溃）→
+    // 先把连通性标成离线。这样上传/删除队列会在闸门上等，轮询器短探活成功后
+    // **先回放 outbox、再放行队列** —— 否则上传可能抢在「改名 / 建目录」之前
+    // 把内容推到旧路径上，远端与本地视图分叉。
+    let connectivity = qxync_core::connectivity::Connectivity::shared();
+    match sync_store.store.outbox_len() {
+        Ok(n) if n > 0 => {
+            connectivity.mark_offline(format!(
+                "启动时发现离线缓冲区有 {n} 项未回放的离线操作，先恢复再同步"
+            ));
+            tracing::warn!("离线缓冲区有 {n} 项待回放（恢复网络后由同步引擎按序执行）");
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("读取离线缓冲区失败（不影响启动）: {e}"),
+    }
     let state = Arc::new(State {
         version: env!("CARGO_PKG_VERSION"),
         started: Instant::now(),
@@ -948,6 +971,7 @@ pub async fn run(opts: Options) -> Result<()> {
         proxy: StdMutex::new(proxy),
         auto_free_last: Arc::new(AtomicU64::new(0)),
         sync_epoch: SyncEpoch::new(),
+        connectivity,
     });
 
     // ★ M7：LAN 对等主机（`link.peer_listen` 配了才真正监听；失败只告警不致命 ——
@@ -982,7 +1006,10 @@ pub async fn run(opts: Options) -> Result<()> {
     if opts.auto_login {
         match login_internal(&state, None, None, None).await {
             Ok(s) => tracing::info!("自动登录成功 user={} sid={}", s.username, mask_sid(&s.sid)),
-            Err(e) => tracing::warn!("自动登录失败（可稍后 `qxync login`）: {}", e.message),
+            Err(e) => {
+                note_login_failure_connectivity(&state, &e);
+                tracing::warn!("自动登录失败（可稍后 `qxync login`）: {}", e.message)
+            }
         }
     }
 
@@ -1906,7 +1933,12 @@ async fn status(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
     let logged_in = session.is_some();
 
     // 只读快照：登录了才去问 NAS，失败也不报错（status 不该失败）
-    let (server, cursors, alive) = if logged_in {
+    //
+    // ★ M20：**已知离线就不发这三个请求**。之前断网时 `status` 会依次打
+    // `nas_uid` / `max_log` / `check_alive`，每个都要等 20s connect timeout ——
+    // `qxync status` 离线时能卡一分钟。正好这个命令是用户排查「怎么不动了」
+    // 时最想跑的那一条。
+    let (server, cursors, alive) = if logged_in && state.connectivity.is_online() {
         let nas = with_client!(state, |c| c.nas_uid()).ok();
         let max_log = with_client!(state, |c| c.max_log()).ok();
         let alive = with_client!(state, |c| c.check_alive()).unwrap_or(false);
@@ -1962,6 +1994,9 @@ async fn status(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
         cache: Some(cache_info(state)),
         // ★ T8：传输汇总（没有在途作业时为 `None`）
         transfers,
+        // ★ M20：连通性 + 离线缓冲区（在线且无积压时 `offline` 为 None）
+        connectivity: Some(state.connectivity.snapshot()),
+        offline: offline_info(state),
         mounts,
     })
 }
@@ -2383,7 +2418,9 @@ async fn mount(
         // `SyncState.store` 是裸 `Store`，这里包一层 `Arc` 交给 FUSE 侧 ——
         // `Store` 的连接本来就在 `Arc` 里（见 `qxync-core/src/store.rs`），
         // 所以两边看到的仍是**同一个 SQLite 连接**，不会出现两个连接抢写锁。
-        .with_nodes_store(Arc::new(state.sync_store.lock().unwrap().store.clone()));
+        .with_nodes_store(Arc::new(state.sync_store.lock().unwrap().store.clone()))
+        // ★ M20：离线时写路径进 outbox、读未水合区间立即 EIO、网络错误回写状态机。
+        .with_connectivity(state.connectivity.clone());
     if let Some(limit) = delete_limit {
         fs = fs.with_delete_limit(limit);
     }
@@ -2409,6 +2446,9 @@ async fn mount(
             marker_dir.clone(),
         )
         .map_err(|e| IpcError::new(ErrorKind::Io, format!("创建上传队列失败: {e}")))?;
+        // ★ M20：先把连通性接进队列，再起 worker —— 离线/缓冲未清时 worker 会等在
+        // 闸门上，不会先发出去一批「依赖离线结构操作」的作业。
+        q.set_connectivity(state.connectivity.clone());
         q.spawn_worker()
             .map_err(|e| IpcError::new(ErrorKind::Io, format!("启动上传 worker 失败: {e}")))?;
         // ★ M11：删除队列。与上传队列**共用同一个队列目录 / 同一个 queue.db**
@@ -2420,8 +2460,15 @@ async fn mount(
             marker_dir,
         )
         .map_err(|e| IpcError::new(ErrorKind::Io, format!("创建删除队列失败: {e}")))?;
+        dq.set_connectivity(state.connectivity.clone());
         dq.spawn_worker()
             .map_err(|e| IpcError::new(ErrorKind::Io, format!("启动删除 worker 失败: {e}")))?;
+        // ★ M20：启动时有未回放的离线结构操作（daemon 在上次离线/崩溃前留下的）→
+        // 两个队列都先冻结，等轮询器探活成功、回放完 outbox 再解开。
+        if !state.connectivity.is_online() {
+            q.set_backlog_blocked(true);
+            dq.set_backlog_blocked(true);
+        }
         fs = fs
             .with_write_mode()
             .with_upload_queue(q.clone())
@@ -2704,10 +2751,22 @@ async fn umount_inner(
         )
     })?;
 
-    // 先把未完成的上传做完，避免卸载丢改动
+    // 先把未完成的上传做完，避免卸载丢改动。
+    //
+    // ★ M20：**离线时不排空** —— 队列在「等联网」闸门上，排空必然等满 120 秒且
+    // 不可能成功（真机 `qxync umount` / `daemon stop` 会因此看起来卡死两分钟）。
+    // 作业都在持久化库里，下次启动 / 联网恢复后继续，一个都不会丢。
     if let Some(q) = &entry.upload {
-        if !q.drain(Duration::from_secs(120)) {
-            tracing::warn!("卸载前上传队列未排空（继续卸载，标记文件保留，下次启动会重试）");
+        // 离线 / 离线结构缓冲未回放完都不要排空：队列在闸门上，等满 120 秒也不可能推进。
+        if state.connectivity.is_online() && !q.backlog_blocked() {
+            if !q.drain(Duration::from_secs(120)) {
+                tracing::warn!("卸载前上传队列未排空（继续卸载，标记文件保留，下次启动会重试）");
+            }
+        } else {
+            tracing::info!(
+                "离线 / 离线缓冲未回放：卸载前不排空上传队列（作业已持久化 {} 项，联网后继续）",
+                q.snapshot().pending
+            );
         }
         q.shutdown();
     }
@@ -2715,8 +2774,17 @@ async fn umount_inner(
     // 否则会留下「本地已经删了、NAS 上还在」的空洞。
     // 排不空也不阻塞卸载：`deletes` 表已持久化，下次启动会重新入队。
     if let Some(q) = &entry.delete_queue {
-        if !q.drain(Duration::from_secs(120)) {
-            tracing::warn!("卸载前删除队列未排空（继续卸载，未发出的删除已入库，下次启动会重试）");
+        if state.connectivity.is_online() && !q.backlog_blocked() {
+            if !q.drain(Duration::from_secs(120)) {
+                tracing::warn!(
+                    "卸载前删除队列未排空（继续卸载，未发出的删除已入库，下次启动会重试）"
+                );
+            }
+        } else {
+            tracing::info!(
+                "离线 / 离线缓冲未回放：卸载前不排空删除队列（作业已持久化 {} 项，联网后继续）",
+                q.snapshot().pending
+            );
         }
         q.shutdown();
     }
@@ -3241,6 +3309,238 @@ fn scan_budget_for(state: &State, manual: bool) -> Duration {
     Duration::from_secs_f64(interval as f64 * sync::SCAN_BUDGET_RATIO_OF_INTERVAL)
 }
 
+// ---------------------------------------------------------------- ★ M20：离线 / 重连
+
+/// 把所有挂载点的上传/删除队列置/清「离线结构缓冲未清」闸门。
+///
+/// 为什么要统一在这里置：回放 outbox 期间，任何挂载点的上传/删除都不能发 ——
+/// 否则「离线时改名的目录」还没在 NAS 上改名，上传就按新名字发过去了。
+/// 队列没注入（只读挂载）时自然是 no-op。
+fn set_mount_queues_blocked(state: &State, blocked: bool) {
+    let g = state.mounts.lock().unwrap();
+    for m in g.values() {
+        if let Some(q) = &m.upload {
+            q.set_backlog_blocked(blocked);
+        }
+        if let Some(q) = &m.delete_queue {
+            q.set_backlog_blocked(blocked);
+        }
+    }
+}
+
+fn wake_mount_queues(state: &State) {
+    let g = state.mounts.lock().unwrap();
+    for m in g.values() {
+        if let Some(q) = &m.upload {
+            q.wake();
+        }
+        if let Some(q) = &m.delete_queue {
+            q.wake();
+        }
+    }
+}
+
+/// 回放离线结构操作（outbox），返回「是否已清空」。
+///
+/// 顺序语义（正确性关键）：
+/// 1. 先冻结所有挂载点的上传/删除；
+/// 2. 按 `seq` 回放 mkdir / rename / setmtime；
+/// 3. 清空后才解冻并**唤醒** —— 此时目录和名字都已在 NAS 上对齐，上传/删除
+///    才落在正确的位置。
+///
+/// 网络断了（`report.offline`）就保持冻结、原样留着剩余行；下一轮短探活成功
+/// 再来 —— 不消耗重试次数（见 `sync::flush_outbox`）。
+async fn flush_offline_backlog(state: &Arc<State>, client: &Arc<qxync_client::Client>) -> bool {
+    let store = state.sync_store.lock().unwrap().store.clone();
+    let pending = match store.outbox_len() {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("读取离线缓冲区失败（下一轮再试）: {e}");
+            return false;
+        }
+    };
+    if pending == 0 {
+        // 没有结构操作 → 队列可以跑了（幂等：本来就没冻结也无所谓）
+        set_mount_queues_blocked(state, false);
+        wake_mount_queues(state);
+        return true;
+    }
+
+    set_mount_queues_blocked(state, true);
+    let report = sync::flush_outbox(client, &store, 500).await;
+    // ★ 把「NAS 上已经成立」的事实回写到 FUSE 节点：离线建的目录 / 改名的目标
+    // 此后 `remote_known = true`，在线改名才不会误判成「远端没有老副本」。
+    if !report.mkdir_paths.is_empty() || !report.rename_paths.is_empty() {
+        let g = state.mounts.lock().unwrap();
+        for m in g.values() {
+            for p in &report.mkdir_paths {
+                m.handle.mark_remote_known(p);
+            }
+            for (_, dst) in &report.rename_paths {
+                m.handle.mark_remote_known(dst);
+            }
+        }
+    }
+    // 只把「终态」写进 journal：放弃 / 冲突副本。重试类 note 每轮都会重来，
+    // 全量写会把「文件更新中心」刷成噪音（flush 在回放没清空时 3 秒重试一次）。
+    for note in &report.notes {
+        let gave_up = note.contains("放弃");
+        if !gave_up && !note.contains("冲突副本") {
+            continue;
+        }
+        journal_log(
+            state,
+            JournalEntry::new(
+                "offline",
+                "",
+                note.clone(),
+                if gave_up { "error" } else { "ok" },
+            ),
+        );
+    }
+    if report.applied + report.already_done + report.conflicts + report.gave_up > 0 {
+        journal_log(
+            state,
+            JournalEntry::ok(
+                "offline",
+                "",
+                format!(
+                    "离线操作回放：应用 {}｜幂等命中 {}｜冲突副本 {}｜放弃 {}",
+                    report.applied, report.already_done, report.conflicts, report.gave_up
+                ),
+            ),
+        );
+    }
+
+    if !report.drained() {
+        if let Some(err) = &report.offline {
+            state
+                .connectivity
+                .mark_offline(format!("离线缓冲区回放中断（网络不可用）: {err}"));
+            tracing::warn!("离线缓冲区回放中断（网络不可用，剩余操作保留、队列继续冻结）: {err}");
+        } else if let Some(why) = &report.waiting {
+            // ★ 会话失效 / 服务端未就绪：**网络是通的**，别把挂载点切到离线
+            // （否则 FUSE 会把用户的写操作也攒起来，明明能连 NAS）。
+            state.connectivity.mark_online();
+            if report.auth_failed {
+                tracing::warn!("离线缓冲区回放遇会话失效，立即重登后下一轮继续: {why}");
+                if let Err(e) = login_internal(state, None, None, None).await {
+                    tracing::warn!("离线缓冲回放重登失败: {}", e.message);
+                }
+            } else {
+                tracing::warn!("离线缓冲区回放中断（服务端未就绪，稍后继续）: {why}");
+            }
+            // 队列继续冻结：结构操作没回放完，上传/删除不能抢跑。
+        }
+        return false;
+    }
+
+    let left = store.outbox_len().unwrap_or(pending);
+    if left == 0 {
+        set_mount_queues_blocked(state, false);
+        wake_mount_queues(state);
+        state.connectivity.mark_online();
+        tracing::info!(
+            "离线缓冲区已清空：应用 {}｜幂等命中 {}｜冲突副本 {}｜放弃 {}（上传/删除队列已放行）",
+            report.applied,
+            report.already_done,
+            report.conflicts,
+            report.gave_up
+        );
+        true
+    } else {
+        tracing::info!("离线缓冲区还剩 {left} 项，下一轮继续（队列保持冻结）");
+        false
+    }
+}
+
+/// 离线时的短探活：5 秒超时打一次 `max_log`。
+///
+/// 返回 `true` = 网络恢复（服务端回了话，哪怕只是 sid 失效 —— 那也能走正常轮询
+/// 去重登）。`false` = 仍然连不上。
+async fn probe_online(state: &Arc<State>) -> bool {
+    // ★ 不依赖会话：断网时登录要等 20s connect timeout，先登录再探活会把
+    //   3 秒的恢复检测拖成 20 多秒。任何一个 HTTP 回应都说明网络通了。
+    let client = state.client.lock().await;
+    let up = client.probe_network(Duration::from_secs(5)).await;
+    if !up {
+        tracing::debug!("离线探活失败（仍然连不上）");
+    }
+    up
+}
+
+/// ★ M20：登录失败的连通性分类 —— `Transport` 才进离线，业务错误不算。
+///
+/// 场景：daemon 已配置但 NAS 关机 / 断网，启动自动登录就失败。分类之后
+/// 轮询器才会切到 3 秒短探活（否则要等一个完整的轮询间隔才知道网络回来了）。
+fn note_login_failure_connectivity(state: &State, e: &IpcError) {
+    if e.kind == ErrorKind::Transport {
+        state
+            .connectivity
+            .mark_offline(format!("登录时网络不可用: {}", e.message));
+    }
+}
+
+/// `status` 里的离线缓冲区汇总（**只有真的有事才 `Some`**，首页不常驻 0）。
+fn offline_info(state: &Arc<State>) -> Option<OfflineInfo> {
+    let (mut pending_upload, mut pending_delete) = {
+        let g = state.mounts.lock().unwrap();
+        let mut up = 0u64;
+        let mut del = 0u64;
+        for m in g.values() {
+            if let Some(q) = &m.upload {
+                up += q.snapshot().pending;
+            }
+            if let Some(q) = &m.delete_queue {
+                del += q.snapshot().pending;
+            }
+        }
+        (up, del)
+    };
+    // ★ M20：离线重启时挂载点可能还没恢复（登录失败 → 没有 mount entry），
+    // 内存队列自然也是空的；但 queue.db 里的作业一个不少。只读统计一下，
+    // 让「累计缓冲区」在 status 里仍然看得见。
+    if pending_upload == 0 && pending_delete == 0 {
+        if let Ok(paths) = qxync_core::ConfigPaths::discover() {
+            let db = paths.queue_dir_for(&state.link).join("queue.db");
+            if let Ok(Some(store)) = qxync_core::Store::open_readonly(&db) {
+                pending_upload = store.uploads().map(|r| r.len() as u64).unwrap_or(0);
+                pending_delete = store.deletes().map(|r| r.len() as u64).unwrap_or(0);
+            }
+        }
+    }
+    let (pending_mkdir, pending_rename, pending_set_mtime) = state
+        .sync_store
+        .lock()
+        .unwrap()
+        .store
+        .outbox_counts()
+        .unwrap_or((0, 0, 0));
+    let snapshot = state.connectivity.snapshot();
+    let info = OfflineInfo {
+        pending_upload,
+        pending_delete,
+        pending_mkdir,
+        pending_rename,
+        pending_set_mtime,
+        // 结构操作「待回放或正在回放」。注意**不能用 connectivity.online 判断**：
+        // 真正回放时连通性往往还是离线（回放成功后才置在线），那样界面永远看不到
+        // 「正在回放」。只要 outbox 还有行，就说明上传/删除队列被冻结着。
+        replaying: pending_mkdir + pending_rename + pending_set_mtime > 0,
+        last_note: if snapshot.online {
+            None
+        } else {
+            snapshot.last_error.clone()
+        },
+    };
+    // 在线且没有任何积压 → 不出现（老前端也不会因此变样）
+    if snapshot.online && info.is_empty() {
+        None
+    } else {
+        Some(info)
+    }
+}
+
 /// 跑一轮同步（拉事件 + baseline 对账）。
 async fn run_sync_once(state: &Arc<State>, manual: bool) -> Result<sync::SyncReport, IpcError> {
     // ★ 串行化「一整轮」：见 [`State::sync_run`] 的字段注释。
@@ -3254,6 +3554,22 @@ async fn run_sync_once(state: &Arc<State>, manual: bool) -> Result<sync::SyncRep
     //   在轮询进行中会排队等这一轮结束再跑（用户看到的是「稍慢」，不是数据错乱）。
     let _run = state.sync_run.lock().await;
     let client = engine_client(state).await?;
+    // ★ M20：**先回放离线结构操作，再对账** —— 顺序不能反。
+    //
+    // 离线时改名/建目录只落在本地视图与 outbox 里；如果先对账，对账看到的
+    // 远端还是旧状态，会把「本地改名后的新路径」当成远端新增、旧路径当成
+    // 本地删除，平白生成一堆冲突/刷新。回放先做，对账拿到的就是对齐后的现状。
+    if !flush_offline_backlog(state, &client).await {
+        // 网络仍不可用 / 缓冲没清空：本轮不跑对账（否则只是把同一条网络错误再刷一遍）。
+        // 队列继续保持冻结；轮询器会短探活，恢复后重来。
+        let mut r = sync::SyncReport::default();
+        r.note("离线：离线缓冲区仍未回放完，本轮跳过对账（等网络恢复后自动继续）".to_string());
+        r.offline_backlog_pending = true;
+        // completed=false：保留旧的错误/熔断告警，只把「当前在等什么」写进 last_note。
+        sync::absorb_round(&state.sync_stats, &mut r, false);
+        journal_record_sync(state, &r);
+        return Ok(r);
+    }
     let views = build_views(state);
     let mut cfg = state.sync_cfg.lock().unwrap().clone();
     // ★ 时间预算每轮推导（间隔可运行时调；手动一轮给足预算想全量）。
@@ -3270,6 +3586,19 @@ async fn run_sync_once(state: &Arc<State>, manual: bool) -> Result<sync::SyncRep
         &user,
     )
     .await;
+    // ★ M20：用本轮结论刷新连通性。网络错误 → 离线（队列会停）；正常跑完 →
+    // 在线，并唤醒可能还在闸门上等的上传/删除 worker。
+    if report.transport_offline {
+        let reason = report
+            .errors
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "网络请求失败".to_string());
+        state.connectivity.mark_offline(reason);
+    } else {
+        state.connectivity.mark_online();
+        wake_mount_queues(state);
+    }
     // ★ M8.3：把这一轮的结论写进 journal（界面「文件更新中心 / 错误列表」的数据来源）。
     //   只 push 到内存缓冲，落库交给后台批量任务 —— 这里位于轮询热路径上。
     journal_record_sync(state, &report);
@@ -3340,55 +3669,106 @@ async fn sync_cmd(
 fn spawn_poller(state: Arc<State>, mut gen: EngineGen) -> tokio::task::JoinHandle<()> {
     let interval = *state.sync_interval.lock().unwrap();
     if interval == 0 {
-        tracing::info!("变更轮询已禁用（QXNYC_POLL_INTERVAL=0）");
-        return tokio::spawn(async {});
+        // ★ M20：轮询禁用 ≠ 离线缓冲区永远不推。循环照样起，只是「在线时」每 2 秒
+        // 空转（见循环里的 `secs == 0` 分支）；**离线时的短探活必须保留** ——
+        // 否则用户把轮询设成 0 之后，断网攒下的改动就再也没人负责回放了。
+        tracing::info!("变更轮询已禁用（QXNYC_POLL_INTERVAL=0）；仍保留离线缓冲区的短探活恢复");
+    } else {
+        tracing::info!("变更轮询已启动：每 {interval}s 一轮（QXNYC_POLL_INTERVAL 可调）");
     }
-    tracing::info!("变更轮询已启动：每 {interval}s 一轮（QXNYC_POLL_INTERVAL 可调）");
     tokio::spawn(async move {
         let mut last_run = Instant::now() - Duration::from_secs(3600);
+        // ★ M20：上一轮因为「离线缓冲没回放完」提前返回 → 下一圈不等完整间隔，
+        // 2 秒后就重试（重登成功 / NAS 就绪后通常下一轮就能推进）。
+        let mut retry_soon = false;
         loop {
             let secs = *state.sync_interval.lock().unwrap();
-            if secs == 0 {
+            let mut recovered = false;
+            let hurry = std::mem::take(&mut retry_soon);
+            // ★ M20：**已知离线 → 3 秒短探活**，不等 30s/600s 的完整轮询间隔。
+            //   探活成功立刻回放离线缓冲区并补一轮对账，然后回到正常节奏。
+            //   注意这里不看 `secs`：即使把轮询间隔设成 0（暂停自动对账），
+            //   离线的发送队列也需要一个恢复检测，否则离线缓冲区永远不会被推上去。
+            if hurry {
+                if !gen.sleep(Duration::from_secs(3)).await {
+                    tracing::info!("变更轮询退出（同步引擎已换代）");
+                    return;
+                }
+            } else if !state.connectivity.is_online() {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+                    _ = gen.changed() => {
+                        tracing::info!("变更轮询退出（同步引擎已换代）");
+                        return;
+                    }
+                    _ = state.peer_wake.notified() => {}
+                }
+                // 先探网络（不需要会话），通了再登录 —— 断网时不能先等登录超时。
+                if !probe_online(&state).await {
+                    continue;
+                }
+                if state.client.lock().await.sid().is_none() {
+                    match login_internal(&state, None, None, None).await {
+                        Ok(_) => {}
+                        Err(e) => {
+                            note_login_failure_connectivity(&state, &e);
+                            tracing::debug!("离线探活等待登录: {}", e.message);
+                            continue;
+                        }
+                    }
+                }
+                tracing::info!("离线探活成功：先回放离线缓冲区，再补一轮对账");
+                recovered = true;
+            } else if secs == 0 {
                 if !gen.sleep(Duration::from_secs(2)).await {
                     tracing::info!("变更轮询退出（同步引擎已换代）");
                     return;
                 }
                 continue;
-            }
-            // ★ M7：正常睡到下一轮；对端事件到达时提前醒来（事件是快路径，对账是主路径）
-            //
-            // ★ M15/T6：多了一个「换代通知」分支 —— 它一到就退出，**不会**顺手续一轮，
-            //   否则新旧两代会同时对同一棵树做对账（同一处改动被判两次冲突）。
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(secs.clamp(1, 3600))) => {}
-                _ = gen.changed() => {
-                    tracing::info!("变更轮询退出（同步引擎已换代）");
-                    return;
-                }
-                _ = state.peer_wake.notified() => {
-                    let since = last_run.elapsed();
-                    if since < crate::peer_host::WAKE_DEBOUNCE {
-                        tokio::time::sleep(crate::peer_host::WAKE_DEBOUNCE - since).await;
+            } else {
+                // ★ M7：正常睡到下一轮；对端事件到达时提前醒来（事件是快路径，对账是主路径）
+                //
+                // ★ M15/T6：多了一个「换代通知」分支 —— 它一到就退出，**不会**顺手续一轮，
+                //   否则新旧两代会同时对同一棵树做对账（同一处改动被判两次冲突）。
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(secs.clamp(1, 3600))) => {}
+                    _ = gen.changed() => {
+                        tracing::info!("变更轮询退出（同步引擎已换代）");
+                        return;
                     }
-                    tracing::debug!("对端事件唤醒轮询（距上轮 {:?}）", last_run.elapsed());
+                    _ = state.peer_wake.notified() => {
+                        let since = last_run.elapsed();
+                        if since < crate::peer_host::WAKE_DEBOUNCE {
+                            tokio::time::sleep(crate::peer_host::WAKE_DEBOUNCE - since).await;
+                        }
+                        tracing::debug!("对端事件唤醒轮询（距上轮 {:?}）", last_run.elapsed());
+                    }
                 }
-            }
-            if *state.sync_interval.lock().unwrap() == 0 {
-                continue;
+                if *state.sync_interval.lock().unwrap() == 0 {
+                    continue;
+                }
             }
             if state.client.lock().await.sid().is_none() {
                 // 懒登录：没会话就不轮询（避免每次都发一个必然失败的请求）
                 match login_internal(&state, None, None, None).await {
                     Ok(_) => {}
                     Err(e) => {
+                        note_login_failure_connectivity(&state, &e);
                         tracing::debug!("轮询等待登录: {}", e.message);
                         continue;
                     }
                 }
             }
+            if recovered {
+                tracing::info!("网络恢复：开始回放离线缓冲区");
+            }
             last_run = Instant::now();
             match run_sync_once(&state, false).await {
                 Ok(r) => {
+                    // ★ M20：离线缓冲还没清 → 尽快重试（2 秒），别等完整轮询间隔。
+                    if r.offline_backlog_pending {
+                        retry_soon = true;
+                    }
                     // ★ 会话失效自愈：`poll_once` 把错误塞进 report.errors 后仍返回 Ok，
                     //   所以下面 Err 分支的 `is_auth` 重登永远等不到。真机实测：
                     //   sid 过期后每 30s 一条 `qbox_get_max_log 失败: status=3`，

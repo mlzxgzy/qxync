@@ -33,8 +33,16 @@
 //! 失败重试到超限后 `stats.failed` 自增、journal 记错误、daemon 日志显眼告警，
 //! 运维可以从这些痕迹发现并手动补删。**熔断（`DeleteGuard`）仍然在入队前生效** ——
 //! 大批量误删仍然会被 `EACCES` 挡住，不会悄悄溜进队列。
+//!
+//! ## ★ M20：离线时删除不丢
+//!
+//! 旧行为与上传队列一样：断网后 5 次退避（约 10 秒）就把作业当「失败」删库 ——
+//! 用户离线删掉的文件，联网后**又出现在挂载点里**（下一轮对账把远端那份当成新增
+//! 刷回来），而没有任何地方说明它为什么回来。现在注入 [`Connectivity`] 后，
+//! 网络错误只让队列停在「等联网」，作业原样留在 `deletes` 表里，联网后统一推送。
 
 use qxync_client::{write_action, Client};
+use qxync_core::connectivity::Connectivity;
 use qxync_core::store::{DeleteRow, Store};
 use qxync_core::Error as CoreError;
 use std::collections::VecDeque;
@@ -138,12 +146,22 @@ pub struct DeleteQueue {
     cv: Condvar,
     shutdown: AtomicBool,
     stats: DeleteStats,
+    /// ★ M20：连通性状态（daemon 注入）。`None` = 没注入 → 行为与 M20 之前一致。
+    connectivity: Mutex<Option<Arc<Connectivity>>>,
+    /// ★ M20：离线结构操作（outbox）还没回放完 → 先别删。
+    ///
+    /// 为什么要等：离线期间可能先改名 `a→b` 再删 `a/x`（本地视图已经按新名字走），
+    /// 删除作业里存的是**新路径**；远程目录还没改成 `b` 就先去删 `b/x` 必然失败。
+    /// 回放完 outbox 再放行，删除才落在正确的路径上。
+    backlog_blocked: AtomicBool,
 }
 
 struct State {
     pending: VecDeque<DeleteJob>,
     /// 是否有批次在途。
     active: bool,
+    /// ★ M20：改名临界区暂停取新批次（与上传队列的 pause 同语义）。
+    paused: bool,
 }
 
 impl DeleteQueue {
@@ -195,6 +213,7 @@ impl DeleteQueue {
             state: Mutex::new(State {
                 pending,
                 active: false,
+                paused: false,
             }),
             cv: Condvar::new(),
             shutdown: AtomicBool::new(false),
@@ -202,7 +221,134 @@ impl DeleteQueue {
                 pending: AtomicU64::new(n),
                 ..Default::default()
             },
+            // ★ M20：默认不注入 = 行为与 M20 之前一致；daemon 在 spawn_worker 前注入。
+            connectivity: Mutex::new(None),
+            backlog_blocked: AtomicBool::new(false),
         }))
+    }
+
+    /// ★ M20：注入连通性状态（daemon 在启动 worker 之前调）。
+    pub fn set_connectivity(&self, c: Arc<Connectivity>) {
+        *self.connectivity.lock().unwrap() = Some(c);
+    }
+
+    /// ★ M20：现在是不是「已知离线」。
+    pub fn is_offline(&self) -> bool {
+        self.connectivity
+            .lock()
+            .ok()
+            .and_then(|c| c.clone())
+            .map(|c| !c.is_online())
+            .unwrap_or(false)
+    }
+
+    /// ★ M20：置/清「离线结构缓冲未清」闸门（与上传队列同一语义）。
+    pub fn set_backlog_blocked(&self, blocked: bool) {
+        self.backlog_blocked.store(blocked, Ordering::Relaxed);
+        if !blocked {
+            self.cv.notify_all();
+        }
+    }
+
+    pub fn backlog_blocked(&self) -> bool {
+        self.backlog_blocked.load(Ordering::Relaxed)
+    }
+
+    /// ★ M20：唤醒 worker（联网恢复 / outbox 回放完成时用）。
+    pub fn wake(&self) {
+        self.cv.notify_all();
+    }
+
+    /// ★ M20：暂停取新批次（改名临界区用；在途批次跑完为止）。与 [`Self::resume`] 成对。
+    pub fn pause(&self) {
+        self.state.lock().unwrap().paused = true;
+    }
+
+    pub fn resume(&self) {
+        {
+            self.state.lock().unwrap().paused = false;
+        }
+        self.cv.notify_all();
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.state.lock().unwrap().paused
+    }
+
+    /// ★ M20：等「在途批次」结束（改名 retarget 前调用）。`false` = 超时。
+    pub fn wait_active(&self, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut st = self.state.lock().unwrap();
+        while st.active {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let left = deadline.saturating_duration_since(now);
+            let (g, _) = self.cv.wait_timeout(st, left).unwrap();
+            st = g;
+        }
+        true
+    }
+
+    /// ★ M20：把排队中的、路径落在 `old`（含子树）的删除作业改写到 `new`。
+    ///
+    /// 为什么删也要 retarget：离线先删 `a/x`、再把 `a` 改名成 `b` 时，删除作业里
+    /// 存的还是 `/a/x`。回放改名之后 NAS 上只有 `/b/x`，再去删 `/a/x` 必然
+    /// 永远失败（5 次后放弃）；下一轮对账又会把 `/b/x` 当远端新增拉回来 ——
+    /// 用户离线删掉的文件「复活」。返回改写的作业数。
+    ///
+    /// 调用前应先 [`Self::pause`] 并 [`Self::wait_active`]，否则在途批次用的是旧路径
+    /// （那也没关系：它删的是改名前的远端老路径，正好该删）。
+    pub fn retarget_pending_under(&self, old: &str, new: &str) -> usize {
+        let old = old.trim_end_matches('/');
+        let new = new.trim_end_matches('/');
+        if old.is_empty() || new.is_empty() || old == new {
+            return 0;
+        }
+        let under = |path: &str| {
+            path == old
+                || (path.len() > old.len()
+                    && path.starts_with(old)
+                    && path.as_bytes()[old.len()] == b'/')
+        };
+        let mut changes: Vec<(String, DeleteJob)> = Vec::new();
+        {
+            let mut st = self.state.lock().unwrap();
+            for job in st.pending.iter_mut() {
+                let path = job.remote_path();
+                if !under(&path) {
+                    continue;
+                }
+                let new_path = format!("{new}{}", &path[old.len()..]);
+                let (dir, name) = match new_path.rsplit_once('/') {
+                    Some((d, n)) => (d.to_string(), n.to_string()),
+                    None => ("/".to_string(), new_path.clone()),
+                };
+                job.remote_dir = dir;
+                job.remote_name = name;
+                changes.push((path, job.clone()));
+            }
+        }
+        for (old_path, job) in &changes {
+            // 主键变了 → 旧行删、新行写（put_delete 是 upsert，attempts 取 MAX）
+            self.persist_delete(old_path);
+            self.persist_put(job);
+        }
+        if !changes.is_empty() {
+            self.stats
+                .pending
+                .store(self.pending_len(), Ordering::Relaxed);
+            tracing::info!(
+                "删除队列已按改名改写 {} 条作业 {old} -> {new}",
+                changes.len()
+            );
+        }
+        changes.len()
+    }
+
+    fn should_hold(&self) -> bool {
+        self.backlog_blocked() || self.is_offline()
     }
 
     /// 入队：**先写状态库，再改内存**（崩溃安全）。
@@ -316,9 +462,13 @@ impl DeleteQueue {
             let first = {
                 let mut st = self.state.lock().unwrap();
                 loop {
-                    if let Some(j) = st.pending.pop_front() {
-                        st.active = true;
-                        break Some(j);
+                    // ★ M20：离线 / 离线结构缓冲未回放完 → 不取作业（留在库里，联网后统一删）。
+                    // 改名临界区（paused）同样不取。
+                    if !self.should_hold() && !st.paused {
+                        if let Some(j) = st.pending.pop_front() {
+                            st.active = true;
+                            break Some(j);
+                        }
                     }
                     if self.shutdown.load(Ordering::Relaxed) {
                         break None;
@@ -348,6 +498,23 @@ impl DeleteQueue {
                 self.finish_active();
                 continue;
             }
+            // ★ M20：取作业到真正发请求之间（攒批窗口 200ms）可能刚断网 /
+            // 刚有离线结构操作入队 / 刚被改名暂停 → 整批原样放回，**不消耗尝试次数**。
+            if self.should_hold() || self.state.lock().unwrap().paused {
+                {
+                    let mut st = self.state.lock().unwrap();
+                    for (name, is_dir, attempts) in batch.items.iter().rev() {
+                        st.pending.push_front(DeleteJob {
+                            remote_dir: batch.dir.clone(),
+                            remote_name: name.clone(),
+                            is_dir: *is_dir,
+                            attempts: *attempts,
+                        });
+                    }
+                }
+                self.finish_active();
+                continue;
+            }
             self.stats.batches.fetch_add(1, Ordering::Relaxed);
             match self.rt.block_on(self.delete_batch(&batch)) {
                 Ok(()) => {
@@ -364,6 +531,10 @@ impl DeleteQueue {
                     self.stats
                         .deleted
                         .fetch_add(batch.items.len() as u64, Ordering::Relaxed);
+                    // ★ M20：一次成功说明网络是通的 → 翻回在线（轮询器会补对账）。
+                    if let Some(c) = self.connectivity.lock().ok().and_then(|c| c.clone()) {
+                        c.mark_online();
+                    }
                     tracing::info!(
                         "已删除 {}/{}（{} 项）",
                         batch.dir,
@@ -375,6 +546,37 @@ impl DeleteQueue {
                             .join(", "),
                         batch.items.len()
                     );
+                }
+                Err(e) if e.is_offline() => {
+                    // ★ M20：网络错误不是一次失败 —— 整批原样退回（attempts 不变、
+                    // 库不写），worker 下一圈会停在「等联网」闸门上。
+                    if let Some(c) = self.connectivity.lock().ok().and_then(|c| c.clone()) {
+                        c.mark_error(&e);
+                    }
+                    tracing::warn!(
+                        "删除因网络不可用暂停（不计失败次数，联网后自动继续）: {}/{}（{} 项）: {e}",
+                        batch.dir,
+                        batch.items.len(),
+                        batch
+                            .items
+                            .iter()
+                            .map(|(n, _, _)| n.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    );
+                    {
+                        let mut st = self.state.lock().unwrap();
+                        for (name, is_dir, attempts) in batch.items.iter().rev() {
+                            st.pending.push_front(DeleteJob {
+                                remote_dir: batch.dir.clone(),
+                                remote_name: name.clone(),
+                                is_dir: *is_dir,
+                                attempts: *attempts,
+                            });
+                        }
+                    }
+                    // 没注入 connectivity 的独立用法没有「等联网」闸门，退避一下避免忙等。
+                    std::thread::sleep(Duration::from_millis(500));
                 }
                 Err(e) => {
                     // 整批退回队列重试。批内每项**各自**计数（不能取批内最大值
@@ -627,12 +829,116 @@ mod tests {
         }
     }
 
+    /// ★ M20：注入连通性后，删除队列能感知离线 / 离线结构缓冲闸门。
+    #[test]
+    fn delete_queue_follows_connectivity_and_backlog_gate() {
+        use qxync_core::connectivity::Connectivity;
+        let link = qxync_core::LinkConfig {
+            id: "test".into(),
+            host: "nas.invalid".into(),
+            port: 9834,
+            https: true,
+            insecure: true,
+            user: "test1".into(),
+            ipv4_only: false,
+            exclude: Vec::new(),
+            filter_temp: true,
+            peer_listen: None,
+            peer_name: None,
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "qxync-delete-offline-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = Arc::new(Client::new(&link).unwrap());
+        let q = DeleteQueue::new(client, rt.handle().clone(), dir.clone()).unwrap();
+        assert!(!q.is_offline(), "没注入时永远在线（与 M20 之前一致）");
+        let c = Connectivity::shared();
+        q.set_connectivity(c.clone());
+        c.mark_offline("连接超时");
+        assert!(q.is_offline());
+        c.mark_online();
+        assert!(!q.is_offline());
+        q.set_backlog_blocked(true);
+        assert!(q.backlog_blocked());
+        q.set_backlog_blocked(false);
+        assert!(!q.backlog_blocked());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M20：改名时删除作业必须跟着改写（否则「先删子项再改父目录名」的删除
+    /// 永远指向旧路径 → 5 次放弃 → 对账把新路径当远端新增拉回来，删掉的文件复活）。
+    #[test]
+    fn retarget_pending_under_rewrites_delete_jobs_and_store() {
+        let dir = std::env::temp_dir().join(format!(
+            "qxync-delete-retarget-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let link = qxync_core::LinkConfig {
+            id: "test".into(),
+            host: "nas.invalid".into(),
+            port: 9834,
+            https: true,
+            insecure: true,
+            user: "test1".into(),
+            ipv4_only: false,
+            exclude: Vec::new(),
+            filter_temp: true,
+            peer_listen: None,
+            peer_name: None,
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = Arc::new(Client::new(&link).unwrap());
+        let q = DeleteQueue::new(client, rt.handle().clone(), dir.clone()).unwrap();
+        q.enqueue(job("/home/a", "x.txt"));
+        q.enqueue(job("/home/a", "sub"));
+        q.enqueue(job("/home/other", "keep.txt"));
+        q.enqueue(job("/home/ab", "not-under.txt"));
+
+        assert_eq!(q.retarget_pending_under("/home/a", "/home/b"), 2);
+        assert!(q.has_pending("/home/b/x.txt"), "子项路径要跟着改名");
+        assert!(q.has_pending("/home/b/sub"));
+        assert!(q.has_pending("/home/other/keep.txt"), "无关目录不能动");
+        assert!(
+            q.has_pending("/home/ab/not-under.txt"),
+            "段级前缀：/home/a 不能命中 /home/ab"
+        );
+        assert!(!q.has_pending("/home/a/x.txt"));
+        // 状态库也 rekey 了（表 = 未完成作业）
+        let store = Store::open(dir.join("queue.db")).unwrap();
+        let paths: Vec<String> = store
+            .deletes()
+            .unwrap()
+            .iter()
+            .map(|r| r.remote_path())
+            .collect();
+        assert!(paths.contains(&"/home/b/x.txt".to_string()));
+        assert!(!paths.contains(&"/home/a/x.txt".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 批处理的核心不变量：**只合并同目录**（`path` 参数只有一个）。
     #[test]
     fn batch_only_merges_same_dir() {
         let mut st = State {
             pending: VecDeque::new(),
             active: false,
+            paused: false,
         };
         st.pending.push_back(job("/home", "a"));
         st.pending.push_back(job("/home", "b"));
