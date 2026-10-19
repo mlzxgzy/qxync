@@ -411,10 +411,20 @@ impl DeleteQueue {
     }
 
     /// 等队列清空（卸载 / 测试用）。
+    ///
+    /// ★ M22：与上传队列同一条规则 —— 闸门（离线 / 离线结构缓冲未回放）落下时
+    /// 队列不可能推进，提前返回而不是陪等到超时（作业已持久化，联网后继续）。
     pub fn drain(&self, timeout: Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         let mut st = self.state.lock().unwrap();
         while (!st.pending.is_empty() || st.active) && std::time::Instant::now() < deadline {
+            if self.should_hold() {
+                tracing::info!(
+                    "排空中止：删除队列在「等联网/回放」闸门上（作业已持久化 {} 项，联网后继续）",
+                    st.pending.len()
+                );
+                break;
+            }
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             let (g, _) = self.cv.wait_timeout(st, left).unwrap();
             st = g;
@@ -871,6 +881,62 @@ mod tests {
         assert!(q.backlog_blocked());
         q.set_backlog_blocked(false);
         assert!(!q.backlog_blocked());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M22：闸门（离线 / 回放未完）落下时 `drain` **提前返回**，不陪等到超时
+    /// （与上传队列同一条规则；卸载路径 120s 超时的另一半）。
+    #[test]
+    fn delete_drain_returns_early_when_gate_falls() {
+        use qxync_core::connectivity::Connectivity;
+        let dir = std::env::temp_dir().join(format!(
+            "qxync-delete-drain-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let link = qxync_core::LinkConfig {
+            id: "test".into(),
+            host: "nas.invalid".into(),
+            port: 9834,
+            https: true,
+            insecure: true,
+            user: "test1".into(),
+            ipv4_only: false,
+            exclude: Vec::new(),
+            filter_temp: true,
+            peer_listen: None,
+            peer_name: None,
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = Arc::new(Client::new(&link).unwrap());
+        let q = DeleteQueue::new(client, rt.handle().clone(), dir.clone()).unwrap();
+        q.enqueue(job("/home/a", "gated.txt"));
+
+        // 在线 + 无闸门：没人消费 → 真等满超时（行为不变）
+        let t0 = std::time::Instant::now();
+        assert!(!q.drain(Duration::from_millis(300)));
+        assert!(t0.elapsed() >= Duration::from_millis(250));
+
+        // 离线闸门：立即返回
+        let c = Connectivity::shared();
+        q.set_connectivity(c.clone());
+        c.mark_offline("连接被拒绝");
+        let t1 = std::time::Instant::now();
+        assert!(!q.drain(Duration::from_secs(30)));
+        assert!(t1.elapsed() < Duration::from_secs(5));
+
+        // 回放闸门同理
+        c.mark_online();
+        q.set_backlog_blocked(true);
+        let t2 = std::time::Instant::now();
+        assert!(!q.drain(Duration::from_secs(30)));
+        assert!(t2.elapsed() < Duration::from_secs(5));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

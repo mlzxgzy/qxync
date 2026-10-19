@@ -568,6 +568,17 @@ pub struct SessionInfo {
     /// **只回掩码**，避免日志/截图泄漏 sid。
     pub sid_masked: String,
     pub alive: bool,
+    /// ★ M22：`alive` 这条**是不是真探测过**。
+    ///
+    /// `false` 的含义是「不知道」而不是「死了」：已知离线时 `status` 不发
+    /// `check_alive`（M20 的 20s×3 卡顿修复），此时 `alive` 只是保守默认值
+    /// `false`。界面必须按「未知」展示，不能写成「失活」—— 那会让用户以为
+    /// 会话真失效了去重登，而其实只是网断了。
+    ///
+    /// `#[serde(default)]`：老 daemon 的 payload 没有这个键 → 按 `false`
+    /// （未知）解析 —— 宁可多显示一次「未知」，不把「没探测」粉饰成「失活」。
+    #[serde(default)]
+    pub alive_known: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1340,6 +1351,43 @@ pub fn decode_line<T: serde::de::DeserializeOwned>(line: &[u8]) -> Result<T, ser
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ★ M22：`alive_known` 的跨版本兼容 —— 老 daemon 的 payload 没有这个键，
+    /// 必须按 `false`（未知）解析，而不是反序列化失败或默认成「探测过」。
+    #[test]
+    fn session_info_parses_old_daemon_payload_without_alive_known() {
+        // 老 daemon（0.6.x）的 status payload 形状
+        let old = serde_json::json!({ "sid_masked": "sid-***", "alive": false });
+        let si: SessionInfo = serde_json::from_value(old).unwrap();
+        assert_eq!(si.sid_masked, "sid-***");
+        assert!(!si.alive);
+        assert!(!si.alive_known, "缺键 = 未知，绝不粉饰成「探测过」");
+
+        // 新 daemon：离线跳过探测 → alive=false + alive_known=false（界面显示「未知」）
+        let offline = serde_json::json!({
+            "sid_masked": "sid-***", "alive": false, "alive_known": false
+        });
+        let si: SessionInfo = serde_json::from_value(offline).unwrap();
+        assert!(!si.alive && !si.alive_known);
+
+        // 在线真探测：alive=false + alive_known=true → 界面才能说「失活」
+        let dead = serde_json::json!({
+            "sid_masked": "sid-***", "alive": false, "alive_known": true
+        });
+        let si: SessionInfo = serde_json::from_value(dead).unwrap();
+        assert!(!si.alive && si.alive_known);
+
+        // 往返无损
+        let rt = SessionInfo {
+            sid_masked: "sid-***".into(),
+            alive: true,
+            alive_known: true,
+        };
+        let back: SessionInfo = serde_json::from_value(serde_json::to_value(&rt).unwrap()).unwrap();
+        assert_eq!(back.sid_masked, rt.sid_masked);
+        assert_eq!(back.alive, rt.alive);
+        assert_eq!(back.alive_known, rt.alive_known);
+    }
 
     // ------------------------------------------------------------ ★ M16 多连接路径
 

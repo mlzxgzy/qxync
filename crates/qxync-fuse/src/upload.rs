@@ -938,10 +938,23 @@ impl UploadQueue {
     }
 
     /// 等队列清空（测试/卸载时用）。
+    ///
+    /// ★ M22：**闸门落下时提前返回**。排队中途断网（连通性还没翻成「已知离线」）
+    /// 时调用方仍会走到这里 —— worker 第一次上传失败置离线、作业原样放回，
+    /// 队列从此不可能推进。旧实现会陪等到超时（卸载路径 120s，真机表现为
+    /// `daemon stop` 卡两分钟）。现在 `should_hold()` 一真就退出：作业都在
+    /// 持久化库里，联网后继续，一个不丢。
     pub fn drain(&self, timeout: Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         let mut st = self.state.lock().unwrap();
         while (!st.pending.is_empty() || st.active) && std::time::Instant::now() < deadline {
+            if self.should_hold() {
+                tracing::info!(
+                    "排空中止：队列在「等联网/回放」闸门上（作业已持久化 {} 项，联网后继续）",
+                    st.pending.len()
+                );
+                break;
+            }
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             let (g, _) = self.cv.wait_timeout(st, left).unwrap();
             st = g;
@@ -1505,6 +1518,57 @@ mod tests {
         assert!(q.backlog_blocked(), "离线结构缓冲未回放完 → 上传闸门");
         q.set_backlog_blocked(false);
         assert!(!q.backlog_blocked());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M22：闸门（离线 / 回放未完）落下时 `drain` **提前返回**，不陪等到超时。
+    ///
+    /// 场景：排队中途断网（连通性还没翻成「已知离线」），`daemon stop` / `umount`
+    /// 走到 drain —— 旧实现等满 120s；现在 `should_hold()` 一真就退出。
+    /// 作业都在持久化库里，联网后继续，一个不丢。
+    #[test]
+    fn drain_returns_early_when_gate_falls() {
+        use qxync_core::connectivity::Connectivity;
+        let dir = tmpdir("drain-gate");
+        let (q, _rt) = test_queue(&dir.join("queue"));
+        {
+            let mut st = q.state.lock().unwrap();
+            st.pending.push_back(job(&dir, "gated.txt"));
+        }
+
+        // 在线 + 无闸门：没人消费 → 真等满超时（行为与 M22 之前一致）
+        let t0 = std::time::Instant::now();
+        assert!(!q.drain(Duration::from_millis(300)));
+        assert!(
+            t0.elapsed() >= Duration::from_millis(250),
+            "在线时 drain 要真等（队列只是没人消费，不是不能推进）"
+        );
+
+        // 离线闸门：立即返回，30s 的超时不能陪等
+        let c = Connectivity::shared();
+        q.set_connectivity(c.clone());
+        c.mark_offline("连接被拒绝");
+        let t1 = std::time::Instant::now();
+        assert!(!q.drain(Duration::from_secs(30)));
+        assert!(
+            t1.elapsed() < Duration::from_secs(5),
+            "闸门上陪等到超时就是 daemon stop 卡两分钟的根因"
+        );
+
+        // 回放闸门（backlog_blocked）同理
+        c.mark_online();
+        q.set_backlog_blocked(true);
+        let t2 = std::time::Instant::now();
+        assert!(!q.drain(Duration::from_secs(30)));
+        assert!(t2.elapsed() < Duration::from_secs(5));
+
+        // 闸门清掉 + 队列清空 → drain 恢复「真等到空」
+        q.set_backlog_blocked(false);
+        {
+            let mut st = q.state.lock().unwrap();
+            st.pending.clear();
+        }
+        assert!(q.drain(Duration::from_millis(50)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
