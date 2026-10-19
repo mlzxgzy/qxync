@@ -19,8 +19,10 @@
 //! * **`sid`** —— 会话每次挂载重新登录（daemon 侧 `mount()` 本就 `set_sid`）。
 //!   存下来等于把过期令牌写进磁盘。
 //! * **`Client` / 节点表** —— 靠懒加载重建（`lookup` 三级回退），落盘反而会过期。
-//! * **`cache_dir`** —— 存的是**父目录**，daemon 会再拼一层 NAS 主机名；
-//!   存主机名进去等于把「当前连的是哪台 NAS」也固化下来，换 link 就错位。
+//! * ~~**`cache_dir`**~~ —— ★ M21 起改为**存父目录**（见 [`MountRecord::cache_dir`]）：
+//!   恢复时按当前 link 重新拼命名空间，不固化「连的是哪台 NAS」。旧版不存的
+//!   理由针对的是拼好主机名的最终路径；不存父目录的代价（自定义缓存目录的
+//!   挂载恢复后认领不到旧缓存）在 M21「离线重启读缓存」场景下不可接受。
 //!
 //! ## 损坏的降级原则
 //!
@@ -65,6 +67,19 @@ pub struct MountRecord {
     /// FUSE 会话结束时不自动卸载。
     #[serde(default = "yes")]
     pub auto_unmount: bool,
+    /// ★ M21：自定义缓存目录的**父目录**（`None` = 默认目录）。
+    ///
+    /// 存的是调用方给 `mount()` 的那个参数原样（父目录），**不是**拼好主机名的
+    /// 最终路径 —— 恢复时 `mount()` 会按当前 link 重新拼 `link_namespace`，
+    /// 换 NAS / 换账号不会错位（旧版「故意不存」的理由针对的是**拼好的路径**，
+    /// 存父目录没有那个问题）。
+    ///
+    /// 为什么必须存（M21 修的缺口）：恢复时传 `None` 会落回默认缓存目录 ——
+    /// 原挂载用自定义目录的话，恢复后**认领不到旧缓存**：在线重启白白重新水合
+    /// 一遍，离线重启直接读不了已水合内容（M21 的核心场景）。
+    /// 老文件没有这一栏（`serde(default)`）→ `None` → 默认目录，行为不变。
+    #[serde(default)]
+    pub cache_dir: Option<PathBuf>,
 }
 
 fn yes() -> bool {
@@ -259,6 +274,7 @@ mod tests {
             hydrate_timeout_secs: 60,
             delete_limit: None,
             auto_unmount: true,
+            cache_dir: None,
         }
     }
 
@@ -268,6 +284,8 @@ mod tests {
         let mut f = MountsFile::default();
         let mut r = rec("/home/tester/qxync");
         r.delete_limit = Some(3);
+        // ★ M21：自定义缓存目录（父目录）也要原样往返
+        r.cache_dir = Some("/custom/cache-parent".into());
         f.put(r.clone());
         f.save(&p).unwrap();
 

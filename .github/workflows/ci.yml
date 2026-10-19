@@ -88,6 +88,13 @@ jobs:
       - name: M20 离线状态 / 缓冲区 e2e（隔离 XDG）
         run: bash xtask/tests/m20-offline.sh
 
+      # ★ M21：离线可重启 daemon 的隔离 e2e —— 假 NAS（127.0.0.1:9）+ 真 FUSE 挂载。
+      # 断言：离线启动后挂载点从 mounts.json + listings 表恢复、离线 ls / 写缓冲、
+      # 第二次离线重启幂等。需要 /dev/fuse 与 python3，缺任一自动 SKIP
+      # （CI 的 ubuntu runner 没有 /dev/fuse，本地与真机验收跑全量）。
+      - name: M21 离线重启 e2e（隔离 XDG + 真 FUSE，无 /dev/fuse 时 SKIP）
+        run: bash xtask/tests/m21-offline-restart.sh
+
   # ---------------------------------------------------------------- MSRV
   msrv:
     name: MSRV check (rust 1.90)
