@@ -47,16 +47,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   listing snapshot.
 - Offline `touch` followed by a queued upload restored the stale mtime; the queued job's
   mtime is now updated as well.
+- **An offline-created directory could be created but not used** (found by real-device FUSE
+  verification): the kernel issues a FUSE `LOOKUP` for the target name before `mkdir` /
+  `open(O_CREAT)`; with no local listing snapshot for that brand-new directory and a known
+  offline state, the lookup returned EIO, so `ls` and creating files inside it failed. Fix:
+  an offline `mkdir` now seeds an **empty listing snapshot** for the new directory, and the
+  snapshot follows a directory rename (otherwise the renamed directory hits the same wall).
+- **Creating files directly under the mount root failed after going offline** (when the root
+  had never been `ls`ed in that mount): the mount root listing is now **preheated** right
+  after a successful mount. The preheat uses `seed_listing` (only fills in when no snapshot
+  exists yet) so a late-landing stale listing can never wipe files the user just created
+  (this race was reproduced on the real device too).
 
 ### Verification
 
 `cargo build --workspace` and `cargo test --workspace` pass (core 230 / daemon 68 /
-fuse 98 / client 32), `cargo fmt --all --check` is clean, and the new isolated e2e
+fuse 101 / client 32), `cargo fmt --all --check` is clean, and the new isolated e2e
 script `xtask/tests/m20-offline.sh` passes 9/9 (offline `status` in 6ms, buffered counts
 visible, rows survive a daemon restart with `attempts = 0`).
 
-Real-mount verification is still pending: this machine has no `/dev/fuse`, so the offline
-`mkdir`/`rename` paths are covered by unit tests plus logic-level e2e only.
+Real-device FUSE verification was completed on 2026-10-19 (real NAS + real mount + a TCP
+relay cut to emulate the network dropping): `xtask/tests/m20-real-nas.sh` passes 57/57.
+It covers online writes, offline `mkdir` / nested dirs / writes, file and directory
+renames, `ls`, `rm`, `touch`, cached and uncached reads, a daemon restart while offline
+(4 outbox rows survive, `attempts = 0`), and reconnect replay (renamed dirs/files land on
+the NAS with the right content, old names disappear, deletes apply, mtime applies, buffers
+reach zero). Two real-mount-only bugs were found and fixed (see Fixed above). Remaining
+limitation: after a daemon restart while offline, the mount is restored only once the
+network is back (restoring mounts requires a login); buffered work is not lost.
 
 ## [0.6.8] - 2026-10-19
 

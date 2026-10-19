@@ -875,6 +875,24 @@ fn listing_drop(inner: &Arc<Mutex<Inner>>, dir: &str) {
     inner.lock().unwrap().dirs.remove(dir);
 }
 
+/// ★ M20：目录改名后，把清单快照从旧路径搬到新路径。
+///
+/// 不搬的后果（真机 FUSE 验收抓到的 bug）：离线新建/改名的目录在新路径下
+/// 「没有快照 + 已知离线」→ `lookup`/`readdir` 直接 `EIO`，`ls` 和往里写文件
+/// 全部失败 —— 尽管目录本身已经在本地节点表里、内容与操作都在 outbox 里。
+///
+/// 快照描述的是「这个目录里有什么」，目录改名不改变其内容，所以整体搬过去。
+/// 目标路径若已有快照（极少见：改名覆盖），以搬过来的这份为准。
+fn listing_move(inner: &Arc<Mutex<Inner>>, old: &str, new: &str) {
+    if old == new {
+        return;
+    }
+    let mut g = inner.lock().unwrap();
+    if let Some(list) = g.dirs.remove(old) {
+        g.dirs.insert(new.to_string(), list);
+    }
+}
+
 /// 从目录清单快照里摘掉一个名字（本地删除后立刻生效，不用等下一轮轮询）。
 ///
 /// 不做这一步的话：`rm a` 之后 `ls` 会把快照里还在的 `a` 重新物化成幽灵节点。
@@ -1392,6 +1410,12 @@ pub trait LocalView: Send + Sync {
     /// daemon 的变更轮询每轮列完目录后调用；此后 `readdir`/`lookup` 吃本地快照，
     /// 不再每次都往 NAS 跑。默认空实现（测试替身不需要）。
     fn apply_listing(&self, _dir: &str, _entries: &[DirEntry]) {}
+    /// ★ M20：**只在还没有快照时**灌入一份清单（挂载时预热根目录用）。
+    ///
+    /// 与 [`Self::apply_listing`] 的区别：预热是「挂载时抓的、可能已经过时的」清单，
+    /// 迟到落地时**绝不能覆盖**更新的本地快照（本地新建/上传 upsert 出来的那份）。
+    /// 默认空实现（测试替身不需要）。
+    fn seed_listing(&self, _dir: &str, _entries: &[DirEntry]) {}
     /// 远端目录已经不存在 → 丢掉清单快照。默认空实现。
     fn drop_listing(&self, _dir: &str) {}
     /// 该路径是否在等后台把远端新内容换上（此时 baseline 先别推进）。
@@ -2480,6 +2504,23 @@ impl LocalView for FsHandle {
         listing_put(&self.inner, dir, Arc::new(entries.to_vec()));
     }
 
+    fn seed_listing(&self, dir: &str, entries: &[DirEntry]) {
+        // 检查和插入在同一把锁里：不能先 `contains_key` 再 `insert` ——
+        // 中间用户新建文件的 upsert 会被迟到的预热抹掉（首次真机 FUSE 验收踩过：
+        // 挂载刚完成就 `printf` 的文件在 `ls` 里凭空消失，随后 `mv` 报源不存在）。
+        let mut g = self.inner.lock().unwrap();
+        if g.dirs.contains_key(dir) {
+            return;
+        }
+        g.dirs.insert(
+            dir.to_string(),
+            DirListing {
+                entries: Arc::new(entries.to_vec()),
+                fetched: Instant::now(),
+            },
+        );
+    }
+
     fn drop_listing(&self, dir: &str) {
         listing_drop(&self.inner, dir);
     }
@@ -3542,6 +3583,43 @@ impl QxyncFs {
         // ★ T9：节点一建出来就把身份记进索引（对账要靠它把「删除 + 新增」配成改名）。
         //   锁外写库：SQLite 有自己的锁，不能在持有节点表锁时做慢 IO。
         nodes_remember(self.nodes.as_ref(), remote, file_id, size, mtime, is_dir);
+        node
+    }
+
+    /// ★ M20：在本地节点表 + 清单快照里物化一个刚建出来的目录（`mkdir` 的本地部分）。
+    ///
+    /// 抽成独立方法是为了能被单测直接覆盖：FUSE 回调 `mkdir` 要 `Request`，单测造
+    /// 不出来，而「离线建目录之后能不能 `ls`、能不能往里写文件」恰好只取决于这里。
+    ///
+    /// `offline=true` 时还差最后一块拼图：**给新目录放一份空清单快照**。
+    /// 没有它的话，新目录在远端还不存在（离线），本地也没有它的清单 → 内核对目录里
+    /// 名字的 `lookup` 走「没有快照 + 已知离线 → EIO」，`create` 根本走不到
+    /// （`open(O_CREAT)` 先 lookup）；`ls` 新目录同样 EIO。用户看到的就是
+    /// 「mkdir 成功了，但既进不去、也放不进文件」—— 真机 FUSE 验收抓到的 bug。
+    ///
+    /// 空清单是**诚实**的：这个目录就是本地刚建的、里面确实什么都没有；
+    /// 联网回放后 daemon 的清单刷新会把它换成远端真实列表。
+    fn materialize_local_dir(
+        &self,
+        parent: INodeNo,
+        parent_remote: &str,
+        name: &str,
+        remote: &str,
+        offline: bool,
+    ) -> Node {
+        let entry = DirEntry::local(name, true, 0, Self::epoch_of(SystemTime::now()));
+        // ★ M20：离线建出来的目录远端**还没有** → remote_known=false，语义与
+        // `create()` 的本地新建一致（后续改名/删除不会误以为远端有老副本）。
+        let node = if offline {
+            self.insert_node_with(parent, name, remote, &entry, false)
+        } else {
+            self.insert_node(parent, name, remote, &entry)
+        };
+        // ★ M9：本地新建目录立刻进「映射」
+        listing_upsert(&self.inner, parent_remote, &entry);
+        if offline {
+            listing_put(&self.inner, remote, Arc::new(Vec::new()));
+        }
         node
     }
 
@@ -5003,16 +5081,8 @@ impl Filesystem for QxyncFs {
         if offline_queued {
             tracing::info!("离线创建目录: {remote}（已进缓冲区，联网后回放）");
         }
-        let entry = DirEntry::local(name, true, 0, Self::epoch_of(SystemTime::now()));
-        // ★ M20：离线建出来的目录远端**还没有** → remote_known=false，语义与
-        // `create()` 的本地新建一致（后续改名/删除不会误以为远端有老副本）。
-        let node = if offline_queued {
-            self.insert_node_with(parent, name, &remote, &entry, false)
-        } else {
-            self.insert_node(parent, name, &remote, &entry)
-        };
-        // ★ M9：本地新建目录立刻进「映射」
-        listing_upsert(&self.inner, &parent_remote, &entry);
+        let node =
+            self.materialize_local_dir(parent, &parent_remote, name, &remote, offline_queued);
         reply.entry(&ENTRY_TTL, &node.attr, Generation(0));
     }
 
@@ -5281,6 +5351,12 @@ impl Filesystem for QxyncFs {
         }
         // ★ T9：把 `nodes` 行的 path 一起搬过去（`file_id` 一个字节都不动）。
         self.migrate_nodes_row(&old_remote, &new_remote);
+        // ★ M20 修复：目录改名 → 它自己的清单快照跟着搬到新路径。
+        //   不搬的话，离线改名后的目录在新路径下「没有快照 + 离线」→ `ls`/写入 EIO
+        //   （与 `mkdir` 离线分支创建空快照是同一个坑的两条入口）。
+        if is_dir {
+            listing_move(&self.inner, &old_remote, &new_remote);
+        }
         // ★ M9：改名同步到「映射」：旧名字摘掉、新名字补上
         listing_remove(&self.inner, &parent_remote, name);
         if let Some(node) = self.node_by_remote(&new_remote) {
@@ -8383,6 +8459,113 @@ mod tests {
         assert!(paths.contains(&"/home/new".to_string()));
         assert!(paths.contains(&"/home/new/sub".to_string()));
         assert!(!paths.iter().any(|p| p.starts_with("/home/old")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M20 真机 FUSE 验收回归：**离线建出来的目录必须能 ls、能往里建文件**。
+    ///
+    /// 修复前的真机现象（2026-10-19，test1 账号 + 真 NAS + TCP 中继断网）：
+    /// `mkdir offline-dir` 回 0，但紧接着 `ls offline-dir` 回 EIO、
+    /// `printf > offline-dir/a.txt` 回 EIO —— 原因是新目录没有本地清单快照，
+    /// `lookup`/`readdir` 在「没有快照 + 已知离线」时直接 EIO（`create` 需要先
+    /// lookup 通过才会被内核调用）。
+    ///
+    /// 这里直接覆盖 `mkdir` 的本地部分（FUSE 回调要 `Request`，单测造不出来）。
+    #[test]
+    fn m20_offline_mkdir_local_view_is_usable() {
+        use qxync_core::store::OUTBOX_MKDIR;
+        let dir = m7_tmpdir("m20-offline-mkdir-view");
+        let fs = test_fs(&dir, true);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let c = Connectivity::shared();
+        let fs = fs
+            .with_nodes_store(store.clone())
+            .with_connectivity(c.clone());
+        c.mark_offline("连接超时");
+
+        // 与 `mkdir` 的离线分支同序：先落 outbox（持久化），再物化本地视图。
+        fs.enqueue_outbox(OUTBOX_MKDIR, "/home/newdir", "", true)
+            .unwrap();
+        let node = fs.materialize_local_dir(INodeNo::ROOT, "/home", "newdir", "/home/newdir", true);
+
+        // ① `ls` 新目录不能 EIO：拿到的必须是「空」，而不是「不知道」。
+        let entries = fs
+            .dir_entries("/home/newdir")
+            .expect("离线新建的目录必须能 ls（修复前这里 EIO）");
+        assert!(entries.is_empty(), "刚建的空目录里面就该是空的");
+
+        // ② 往里建文件：lookup 必须能答 ENOENT（快照在、只是没这个名字）。
+        //    修复前这里是 EIO → 内核拿不到 ENOENT → create 走不到 → 写入失败。
+        assert_eq!(
+            fs.lookup_child(node.ino, "a.txt").err().map(|e| e.code()),
+            Some(libc::ENOENT),
+            "离线新建目录里的 lookup 必须是 ENOENT（修复前是 EIO，create 走不到）"
+        );
+
+        // ③ 新目录必须仍然标记为「远端还没有」：后续改名不能误发远端 rename。
+        assert!(
+            !fs.node_by_remote("/home/newdir").unwrap().remote_known,
+            "离线建出来的目录远端确实还没有副本"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M20 真机 FUSE 验收回归：目录改名后，本地清单快照要跟着搬。
+    ///
+    /// 不搬的话，离线改名后的目录在新路径下「没有快照 + 离线」→ `ls`/写入 EIO
+    /// （与离线 mkdir 是同一个坑的另一条入口）。
+    #[test]
+    fn m20_listing_snapshot_follows_dir_rename() {
+        let dir = m7_tmpdir("m20-listing-rename");
+        let fs = test_fs(&dir, true);
+        listing_put(&fs.inner, "/home/old", Arc::new(Vec::new()));
+        listing_move(&fs.inner, "/home/old", "/home/new");
+        assert!(
+            listing_get(&fs.inner, "/home/old").is_none(),
+            "旧路径不能再留着快照（否则旧名字复活）"
+        );
+        assert!(
+            listing_get(&fs.inner, "/home/new").is_some(),
+            "改名后的目录必须保住本地清单，否则离线时 ls/写入 EIO"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M20 真机 FUSE 验收回归：挂载时的「根清单预热」不能抹掉更新后的本地快照。
+    ///
+    /// 真机现象（2026-10-19）：挂载成功后预热请求刚发出，用户立刻在根目录 `printf`
+    /// 一个文件；预热结果（挂载那一刻抓的旧清单）迟到落地，直接覆盖快照 ——
+    /// `ls` 里新文件凭空消失，紧接着的 `mv` 报「源不存在」。
+    #[test]
+    fn m20_seed_listing_never_clobbers_newer_snapshot() {
+        let dir = m7_tmpdir("m20-seed");
+        let fs = test_fs(&dir, true);
+        let h = fs.handle();
+
+        // 第一次预热：还没有快照 → 灌进去
+        h.seed_listing("/home", &[]);
+        assert!(listing_get(&fs.inner, "/home").is_some());
+
+        // 本地新建文件 → 快照 updated
+        listing_upsert(
+            &fs.inner,
+            "/home",
+            &DirEntry::local("a.txt", false, 3, 1000),
+        );
+
+        // 迟到的预热（挂载时抓的旧清单里没有 a.txt）→ 必须被忽略
+        h.seed_listing("/home", &[DirEntry::local("b.txt", false, 3, 1000)]);
+        let names: Vec<String> = listing_get(&fs.inner, "/home")
+            .unwrap()
+            .entries
+            .iter()
+            .map(|e| e.filename.clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["a.txt".to_string()],
+            "迟到的预热不能覆盖更新的快照"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
