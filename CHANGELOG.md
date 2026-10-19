@@ -42,6 +42,14 @@
   现在已知离线直接跳过网络探测（真机脚本实测 6ms 返回）。
 - 离线读未水合文件要白等 connect timeout 才 EIO；列过目录的 `readdir` 仍吃本地快照。
 - 离线 `touch` 后，排队中的上传会把 mtime 覆盖回旧值（现在同步更新队列作业的 mtime）。
+- **离线建出来的目录「能建不能用」**（真机 FUSE 验收抓到）：内核在 `mkdir` /
+  `open(O_CREAT)` 之前会先对目标名字发一次 FUSE `LOOKUP`；新目录在远端还不存在、
+  本地又没有清单快照 → 「无快照 + 已知离线」直接 EIO，`ls` 和往里写文件全部失败。
+  修复：离线 `mkdir` 在本地视图里给新目录放一份**空清单快照**；目录改名时清单快照
+  跟着搬到新路径（否则改名后的目录同样进不去）。
+- **断网后挂载根目录建不了东西**（用户从没在挂载点里 `ls` 过根时）：挂载成功后主动
+  **预热挂载根清单**；预热用 `seed_listing`（只在还没有快照时灌入），避免「挂载时抓的
+  旧清单」迟到落地把刚新建的文件从 `ls` 里抹掉。
 
 ### 验证
 
@@ -50,7 +58,8 @@ cargo build --workspace                         ✅
 cargo test --workspace                          ✅
   qxync-core   230 passed（含 connectivity / outbox 新用例）
   qxync-daemon  68 passed（含回放计划 / 网络错误不丢行 / 不计次数）
-  qxync-fuse    98 passed（含队列离线闸门 / 离线 touch 更新 mtime / outbox 冻结队列）
+  qxync-fuse   101 passed（含队列离线闸门 / 离线 touch 更新 mtime / outbox 冻结队列 /
+                          真机验收后补的 3 个离线 FUSE 回归）
   qxync-client   32 passed
 cargo fmt --all --check                         ✅
 node xtask/tests/task-defaults.test.mjs         ✅ 24 passed
@@ -60,14 +69,25 @@ xtask/tests/m20-offline.sh                      ✅ 9 passed（隔离 XDG，NAS 
   · 跨 daemon 重启行不丢、attempts 仍为 0
 ```
 
-**真挂载段未验**：本机没有 `/dev/fuse`，`mkdir`/`rename` 在真挂载点上的离线行为
-只有逻辑层单测覆盖（与 M15 的说明一致）。建议在有 FUSE 的机器上补一段
-「断网 → 建目录 / 改名 → 恢复 → 远端出现对应变化」的真机验收。
+**真机 FUSE 验收（2026-10-19 补做）**：
+
+```text
+xtask/tests/m20-real-nas.sh                     ✅ 57 passed（真 NAS + 真挂载 + TCP 中继断网）
+  · 在线写 → 断网 → 离线 mkdir / 建二级目录 / 写文件 / rename 文件与目录 / rm / touch
+  · 离线 ls 新建目录、读缓存、读未水合（2ms EIO）；status 缓冲区计数、outbox attempts=0
+  · daemon 离线重启：outbox 4 行不丢、attempts 仍 0
+  · 恢复网络 3s 内：远端出现改名后的目录/文件与内容、旧名消失、删除生效、mtime 生效、清零
+```
+
+验收中抓到并修复的两个真机问题见上面「修复」；仍存在的限制见下方「已知限制」。
 
 ### 已知限制
 
 - 离线新建/改名的文件在同步落地前不会出现在「重新打开挂载点」的目录列表里
   （本地节点表是进程内状态）；但内容与操作都在持久化队列/outbox 里，不会丢。
+  同一进程内它们是立即可见、可继续写入的（空清单快照 + 目录清单随改名搬迁）。
+- **离线重启 daemon 时，挂载点要等网络恢复后才恢复**（恢复挂载要先登录；登录需要网络）。
+  缓冲区、队列都不丢；联网后先回放 outbox、再补挂载点。
 - 回放改名的冲突处理固定走 `rename_remote` 语义（NAS 那份改名成冲突副本），
   暂不读取任务的 `conflict` 策略（离线时无法保证策略在回放时仍有效）。
 - 任务级 purge 暂不清理 outbox 行（与上传/删除队列一样按连接共享；连接级 purge 会整体删掉 `sync.db`）。

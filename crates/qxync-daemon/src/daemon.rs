@@ -2618,6 +2618,44 @@ async fn mount(
     // ★ M15/T5：挂载成功才写盘。写失败只 WARN —— 记录文件是为了下次重启省一步，
     // 不能因为它把「已经挂上了」这件事变成失败（用户会以为没挂成功去重试）。
     mounts_persist(state);
+    // ★ M20：挂载成功后**主动预热挂载根目录的清单快照**（在线时）。
+    //
+    // 内核在 `mkdir` / `open(O_CREAT)` 之前会先对目标名字发一次 FUSE LOOKUP；
+    // 如果根目录从没被 `ls` 过、本地又没有清单快照，M20 的离线策略会诚实地回
+    // `EIO` —— 结果就是「断网后在挂载点根目录里建不了目录/文件」。
+    // 真机 FUSE 验收（2026-10-19，真 NAS + 真挂载 + 断网）抓到的就是这个现象：
+    // `mkdir` 报 EIO，而 daemon 侧只看到一次 `lookup`，`mkdir` 回调根本没被调用。
+    //
+    // 挂载时顺手拉一次根清单，用户就不需要先手动 `ls` 一遍才能获得离线写能力。
+    // 失败只 debug：离线挂载 / 服务端拒绝都不该影响「已经挂上了」这件事。
+    {
+        let h = state
+            .mounts
+            .lock()
+            .unwrap()
+            .get(&mp)
+            .map(|m| m.handle.clone());
+        if let Some(h) = h {
+            let client = fuse_client.clone();
+            let root = info.remote.clone();
+            let conn = state.connectivity.clone();
+            tokio::spawn(async move {
+                if !conn.is_online() {
+                    return;
+                }
+                match client.list(&root).await {
+                    Ok(entries) => {
+                        tracing::debug!("挂载根清单预热完成 {root}（{} 项）", entries.len());
+                        // ★ 用 seed_listing（只在还没有快照时灌入）而不是 apply_listing：
+                        //   这次 list 是挂载那一刻抓的，落地时用户可能已经在根目录里
+                        //   建了文件 —— 直接覆盖会把新文件从 `ls` 里抹掉。
+                        h.seed_listing(&root, &entries);
+                    }
+                    Err(e) => tracing::debug!("挂载根清单预热失败 {root}: {e}"),
+                }
+            });
+        }
+    }
     to_value(info)
 }
 
