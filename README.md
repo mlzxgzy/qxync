@@ -235,6 +235,11 @@ systemctl --user restart qxyncd       # 用了 systemd 单元
 qxync daemon stop && qxync daemon start
 ```
 
+`qxync daemon stop` 停止前会检查挂载点有没有被别的进程占用（在挂载点里打开了文件、
+或者 `cd` 进去了）：有的话会列出 `pid / 程序 / 路径` 并**拒绝停止**，关掉这些程序后
+再停；确实要硬停就加 `--force`（挂载点里打开着的文件会立刻失效）。`qxync umount`
+走同一套检查。
+
 从 0.1.x（原名 `qsync`）或 0.2.x（多根挂载）升级的破坏性变更见 [CHANGELOG](CHANGELOG.md)。
 
 ## 已知限制

@@ -11,7 +11,7 @@ use qxync_client::Client;
 use qxync_core::ipc::{
     socket_path_for, CacheInfo, CursorInfo, DecisionsData, DehydrateData, ErrorKind,
     FileStatesData, GetData, LsData, MountInfo, PeerData, PingData, PutData, Request, RootsData,
-    RulesData, SettingsData, SpaceData, StatusData, StoreData, SyncInfo, TasksData,
+    RulesData, SettingsData, ShutdownData, SpaceData, StatusData, StoreData, SyncInfo, TasksData,
 };
 use qxync_core::settings::{Settings, PROXY_AUTO, PROXY_MANUAL, PROXY_NONE};
 use qxync_core::{ConfigPaths, Credentials, DirEntry, LinkConfig, HOME_ROOT};
@@ -519,9 +519,16 @@ enum DaemonAction {
         all: bool,
     },
     /// 请求 qxyncd 干净退出（★ M15/T6：会**真正卸载**全部 FUSE 挂载点）；`--all` = 所有连接
+    ///
+    /// 停止前会先检查挂载点有没有被别的进程占用（在挂载点里打开了文件、或者 `cd`
+    /// 进去了）。有的话**列出 pid / 程序 / 路径并拒绝停止**，关掉那些程序再重试；
+    /// 挂载点干净才继续。确实要硬停就用 `--force`（挂载点里打开着的文件会立刻失效）。
     Stop {
         #[arg(long)]
         all: bool,
+        /// 挂载点被占用时也停止（默认拒绝并报「谁在占用」）
+        #[arg(long)]
+        force: bool,
     },
     /// ping + 状态快照；`--all` = 所有连接
     Status {
@@ -540,6 +547,61 @@ enum DaemonAction {
 
 fn paths() -> Result<ConfigPaths> {
     Ok(ConfigPaths::discover()?)
+}
+
+/// 把用户给的路径变成绝对路径（不改写内容：`..` / 符号链接保持原样，交给 fusermount）。
+///
+/// 用途：`chdir` 之后相对路径就失效了，所以卸载命令要先把挂载点定死。
+fn absolute_path(p: &std::path::Path) -> PathBuf {
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(p))
+        .unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// 本进程的工作目录在某个挂载点里时，切到 `/`。
+///
+/// 为什么需要：`qxync daemon stop` / `qxync umount` 常常就是**在挂载点里**敲的。
+/// 本进程会被占用扫描排除（它下一秒就退出），但 `fusermount3 -u` 不看扫描 ——
+/// 只要 cwd 还在挂载点里就回 EBUSY，纯属误伤。
+fn chdir_out_of(mounts: &[PathBuf]) {
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    if mounts.iter().any(|mp| cwd.starts_with(mp)) {
+        let _ = std::env::set_current_dir("/");
+    }
+}
+
+/// 这个路径此刻是不是挂载点（读 `/proc/self/mounts`，处理空格的八进制转义）。
+///
+/// 用途：`daemon stop` 之后复核「挂载点真的没了吗」—— 进程退出不等于卸载成功：
+/// `--force` 或者检查之后到卸载之前又有人打开文件，`fusermount` 会失败、daemon
+/// 按约定继续退出，挂载点就留下一个连不上的死挂载。这时必须如实告诉用户。
+fn is_mountpoint(path: &std::path::Path) -> bool {
+    let Ok(txt) = std::fs::read_to_string("/proc/self/mounts") else {
+        return false;
+    };
+    let target = path.to_string_lossy().to_string();
+    txt.lines().any(|line| {
+        let mut it = line.split_whitespace();
+        let _dev = it.next();
+        match it.next() {
+            Some(mp) => unescape_mount_field(mp) == target,
+            None => false,
+        }
+    })
+}
+
+/// `/proc/self/mounts` 的转义：`\040` 空格、`\011` tab、`\012` 换行、`\134` 反斜杠。
+fn unescape_mount_field(field: &str) -> String {
+    field
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
 }
 
 /// 优先用命令行参数；其次读已有 link 文件；最后用默认值兜底。
@@ -1048,19 +1110,31 @@ async fn main() -> Result<()> {
         Cmd::Umount { mountpoint } => {
             // 注意：直连模式下队列在挂载进程里，这里只负责卸载；
             // daemon 模式由 daemon 侧排空队列后再卸载。
+            let mp = absolute_path(mountpoint);
+            // 用户常常就在挂载点里敲命令：本进程 cwd 先挪出去，否则 fusermount 回 EBUSY。
+            chdir_out_of(std::slice::from_ref(&mp));
+            // 与 daemon 侧同一套判据：先看谁在用，别让用户对着 Device or resource busy 猜。
+            let busy = qxync_core::mountbusy::scan(&mp);
+            if busy.is_in_use() {
+                bail!(
+                    "{} 卸载失败：还有进程在使用它（先关掉这些程序 / 退出这些目录再重试）：\n{}",
+                    mp.display(),
+                    qxync_core::mountbusy::report(std::slice::from_ref(&busy))
+                );
+            }
             let out = std::process::Command::new("fusermount3")
                 .arg("-u")
-                .arg(mountpoint)
+                .arg(&mp)
                 .output()
                 .or_else(|_| {
                     std::process::Command::new("fusermount")
                         .arg("-u")
-                        .arg(mountpoint)
+                        .arg(&mp)
                         .output()
                 })
                 .context("执行 fusermount3 失败")?;
             if out.status.success() {
-                println!("✅ 已卸载 {}", mountpoint.display());
+                println!("✅ 已卸载 {}", mp.display());
             } else {
                 bail!(
                     "卸载失败: {}{}",
@@ -1800,8 +1874,18 @@ async fn route_via_daemon(
             }
         }
         Cmd::Umount { mountpoint } => {
-            ipc_client::call_ok(&socket, req).await?;
-            println!("✅ 已卸载 {}", mountpoint.display());
+            // daemon 侧会先扫「谁在用」并拒绝占用中的卸载；这里先做两件本进程的事：
+            // 把路径定成绝对（chdir 之后相对路径就废了）、把 cwd 挪出挂载点。
+            let mp = absolute_path(mountpoint);
+            chdir_out_of(std::slice::from_ref(&mp));
+            ipc_client::call_ok(
+                &socket,
+                Request::Umount {
+                    mountpoint: mp.clone(),
+                },
+            )
+            .await?;
+            println!("✅ 已卸载 {}", mp.display());
         }
         Cmd::Pin { path, state } => {
             let v: serde_json::Value = ipc_client::call(&socket, req).await?;
@@ -2703,7 +2787,7 @@ async fn daemon_cmd(cli: &Cli, socket: &std::path::Path, action: &DaemonAction) 
     let all = matches!(
         action,
         DaemonAction::Start { all: true }
-            | DaemonAction::Stop { all: true }
+            | DaemonAction::Stop { all: true, .. }
             | DaemonAction::Status { all: true }
             | DaemonAction::Reload { all: true }
     );
@@ -2789,19 +2873,97 @@ async fn daemon_action_one(
                 );
             }
         }
-        DaemonAction::Stop { .. } => {
+        DaemonAction::Stop { force, .. } => {
             if !ipc_client::available(socket).await {
                 println!("qxyncd（link={link_id}）未在运行");
                 return Ok(());
             }
-            ipc_client::call_ok(socket, Request::Shutdown)
+            let ping: PingData = ipc_client::call(socket, Request::Ping)
                 .await
                 .map_err(ipc_err)?;
-            for _ in 0..40 {
-                if !ipc_client::available(socket).await {
+            // 空转待命的 daemon（还没有连接配置）会对 `mounts` 回 NotLoggedIn ——
+            // 它没有挂载点，当成空表即可，不然 `daemon stop` 反而停不了一个闲着的 daemon。
+            let mounts: Vec<MountInfo> = match ipc_client::call(socket, Request::Mounts).await {
+                Ok(m) => m,
+                Err(e) if e.kind == ErrorKind::NotLoggedIn => Vec::new(),
+                Err(e) => return Err(ipc_err(e)),
+            };
+            let mps: Vec<PathBuf> = mounts.iter().map(|m| m.mountpoint.clone()).collect();
+            // 用户常常就是在挂载点里敲命令：本进程的 cwd 先挪出去。扫描里本进程本来
+            // 就被排除，但 fusermount 不看扫描 —— cwd 还在挂载点里就是 EBUSY。
+            chdir_out_of(&mps);
+            let busy =
+                qxync_core::mountbusy::scan_many(mps.iter().map(|p| p.as_path()), &[ping.pid]);
+            if !busy.is_empty() {
+                let text = qxync_core::mountbusy::report(&busy);
+                if !*force {
+                    bail!(
+                        "{text}\n\n没有停止 qxyncd（pid {}）。先关掉上面列出的程序、退出这些目录后重试；\n\
+                         确实要强制停止：`qxync daemon stop --force`（挂载点里打开着的文件会立刻失效）。",
+                        ping.pid
+                    );
+                }
+                eprintln!("⚠️  挂载点仍被占用，按 --force 继续停止：");
+                eprintln!("{text}");
+            }
+            let sd: ShutdownData = ipc_client::call(socket, Request::Shutdown)
+                .await
+                .map_err(ipc_err)?;
+            if sd.pending_uploads + sd.pending_deletes > 0 {
+                eprintln!(
+                    "⏳ qxyncd 已收到停止请求：还有 {} 个上传、{} 个删除要收尾（两个队列各自最长等 120 秒；作业已入库，等不到会在下次启动继续）…",
+                    sd.pending_uploads, sd.pending_deletes
+                );
+            }
+            // ★ 等**进程**真的退出，而不是等 socket 连不上：
+            //   daemon 退出前要先排空队列、再卸载挂载点（队列卡住时最长 ~2 分钟），
+            //   而 socket 直到最后才删。旧实现只看 socket，10 秒就打印「已停止」，
+            //   用户以为好了、其实进程还在 —— 这就是「daemon 停不下来」的观感来源。
+            let proc_dir = format!("/proc/{}", ping.pid);
+            let t0 = std::time::Instant::now();
+            // 上限 260 秒：上传队列 120s + 删除队列 120s（每个挂载点各算一次）之后
+            // 还要留出 fusermount 的时间。比这更久就真不正常了。
+            let mut next_hint = Duration::from_secs(5);
+            loop {
+                if !std::path::Path::new(&proc_dir).exists() {
                     break;
                 }
+                let waited = t0.elapsed();
+                if waited > Duration::from_secs(260) {
+                    bail!(
+                        "qxyncd（pid {}）收到停止请求后 260 秒仍未退出：卡在排空上传/删除队列或卸载挂载点。\n\
+                         看日志（~/.local/state/qxync/log/qxyncd.log*）或 `qxync daemon status --all`；\
+                         必要时 `kill -9 {}`，但那样挂载点可能残留（要手工 `fusermount3 -uz <挂载点>`）。",
+                        ping.pid,
+                        ping.pid
+                    );
+                }
+                if waited > next_hint {
+                    if next_hint == Duration::from_secs(5) {
+                        eprintln!(
+                            "⏳ qxyncd（pid {}）还在退出：在排空上传/删除队列并卸载挂载点（两个队列各自最长 120 秒）…",
+                            ping.pid
+                        );
+                    } else {
+                        eprintln!("⏳ 已等 {} 秒，仍在退出…", waited.as_secs());
+                    }
+                    next_hint += Duration::from_secs(30);
+                }
                 tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            // 进程退了 ≠ 挂载点一定干净：`--force`、或者检查之后到卸载之前又有人打开
+            // 文件时，fusermount 会失败、daemon 按约定继续退出，留下「连不上」的死挂载。
+            // 给 auto_unmount 一点时间，再复核一次，如实报出来。
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let leftover: Vec<&PathBuf> = mps.iter().filter(|mp| is_mountpoint(mp)).collect();
+            if !leftover.is_empty() {
+                eprintln!("⚠️  qxyncd 已停止，但这些挂载点还在（卸载失败，多半是还有进程占用）：");
+                for mp in &leftover {
+                    eprintln!("   {}", mp.display());
+                }
+                eprintln!(
+                    "   清理：先关掉占用者，再 `fusermount3 -uz <挂载点>`；重新 `qxync daemon start` 也会按记录重挂。"
+                );
             }
             println!("✅ qxyncd 已停止（link={link_id}）");
         }

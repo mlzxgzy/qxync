@@ -5,6 +5,23 @@
 
 [English](CHANGELOG.en.md) · [README](README.md) · [验收记录](docs/验收记录.md)
 
+## [Unreleased]
+
+### 修复
+
+- **`qxync daemon stop` 在挂载点被占用时「看起来停不下来」**：停止前要先排空上传 / 删除
+  队列再卸载挂载点（队列卡住时各等 120 秒），而旧 CLI 只看 socket 连不连得上、10 秒就
+  打印「已停止」，进程其实还在；`fusermount -u` 撞上「有进程在用」时又只回一句
+  `Device or resource busy`，用户不知道是谁占着。真机取证（2026-10-19 12:48:40 →
+  12:50:40）：挂载点里还压着一个未上传作业（`HTML 文件.html`），`daemon stop` 卡了
+  整整 120 秒才退出，CLI 却早已报成功。现在：
+  * 停止前扫 `/proc`（进程 cwd / root / 打开的文件 / mmap，以及挂载点下的子挂载），
+    有进程占用就**列出 pid / 程序 / 路径并拒绝停止**，关掉这些程序后再停；
+    `qxync daemon stop --force` 可强制停止（挂载点里打开着的文件会立刻失效）；
+  * 等**进程真正退出**（不再只等 socket），退出前排空队列时明确说明「在等什么」；
+  * `qxync umount` 走同一套判据：占用中直接返回「谁在用」，不再只回
+    `Device or resource busy`；daemon 侧卸载失败时也会把占用者写进日志。
+
 ## [0.6.6] - 2026-10-19
 
 ### 修复

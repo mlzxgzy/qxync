@@ -265,6 +265,11 @@ systemctl --user restart qxyncd       # with the systemd unit
 qxync daemon stop && qxync daemon start
 ```
 
+Before stopping, `qxync daemon stop` checks whether the mount point is still in use (a file
+inside it is open, or a process `cd`'d into it). If so it lists the `pid / program / path`
+and **refuses to stop** until those programs are closed; add `--force` to stop anyway (open
+files under the mount point stop working immediately). `qxync umount` uses the same check.
+
 Breaking changes when upgrading from 0.1.x (named `qsync`) or 0.2.x (multi-root mounts) are in the
 [CHANGELOG](CHANGELOG.en.md).
 

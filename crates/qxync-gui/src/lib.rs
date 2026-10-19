@@ -224,7 +224,10 @@ async fn self_test_login_inner() -> Value {
     }
 
     // 1) 停掉（可能本来就没跑）
-    let stopped = commands::daemon_stop(None).await.unwrap_or(Value::Null);
+    //    自检没有真实挂载点，`force = true` 只是让这条链路不受环境里其它进程影响。
+    let stopped = commands::daemon_stop(None, Some(true))
+        .await
+        .unwrap_or(Value::Null);
     let stop_ok = stopped["stopped"].as_bool().unwrap_or(false)
         || stopped["already"].as_bool().unwrap_or(false);
 
@@ -414,7 +417,7 @@ async fn self_test_multi_inner() -> Value {
         }}),
     )
     .await;
-    let stop_nas2 = commands::daemon_stop(Some("nas2".into()))
+    let stop_nas2 = commands::daemon_stop(Some("nas2".into()), Some(true))
         .await
         .unwrap_or(Value::Null);
     let offline_nas2 = commands::tasks_config("nas2".into())
@@ -441,7 +444,9 @@ async fn self_test_multi_inner() -> Value {
     let delete_ok = del_done["deleted"].as_bool() == Some(true)
         && del_done["tasks_deleted"].as_u64() == Some(1);
 
-    let stopped = commands::daemon_stop_all().await.unwrap_or(Value::Null);
+    let stopped = commands::daemon_stop_all(Some(true))
+        .await
+        .unwrap_or(Value::Null);
     let _ = std::fs::remove_dir_all(&root);
 
     let default_has = list_default["data"]["tasks"]

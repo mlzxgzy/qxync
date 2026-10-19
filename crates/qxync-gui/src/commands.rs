@@ -8,7 +8,9 @@
 //! * 一次性 6 位验证码**不落盘**：只随本次登录请求发给 daemon，30 秒就过期。
 
 use crate::ipc;
-use qxync_core::ipc::{ErrorKind, PingData, Request, RequestEnvelope, StatusData, IPC_VERSION};
+use qxync_core::ipc::{
+    ErrorKind, MountInfo, PingData, Request, RequestEnvelope, StatusData, IPC_VERSION,
+};
 use qxync_core::totp::{normalize_otp, Otp};
 use qxync_core::{ConfigPaths, Credentials, LinkConfig, Settings};
 use serde::{Deserialize, Serialize};
@@ -58,6 +60,23 @@ async fn wait_gone(socket: &std::path::Path) -> bool {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     false
+}
+
+/// 等某个 **pid 真的消失**（`/proc/<pid>` 不见），最多 `timeout`。
+///
+/// 与 [`wait_gone`] 的区别：socket 要等 daemon 走完退出流程（排空上传/删除队列、
+/// 卸载挂载点）才删；只盯 socket 会在队列卡住时误报「已停止/未退出」。停止按钮
+/// 用 pid 判据，和 CLI 一致。
+async fn wait_pid_gone(pid: u32, timeout: Duration) -> bool {
+    let path = format!("/proc/{pid}");
+    let deadline = std::time::Instant::now() + timeout;
+    while std::path::Path::new(&path).exists() {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    true
 }
 
 async fn wait_ready(socket: &std::path::Path) -> bool {
@@ -576,19 +595,53 @@ pub async fn daemon_start(link_id: Option<String>) -> Result<Value, String> {
 }
 
 /// 干净退出某个连接的 daemon（卸载全部挂载 + 删 socket/pid）。
+///
+/// ★ 停止前先扫挂载点有没有被占用（与 CLI 同一套判据，见 `qxync_core::mountbusy`）：
+/// 有进程开着挂载点里的文件、或者 `cd` 进去了，就**不停止**，把 pid / 程序 / 路径
+/// 报回前端 —— 否则 `fusermount -u` 只会回一句 Device or resource busy，挂载点
+/// 变成连不上的死挂载。内部流程（删连接 / 清数据）确需强停时传 `force = true`。
 #[tauri::command]
-pub async fn daemon_stop(link_id: Option<String>) -> Result<Value, String> {
+pub async fn daemon_stop(link_id: Option<String>, force: Option<bool>) -> Result<Value, String> {
     let id = link_id
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "default".into());
+    let force = force.unwrap_or(false);
     let socket = ipc::socket_path_for(&id);
     if !ipc::available(&socket).await {
         return Ok(
             json!({"stopped": false, "already": true, "id": id, "message": "qxyncd 未在运行"}),
         );
     }
+    // 先看谁在用。空转待命的 daemon（没有连接配置）会对 `mounts` 回 NotLoggedIn，
+    // 它本来就没有挂载点 —— 按空表处理，否则连闲着的 daemon 都停不掉。
+    let ping = ipc::call_typed::<PingData>(&socket, Request::Ping)
+        .await
+        .ok();
+    let mounts = ipc::call_typed::<Vec<MountInfo>>(&socket, Request::Mounts)
+        .await
+        .unwrap_or_default();
+    let skip: Vec<u32> = ping.iter().map(|p| p.pid).collect();
+    let mps: Vec<PathBuf> = mounts.iter().map(|m| m.mountpoint.clone()).collect();
+    let busy = qxync_core::mountbusy::scan_many(mps.iter().map(|p| p.as_path()), &skip);
+    if !busy.is_empty() && !force {
+        return Err(format!(
+            "{}\n\n没有停止 daemon。先关掉上面列出的程序 / 退出这些目录再重试；\
+             必要时用 `qxync daemon stop --force` 强制停止（挂载点里打开着的文件会立刻失效）。",
+            qxync_core::mountbusy::report(&busy)
+        ));
+    }
+    if !busy.is_empty() {
+        eprintln!(
+            "⚠️ 强制停止 daemon（{id}）：{}",
+            qxync_core::mountbusy::report(&busy)
+        );
+    }
     let resp = ipc::call(&socket, Request::Shutdown).await;
-    let gone = wait_gone(&socket).await;
+    // 有 pid 就等进程真的退出（上限与 CLI 一致：两个队列各 120 秒）。
+    let gone = match ping {
+        Some(p) => wait_pid_gone(p.pid, Duration::from_secs(260)).await,
+        None => wait_gone(&socket).await,
+    };
     Ok(json!({
         "stopped": gone, "already": false, "id": id,
         "socket": socket.display().to_string(), "response": resp
@@ -613,16 +666,25 @@ pub async fn daemon_start_all() -> Result<Value, String> {
 }
 
 /// ★ M16：停止所有配置里的连接。
+///
+/// 某条连接被占用时只跳过它（其余照停），并在结果里带上错误 —— 不能因为一条
+/// 有文件开着就让「全部停止」整体失败、别的连接都不动。
 #[tauri::command]
-pub async fn daemon_stop_all() -> Result<Value, String> {
+pub async fn daemon_stop_all(force: Option<bool>) -> Result<Value, String> {
     let p = paths()?;
     let (links, _bad) = LinkConfig::list(&p);
     let mut ids = Vec::new();
+    let mut ok = true;
     for l in &links {
-        let v = daemon_stop(Some(l.id.clone())).await?;
-        ids.push(json!({"id": l.id, "result": v}));
+        match daemon_stop(Some(l.id.clone()), force).await {
+            Ok(v) => ids.push(json!({"id": l.id, "result": v})),
+            Err(e) => {
+                ok = false;
+                ids.push(json!({"id": l.id, "error": e}));
+            }
+        }
     }
-    Ok(json!({"ok": true, "links": ids}))
+    Ok(json!({"ok": ok, "links": ids}))
 }
 
 /// 「保存连接 + 登录」一条龙：
@@ -973,17 +1035,20 @@ pub async fn task_purge(link_id: Option<String>, task_id: String) -> Result<Valu
 /// ★ M19：删除本机**所有** qxync 数据（连接 / 凭据 / 任务 / 缓存 / 状态 / 日志）。
 ///
 /// 会先停掉所有 daemon；NAS 数据与挂载点目录不动。
+///
+/// 这里显式 `force = true`：用户点的是「删除所有数据」，删除前必须把 daemon 收干净；
+/// 有文件开着时由占用报告见日志，不让它把整个清理卡住。
 #[tauri::command]
 pub async fn purge_all() -> Result<Value, String> {
     let p = paths()?;
     let (links, bad) = LinkConfig::list(&p);
     for l in &links {
-        let _ = daemon_stop(Some(l.id.clone())).await;
+        let _ = daemon_stop(Some(l.id.clone()), Some(true)).await;
     }
     // 解析失败的 link 文件也可能还有 daemon 在跑（删完配置它就成了孤儿进程）。
     for (path, _err) in &bad {
         if let Some(id) = path.file_stem().and_then(|s| s.to_str()) {
-            let _ = daemon_stop(Some(id.to_string())).await;
+            let _ = daemon_stop(Some(id.to_string()), Some(true)).await;
         }
     }
     let plan = qxync_core::purge::plan_all(&p, &links);
@@ -1047,7 +1112,10 @@ pub async fn link_delete(
     // 计划要在删任务/连接**之前**算：清单里包含这些文件，删完再算就什么都统计不到了。
     let plan = purge_data.then(|| qxync_core::purge::plan_link(&p, &link, &tasks));
     // 用户还没确认任务怎么处理时先不动 daemon：取消移除不该把正在同步的连接停掉。
-    let stop = daemon_stop(Some(link_id.clone())).await?;
+    //
+    // `force = true`：走到这里说明用户已经确认「移除连接」（含停 daemon、卸挂载点），
+    // 这时候再拿「有文件开着」把人挡回去只会让连接删一半；占用情况仍会打日志。
+    let stop = daemon_stop(Some(link_id.clone()), Some(true)).await?;
     let mut deleted_tasks = 0usize;
     for t in &tasks {
         if qxync_core::tasks::Task::delete(&p, &t.id).map_err(|e| e.to_string())? {

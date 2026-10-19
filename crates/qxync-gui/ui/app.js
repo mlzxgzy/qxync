@@ -3600,7 +3600,20 @@
       return call('daemon_stop_all', {});
     }).then(function (r) {
       if (!r.ok) { logErr('全部停止失败：' + str(r.error)); }
-      else { logOk('全部连接的 daemon 已停止'); }
+      else {
+        // ★ 某条连接被占用时会**单独跳过**（不影响其它连接），逐条把「谁在占用」报出来。
+        var d = isObj(r.data) ? r.data : {};
+        var ls = Array.isArray(d.links) ? d.links : [];
+        var bad = 0;
+        for (var i = 0; i < ls.length; i++) {
+          if (ls[i].error) {
+            bad++;
+            logErr('停止 ' + str(ls[i].id) + ' 失败：' + str(ls[i].error));
+          }
+        }
+        if (!bad) { logOk('全部连接的 daemon 已停止'); }
+        else if (bad < ls.length) { logOk('其余 ' + (ls.length - bad) + ' 个连接的 daemon 已停止'); }
+      }
       return refreshStatus(true).then(function () { return r; });
     });
   }

@@ -763,7 +763,11 @@ async fn handle_idle_conn(
                             tokio::time::sleep(Duration::from_millis(150)).await;
                             let _ = tx.send(()).await;
                         });
-                        to_value(ShutdownData { unmounted: 0 })
+                        // 空转待命：没有任何挂载点，也就没有队列要排空。
+                        to_value(ShutdownData {
+                            unmounted: 0,
+                            ..Default::default()
+                        })
                     }
                     other => {
                         tracing::debug!("空转待命：拒绝 {}（还没有配置 NAS 连接）", other.method());
@@ -1545,13 +1549,22 @@ async fn dispatch(state: &Arc<State>, req: Request, shutdown: &mpsc::Sender<()>)
             .await
         }
         Request::Shutdown => {
-            // 先回响应，再触发退出，避免对端拿不到回包
+            // 先回响应，再触发退出，避免对端拿不到回包。
+            //
+            // ★ 顺手把「还有多少上传/删除没落盘」回给客户端：卸载前要先排空两个队列
+            //   （各自最长 120 秒），队列里有东西时退出会明显变慢。CLI 据此告诉用户
+            //   「在等什么」，而不是干等两分钟看起来像卡死。
+            let (pending_uploads, pending_deletes) = pending_backlog(state);
             let tx = shutdown.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(150)).await;
                 let _ = tx.send(()).await;
             });
-            to_value(ShutdownData { unmounted: 0 })
+            to_value(ShutdownData {
+                unmounted: 0,
+                pending_uploads,
+                pending_deletes,
+            })
         }
     };
     match out {
@@ -2643,7 +2656,7 @@ fn externally_held_records(
 }
 
 async fn umount(state: &Arc<State>, mountpoint: PathBuf) -> Result<serde_json::Value, IpcError> {
-    umount_inner(state, mountpoint, true).await
+    umount_inner(state, mountpoint, true, true).await
 }
 
 /// `umount` 的真正实现。
@@ -2658,12 +2671,32 @@ async fn umount(state: &Arc<State>, mountpoint: PathBuf) -> Result<serde_json::V
 ///
 /// （T6「SIGTERM 保留挂载」做完之后，退出路径会连 fusermount 都不调，
 /// 但这个区分仍然要留着 —— 它现在的语义是「谁该为这次卸载负责」。）
+///
+/// `check_busy`：卸载前要不要先扫 `/proc` 看谁在用（[`qxync_core::mountbusy`]）。
+/// 用户主动卸载时**要**（fusermount 只会回一句 `Device or resource busy`，用户
+/// 不知道是谁占着）；daemon 退出时的清理**不要**（进程马上没了，报错也拦不住退出）。
 async fn umount_inner(
     state: &Arc<State>,
     mountpoint: PathBuf,
     persist_record: bool,
+    check_busy: bool,
 ) -> Result<serde_json::Value, IpcError> {
     let mp = std::fs::canonicalize(&mountpoint).unwrap_or(mountpoint);
+    // ★ 先看谁在用：有进程占着就别把条目从挂载表里摘掉、也别去惊动队列 ——
+    //   直接把这几个进程（pid / 程序 / 路径）告诉用户。
+    if check_busy {
+        let busy = qxync_core::mountbusy::scan(&mp);
+        if busy.is_in_use() {
+            return Err(IpcError::new(
+                ErrorKind::Io,
+                format!(
+                    "{} 卸载失败：还有进程在使用它（先关掉这些程序 / 退出这些目录再重试）：\n{}",
+                    mp.display(),
+                    qxync_core::mountbusy::report(std::slice::from_ref(&busy))
+                ),
+            ));
+        }
+    }
     let mut entry = state.mounts.lock().unwrap().remove(&mp).ok_or_else(|| {
         IpcError::new(
             ErrorKind::BadRequest,
@@ -2700,11 +2733,23 @@ async fn umount_inner(
         .map_err(|e| IpcError::new(ErrorKind::Io, format!("执行 fusermount3 失败: {e}")))?;
     if !out.status.success() {
         // 放回挂载表，保持状态一致
-        let msg = format!(
+        let mut msg = format!(
             "卸载失败: {}{}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
+        // ★ 卸载失败最常见的原因是「挂载点里还有进程在用」（EBUSY）。fusermount
+        //   只会回一句 Device or resource busy —— 再扫一遍 /proc 把「是谁」补上，
+        //   否则用户只看到「卸载失败」，不知道该关哪个程序。
+        //   （这里也会被退出路径用到：那时只进日志，同样有用。）
+        let busy = qxync_core::mountbusy::scan(&mp);
+        if busy.is_in_use() {
+            msg = format!(
+                "{msg}\n{}",
+                qxync_core::mountbusy::report(std::slice::from_ref(&busy))
+            );
+        }
+        tracing::warn!("{}", msg);
         state.mounts.lock().unwrap().insert(mp.clone(), entry);
         return Err(IpcError::new(ErrorKind::Io, msg));
     }
@@ -2807,11 +2852,28 @@ async fn shutdown_all_mounts(state: &Arc<State>) -> usize {
         // 忽略错误：即使 fusermount 失败，进程退出时 auto_unmount 也会兜底。
         // ★ M15/T5：`persist_record=false` —— 退出时的清理不是「用户不要这个挂载点」，
         // 不能让它把 `mounts.json` 清空（否则 T5 的自动重挂每次都无记录可依）。
-        if let Ok(_) = umount_inner(state, mp, false).await {
+        // `check_busy=false`：退出路径不拦用户，占用报告由 umount 的失败分支打日志。
+        if let Ok(_) = umount_inner(state, mp, false, false).await {
             n += 1;
         }
     }
     n
+}
+
+/// 停止前还剩多少上传 / 删除作业没落盘（只用于告诉用户「在等什么」，不做决定）。
+fn pending_backlog(state: &Arc<State>) -> (usize, usize) {
+    let g = state.mounts.lock().unwrap();
+    let mut uploads = 0;
+    let mut deletes = 0;
+    for m in g.values() {
+        if let Some(q) = &m.upload {
+            uploads += q.snapshot().pending as usize;
+        }
+        if let Some(q) = &m.delete_queue {
+            deletes += q.snapshot().pending as usize;
+        }
+    }
+    (uploads, deletes)
 }
 
 /// 判断路径是否已是挂载点（读 `/proc/self/mounts`，处理空格的八进制转义）。

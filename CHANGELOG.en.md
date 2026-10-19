@@ -5,6 +5,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [中文](CHANGELOG.md) · [README](README.en.md) · [Acceptance log](docs/验收记录.md)
 
+## [Unreleased]
+
+### Fixed
+
+- **`qxync daemon stop` looked like it could not stop when the mount point was in use**:
+  stopping first drains the upload / delete queues and then unmounts (each queue may wait
+  up to 120 s), but the old CLI only watched the socket, printed "stopped" after 10 s and
+  left the process running; when `fusermount -u` hit "a process is using it", it only
+  returned `Device or resource busy`, so the user could not tell *who* was holding it.
+  On a real machine (2026-10-19 12:48:40 → 12:50:40) one pending upload (`HTML 文件.html`)
+  made `daemon stop` hang for the full 120 s while the CLI had already reported success.
+  Now:
+  * before stopping, scan `/proc` (process cwd / root / open files / mmap, plus any
+    sub-mounts under the mount point); if anything is in use, **list pid / program / path
+    and refuse to stop** until those programs are closed;
+    `qxync daemon stop --force` still forces it (open files under the mount point stop
+    working immediately);
+  * wait for the **process to actually exit** (not just for the socket), and say what it
+    is waiting for while the queues drain;
+  * `qxync umount` uses the same check: while in use it reports *who* instead of a bare
+    `Device or resource busy`; the daemon also logs the holders when an unmount fails.
+
 ## [0.6.6] - 2026-10-19
 
 ### Fixed

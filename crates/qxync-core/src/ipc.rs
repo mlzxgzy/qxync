@@ -1027,9 +1027,19 @@ pub struct PingData {
     pub uptime_secs: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `shutdown` 的返回（**先回包、再退出**，所以这里只报「收到请求那一刻」的状态）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ShutdownData {
+    /// 本次退出真正卸载了几个挂载点。旧版本恒为 0（退出路径异步完成，回包时还没卸）。
     pub unmounted: usize,
+    /// 收到停止请求时，上传队列里还没落盘的作业数（daemon 会尽力排空，最长 120 秒）。
+    ///
+    /// ★ 给 `qxync daemon stop` 用：队列里有东西时停止会慢，CLI 据此告诉用户
+    /// 「在等什么」，而不是干等 2 分钟看起来像卡死。旧 daemon 不回这两个字段 → 0。
+    pub pending_uploads: usize,
+    /// 收到停止请求时，删除队列里还没推完的作业数（同上）。
+    pub pending_deletes: usize,
 }
 
 // ---------------------------------------------------------------- ★ M8.4 数据体
