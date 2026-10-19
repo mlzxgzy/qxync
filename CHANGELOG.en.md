@@ -35,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `decide` took the `(dirty=false, remote≠base)` branch and, because the local signature ≠
   the stale base, returned **Conflict** - and the then-effective conflict policy produced a
   copy that was **byte-for-byte identical** to the original (2026-10-19 08:06:
-  `防火墙配置 (conflicted copy from devhost 2026-10-19).txt`, 12,218 = 12,218 bytes). The round
+  `防火墙配置 (conflicted copy from <hostname> 2026-10-19).txt`, 12,218 = 12,218 bytes). The round
   now also clears a "hook advances seen this round" table, and every decision (reconcile /
   events / conflict re-judgement) uses "snapshot ∪ this round's hook advances" as the base;
   multiple uploads within one round are matched as a **list** (a directory listing can fall

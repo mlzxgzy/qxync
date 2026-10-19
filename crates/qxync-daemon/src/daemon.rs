@@ -3966,7 +3966,7 @@ async fn tasks_cmd(
             // ① 任务页改了策略**当场不生效**；② 重启后又被 `mounts.json` 的旧值盖回来。
             // 真机 2026-10-19 的现场：任务写 `ask`、`mounts.json` 还是 `rename_local`，
             // 于是本该进「待裁决队列」的冲突直接按 rename_local 生成了冲突副本
-            // （`防火墙配置 (conflicted copy from devhost 2026-10-19).txt`）。
+            // （`防火墙配置 (conflicted copy from <本机名> 2026-10-19).txt`）。
             let canon =
                 std::fs::canonicalize(&t.mountpoint).unwrap_or_else(|_| t.mountpoint.clone());
             let applied = {

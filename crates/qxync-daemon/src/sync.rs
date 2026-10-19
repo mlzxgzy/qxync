@@ -284,7 +284,7 @@ pub struct SyncState {
     /// `remote != base`，节点又被 hook 的 `clear_dirty` 标干净（`dirty == false`）→
     /// 走进 `decide` 的 `(false, true)` 分支，且本地签名 ≠ 旧 base → 判 **Conflict**。
     /// 真机 2026-10-19 08:06 就是这样凭空生成了一个字节完全相同的冲突副本
-    /// （`防火墙配置 (conflicted copy from devhost 2026-10-19).txt`）。
+    /// （`防火墙配置 (conflicted copy from <本机名> 2026-10-19).txt`）。
     ///
     /// ★ 为什么是**列表**而不是单个签名：一轮 20–30 秒，用户可能保存两次（真机那轮
     /// 08:06:23 与 08:06:44 各上传一次），而目录列举完全可能落在两次推进**之间** ——

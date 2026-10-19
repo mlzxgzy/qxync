@@ -1,6 +1,7 @@
 import json, glob, os, re
+from pathlib import Path
 
-root = '/home/tester/项目/qxync/xtask/probe/probe-out'
+root = str(Path(__file__).resolve().parent / 'probe-out')
 files = sorted(glob.glob(root + '/**/*.http', recursive=True))
 rows = []
 for f in files:

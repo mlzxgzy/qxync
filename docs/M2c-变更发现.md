@@ -316,8 +316,7 @@ cargo test -p qxync-proto-test -- --ignored --test-threads=1 --nocapture  # 协�
 ## 10. 修正（2026-10-19，真机事故复盘）
 
 一次真机操作把**三个互相独立**的问题同时暴露出来：08:05–08:06 用户连续保存
-`…/28-比赛项目/01配置备份/防火墙配置.txt`（事件里可见编辑器交换文件
-`.防火墙配置.txt.kate-swp`），08:06:47 该文件被判冲突并生成了副本；删掉副本之后，
+`…/28-比赛项目/01配置备份/防火墙配置.txt`（事件里可见编辑器交换文件），08:06:47 该文件被判冲突并生成了副本；删掉副本之后，
 后续事件仍每轮报 `事件 stat … 失败: status=5 (路径不存在 / 无权限)`。
 取证来源：daemon 日志（`$XDG_STATE_HOME/qxync/log/qxyncd.log.2026-10-18` / `…-10-19`）、
 `sync.db` 的 `journal` 表（`$XDG_DATA_HOME/qxync/sync/<host>/sync.db`）、
@@ -359,8 +358,8 @@ cargo test -p qxync-proto-test -- --ignored --test-threads=1 --nocapture  # 协�
 ### 10.2 凭空冲突副本：本轮上传 hook 推进了 baseline，判定却用开轮快照
 
 * **症状**：连续保存（每次保存都触发一次上传落地）之后凭空出现
-  `防火墙配置 (conflicted copy from devhost 2026-10-19).txt`，且**与原文件字节完全相同**
-  （12218 = 12218）。副本名里的 `devhost` 是本机 hostname —— 是自己跟自己打出冲突。
+  `防火墙配置 (conflicted copy from <本机名> 2026-10-19).txt`，且**与原文件字节完全相同**
+  （12218 = 12218）。副本名里的主机名就是本机 —— 是自己跟自己打出冲突。
 * **根因**：`poll_once` 开轮时克隆 baseline 快照，整轮（几十秒、要列几百个目录）都用它
   判定；上传成功 hook 却在**本轮进行中**就把权威 baseline 推进到刚落上去的签名
   （`SyncState::note_uploaded`）并 `clear_dirty`。于是判这个文件时：

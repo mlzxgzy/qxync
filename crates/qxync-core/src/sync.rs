@@ -908,7 +908,7 @@ mod tests {
     /// `事件 stat` 失败，100% 命中双写前缀）。
     #[test]
     fn event_path_under_home_subdir_is_not_double_prefixed() {
-        // 真机原样路径（含中文目录与空格）
+        // 真机同形路径（含中文目录；账号与目录名已脱敏）
         assert_eq!(
             map_event_path(
                 "/share/homes/test1/.Qsync/2026/28-比赛项目/01配置备份/防火墙配置.txt",

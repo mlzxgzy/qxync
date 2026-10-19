@@ -74,7 +74,7 @@ def main():
     n = a.size_mb * 1024 * 1024
 
     # 造 N 字节文件在磁盘上（分块写，不占内存）
-    tmpdir = os.environ.get("QXYNC_TEST_TMPDIR", "/home/tester/项目/qxync/target/tmp")
+    tmpdir = os.environ.get("QXYNC_TEST_TMPDIR", "target/tmp")
     os.makedirs(tmpdir, exist_ok=True)
     path = os.path.join(tmpdir, f"qxync-mem-{n}.bin")
     print(f"造 {n >> 20} MiB 文件 {path} ...")
