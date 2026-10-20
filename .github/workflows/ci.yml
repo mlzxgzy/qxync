@@ -90,8 +90,19 @@ jobs:
 
       # ★ M21：离线可重启 daemon 的隔离 e2e —— 假 NAS（127.0.0.1:9）+ 真 FUSE 挂载。
       # 断言：离线启动后挂载点从 mounts.json + listings 表恢复、离线 ls / 写缓冲、
-      # 第二次离线重启幂等。需要 /dev/fuse 与 python3，缺任一自动 SKIP
-      # （CI 的 ubuntu runner 没有 /dev/fuse，本地与真机验收跑全量）。
+      # 第二次离线重启幂等。需要 /dev/fuse 与 python3，缺任一自动 SKIP。
+      #
+      # ★ v0.7.0 首跑抓到的坑（2026-10-20）：runner 的 /dev/fuse **是有的**（这步
+      #   真跑了，不是 SKIP），但 stock /etc/fuse.conf 没有 `user_allow_other` ——
+      #   脚本 fixture 的 mounts.json 忠实还原 task add 流程（auto_unmount=true），
+      #   fuser 据此传 allow_other → fusermount3 拒绝非特权挂载 → 恢复挂载失败，
+      #   9 条断言连锁挂。本地能过是因为开发机的 /etc/fuse.conf 已启用它。
+      #   修法：跑之前把这行放开（runner 是 sudo 免密的）。
+      - name: 启用 FUSE user_allow_other（auto_unmount 挂载需要）
+        run: |
+          sudo sed -i 's/^#user_allow_other$/user_allow_other/' /etc/fuse.conf || true
+          grep -q '^user_allow_other' /etc/fuse.conf || echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
+          grep '^user_allow_other' /etc/fuse.conf
       - name: M21 离线重启 e2e（隔离 XDG + 真 FUSE，无 /dev/fuse 时 SKIP）
         run: bash xtask/tests/m21-offline-restart.sh
 
