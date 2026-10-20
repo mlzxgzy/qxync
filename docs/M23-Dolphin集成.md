@@ -112,7 +112,7 @@ include 空（默认索引整个家目录）→ 与家目录有交集 → 会索
 
 | 层 | 文件 | 内容 |
 |---|---|---|
-| core | `src/baloo.rs`（新） | `BalooConfig::parse/load`、`is_excluded`、`would_index`、`find_balooctl`、`exclude_cmd`、`shell_quote` + 10 个单测 |
+| core | `src/baloo.rs`（新） | `BalooConfig::parse/load`、`is_excluded`、`would_index`、`find_balooctl`、`exclude_cmd`、`shell_quote` + 12 个单测（含 balooctl 实写格式 `[$e]`/尾斜杠、`config_path` 的 XDG 语义） |
 | core | `src/settings.rs` | `Settings.dolphin_tags`（`#[serde(default)]`，旧文件零迁移）+ `set_kv("dolphin_tags")` |
 | core | `src/ipc.rs` | `Request::BalooStatus`（`baloo_status`）、`BalooStatusData`/`BalooMountInfo`、`MountInfo.baloo_warning`（`skip_serializing_if=None`，老客户端无感） |
 | fuse | `src/lib.rs` | `QxyncFs.dolphin_tags: Arc<AtomicBool>` + `with_dolphin_tags`；`getxattr`/`listxattr` 拆出可单测的 `xattr_value`/`xattr_names`；`user.xdg.tags` 条件暴露 |
@@ -139,9 +139,11 @@ include 空（默认索引整个家目录）→ 与家目录有交集 → 会索
 
 ### 单测（全绿）
 
-* `qxync-core::baloo`：10 例 —— 缺省视为开 / 只有字面 false 才关 / 排除与 include
-  列表解析 / `~` 与 `$HOME` 展开 / 排除覆盖自身与后代但不覆盖内部 / 双向祖先交集 /
-  家目录外默认不索引 / `find_balooctl` KF6 优先 / shell 引用 / 命令拼装；
+* `qxync-core::baloo`：12 例 —— 缺省视为开 / 只有字面 false 才关 / 排除与 include
+  列表解析 / `~` 与 `$HOME` 展开 / **balooctl 实写格式（`[$e]` 标记 + 尾斜杠 +
+  逗号多项）** / **`config_path` 的 XDG 语义（未设/绝对/相对回落）** / 排除覆盖
+  自身与后代但不覆盖内部 / 双向祖先交集 / 家目录外默认不索引 / `find_balooctl`
+  KF6 优先 / shell 引用 / 命令拼装；
 * `qxync-fuse`：`xdg_tags_reflect_hydration_state_only_when_enabled` —— 开关关
   ENODATA+名单不含 → 开：三态逐一对上 + 目录空串 + 名单含 + 末尾 NUL → 再关：
   立刻消失（`Arc<AtomicBool>` 热切换）。
@@ -163,12 +165,49 @@ include 空（默认索引整个家目录）→ 与家目录有交集 → 会索
 4. 热切换：关回去 → ENODATA 立刻出现（无重挂载）；
 5. 净退出：设置还原 + 门禁段加的 Baloo 排除项移除。
 
+**真机验证（2026-10-20，CachyOS / baloo 6.31 / KDE，9/9 全绿）**：上述 1–5
+全部通过。真机首跑暴露了两个实现 bug（当时单测/假连接实测都没覆盖到），
+已修复并补了单测：
+
+* **读侧不认 `XDG_CONFIG_HOME`**：balooctl 写配置走 KConfig 语义
+  （`$XDG_CONFIG_HOME/baloofilerc` 优先），而 `config_path()` 写死了
+  `$HOME/.config`。真实用户环境两者恰好一致（XDG 未设）所以没炸；
+  fuse-matrix 为隔离凭据设了 `XDG_CONFIG_HOME` → 门禁永远看不到
+  balooctl 刚写的排除项。修复：`config_path` 对齐 KConfig 语义（拆出
+  可单测的 `config_path_with`）。
+* **不认 balooctl 实写的键格式**：balooctl 写的是
+  `exclude folders[$e]=$HOME/项目/.../mnt-m23/` —— 键带 KConfig 扩展标记
+  `[$e]`、值是 `$HOME` 变量形式 + 尾斜杠。解析器只精确匹配
+  `exclude folders` → 一个条目都读不到。修复：键匹配前剥 `[...]` 后缀
+  （`$HOME` 展开和尾斜杠的组件比较原本就有，恰好兜住）。
+
+顺带修了 fuse-matrix 自身的两个测试缺陷（见 §5.1）。
+
 ### 手工（Dolphin，真机）
 
 1. 排除挂载点 → 开开关 → Dolphin 右键列头勾 Tags → 三态可见；
 2. F5 / 重进目录刷新语义符合预期；
 3. 挂载点上加标签 → 报「不支持」（`setxattr` 未实现，预期行为）；
 4. `tags://` 虚拟目录搜不到这些标签（走 Baloo 索引库，预期行为）。
+
+### 5.1 真机验证顺带修掉的 fuse-matrix 测试缺陷
+
+* **M23 段不重置起始状态**：门禁只在「关→开」边沿拦（产品语义，见
+  `settings_save_cmd` 注释）。上一轮跑挂在中途 / 外部手动验证把
+  `dolphin_tags=true` 留在 settings.json 里，下一轮的门禁断言就被边沿
+  条件静默吞掉（实测：手动验证 save true 后没还原 → 下一轮「门禁未拦」
+  + M23-3 全红，且日志线索极具误导性）。修复：M23 段开跑先
+  `save_dolphin false` 强制回到已知状态。
+* **缓存清理不认 host 子目录**（M9 布局）：`rm -f "$CACHE"/*` 删不掉
+  `qnap.kdajv.com/` 目录 → 残留缓存让「读元数据不触发下载」「#11 不吐
+  假数据」「稀疏缓存 apparent size」三个断言假失败（cat 命中上轮已下载
+  的区间，EIO 前吐了 128 KiB 真数据）。修复：`rm -rf` + 稀疏缓存断言
+  改用 `find` 拿完整路径（`ls -S` 对子目录布局输出 basename，stat 找
+  不到文件）。
+
+基线对照（`dbc02cb`，M23 之前的代码）确认：fuse-matrix 剩余失败
+（M2b 改名三项、M2c 删除熔断/冲突副本等）在基线上同样失败 —— 是
+WAN 环境下 NAS 端 rename/删除判定的固有问题，与 M23 无关。
 
 ## 6. 已知限制（调研文档 §5 全部继承）
 

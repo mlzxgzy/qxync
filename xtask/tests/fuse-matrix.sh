@@ -106,7 +106,10 @@ cleanup() {
 trap cleanup EXIT
 
 echo "=== 挂载（只读 + on-demand，60s 水合超时）==="
-rm -f "$CACHE"/*
+# ★ 缓存按 host 分子目录（M9）：rm -f 删不掉子目录，残留会让「读元数据不触发
+#   下载」「#11 不吐假数据」等断言假失败（实测踩过：上轮的 qnap.kdajv.com/ 留下，
+#   cat 命中已下载区间 → EIO 前吐了 128 KiB 真数据）。
+rm -rf "$CACHE"/*
 "$QS" mount "$MNT" --remote "${QXNYC_REMOTE_ROOT:-/home}" --cache-dir "$CACHE" \
       --threads 4 --auto-unmount ${QXNYC_MOUNT_EXTRA:-} >"$LOG" 2>&1 &
 MOUNT_PID=$!
@@ -150,11 +153,13 @@ if cmp -s "$RUNDIR/head100.bin" <(head -c 100 "$LOCAL_FIXTURE/big.bin"); then
 else
   bad "head -c 100 数据不正确"
 fi
-bigcache=$(ls -S "$CACHE" 2>/dev/null | head -1)
+# ★ 缓存按 host 分子目录（M9），用 find 拿完整路径；跳过 .qxstate/.qxsum 边车文件
+bigcache=$(find "$CACHE" -type f ! -name '*.qxstate' ! -name '*.qxsum' -printf '%s %p\n' 2>/dev/null \
+           | sort -rn | head -1 | cut -d' ' -f2-)
 if [ -n "$bigcache" ]; then
-  apparent=$(stat -c %s "$CACHE/$bigcache")
-  alloc_kib=$(( $(stat -c %b "$CACHE/$bigcache") / 2 ))
-  echo "  缓存 $bigcache: apparent=${apparent}B allocated=${alloc_kib}KiB"
+  apparent=$(stat -c %s "$bigcache")
+  alloc_kib=$(( $(stat -c %b "$bigcache") / 2 ))
+  echo "  缓存 $(basename "$bigcache"): apparent=${apparent}B allocated=${alloc_kib}KiB"
   check "$([ "$apparent" = "134217728" ] && echo 0 || echo 1)" "稀疏缓存 apparent size = 文件大小（128 MiB）"
   # 128 KiB 区间 + 文件系统开销，宽限到 300 KiB；M1 的整文件水合会是 128 MiB
   check "$([ "$alloc_kib" -le 300 ] && echo 0 || echo 1)" "只下载了 1 个区间（allocated ≤ 300 KiB，M1 整文件会是 131072 KiB）"
@@ -190,7 +195,7 @@ echo "=== #11 水合失败 → EIO，不挂死、不零填充 ==="
 # 0 秒是确定性的失败注入。
 MNT2="$RUNDIR/mnt-timeout"
 mkdir -p "$MNT2"
-rm -f "$CACHE"/*          # 别让上一个挂载的缓存把这步短路
+rm -rf "$CACHE"/*          # 别让上一个挂载的缓存把这步短路
 "$QS" mount "$MNT2" --remote "${QXNYC_REMOTE_ROOT:-/home}" --cache-dir "$CACHE" \
       --threads 2 --auto-unmount --hydrate-timeout 0 >>"$LOG" 2>&1 &
 for _ in $(seq 1 30); do is_mounted "$MNT2" && break; sleep 0.5; done
@@ -237,7 +242,7 @@ if [ "$BIG" = "1" ]; then
   echo "=== 水合去重（4 并发读同一文件）==="
   unmount_retry "$MNT"
   # 重新挂载以清掉内核 page cache，否则读到的是内核缓存，测不出并发
-  rm -f "$CACHE"/* "$RUNDIR"/dedup-*.txt
+  rm -rf "$CACHE"/* "$RUNDIR"/dedup-*.txt
   : >"$LOG"
   RUST_LOG=debug "$QS" mount "$MNT" --remote "${QXNYC_REMOTE_ROOT:-/home}" --cache-dir "$CACHE" \
         --threads 4 --auto-unmount --hydrate-timeout "$HYD" >>"$LOG" 2>&1 &
@@ -712,6 +717,12 @@ PYEOF
 if "$QS" mount "$MNT23" --remote "${QXNYC_REMOTE_ROOT:-/home}" --cache-dir "$CACHE23" \
         --threads 2 >/dev/null 2>&1; then
   M23="$MNT23$(echo "$FIXTURE" | sed 's#^/home##')"
+
+  # ★ 开跑先重置到已知状态：门禁只在「关→开」边沿拦（产品语义，见
+  #   settings_save_cmd 注释），若上一轮跑挂在中途 / 外部验证把 dolphin_tags
+  #   留成了 true，这轮 M23-2 的门禁断言会被边沿条件静默吞掉（实测踩过：
+  #   手动验证 save true 后没还原，下一轮「门禁未拦」+ M23-3 全红）。
+  save_dolphin false >/dev/null 2>&1
 
   # ---- M23-1 默认关：ENODATA + 名单里没有（M23 之前的行为一字不变）
   check "$([ "$(xdg_tags "$M23/hello.txt")" = ERR61 ] && echo 0 || echo 1)" \
