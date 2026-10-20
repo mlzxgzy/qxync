@@ -21,10 +21,14 @@ Dolphin **没有**「插件往列表里加一列」的接口（列是 `KFileItem
 
 * 只对 `fstype == fuse.qxync` 的挂载点里的本地文件生效（`/proc/self/mounts`，
   2 秒缓存）；其它路径**一次 xattr 都不读**，普通目录零开销。
-* 开关与 FUSE 侧同源：`user.xdg.tags` 不存在（ENODATA）= Dolphin 集成关 →
-  不画角标。打开方式见 M23 文档（设置 → 高级，需要先把挂载点排除出 Baloo 索引）。
-* 语义读 `user.qxync.state`（placeholder / partial / hydrated）；目录的
-  `user.xdg.tags` 是空串 → 目录不画角标。
+* 开关开/关是**热切换**（FUSE 现算属性），关掉后角标立刻消失，不用重挂载；
+  但已打开的 Dolphin 窗口要 F5 / 重进目录才刷新。
+* **独立开关**：读 `user.qxync.overlay`（不是 Tags 列用的 `user.xdg.tags`）。
+  属性不存在（ENODATA）= 角标开关关着（或该挂载点会被 Baloo 索引）→ 不画角标。
+  打开方式：GUI 设置 → 高级 →「在文件图标上显示状态角标」（默认关，与 Tags 列
+  是两个独立开关，可只开一个；需要先把挂载点排除出 Baloo 索引）。
+* 属性值就是三态本身（`placeholder` / `partial` / `hydrated`）；目录是空串 →
+  目录不画角标。插件只读、无状态。
 * 图标走 hicolor 主题（`qxync-hydrated` 等），Dolphin 用 `QIcon::fromTheme` 解析。
 * `getOverlays` 在 Dolphin 主线程调用：只做字符串比较 + 2 次 `getxattr`（本地
   daemon 应答），不联网、不枚举目录。大目录下每个可见条目 2 次 FUSE 往返，
@@ -73,7 +77,7 @@ QT_PLUGIN_PATH=$HOME/.local/lib/qt6/plugins dolphin
 * 图标来自主题缓存：换过 SVG 后若没更新，`gtk-update-icon-cache ~/.local/share/icons/hicolor`
   或重登一次；Dolphin 进程内的 `QIcon` 缓存按进程存活。
 * `QT_DEBUG_PLUGINS=1 dolphin` 可以看到插件是否被加载。
-* 查看 xattr 原文：`getfattr -d <文件>`（`user.xdg.tags` / `user.qxync.state`）。
+* 查看 xattr 原文：`getfattr -d <文件>`（`user.qxync.overlay` / `user.qxync.state`）。
 
 ## 已知限制
 

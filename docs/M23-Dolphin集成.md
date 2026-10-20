@@ -105,10 +105,16 @@ include 空（默认索引整个家目录）→ 与家目录有交集 → 会索
 | 名字 | 值 | 说明 |
 |---|---|---|
 | `user.xdg.tags` | `✓` / `☁` / `◐` / 空串 | **动态算的**，不落盘；目录 = 空串。字符与语义的映射见评论区（`✓`=hydrated、`☁`=placeholder、`◐`=partial） |
+| `user.qxync.overlay` | `placeholder` / `partial` / `hydrated` / 空串 | ★ M24：**角标插件专用**（`contrib/dolphin/overlay` 读它；值就是三态本身，目录 = 空串，开关关 → `ENODATA`）。与 `user.xdg.tags` **相互独立** |
 
-* 开关关 → `getxattr` 回 `ENODATA`、`listxattr` 名单不含它 —— Dolphin 的
-  `queryAttributes` 当这个文件没有 Tags 属性，**M23 之前的行为一字不变**；
+* 两个开关各管一个属性：`dolphin_tags` → `user.xdg.tags`（Tags 列），
+  `dolphin_overlay` → `user.qxync.overlay`（角标插件）；默认都关，可只开一个；
+* 开关关 → `getxattr` 回 `ENODATA`、`listxattr` 名单不含它 —— 对应通道完全静默，
+  M23/M24 之前的行为一字不变；
 * 开关开 → 名单含它、值按 `user.qxync.state`（placeholder/partial/hydrated）映射；
+* 两开关共用同一套 Baloo 前置门禁与「按挂载点判定」（`设置开 && 不会被索引`）；
+  `baloo_status` 会顺带**热刷新**挂载点标志 —— 用户在终端手动排除后点 GUI 的
+  「重新检测 Baloo」即可生效，不用重挂载；
 * `setxattr` 不实现（有意）：用户在挂载点上加自己的标签会报「不支持」——
   挂载点上的标签是系统生成的只读状态，脱水后也不该跟着走。
 
@@ -226,6 +232,9 @@ WAN 环境下 NAS 端 rename/删除判定的固有问题，与 M23 无关。
 
 ### 8.1 为什么又做插件
 
+> M24 起角标是**独立开关**（`settings.dolphin_overlay`，默认关），不再借用
+> Tags 的开关；两条通道可以只开一个。详见 §8.5。
+
 Tags 列**只能显示文字/字符**：字号跟正文一样、没有颜色。真机上「已水合」这行字
 在满屏文件名里并不显眼（用户实测反馈：「看也看不太出来」）。要 CFA（Windows
 Cloud Files API）/ 资源管理器那种**文件图标上的彩色角标**，Dolphin 唯一开放的
@@ -251,20 +260,22 @@ Cloud Files API）/ 资源管理器那种**文件图标上的彩色角标**，Do
 | `icons/qxync-*.svg` | 三个 16px 网格图标：绿圆白对钩 / 蓝云 / 半满圆 |
 | `README.md` | 构建、系统级/用户级安装、重启 Dolphin、排查、限制、卸载 |
 
-判定顺序（`getOverlays`）：
+判定顺序（`getOverlays`，M24 起只读一个 xattr）：
 
 ```text
-URL 不是 file://                              → {}
-不在 fuse.qxync 挂载点下                      → {}   （一次 xattr 都不读）
-user.xdg.tags 不存在（= 开关关）或为空串（目录）→ {}
-user.qxync.state = hydrated                   → qxync-hydrated
-                  partial                     → qxync-partial
-                  placeholder                 → qxync-placeholder
+URL 不是 file://                                    → {}
+不在 fuse.qxync 挂载点下                            → {}   （一次 xattr 都不读）
+user.qxync.overlay 不存在（= 角标开关关 / 挂载点会被索引）→ {}
+值为空串（目录）                                    → {}
+值 = hydrated                                       → qxync-hydrated
+值 = partial                                        → qxync-partial
+值 = placeholder                                    → qxync-placeholder
 ```
 
-**为什么读 `user.qxync.state` 而不是认 tags 字符**：语义与展示解耦 —— 以后改
-Tags 列的字面（或做本地化）不会让角标跟着坏；开关仍由 `user.xdg.tags` 是否
-存在表达（和 FUSE 同源，关掉开关角标立刻消失，不需要重装插件）。
+**为什么读专用属性 `user.qxync.overlay` 而不是认 tags 字符**：语义与展示解耦 ——
+改 Tags 列的字面/图标字符不会让角标跟着坏；而且 Tags 列与角标是**两个独立开关**
+（只开角标、不写 tags 也完全正常）。开关状态由 FUSE 侧现算：开关关着、或该挂载点
+会被 Baloo 索引时，属性根本不存在（`ENODATA`），插件只读、无状态。
 
 ### 8.3 实测（本机，Dolphin 26.08.2 / KF6 6.31 / Wayland）
 
@@ -273,7 +284,11 @@ Tags 列的字面（或做本地化）不会让角标跟着坏；开关仍由 `u
 * **截图可见**：两个已水合文件左下角绿色对钩，目录与普通文件无角标；
 * 非挂载点路径（`/etc/hostname`）不读 xattr、直接返回空（日志验证）；
 * 图标在 8 / 16 / 22 / 32 / 64 px 下都渲染正常（`QIcon::fromTheme` 逐尺寸渲染检查）；
-* 开关关（`user.xdg.tags` ENODATA）→ 角标消失（插件只读、无状态）。
+* 开关关（`user.qxync.overlay` ENODATA）→ 角标消失（插件只读、无状态）；
+* **开关热切换实测**：IPC `settings_save` 把 `dolphin_overlay` 关掉 → 两个文件的
+  xattr 立即 `No such attribute`、重开 Dolphin 无角标（Tags 列的 `✓` 不受影响，
+  两开关独立）；再打开 → xattr 立即回到 `hydrated` / `placeholder`，角标恢复，
+  全程没重挂载。
 
 ### 8.4 安装与限制
 
@@ -282,10 +297,26 @@ Tags 列的字面（或做本地化）不会让角标跟着坏；开关仍由 `u
 * 用户级：装 `~/.local` 后要给 Dolphin 设 `QT_PLUGIN_PATH`（Qt 默认不搜
   `~/.local/lib/qt6/plugins`，实测 `KPluginMetaData::findPlugins` 只认
   `QCoreApplication::libraryPaths()`）；
+* 装完插件还要在 GUI **设置 → 高级**打开「在文件图标上显示状态角标」开关
+  （默认关；与 Tags 列开关独立，可只开一个），保存时同样走 Baloo 预检/门禁；
 * Dolphin **在创建视图时**加载插件：已经开着的窗口不会热加载，重启 Dolphin 即可；
 * 详情视图默认 16px 图标 → 角标只有 8px（能认，但小）；把图标尺寸调到 22/32px
   会得到 16/22px 角标；
 * 只支持本地 `file://`、KF6 Dolphin；最多 3 个角标；状态仍不实时推送（F5 刷新）。
+
+### 8.5 开关语义（M24）
+
+| 层 | 行为 |
+|---|---|
+| `settings.json` | 新增 `dolphin_overlay`（`#[serde(default)]`，默认 **关**；旧文件零迁移） |
+| GUI | 高级区两个复选框：Tags 列 / 文件角标；任一「关→开」边沿 → 先做 Baloo 预检（不过就弹终端一键排除），daemon 侧同一道门禁兜底 |
+| FUSE | `QxyncFs.dolphin_overlay: Arc<AtomicBool>`；`user.qxync.overlay` 条件暴露 + 进 `listxattr` 名单 |
+| daemon | `mount` 时按 `设置开 && !会被索引` 算初值；`settings_save` 热刷新；`baloo_status` 也顺带刷新（手动排除后「重新检测」即生效） |
+| CLI | `qxync state` / `qxync baloo-status` 显示两个开关；直连 `--set dolphin_overlay=true` 打同样的前置警告 |
+| 兼容 | 老 daemon 没有该属性 → 插件不画角标（`ENODATA`），本版本之前的行为一字不变 |
+
+实测（本机 Dolphin 26.08.2 / KF6 6.31）：开 → 绿对钩 + 蓝云；关 → 角标消失；
+再开 → 立刻恢复；Tags 列开关全程不受影响。
 
 ## 7. 与既有行为的关系
 

@@ -3076,6 +3076,13 @@ pub struct QxyncFs {
     /// 索引 —— 两个条件都满足才置 true（不满足时 tags 静默不暴露，挂载照常）。
     /// 默认 false = M23 之前的行为一字不变（`user.xdg.tags` 不在名单里）。
     dolphin_tags: Arc<AtomicBool>,
+    /// ★ M24：Dolphin 角标 —— 是否暴露 `user.qxync.overlay`（供
+    /// `contrib/dolphin/overlay` 的 `KOverlayIconPlugin` 画文件图标角标）。
+    ///
+    /// 与 `dolphin_tags` **独立开关**（两个可以只开一个），同样与 daemon 共享
+    /// `Arc<AtomicBool>`、`settings_save` 热切换。值是该条目的三态字符串
+    /// （placeholder / partial / hydrated），目录为空串，关着时整个属性不存在。
+    dolphin_overlay: Arc<AtomicBool>,
 }
 
 /// ★ M7：LAN 快路径计数（`status` 里能看到省了多少次 NAS 请求）。
@@ -3199,6 +3206,8 @@ impl QxyncFs {
             connectivity: None,
             // ★ M23：默认关 = 不暴露 user.xdg.tags（M23 之前的行为一字不变）。
             dolphin_tags: Arc::new(AtomicBool::new(false)),
+            // ★ M24：默认关 = 不暴露 user.qxync.overlay（不装角标插件的人无感）。
+            dolphin_overlay: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -3223,6 +3232,18 @@ impl QxyncFs {
     /// ★ M23：当前是否暴露 `user.xdg.tags`（诊断 / 测试用）。
     pub fn dolphin_tags_enabled(&self) -> bool {
         self.dolphin_tags.load(Ordering::Relaxed)
+    }
+
+    /// ★ M24：注入 Dolphin **角标**开关（`contrib/dolphin/overlay` 插件读
+    /// `user.qxync.overlay`）。与 `with_dolphin_tags` 一样是活开关，热切换不重挂载。
+    pub fn with_dolphin_overlay(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.dolphin_overlay = flag;
+        self
+    }
+
+    /// ★ M24：当前是否暴露 `user.qxync.overlay`（诊断 / 测试用）。
+    pub fn dolphin_overlay_enabled(&self) -> bool {
+        self.dolphin_overlay.load(Ordering::Relaxed)
     }
 
     /// 单个 xattr 的值（`None` = ENODATA / 节点不存在）。
@@ -3278,6 +3299,21 @@ impl QxyncFs {
                     (false, _) => String::new(),
                 })
             }
+            // ★ M24：Dolphin 角标插件读的专用属性（与 tags 独立开关）。
+            // 值是三态字符串本身（placeholder / partial / hydrated），目录为空串 ——
+            // 插件据此选图标；开关关着时属性不存在（ENODATA），插件不画角标。
+            "user.qxync.overlay" => {
+                if !self.dolphin_overlay_enabled() {
+                    return None;
+                }
+                Some(match (is_dir, state) {
+                    (true, _) => String::new(),
+                    (false, "placeholder") => "placeholder".into(),
+                    (false, "partial") => "partial".into(),
+                    (false, "hydrated") => "hydrated".into(),
+                    (false, _) => String::new(),
+                })
+            }
             _ => None,
         }
     }
@@ -3293,6 +3329,9 @@ impl QxyncFs {
         );
         if self.dolphin_tags_enabled() {
             names.push_str("user.xdg.tags\0");
+        }
+        if self.dolphin_overlay_enabled() {
+            names.push_str("user.qxync.overlay\0");
         }
         names
     }
@@ -7159,6 +7198,77 @@ mod tests {
         flag.store(false, Ordering::Relaxed);
         assert_eq!(fs.xattr_value(ino, "user.xdg.tags"), None);
         assert!(!fs.xattr_names().contains("user.xdg.tags"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M24：`user.qxync.overlay` —— 角标专用属性，与 `user.xdg.tags` **独立开关**。
+    ///
+    /// 三态值直接是 placeholder / partial / hydrated（插件不再认 Tags 字符）；
+    /// 目录空串、开关关着时整个属性不存在。
+    #[test]
+    fn overlay_xattr_is_independent_from_tags_and_reflects_state() {
+        let dir = std::env::temp_dir().join(format!("qxync-fuse-m24-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let tags = Arc::new(AtomicBool::new(false));
+        let overlay = Arc::new(AtomicBool::new(false));
+        let (fs, ino, _cache) = {
+            let (fs, ino, cache) = hydrated_fs(&dir, Arc::new(Mutex::new(HashMap::new())));
+            let fs = fs
+                .with_dolphin_tags(tags.clone())
+                .with_dolphin_overlay(overlay.clone());
+            (fs, ino, cache)
+        };
+        let set_state = |frac: f64| {
+            let mut g = fs.inner.lock().unwrap();
+            let n = g.nodes.get_mut(&ino).unwrap();
+            let total = n.chunk_count(DEFAULT_CHUNK_SIZE);
+            let done = ((total as f64) * frac).round() as usize;
+            n.chunks_done = vec![false; total];
+            for d in n.chunks_done.iter_mut().take(done) {
+                *d = true;
+            }
+        };
+
+        // 两个开关都关：两个属性都不存在
+        assert_eq!(fs.xattr_value(ino, "user.qxync.overlay"), None);
+        assert!(!fs.xattr_names().contains("user.qxync.overlay"));
+
+        // 只开角标：overlay 有值，tags 仍然没有（两条通道互不影响）
+        overlay.store(true, Ordering::Relaxed);
+        set_state(0.0);
+        assert_eq!(
+            fs.xattr_value(ino, "user.qxync.overlay"),
+            Some("placeholder".into())
+        );
+        assert_eq!(fs.xattr_value(ino, "user.xdg.tags"), None);
+        set_state(0.5);
+        assert_eq!(
+            fs.xattr_value(ino, "user.qxync.overlay"),
+            Some("partial".into())
+        );
+        set_state(1.0);
+        assert_eq!(
+            fs.xattr_value(ino, "user.qxync.overlay"),
+            Some("hydrated".into())
+        );
+        assert!(fs.xattr_names().contains("user.qxync.overlay"));
+        assert!(fs.xattr_names().ends_with('\0'));
+
+        // 目录：空串（插件据此不画角标）
+        let dentry = DirEntry::local("sub", true, 0, 223);
+        let dnode = fs.insert_node(INodeNo::ROOT, "sub", "/home/sub", &dentry);
+        assert_eq!(
+            fs.xattr_value(dnode.ino, "user.qxync.overlay"),
+            Some(String::new())
+        );
+
+        // 只开 tags：overlay 关掉后立刻消失，tags 恢复（仍是独立开关）
+        overlay.store(false, Ordering::Relaxed);
+        tags.store(true, Ordering::Relaxed);
+        assert_eq!(fs.xattr_value(ino, "user.qxync.overlay"), None);
+        assert!(!fs.xattr_names().contains("user.qxync.overlay"));
+        assert_eq!(fs.xattr_value(ino, "user.xdg.tags"), Some("✓".into()));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

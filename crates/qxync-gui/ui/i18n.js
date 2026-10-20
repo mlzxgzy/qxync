@@ -260,7 +260,7 @@
     'modal.cancel': '取消',
 
     // ---- ★ M23 Dolphin 集成（user.xdg.tags / Baloo 门禁）
-    'adv.dolphin_hint': '打开后，挂载点里每个文件的 Tags 列写成图标字符（✓ 已水合 / ☁ 仅在线 / ◐ 部分本地）；装了 contrib/dolphin/overlay 的角标插件后，文件图标上还会直接显示彩色角标（绿对钩 / 蓝云）。前置条件：挂载点必须已排除出 Baloo 索引（否则索引器会把整个 NAS 拉到本地）。状态不实时刷新（F5 / 重进目录后更新）。',
+    'adv.dolphin_hint': '两个开关相互独立，可只开一个，默认都关。Tags 列：把图标字符（✓ 已水合 / ☁ 仅在线 / ◐ 部分本地）写进 user.xdg.tags。文件角标：装了 contrib/dolphin/overlay 的 KOverlayIconPlugin 插件后，Dolphin 在文件图标上画彩色角标（绿对钩 / 蓝云），读的是 user.qxync.overlay。两者前置条件相同：挂载点必须已排除出 Baloo 索引（否则索引器会把整个 NAS 拉到本地）。状态都不实时刷新（F5 / 重进目录后更新）。',
     'baloo.title': '需要先排除 Baloo 索引',
     'baloo.why': '这些挂载点还没排除出 Baloo 索引：{mounts}。Baloo 的内容索引器会读文件内容 —— 在 qxync 挂载点上等于把整个 NAS 拉到本地，节省空间模式就废了。点「打开终端」会自动执行排除命令（全程可见，跑完窗口留在原地）。',
     'baloo.open_terminal': '打开终端，自动添加排除',
@@ -276,7 +276,8 @@
     'baloo.mount_excluded': '已排除',
     'baloo.mount_safe': '不会被索引',
     'baloo.tags_on': 'Tags 已生效',
-    'baloo.tags_note': '在 Dolphin 里右键列头勾「Tags」列即可看到水合状态；状态变化要 F5 / 重进目录才刷新。',
+    'baloo.overlay_on': '角标已生效',
+    'baloo.tags_note': '在 Dolphin 里右键列头勾「Tags」列即可看到水合状态字符；装了角标插件的话文件图标上还会显示彩色角标。状态变化要 F5 / 重进目录才刷新。',
     // ★ NAS 文件夹选择器（一对一配对）
     'nas_picker.title': '选择 NAS 文件夹',
     'nas_picker.hint': '逐层点开目录；「选择这个文件夹」= 把当前目录作为配对的那一个 NAS 目录。',

@@ -263,6 +263,15 @@ pub struct Settings {
     /// 报废）—— daemon 在 `settings_save` 时强制检查，见 `baloo` 模块。
     #[serde(default)]
     pub dolphin_tags: bool,
+    /// ★ M24：Dolphin 文件图标**角标** —— 把三态暴露成 `user.qxync.overlay`，
+    /// `contrib/dolphin/overlay` 的 `KOverlayIconPlugin` 插件读它，在文件图标上
+    /// 画绿对钩 / 蓝云 / 半满圆（Windows 资源管理器 / CFA 同款）。
+    ///
+    /// 与 [`dolphin_tags`] **相互独立**：Tags 列写 `user.xdg.tags`，角标只读
+    /// `user.qxync.overlay`；两个开关可以只开一个。默认关（不装插件的用户
+    /// 完全无感）。开启同样有 Baloo 前置门禁（与 tags 共用一套检查）。
+    #[serde(default)]
+    pub dolphin_overlay: bool,
 }
 
 fn one() -> u32 {
@@ -282,6 +291,7 @@ impl Default for Settings {
             free_space: FreeSpaceSettings::default(),
             close_to_tray: true,
             dolphin_tags: false,
+            dolphin_overlay: false,
         }
     }
 }

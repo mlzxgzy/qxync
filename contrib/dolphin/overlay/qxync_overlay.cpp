@@ -5,12 +5,15 @@
     返回的角标（左下/右上/右下三个角，左上角留给 VCS 插件）。这里把 qxync 的
     FUSE xattr 映射成三个主题图标名：
 
-        user.xdg.tags = ✓（已水合）    → qxync-hydrated   （绿色对钩）
-        user.xdg.tags = ☁（仅在线）    → qxync-placeholder（云）
-        user.xdg.tags = ◐（部分本地）  → qxync-partial    （半满圆）
+        user.qxync.overlay = hydrated     → qxync-hydrated   （绿色对钩）
+        user.qxync.overlay = placeholder  → qxync-placeholder（云）
+        user.qxync.overlay = partial      → qxync-partial    （半满圆）
 
-    开关与 FUSE 侧同源：`user.xdg.tags` 不存在（ENODATA）= Dolphin 集成关 →
-    不画角标，也不读 `user.qxync.state`。目录的 tags 是空串 → 目录不画角标。
+    开关与 FUSE 侧同源：`user.qxync.overlay` 不存在（ENODATA）= 角标开关关着
+    （或该挂载点会被 Baloo 索引而不暴露）→ 不画角标。目录的值是空串 → 不画。
+
+    为什么读专用属性而不是认 Tags 字符：展示与语义解耦 —— 以后改 Tags 列的
+    字面/图标字符不会让角标跟着坏；而且 Tags 列开关与角标开关是**独立**的。
 
     SPDX-License-Identifier: MIT OR Apache-2.0
 */
@@ -109,16 +112,10 @@ public:
             return {};
         }
 
-        const QByteArray encoded = QFile::encodeName(path);
-        const QByteArray tags = readXattr(encoded, "user.xdg.tags");
-        if (tags.isEmpty()) {
-            // 开关关（ENODATA）或目录（空串）：不画角标。
-            return {};
-        }
-
-        // 语义以 user.qxync.state 为准（placeholder/partial/hydrated）。
-        // 这里第二次 getxattr 仍然很便宜：只有 qxync 挂载点内的文件才会走到。
-        const QByteArray state = readXattr(encoded, "user.qxync.state");
+        // 单次 getxattr：`user.qxync.overlay` 是 FUSE 按「角标开关开 && 挂载点
+        // 不会被 Baloo 索引」现算的专用属性 —— 开关关着时根本不存在（ENODATA），
+        // 目录是空串，文件的值就是三态本身（placeholder / partial / hydrated）。
+        const QByteArray state = readXattr(QFile::encodeName(path), "user.qxync.overlay");
         if (state == "hydrated") {
             return {QStringLiteral("qxync-hydrated")};
         }
