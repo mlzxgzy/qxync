@@ -20,12 +20,19 @@ AUR 包定义。
 | 方式 | 命令 |
 |---|---|
 | AUR（发布之后） | `yay -S qxync-dolphin-overlay` |
+| **Release 资产（AUR 注册前的正式渠道）** | 从 [GitHub Release](https://github.com/mlzxgzy/qxync/releases) 下载 `qxync-dolphin-overlay-<版本>-1-x86_64.pkg.tar.zst`，`sudo pacman -U <文件>` |
 | 本机打（改完 PKGBUILD 后） | `makepkg -si` |
 | 不装包、直接编 | 见 [`contrib/dolphin/overlay/README.md`](../../contrib/dolphin/overlay/README.md) |
 
+> Release 里的预编译包与 AUR 源码包是**同一份 PKGBUILD**：CI 在
+> `archlinux:base-devel` 容器里对着当次 tag 的源码归档现编（发版流水线里
+> 逐项校验过包内容）。ABI 锚在 `libKF6KIOCore.so.6` —— KF6 系列内向后兼容，
+> 只要你的系统还是 KF6 就能装；AUR 源码包则永远本机现编、天然匹配。
+
 装完要**重启 Dolphin**（Dolphin 只在创建视图时加载插件），然后在
 GUI「设置 → 高级 → 在文件图标上显示状态角标」打开开关。前置条件：挂载点已
-排除出 Baloo 索引（`qxync baloo-status`）。
+排除出 Baloo 索引（`qxync baloo-status`）。装没装、Dolphin 会不会加载，
+`qxync baloo-status` 的「角标插件」一行会直接告诉你（M25 起有检测）。
 
 ## 发新版本
 

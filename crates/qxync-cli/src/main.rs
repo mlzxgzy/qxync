@@ -2192,6 +2192,27 @@ fn print_baloo_status(d: &qxync_core::ipc::BalooStatusData) {
         if d.dolphin_tags { "开" } else { "关" },
         if d.dolphin_overlay { "开" } else { "关" }
     );
+    // ★ M25：角标插件检测是**本地文件检查**，不走 daemon —— 老版本 daemon 不报
+    //   `overlay_plugin` 字段，而插件加载发生在跑 CLI 的这个桌面会话里，
+    //   本地查最准（规则与 Qt 的插件查找对齐，见 qxync_core::dolphin）。
+    match qxync_core::dolphin::detect_overlay_plugin() {
+        Some(p) if p.effective => {
+            println!("角标插件  : 已安装（{}）", p.path.display());
+        }
+        Some(p) => {
+            println!(
+                "角标插件  : 装在 {}，但 QT_PLUGIN_PATH 未包含该目录 —— Dolphin 不会加载\
+                 （建议改用系统级安装：pacman -U qxync-dolphin-overlay-*.pkg.tar.zst）",
+                p.path.display()
+            );
+        }
+        None => {
+            println!(
+                "角标插件  : 未安装（角标开关开了也不会画角标；Arch 装 \
+                 qxync-dolphin-overlay 包，其它发行版见 docs/M23-Dolphin集成.md §8）"
+            );
+        }
+    }
     if d.mounts.is_empty() {
         println!("挂载点    : （无 —— 开关可以先打开，挂载时会再检查）");
     }
