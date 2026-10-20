@@ -23,6 +23,10 @@ license=('MIT' 'Apache-2.0')
 depends=('qt6-base' 'kio')
 optdepends=('qxync-bin: 主程序（提供 user.qxync.overlay xattr；没有它插件没有数据可显示）')
 makedepends=('cmake' 'qt6-base' 'kio')
+# ★ 禁用 debug 拆分包：archlinux 容器（及部分用户机）的 makepkg.conf 开着 debug，
+#   会额外产出一个 <pkg>-debug 包 —— 200 行的插件用不上它，还会把 CI 的
+#   「恰好一个包」校验与 Release 资产收集炸掉（v0.7.3 第一次真跑抓出来的）。
+options=('!debug')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/mlzxgzy/qxync/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('4a766d615b889d819085485aeffd7811223b153f2dafe7253fd9ce36a90a5c38')
 
