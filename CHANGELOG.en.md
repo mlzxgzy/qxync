@@ -5,6 +5,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [中文](CHANGELOG.md) · [README](README.en.md) · [Acceptance log](docs/验收记录.md)
 
+## [0.7.4] - 2026-10-20
+
+### Fixed
+
+- **Dolphin deletion failed with "Could not write file …trashinfo" (M27)**:
+  when the NAS carries a leftover `.Trash-1000` directory (created by Dolphin
+  under pre-v0.4.3 mounts), KIO's in-volume trash probe `stat(".Trash-$UID")`
+  succeeds and only the subsequent `.trashinfo` write hits our `EPERM` — the
+  user sees an error dialog (reproduced three times from real-machine logs,
+  2026-10-19/20). Fix: trash paths are now **invisible on the read side too**
+  (`lookup` returns `ENOENT`, `readdir` omits them), so the probe fails at
+  step one → mkdir is denied → KIO takes its own established fallback: a
+  **"The trash is not available at this location. Delete permanently
+  instead?"** confirmation dialog (the `ERR_TRASH_NOT_AVAILABLE` path added
+  in KIO 6.21 — the same experience KDE gives for any filesystem without a
+  trash). The write-side `EPERM` defense-in-depth is kept unchanged;
+  recognition still uses the v0.4.3 exact segment match (`.Trash` /
+  `.Trash-$UID` / `@Recycle`), so ordinary names are unaffected. A/B
+  verification: the old behavior reproduces the exact error on the real
+  production mount (via the same `KIO::DeleteOrTrashJob` path Dolphin uses);
+  the new behavior shows the confirmation dialog.
+
 ## [0.7.3] - 2026-10-20
 
 ### Added
@@ -1671,6 +1693,7 @@ Verified on **QNAP TS-464C / QTS 5.2.9 / Qsync QPKG 5.0.0.7 (build 20260723)**.
 - Acceptance results were split out of the README into [`docs/验收记录.md`](docs/验收记录.md).
 - Dual-licensed under **MIT OR Apache-2.0** (`LICENSE-MIT` / `LICENSE-APACHE`).
 
+[0.7.4]: https://github.com/mlzxgzy/qxync/compare/v0.7.3...v0.7.4
 [0.7.3]: https://github.com/mlzxgzy/qxync/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/mlzxgzy/qxync/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/mlzxgzy/qxync/compare/v0.7.0...v0.7.1

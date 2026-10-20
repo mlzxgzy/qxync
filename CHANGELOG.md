@@ -5,6 +5,22 @@
 
 [English](CHANGELOG.en.md) · [README](README.md) · [验收记录](docs/验收记录.md)
 
+## [0.7.4] - 2026-10-20
+
+### 修复
+
+- **Dolphin 删除报「无法写入文件 …trashinfo」（M27）**：NAS 上遗留了
+  `.Trash-1000` 目录时（旧版挂载时代 Dolphin 建出来的），KIO 的卷内回收站探测
+  `stat(".Trash-$UID")` 通过、写 `.trashinfo` 才被 `EPERM` 拒 —— 用户看到的是
+  报错弹窗（真机 2026-10-19/20 日志三次复现）。修法：回收站路径**读侧也藏掉**
+  （`lookup` 回 `ENOENT`、`readdir` 不列出），探测在第一步就拿到「不存在」→
+  mkdir 被拒 → KIO 走它自己的既定回退：**「回收站在此项目的位置不可用。改为
+  彻底删除它吗？」确认框**（KIO 6.21+ 的 `ERR_TRASH_NOT_AVAILABLE` 路径，
+  任何不提供回收站的文件系统在 KDE 里都是这个体验）。写入口的 `EPERM`
+  纵深防御原样保留；判定沿用 v0.4.3 的段级精确匹配（`.Trash` / `.Trash-$UID` /
+  `@Recycle`），正常名字不受影响。A/B 对照实测：旧行为在真实生产挂载上精确
+  复现报错（`KIO::DeleteOrTrashJob` 路径），新行为弹确认框。
+
 ## [0.7.3] - 2026-10-20
 
 ### 新增
@@ -1370,6 +1386,7 @@ NAS 设置名 `QSYNC_FOLDERPAIR_USE_SPACE_SAVING`、Windows 客户端注册表�
 - 验收结论从 README 抽出为 [`docs/验收记录.md`](docs/验收记录.md)。
 - 采用 **MIT OR Apache-2.0** 双许可（`LICENSE-MIT` / `LICENSE-APACHE`）。
 
+[0.7.4]: https://github.com/mlzxgzy/qxync/compare/v0.7.3...v0.7.4
 [0.7.3]: https://github.com/mlzxgzy/qxync/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/mlzxgzy/qxync/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/mlzxgzy/qxync/compare/v0.7.0...v0.7.1
