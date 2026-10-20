@@ -5,7 +5,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [中文](CHANGELOG.md) · [README](README.en.md) · [Acceptance log](docs/验收记录.md)
 
-## [0.7.0] - 2026-10-19
+## [0.7.0] - 2026-10-20
 
 ### Added
 
@@ -102,24 +102,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **GUI diagnostics color coding never rendered** (M22, pre-existing bug found along the
   way): `kvText` silently dropped its 4th argument (`val-dim` / `val-ok` / `val-warn` /
   `val-err`), so about 8 call sites lost their color classification.
-  (this race was reproduced on the real device too).
 
 ### Verification
 
-`cargo build --workspace` and `cargo test --workspace` pass (core 230 / daemon 68 /
-fuse 101 / client 32), `cargo fmt --all --check` is clean, and the new isolated e2e
-script `xtask/tests/m20-offline.sh` passes 9/9 (offline `status` in 6ms, buffered counts
-visible, rows survive a daemon restart with `attempts = 0`).
+`cargo build --workspace` and `cargo test --workspace` pass — **476 passed / 0 failed**
+(core 244 / daemon 68 / fuse 107 / client 32 / cli 7 / gui 15 / proto-test 3),
+`cargo fmt --all --check` is clean, and the isolated e2e scripts pass:
+`xtask/tests/m20-offline.sh` 9/9 (offline `status` in 6ms, buffered counts visible,
+rows survive a daemon restart with `attempts = 0`) and
+`xtask/tests/m21-offline-restart.sh` 19/19 (mount restored offline from `mounts.json`,
+`ls` served from persisted listings, second offline restart idempotent).
 
 Real-device FUSE verification was completed on 2026-10-19 (real NAS + real mount + a TCP
-relay cut to emulate the network dropping): `xtask/tests/m20-real-nas.sh` passes 57/57.
-It covers online writes, offline `mkdir` / nested dirs / writes, file and directory
-renames, `ls`, `rm`, `touch`, cached and uncached reads, a daemon restart while offline
-(4 outbox rows survive, `attempts = 0`), and reconnect replay (renamed dirs/files land on
-the NAS with the right content, old names disappear, deletes apply, mtime applies, buffers
-reach zero). Two real-mount-only bugs were found and fixed (see Fixed above). Remaining
-limitation: after a daemon restart while offline, the mount is restored only once the
-network is back (restoring mounts requires a login); buffered work is not lost.
+relay cut to emulate the network dropping): `xtask/tests/m20-real-nas.sh` passes 57/57
+and `xtask/tests/m21-real-nas.sh` passes 43/43. Together they cover online writes,
+offline `mkdir` / nested dirs / writes, file and directory renames, `ls`, `rm`, `touch`,
+cached and uncached reads, a daemon restart while offline (mount back in 1 second,
+outbox rows survive, `attempts = 0`), a second offline restart, and reconnect replay
+(renamed dirs/files land on the NAS with the right content, old names disappear, deletes
+apply, mtime applies, buffers reach zero). Real-mount-only bugs found along the way were
+fixed (see Fixed above and the M20/M21 milestone docs).
+
+### Known limitations
+
+- Files created/renamed offline do not appear in a **re-opened** mount's listing before
+  they land (the node table is in-process state); the content and the operations are in
+  the durable queues/outbox and are never lost. Since M21, listed and locally-created
+  directories survive restarts too (persisted listings); only directories never listed
+  and never created locally need the poller once back online.
+- Replay conflicts always use `rename_remote` semantics (the NAS copy is renamed to a
+  conflict copy); the task's `conflict` strategy is not consulted during replay.
+- Task-level purge does not clean outbox / listings rows (shared per link, like the
+  upload/delete queues; a link-level purge removes the whole `sync.db`).
 
 ## [0.6.8] - 2026-10-19
 
