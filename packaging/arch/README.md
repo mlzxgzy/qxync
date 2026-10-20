@@ -32,6 +32,7 @@
 | **Release 里 CI 打好的包**（最快，推荐给用户） | `sudo pacman -U qxync-bin-<版本>-1-x86_64.pkg.tar.zst` |
 | 本机自己打（改完 PKGBUILD 后 `updpkgsums` + `makepkg -si`） | 见下面 |
 | 发布到 AUR 之后 | `yay -S qxync-bin`（或 `paru` / `pamac`） |
+| 再装 Dolphin 角标插件（可选） | `yay -S qxync-dolphin-overlay`（源码包，见 [`../arch-dolphin-overlay/`](../arch-dolphin-overlay/)） |
 
 Release 里那份是 CI 用 Arch 官方镜像（`archlinux:base-devel`）里的**真 `makepkg`**、
 从**同一个 tar.gz** 打的 —— 包里三个二进制与 Release 资产**逐字节一致**，所以

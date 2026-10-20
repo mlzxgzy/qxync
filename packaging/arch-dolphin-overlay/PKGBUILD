@@ -1,0 +1,42 @@
+# Maintainer: Kami <mlzxgzy@gmail.com>
+#
+# AUR 源码包（qxync-dolphin-overlay）：Dolphin 文件图标上的 qxync 水合状态角标。
+#
+# 为什么是**源码包**而不是 -bin：这是 KF6 的 C++ 插件（KOverlayIconPlugin），
+# .so 直接链 libKF6KIOCore，ABI 跟发行版的 KF6 绑定。预编译的 .so 在别的 KF6
+# 版本上要么加载失败、要么崩 Dolphin —— 所以在本机对着系统 KF6 现编。
+#
+# 装完**重启 Dolphin**（插件只在创建视图时加载），然后：
+#   GUI 设置 → 高级 → 勾「在文件图标上显示状态角标」
+# 前置条件：挂载点已排除出 Baloo 索引（`qxync baloo-status` 可查）。
+#
+# 发布新版本后：pkgver 与 tag 对齐 → 更新 sha256sums（updpkgsums）→
+#   makepkg --printsrcinfo > .SRCINFO
+
+pkgname=qxync-dolphin-overlay
+pkgver=0.7.2
+pkgrel=1
+pkgdesc='qxync 的水合状态角标插件：Dolphin 文件图标上的绿对钩 / 蓝云 / 半满圆（KOverlayIconPlugin）'
+arch=('x86_64' 'aarch64')
+url='https://github.com/mlzxgzy/qxync'
+license=('MIT' 'Apache-2.0')
+depends=('qt6-base' 'kio')
+optdepends=('qxync-bin: 主程序（提供 user.qxync.overlay xattr；没有它插件没有数据可显示）')
+makedepends=('cmake' 'qt6-base' 'kio')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/mlzxgzy/qxync/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('4a766d615b889d819085485aeffd7811223b153f2dafe7253fd9ce36a90a5c38')
+
+build() {
+  cd "qxync-$pkgver"
+  cmake -S contrib/dolphin/overlay -B build-overlay \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/usr
+  cmake --build build-overlay -j"$(nproc)"
+}
+
+package() {
+  cd "qxync-$pkgver"
+  DESTDIR="$pkgdir" cmake --install build-overlay
+  install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
+  install -Dm644 LICENSE-APACHE "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
+}
