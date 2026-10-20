@@ -314,6 +314,13 @@ enum Cmd {
         json: bool,
     },
 
+    /// ★ M23：Baloo 索引状态检测（Dolphin 集成开关 `dolphin_tags` 的前置条件）
+    BalooStatus {
+        /// 直接输出 JSON（脚本/验收用）
+        #[arg(long)]
+        json: bool,
+    },
+
     /// ★ M8.4：冲突待裁决队列（策略 = 每个文件都问我）
     ///
     /// 一次只能做一件事：`--resolve` / `--forget` / `--diff` / `--clear` 互斥。
@@ -980,6 +987,16 @@ async fn main() -> Result<()> {
                 st.save(&paths)?;
                 saved = true;
                 eprintln!("⚠️ 直连模式：设置已写入文件；正在运行的 daemon 要重启才会读到代理/释放空间的新值");
+                // ★ M23：直连写文件绕过了 daemon 的 Baloo 门禁 —— 这里必须把
+                //   前置条件说清楚，否则用户开了 dolphin_tags 却没排除索引，
+                //   daemon 重启后 tags 不会生效（挂载时按安全条件算过）。
+                if st.dolphin_tags {
+                    eprintln!(
+                        "⚠️ dolphin_tags=true：开启前每个挂载点必须已排除出 Baloo 索引，\
+                         否则内容索引器会把整个 NAS 拉到本地（且 tags 不会生效）。\
+                         排除：balooctl6 config add excludeFolders <挂载点>"
+                    );
+                }
             }
             print_settings(&st, &paths, *json, saved)?;
         }
@@ -989,6 +1006,7 @@ async fn main() -> Result<()> {
         | Cmd::Sync { .. }
         | Cmd::Dehydrate { .. }
         | Cmd::Space { .. }
+        | Cmd::BalooStatus { .. }
         | Cmd::Conflicts { .. }
         | Cmd::FileStates { .. }
         | Cmd::Store { .. }
@@ -997,7 +1015,7 @@ async fn main() -> Result<()> {
         | Cmd::Task { .. }
         | Cmd::Journal { .. }
         | Cmd::Peer { .. } => {
-            bail!("`pin`/`state`/`sync`/`dehydrate`/`space`/`conflicts`/`file-states`/`store`/`roots`/`rules`/`task`/`peer` 需要 daemon：先 `qxync daemon start`（或用 --socket 指向运行中的 daemon）");
+            bail!("`pin`/`state`/`sync`/`dehydrate`/`space`/`baloo-status`/`conflicts`/`file-states`/`store`/`roots`/`rules`/`task`/`peer` 需要 daemon：先 `qxync daemon start`（或用 --socket 指向运行中的 daemon）");
         }
         Cmd::Rm { dir, name } => {
             let (client, _) = connect(&cli, true).await?;
@@ -1280,6 +1298,7 @@ fn to_request(cli: &Cli) -> Option<Request> {
             }
         }
         Cmd::Space { now, .. } => Request::Space { now: Some(*now) },
+        Cmd::BalooStatus { .. } => Request::BalooStatus,
         Cmd::Conflicts {
             resolve,
             resolution,
@@ -1695,6 +1714,11 @@ async fn route_via_daemon(
                 m.remote,
                 if *rw { "读写" } else { "只读" }
             );
+            // ★ M23：挂载点会被 Baloo 索引 → 如实警告（挂载本身已成功）。
+            // 内容索引器读文件 = 水合，这与 Dolphin 集成开关无关，值得单独提醒。
+            if let Some(w) = &m.baloo_warning {
+                println!("⚠️  {w}");
+            }
         }
         Cmd::Task { action } => {
             run_task_cmd(&socket, action).await?;
@@ -1737,6 +1761,19 @@ async fn route_via_daemon(
                 );
             } else {
                 print_space(&d, *now);
+            }
+        }
+        Cmd::BalooStatus { json } => {
+            let d: qxync_core::ipc::BalooStatusData = ipc_client::call(&socket, req).await?;
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&d).map_err(|e| {
+                        qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string())
+                    })?
+                );
+            } else {
+                print_baloo_status(&d);
             }
         }
         Cmd::Conflicts { json, diff, .. } => {
@@ -1998,6 +2035,14 @@ fn print_settings(st: &Settings, paths: &ConfigPaths, json: bool, saved: bool) -
         if st.close_to_tray { "开" } else { "关" }
     );
     println!(
+        "Dolphin   : {}（user.xdg.tags；开启前挂载点须排除出 Baloo 索引，见 `qxync baloo-status`）",
+        if st.dolphin_tags {
+            "集成开"
+        } else {
+            "集成关"
+        }
+    );
+    println!(
         "释放空间  : {}（{}{}）",
         if st.free_space.auto {
             "自动"
@@ -2052,6 +2097,14 @@ fn print_settings_data(d: &SettingsData) {
         },
         if st.debug_log { "开" } else { "关" },
         if st.close_to_tray { "开" } else { "关" }
+    );
+    println!(
+        "Dolphin   : {}（user.xdg.tags；开启前挂载点须排除出 Baloo 索引，见 `qxync baloo-status`）",
+        if st.dolphin_tags {
+            "集成开"
+        } else {
+            "集成关"
+        }
     );
     println!(
         "释放空间  : {}（{}）",
@@ -2119,6 +2172,63 @@ fn print_space(d: &SpaceData, now: bool) {
     if let Some(n) = &d.note {
         println!("说明      : {n}");
     }
+}
+
+/// ★ M23：Baloo 索引状态（Dolphin 集成开关 `dolphin_tags` 的前置检测）。
+fn print_baloo_status(d: &qxync_core::ipc::BalooStatusData) {
+    println!(
+        "Baloo     : {}",
+        match (&d.balooctl, d.indexing_enabled) {
+            (None, _) => "未安装（没有索引风险；Dolphin 的 Tags 列也不可用）".to_string(),
+            (Some(b), true) => format!("已安装（{}），索引开启", b),
+            (Some(b), false) => format!("已安装（{}），索引全局关闭（Tags 列也不会显示）", b),
+        }
+    );
+    println!(
+        "配置文件  : {}（{}）",
+        d.config_path,
+        if d.config_exists {
+            "存在"
+        } else {
+            "不存在"
+        }
+    );
+    println!(
+        "Dolphin 集成: {}（dolphin_tags）",
+        if d.dolphin_tags { "开" } else { "关" }
+    );
+    if d.mounts.is_empty() {
+        println!("挂载点    : （无 —— 开关可以先打开，挂载时会再检查）");
+    }
+    for m in &d.mounts {
+        println!(
+            "  {}  {}{}",
+            m.mountpoint,
+            if m.indexed {
+                "⚠️ 会被 Baloo 索引（危险）"
+            } else if m.excluded {
+                "✅ 已排除"
+            } else {
+                "✅ 不会被索引"
+            },
+            if m.tags_active {
+                " · Tags 已生效"
+            } else {
+                ""
+            }
+        );
+        if m.indexed {
+            println!("            排除命令: {}", m.exclude_cmd);
+        }
+    }
+    println!(
+        "能否打开  : {}",
+        if d.can_enable {
+            "✅ 可以（所有挂载点都不会被索引）"
+        } else {
+            "❌ 不行 —— 先按上面的命令排除，再重试"
+        }
+    );
 }
 
 /// 冲突待裁决队列。

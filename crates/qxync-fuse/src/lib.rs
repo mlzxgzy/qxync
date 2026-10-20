@@ -39,7 +39,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use upload::{UploadJob, UploadQueue, UploadSnapshot};
@@ -3069,6 +3069,13 @@ pub struct QxyncFs {
     /// + outbox；读路径对未水合区间立即 EIO（读缓存内容照常）。见
     /// [`Self::is_offline`] / [`Self::enqueue_outbox`]。
     connectivity: Option<Arc<Connectivity>>,
+    /// ★ M23：Dolphin 集成 —— 是否把水合状态暴露成 `user.xdg.tags`。
+    ///
+    /// 与 daemon **共享同一个原子开关**（`settings_save` 热切换，不用重挂载）。
+    /// daemon 侧的语义：`settings.dolphin_tags` **且** 该挂载点已排除出 Baloo
+    /// 索引 —— 两个条件都满足才置 true（不满足时 tags 静默不暴露，挂载照常）。
+    /// 默认 false = M23 之前的行为一字不变（`user.xdg.tags` 不在名单里）。
+    dolphin_tags: Arc<AtomicBool>,
 }
 
 /// ★ M7：LAN 快路径计数（`status` 里能看到省了多少次 NAS 请求）。
@@ -3190,6 +3197,8 @@ impl QxyncFs {
             nodes: None,
             // ★ M20：默认不注入 = 永远「在线」，行为与 M20 之前一致。
             connectivity: None,
+            // ★ M23：默认关 = 不暴露 user.xdg.tags（M23 之前的行为一字不变）。
+            dolphin_tags: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -3200,6 +3209,90 @@ impl QxyncFs {
     pub fn with_connectivity(mut self, c: Arc<Connectivity>) -> Self {
         self.connectivity = Some(c);
         self
+    }
+
+    /// ★ M23：注入 Dolphin 集成开关（daemon 在挂载前调，与 `settings_save` 共享）。
+    ///
+    /// 传进来的 `Arc` 是**活的**：daemon 之后随时 `store(true/false)` 热切换，
+    /// `getxattr` / `listxattr` 每次现读 —— 不需要重挂载。
+    pub fn with_dolphin_tags(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.dolphin_tags = flag;
+        self
+    }
+
+    /// ★ M23：当前是否暴露 `user.xdg.tags`（诊断 / 测试用）。
+    pub fn dolphin_tags_enabled(&self) -> bool {
+        self.dolphin_tags.load(Ordering::Relaxed)
+    }
+
+    /// 单个 xattr 的值（`None` = ENODATA / 节点不存在）。
+    ///
+    /// ★ M23：从 `getxattr` 拆出来是为了能**直接单测**（fuser 的 `ReplyXattr`
+    /// 在会话外构造不出来）；内核路径只是套了一层 size 协商。
+    pub fn xattr_value(&self, ino: INodeNo, name: &str) -> Option<String> {
+        let (state, remote, fsize, chunks, is_dir) = {
+            let g = self.inner.lock().unwrap();
+            let n = g.nodes.get(&ino)?;
+            let done = n.chunks_done.iter().filter(|d| **d).count();
+            (
+                n.state_str(),
+                n.remote.clone(),
+                n.attr.size,
+                format!("{done}/{}", n.chunks_done.len()),
+                n.attr.kind == FileType::Directory,
+            )
+        };
+        match name {
+            // 占位符状态：placeholder（未取任何区间）/ partial（取了一部分）/ hydrated（全取）
+            "user.qxync.state" => Some(state.into()),
+            // 已就绪区间数 / 总区间数（M2 的可观测性）
+            "user.qxync.chunks" => Some(chunks),
+            "user.qxync.remote" => Some(remote.clone()),
+            "user.qxync.vsize" => Some(fsize.to_string()),
+            // ★ M20：脚本 / 桌面能直接判断「现在这个挂载点能不能指望联网」。
+            // 只在**已知离线**时是 "1"；刚启动还没试过网络时是 "0"（乐观，与内部一致）。
+            "user.qxync.offline" => Some(if self.is_offline() { "1" } else { "0" }.to_string()),
+            "user.qxync.pin" => Some(
+                self.pins
+                    .lock()
+                    .unwrap()
+                    .get(&remote)
+                    .cloned()
+                    .unwrap_or_else(|| "unspecified".to_string()),
+            ),
+            // ★ M23：Dolphin 的 Tags 列（freedesktop 标准 xattr，逗号分隔的标签串）。
+            // 值是**动态算的**（不落盘）：水合状态 → 中文标签；目录不水合 → 空串。
+            // 开关关闭时回 None（ENODATA）—— 与 listxattr 不列它保持一致，
+            // Dolphin 的 queryAttributes 就当这个文件没有 Tags 属性。
+            "user.xdg.tags" => {
+                if !self.dolphin_tags_enabled() {
+                    return None;
+                }
+                Some(match (is_dir, state) {
+                    (true, _) => String::new(),
+                    (false, "placeholder") => "仅在线".into(),
+                    (false, "partial") => "部分本地".into(),
+                    (false, "hydrated") => "已水合".into(),
+                    (false, _) => String::new(),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// xattr 名单（NUL 分隔、末尾带 NUL —— 见 `listxattr` 的铁则注释）。
+    ///
+    /// ★ M23：`user.xdg.tags` 只在 Dolphin 集成开关打开时进名单 ——
+    /// Dolphin 的 `queryAttributes` 靠 listxattr 探测「有没有 tags」，
+    /// 名单里没有它，Tags 列就整列安静（= 开关关闭时的预期行为）。
+    pub fn xattr_names(&self) -> String {
+        let mut names = String::from(
+            "user.qxync.state\0user.qxync.pin\0user.qxync.remote\0user.qxync.vsize\0user.qxync.chunks\0user.qxync.offline\0",
+        );
+        if self.dolphin_tags_enabled() {
+            names.push_str("user.xdg.tags\0");
+        }
+        names
     }
 
     /// ★ M20：现在是不是「已知离线」。
@@ -5743,48 +5836,9 @@ impl Filesystem for QxyncFs {
     }
 
     fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
-        let (state, remote, fsize, chunks) = {
-            let g = self.inner.lock().unwrap();
-            match g.nodes.get(&ino) {
-                Some(n) => {
-                    let done = n.chunks_done.iter().filter(|d| **d).count();
-                    (
-                        n.state_str(),
-                        n.remote.clone(),
-                        n.attr.size,
-                        format!("{done}/{}", n.chunks_done.len()),
-                    )
-                }
-                None => return reply.error(fuser::Errno::ENOENT),
-            }
-        };
-        tracing::debug!(
-            "getxattr ino={} name={} size={size}",
-            u64::from(ino),
-            name.to_string_lossy()
-        );
-        let key = name.to_string_lossy();
-        let value: Option<String> = match key.as_ref() {
-            // 占位符状态：placeholder（未取任何区间）/ partial（取了一部分）/ hydrated（全取）
-            "user.qxync.state" => Some(state.into()),
-            // 已就绪区间数 / 总区间数（M2 的可观测性）
-            "user.qxync.chunks" => Some(chunks),
-            "user.qxync.remote" => Some(remote),
-            "user.qxync.vsize" => Some(fsize.to_string()),
-            // ★ M20：脚本 / 桌面能直接判断「现在这个挂载点能不能指望联网」。
-            // 只在**已知离线**时是 "1"；刚启动还没试过网络时是 "0"（乐观，与内部一致）。
-            "user.qxync.offline" => Some(if self.is_offline() { "1" } else { "0" }.to_string()),
-            "user.qxync.pin" => Some(
-                self.pins
-                    .lock()
-                    .unwrap()
-                    .get(&remote)
-                    .cloned()
-                    .unwrap_or_else(|| "unspecified".to_string()),
-            ),
-            _ => None,
-        };
-        let Some(v) = value else {
+        let key = name.to_string_lossy().to_string();
+        tracing::debug!("getxattr ino={} name={} size={size}", u64::from(ino), key);
+        let Some(v) = self.xattr_value(ino, &key) else {
             return reply.error(fuser::Errno::ENODATA);
         };
         if size == 0 {
@@ -5800,7 +5854,7 @@ impl Filesystem for QxyncFs {
         // ★ 末尾必须留一个 NUL：内核 fuse_verify_xattr_list() 会逐项 strnlen，
         // 最后一项没有终止符就直接对整个 listxattr 回 -EIO（实测过：size<66 回 ERANGE，
         // size>=66 反而回 EIO，就是这个校验触发的）。
-        let names = "user.qxync.state\0user.qxync.pin\0user.qxync.remote\0user.qxync.vsize\0user.qxync.chunks\0user.qxync.offline\0";
+        let names = self.xattr_names();
         let exists = { self.inner.lock().unwrap().nodes.contains_key(&ino) };
         if !exists {
             return reply.error(fuser::Errno::ENOENT);
@@ -7041,6 +7095,73 @@ mod tests {
             std::fs::write(&cache, vec![7u8; 300 * 1024]).unwrap();
         }
         (fs, node.ino, cache)
+    }
+
+    // ------------------------------------------------------------ M23 Dolphin tags 单测
+
+    /// ★ M23：`user.xdg.tags` 的三态映射 + 开关门控。
+    ///
+    /// 用 `hydrated_fs`（全就绪）+ 手改 `chunks_done` 造 partial / placeholder，
+    /// 再插一个目录节点验「目录无标签」。
+    #[test]
+    fn xdg_tags_reflect_hydration_state_only_when_enabled() {
+        let dir = std::env::temp_dir().join(format!("qxync-fuse-m23-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let flag = Arc::new(AtomicBool::new(false));
+        let (fs, ino, _cache) = {
+            let (fs, ino, cache) = hydrated_fs(&dir, Arc::new(Mutex::new(HashMap::new())));
+            (fs.with_dolphin_tags(flag.clone()), ino, cache)
+        };
+
+        // 占位符 / 部分水合 / 全水合 三种状态（改 chunks_done 现造）
+        let set_state = |frac: f64| {
+            let mut g = fs.inner.lock().unwrap();
+            let n = g.nodes.get_mut(&ino).unwrap();
+            let total = n.chunk_count(DEFAULT_CHUNK_SIZE);
+            let done = ((total as f64) * frac).round() as usize;
+            n.chunks_done = vec![false; total];
+            for d in n.chunks_done.iter_mut().take(done) {
+                *d = true;
+            }
+        };
+
+        // 开关关：getxattr 回 None（ENODATA）、listxattr 名单里没有 ——
+        // Dolphin 当这个文件没有 Tags 属性，M23 之前的行为一字不变。
+        set_state(0.0);
+        assert_eq!(fs.xattr_value(ino, "user.xdg.tags"), None);
+        assert!(!fs.xattr_names().contains("user.xdg.tags"));
+        // 老的五个名字不受影响
+        assert!(fs.xattr_names().contains("user.qxync.state"));
+
+        // 开关开：三态逐一对上
+        flag.store(true, Ordering::Relaxed);
+        set_state(0.0);
+        assert_eq!(fs.xattr_value(ino, "user.xdg.tags"), Some("仅在线".into()));
+        set_state(0.5);
+        assert_eq!(
+            fs.xattr_value(ino, "user.xdg.tags"),
+            Some("部分本地".into())
+        );
+        set_state(1.0);
+        assert_eq!(fs.xattr_value(ino, "user.xdg.tags"), Some("已水合".into()));
+        assert!(fs.xattr_names().contains("user.xdg.tags"));
+        // 名单末尾仍带 NUL（内核 fuse_verify_xattr_list 的铁则）
+        assert!(fs.xattr_names().ends_with('\0'));
+
+        // 目录：不水合 → 空串（xattr 存在但没标签，Dolphin 显示空）
+        let dentry = DirEntry::local("sub", true, 0, 222);
+        let dnode = fs.insert_node(INodeNo::ROOT, "sub", "/home/sub", &dentry);
+        assert_eq!(
+            fs.xattr_value(dnode.ino, "user.xdg.tags"),
+            Some(String::new())
+        );
+
+        // 再关回去：立刻消失（daemon settings_save 热切换，不用重挂载）
+        flag.store(false, Ordering::Relaxed);
+        assert_eq!(fs.xattr_value(ino, "user.xdg.tags"), None);
+        assert!(!fs.xattr_names().contains("user.xdg.tags"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

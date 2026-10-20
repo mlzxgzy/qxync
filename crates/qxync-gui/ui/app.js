@@ -565,11 +565,36 @@
   function closeModal(value) {
     var box = $('modal');
     if (box) { box.hidden = true; }
+    // ★ M23：确认模式可能改过输入框可见性 / OK 文案 —— 关闭时一律还原，
+    //   下一个 openModal 拿到的还是干净的输入弹窗。
+    var input = $('modal-input');
+    if (input) { input.hidden = false; }
+    var okBtn = $('modal-ok');
+    if (okBtn) { okBtn.textContent = T('modal.ok'); }
     if (modalLastFocus && isFn(modalLastFocus.focus)) { modalLastFocus.focus(); }
     modalLastFocus = null;
     var r = modalResolve;
     modalResolve = null;
     if (isFn(r)) { r(value); }
+  }
+
+  /**
+   * ★ M23：确认弹窗（复用输入弹窗的 DOM，但**藏掉输入框**、可自定义 OK 文案）。
+   * 返回 Promise<boolean>：OK=true / 取消=false。closeModal 负责还原现场。
+   */
+  function openConfirm(title, message, okLabel) {
+    var box = $('modal');
+    if (!box) { return Promise.resolve(false); }
+    var p = openModal(title, message, '');
+    var input = $('modal-input');
+    if (input) {
+      input.hidden = true;
+      // wireModal 里 Enter 提交的是 input.value —— 藏掉后按 Enter 也应该等于 OK
+    }
+    var okBtn = $('modal-ok');
+    if (okBtn) { okBtn.textContent = okLabel || T('modal.ok'); }
+    if (okBtn) { okBtn.focus(); }
+    return p.then(function (v) { return v !== null; });
   }
 
   function wireModal() {
@@ -5055,6 +5080,9 @@
     // ---- 高级
     var dl = $('s-debug-log'); if (dl) { dl.checked = s.debug_log === true; }
     var nt = $('s-notifications'); if (nt) { nt.checked = s.desktop_notifications !== false; }
+    // ★ M23：Dolphin 集成开关 + Baloo 检测结果（设置页打开时顺手刷一次）
+    var dt = $('s-dolphin-tags'); if (dt) { dt.checked = s.dolphin_tags === true; }
+    refreshBalooStatus();
 
     // ---- 释放空间
     var fa = $('fs-auto'); if (fa) { fa.checked = free.auto === true; }
@@ -5109,6 +5137,8 @@
   function collectAdvanced(s) {
     s.debug_log = isOn('s-debug-log', false);
     s.desktop_notifications = isOn('s-notifications', true);
+    // ★ M23：Dolphin 集成开关（保存前的 Baloo 门禁在 doAdvancedSave 里做）
+    s.dolphin_tags = isOn('s-dolphin-tags', false);
     return s;
   }
 
@@ -5189,7 +5219,102 @@
   }
 
   function doAdvancedSave() {
-    return saveSettings(collectAdvanced(currentSettings()), 'advanced-result', '高级设置已保存', []);
+    var s = collectAdvanced(currentSettings());
+    // ★ M23：勾了 Dolphin 集成 → 保存前先做 Baloo 预检。
+    //   daemon 的 settings_save 里有同样的门禁（CLI / 竞态兜底），这里做是为了
+    //   能在**保存失败之前**给出「弹终端一键排除」的引导，而不是一句报错。
+    if (s.dolphin_tags === true) {
+      return ipc({ method: 'baloo_status' }).then(function (r) {
+        if (!r.ok) {
+          // 检测本身失败（daemon 没跑 / 老版本 daemon 不认识这个方法）：
+          // 不拦保存 —— 让 daemon 侧的门禁（或它的缺席）自己说话。
+          logInfo('Baloo 检测不可用（' + str(r.error) + '），直接保存');
+          return saveSettings(s, 'advanced-result', '高级设置已保存', []);
+        }
+        var d = isObj(r.data) ? r.data : {};
+        if (d.can_enable !== false) { return doAdvancedSaveNow(s); }
+        var mounts = [];
+        for (var i = 0; i < (d.mounts || []).length; i++) {
+          var m = d.mounts[i];
+          if (m && m.indexed === true) { mounts.push(str(m.mountpoint)); }
+        }
+        return promptBalooExclude(mounts).then(function (fixed) {
+          if (!fixed) { return { ok: false, canceled: true }; }
+          // 终端跑完了：重检一次，通过才保存（没通过就再来一轮提示）
+          return doAdvancedSave();
+        });
+      });
+    }
+    return doAdvancedSaveNow(s);
+  }
+
+  function doAdvancedSaveNow(s) {
+    return saveSettings(s, 'advanced-result', '高级设置已保存', []);
+  }
+
+  /**
+   * ★ M23：Baloo 未排除 → 弹确认框，OK = 打开终端自动执行排除命令。
+   * 返回 Promise<boolean>：true = 终端已弹出（用户跑完命令，可以重试保存）。
+   */
+  function promptBalooExclude(mounts) {
+    var list = (mounts || []).join('、') || '（无）';
+    return openConfirm(
+      T('baloo.title'),
+      T('baloo.why', { mounts: list }),
+      T('baloo.open_terminal')
+    ).then(function (yes) {
+      if (!yes) { return false; }
+      return call('open_baloo_exclude', { mountpoints: mounts || [] }).then(function (r) {
+        var d = (r && isObj(r.data)) ? r.data : {};
+        if (r && r.ok && d.ok) {
+          logOk(T('baloo.opened', { terminal: str(d.terminal) }));
+          logInfo(T('baloo.after_open'));
+          return true;
+        }
+        logErr(T('baloo.open_failed', {
+          err: str(d.error || (r && r.error) || '未知错误'),
+          cmd: str(d.command || '')
+        }));
+        return false;
+      }, function (e) {
+        logErr(T('baloo.open_failed', { err: str(e), cmd: '' }));
+        return false;
+      });
+    });
+  }
+
+  /** ★ M23：拉一次 Baloo 检测，画进高级分区的 kv 表。 */
+  function refreshBalooStatus() {
+    var dl = $('dolphin-kv');
+    if (!dl) { return Promise.resolve(); }
+    return ipc({ method: 'baloo_status' }).then(function (r) {
+      clear(dl);
+      if (!r.ok) {
+        kvText(dl, 'Baloo 检测', '不可用（' + str(r.error) + '）');
+        return r;
+      }
+      var d = isObj(r.data) ? r.data : {};
+      var installed = !!d.balooctl;
+      kvText(dl, 'Baloo', installed
+        ? (d.indexing_enabled === false ? T('baloo.disabled') : T('baloo.enabled'))
+        : T('baloo.not_installed'));
+      var ms = d.mounts || [];
+      if (!ms.length) {
+        kvText(dl, '挂载点', T('baloo.no_mounts'));
+      } else {
+        for (var i = 0; i < ms.length; i++) {
+          var m = ms[i];
+          var label = m.indexed === true ? '⚠️ ' + T('baloo.mount_indexed')
+            : (m.excluded === true ? '✅ ' + T('baloo.mount_excluded')
+            : '✅ ' + T('baloo.mount_safe'));
+          kvText(dl, str(m.mountpoint), label + (m.tags_active === true ? ' · ' + T('baloo.tags_on') : ''));
+        }
+      }
+      if (installed && d.indexing_enabled !== false && d.dolphin_tags === true) {
+        kvText(dl, '提示', T('baloo.tags_note'));
+      }
+      return r;
+    });
   }
 
   function doFreeSave() {
@@ -6453,6 +6578,12 @@
     on('btn-proxy-save', 'click', function () { doProxySave(); });
     on('btn-personal-save', 'click', function () { doPersonalSave(); });
     on('btn-advanced-save', 'click', function () { doAdvancedSave(); });
+    // ★ M23：手动重检 Baloo（在终端里跑完排除命令后点它，kv 表会更新）
+    on('btn-baloo-recheck', 'click', function () {
+      refreshBalooStatus().then(function (r) {
+        if (r && r.ok) { logOk(T('baloo.rechecked')); }
+      });
+    });
     // ★ 设置 → 高级 → 危险区：删除本机所有 qxync 数据（先看计划，必须勾选才能确认）
     on('btn-purge-all', 'click', function (ev) { doPurgeAll(ev && ev.currentTarget); });
     on('btn-free-save', 'click', function () { doFreeSave(); });

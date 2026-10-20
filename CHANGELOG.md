@@ -5,6 +5,31 @@
 
 [English](CHANGELOG.en.md) · [README](README.md) · [验收记录](docs/验收记录.md)
 
+## [Unreleased]
+
+### 新增
+
+- **Dolphin 集成：水合状态进 Tags 列（M23）**：挂载点里每个文件把水合状态
+  （仅在线 / 部分本地 / 已水合）动态写进 freedesktop 标准的 `user.xdg.tags` xattr，
+  Dolphin **自带的 Tags 列**直接显示 —— 不用写插件、不用改 Dolphin。分四块：
+  * **开关（默认关）**：`settings.json` 新增 `dolphin_tags`（`qxync settings --set
+    dolphin_tags=true` 或 GUI 设置 → 高级）；关着时 xattr 名单里根本没有它，
+    M23 之前的行为一字不变；
+  * **Baloo 门禁**：开启前 daemon 强制检查**每个挂载点都已排除出 Baloo 索引**
+    （内容索引器读文件 = 水合，没排除就开 tags 等于邀请它把整个 NAS 拉到本地）。
+    新增 `qxync baloo-status`：Baloo 装没装 / 索引开关 / 每个挂载点的结论与
+    排除命令。判定对齐 Baloo 自己的语义：`Indexing-Enabled` 缺省视为开、
+    排除覆盖自身与后代、include 列表与挂载点取双向祖先交集；
+  * **GUI 一键排除**：预检不过 → 弹确认框 → 「打开终端，自动添加排除」→
+    konsole（`--hold`）里逐条自动执行 `balooctl6 config add excludeFolders
+    <挂载点>` 并列出最终排除清单，跑完回来重试保存即可；
+  * **热切换 + 按挂载点生效**：开关与 FUSE 共享 `Arc<AtomicBool>`，改设置不用
+    重挂载；每个挂载点独立判定「设置开了 && 不会被索引」，一个没排除的点不会
+    牵连其它挂载点。`mount` 响应新增非阻塞的 `baloo_warning`（挂载点会被索引就
+    提醒，与开关无关 —— Baloo 自己就会读文件）。
+  限制（调研文档 §5）：状态不实时刷新（F5 / 重进目录）；依赖 Baloo 全局开关；
+  进不了 `tags:` 虚拟目录；挂载点上加不了用户自己的标签（`setxattr` 有意不实现）。
+
 ## [0.7.0] - 2026-10-20
 
 ### 新增

@@ -667,6 +667,104 @@ else
   bad "M3：direct 模式挂载失败"
 fi
 
+# ================================================================ M23 Dolphin 集成
+# user.xdg.tags（Dolphin Tags 列）+ Baloo 门禁。
+# 前半段（tags 值/名单/热切换）不依赖 Baloo；门禁段只在「装了 balooctl 且
+# 挂载点会被索引」时才跑 —— 没装 Baloo 的机器上 can_enable 恒 true，跳过。
+echo "=== M23：Dolphin 集成（user.xdg.tags / Baloo 门禁）==="
+MNT23="$RUNDIR/mnt-m23"; CACHE23="$RUNDIR/cache-m23"
+mkdir -p "$MNT23"; rm -rf "$CACHE23"
+SOCK23="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/qxync/qxyncd.sock"
+
+xdg_tags() {  # $1=挂载点内路径 → 打印 user.xdg.tags 的值（ERR* = 没有）
+  python3 -c "
+import os
+try: print(os.getxattr('$1','user.xdg.tags').decode())
+except OSError as e: print('ERR%d'%e.errno)"
+}
+xdg_listed() {  # listxattr 名单里有没有 user.xdg.tags（0/1）
+  python3 -c "
+import os
+print(1 if 'user.xdg.tags' in os.listxattr('$1') else 0)"
+}
+# 经 daemon socket 改设置（GUI 走的路径；CLI `settings --set` 是直连写文件，
+# daemon 不会热重读 —— 那条路测不到门禁与热切换）。读-改-写：settings → 改 dolphin_tags → settings_save
+save_dolphin() {  # $1=true/false → 打印 ok 或 error:<消息>
+  python3 - "$SOCK23" "$1" <<'PYEOF'
+import json, socket, sys
+s = socket.socket(socket.AF_UNIX); s.settimeout(30)
+s.connect(sys.argv[1])
+def call(obj):
+    s.sendall((json.dumps(obj)+"\n").encode())
+    buf = b""
+    while not buf.endswith(b"\n"):
+        chunk = s.recv(65536)
+        if not chunk: break
+        buf += chunk
+    return json.loads(buf)
+cur = call({"v":1,"method":"settings"})["data"]["settings"]
+cur["dolphin_tags"] = sys.argv[2] == "true"
+r = call({"v":1,"method":"settings_save","settings":cur})
+print("ok" if r.get("ok") else "error:" + str((r.get("error") or {}).get("message")))
+PYEOF
+}
+
+if "$QS" mount "$MNT23" --remote "${QXNYC_REMOTE_ROOT:-/home}" --cache-dir "$CACHE23" \
+        --threads 2 >/dev/null 2>&1; then
+  M23="$MNT23$(echo "$FIXTURE" | sed 's#^/home##')"
+
+  # ---- M23-1 默认关：ENODATA + 名单里没有（M23 之前的行为一字不变）
+  check "$([ "$(xdg_tags "$M23/hello.txt")" = ERR61 ] && echo 0 || echo 1)" \
+    "M23-1 开关默认关 → getxattr user.xdg.tags = ENODATA"
+  check "$([ "$(xdg_listed "$M23/hello.txt")" = 0 ] && echo 0 || echo 1)" \
+    "M23-1b 开关默认关 → listxattr 名单不含 user.xdg.tags"
+
+  # ---- M23-2 Baloo 门禁：挂载点会被索引 → settings_save 被拒
+  BALOOCTL=$(command -v balooctl6 || command -v balooctl || true)
+  GATE_HIT=0
+  if [ -n "$BALOOCTL" ]; then
+    if [ "$(save_dolphin true)" = "ok" ]; then
+      # 挂载点不在索引范围（比如 RUNDIR 在家目录外/索引全局关）→ 门禁不拦，直接过
+      echo "  门禁未拦（挂载点不会被 Baloo 索引）—— 跳过 M23-2，继续验 tags"
+    else
+      GATE_HIT=1
+      check 0 "M23-2 挂载点未排除 → settings_save 被门禁拒绝"
+      "$BALOOCTL" config add excludeFolders "$MNT23" >/dev/null 2>&1
+      check "$([ "$(save_dolphin true)" = "ok" ] && echo 0 || echo 1)" \
+        "M23-2b balooctl 排除挂载点后 → settings_save 成功"
+    fi
+  else
+    echo "  没装 balooctl —— 跳过 M23-2 门禁段"
+    save_dolphin true >/dev/null 2>&1
+  fi
+
+  # ---- M23-3 开了之后：占位符 → 仅在线；水合 → 已水合；名单包含
+  check "$([ "$(xdg_tags "$M23/hello.txt")" = "仅在线" ] && echo 0 || echo 1)" \
+    "M23-3 开关开 → 占位符的 tags = 仅在线"
+  check "$([ "$(xdg_listed "$M23/hello.txt")" = 1 ] && echo 0 || echo 1)" \
+    "M23-3b 开关开 → listxattr 名单含 user.xdg.tags"
+  cat "$M23/hello.txt" >/dev/null 2>&1
+  check "$([ "$(xdg_tags "$M23/hello.txt")" = "已水合" ] && echo 0 || echo 1)" \
+    "M23-3c 水合后 tags = 已水合"
+  # 目录：xattr 存在但为空（Dolphin 显示无标签）
+  check "$([ "$(xdg_tags "$M23")" = "" ] && echo 0 || echo 1)" \
+    "M23-3d 目录的 tags = 空串（不水合，无标签）"
+
+  # ---- M23-4 热切换：关回去立刻消失（不用重挂载）
+  save_dolphin false >/dev/null 2>&1
+  check "$([ "$(xdg_tags "$M23/hello.txt")" = ERR61 ] && echo 0 || echo 1)" \
+    "M23-4 关回去 → user.xdg.tags 立刻消失（热切换，无重挂载）"
+
+  # ---- 收尾：还原设置 + 去掉为门禁段加的 Baloo 排除（净退出）
+  save_dolphin false >/dev/null 2>&1
+  if [ "$GATE_HIT" = "1" ] && [ -n "$BALOOCTL" ]; then
+    "$BALOOCTL" config rm excludeFolders "$MNT23" >/dev/null 2>&1
+  fi
+  unmount_retry "$MNT23"
+else
+  bad "M23：挂载失败（跳过 Dolphin 集成检查）"
+fi
+
 "$QS" daemon stop >/dev/null 2>&1
 
 echo "=== 卸载干净（无残留）==="

@@ -1,7 +1,9 @@
 # xattr 标签（user.xdg.tags）与 Dolphin 状态显示：调研
 
 > 日期：2026-10-20
-> 状态：**调研完成，结论可行，待定是否实施**
+> 状态：**已实施（M23）** —— 见 [M23-Dolphin集成.md](M23-Dolphin集成.md)。
+> 实施时在调研结论之上补了：开关（`settings.dolphin_tags`，默认关）、Baloo 门禁
+> （开启前每个挂载点必须已排除出索引）、GUI 一键弹终端自动执行排除命令。
 > 环境：CachyOS / KDE Plasma 6 / Dolphin 26.08.2 / KF6 6.31 / Qt 6.12 / baloo 6.31
 >
 > 核心问题：把水合状态（仅在线 / 部分本地 / 已水合）写进 `user.xdg.tags` xattr，

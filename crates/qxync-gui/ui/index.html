@@ -602,9 +602,19 @@
               </p>
               <label class="check"><input type="checkbox" id="s-notifications"> 显示桌面通知（Show desktop notifications）</label>
               <p class="hint">同步出错时发一条系统通知（经 <code>org.freedesktop.Notifications</code>）；关掉就完全不发。</p>
+              <!-- ★ M23：Dolphin 集成 —— 水合状态进 user.xdg.tags，Dolphin 自带 Tags 列直接显示 -->
+              <label class="check"><input type="checkbox" id="s-dolphin-tags"> 在 Dolphin 里显示水合状态（Tags 列）</label>
+              <p class="hint" data-i18n="adv.dolphin_hint">
+                打开后，挂载点里每个文件把水合状态（仅在线 / 部分本地 / 已水合）写进
+                <code>user.xdg.tags</code>；在 Dolphin 里右键列头勾「Tags」即可看到。
+                前置条件：挂载点必须已排除出 Baloo 索引（否则索引器会把整个 NAS 拉到本地）。
+                状态不实时刷新（F5 / 重进目录后更新）。
+              </p>
+              <dl class="kv" id="dolphin-kv"></dl>
               <div class="btn-row">
                 <button type="button" id="btn-advanced-save" class="primary">保存高级设置</button>
                 <button type="button" id="btn-notify-test">发一条测试通知</button>
+                <button type="button" class="ghost" id="btn-baloo-recheck">重新检测 Baloo</button>
               </div>
               <div id="advanced-result" class="result" hidden></div>
               <h3 class="sub">明确不做（点了会说明原因）</h3>
