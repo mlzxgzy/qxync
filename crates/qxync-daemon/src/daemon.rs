@@ -10,9 +10,10 @@ use qxync_core::ipc::{
     decode_line, encode_line, mask_sid, mask_token, BalooMountInfo, BalooStatusData, CacheInfo,
     CursorInfo, DaemonInfo, DecisionInfo, DecisionsData, DehydrateData, DiffData, ErrorKind,
     FileStateInfo, FileStatesData, GetData, HydroStats, IpcError, JournalData, LinkInfo, LoginData,
-    LsData, MountInfo, OfflineInfo, PeerData, PingData, PutData, Request, RequestEnvelope,
-    Response, RootsData, RulesData, ServerInfo, SessionInfo, SettingsData, ShutdownData, SpaceData,
-    StatusData, StoreData, SyncCursors, SyncInfo, TaskInfo, TasksData, IPC_VERSION,
+    LsData, MountInfo, OfflineInfo, OverlayPluginInfo, PeerData, PingData, PutData, Request,
+    RequestEnvelope, Response, RootsData, RulesData, ServerInfo, SessionInfo, SettingsData,
+    ShutdownData, SpaceData, StatusData, StoreData, SyncCursors, SyncInfo, TaskInfo, TasksData,
+    IPC_VERSION,
 };
 use qxync_core::mounts::{MountRecord, MountsFile};
 use qxync_core::rules::Rules;
@@ -5346,6 +5347,7 @@ fn idle_baloo_status() -> BalooStatusData {
         indexing_enabled: probe.indexing_enabled(),
         dolphin_tags,
         dolphin_overlay,
+        overlay_plugin: overlay_plugin_info(),
         mounts: Vec::new(),
         can_enable: true,
     }
@@ -5630,8 +5632,20 @@ fn baloo_status_cmd(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
         indexing_enabled: probe.indexing_enabled(),
         dolphin_tags,
         dolphin_overlay,
+        overlay_plugin: overlay_plugin_info(),
         mounts,
         can_enable,
+    })
+}
+
+/// ★ M25：角标插件检测（`baloo_status` 的一个字段，GUI 侧显示用）。
+///
+/// 插件加载发生在**桌面会话**里，daemon 与 GUI 同会话运行，直接查本机
+/// 文件系统即可（`qxync_core::dolphin`，规则与 Qt 的插件查找对齐）。
+fn overlay_plugin_info() -> Option<OverlayPluginInfo> {
+    qxync_core::dolphin::detect_overlay_plugin().map(|p| OverlayPluginInfo {
+        path: p.path.display().to_string(),
+        effective: p.effective,
     })
 }
 
