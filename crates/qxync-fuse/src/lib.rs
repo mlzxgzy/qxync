@@ -6382,6 +6382,11 @@ mod tests {
     /// 写入被 EPERM 拒，用户看到的就是报错弹窗（真机 2026-10-19/20 日志三次）。
     #[test]
     fn trash_paths_are_invisible_on_the_read_side() {
+        // 回收站名必须按**当前进程真实 UID** 构造：生产代码匹配的是
+        // `.Trash-$UID`（KIO 探测的也是当前用户的回收站），硬编码 `.Trash-1000`
+        // 只在 UID=1000 的机器上成立——GitHub runner 是 1001，CI 必炸
+        // （v0.7.4 就这么炸过一次）。
+        let my_trash = format!(".Trash-{}", unsafe { libc::getuid() });
         let dir = std::env::temp_dir().join(format!(
             "qxync-trash-invisible-{}-{}",
             std::process::id(),
@@ -6393,10 +6398,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let fs = test_fs(&dir, true);
 
-        // lookup：挂载根（ino=1）下查 `.Trash-1000` 必须是 ENOENT，
+        // lookup：挂载根（ino=1）下查当前用户的 `.Trash-$UID` 必须是 ENOENT，
         // 即使节点表里已经有这个远端路径的节点（模拟 NAS 上遗留的目录）。
         assert!(
-            matches!(fs.lookup_child(INodeNo::ROOT, ".Trash-1000"), Err(e) if e.code() == libc::ENOENT),
+            matches!(fs.lookup_child(INodeNo::ROOT, &my_trash), Err(e) if e.code() == libc::ENOENT),
             "KIO 的探测 stat 必须拿到「不存在」"
         );
         assert!(
@@ -6407,19 +6412,19 @@ mod tests {
             matches!(fs.lookup_child(INodeNo::ROOT, "@Recycle"), Err(e) if e.code() == libc::ENOENT),
             "QNAP 回收站同样不可见"
         );
-        assert!(fs.is_trash_path("/home/.Trash-1000"));
+        assert!(fs.is_trash_path(&format!("/home/{my_trash}")));
         assert!(
-            fs.is_trash_path("/home/.Trash-1000/info/x.trashinfo"),
+            fs.is_trash_path(&format!("/home/{my_trash}/info/x.trashinfo")),
             "子路径同样不可见"
         );
         // lookup_child 的守卫在 hide_reason 之后第一道就挡（见实现），
         // 这里用同一判定函数验证语义：正常名字不受影响。
         assert!(!fs.is_trash_path("/home/正常目录/文件.txt"));
-        assert!(!fs.is_trash_path("/home/.Trash-1000.txt"));
+        assert!(!fs.is_trash_path(&format!("/home/{my_trash}.txt")));
 
         // filter_visible：NAS 清单里的回收站条目必须被滤掉。
         let entries = vec![
-            DirEntry::local(".Trash-1000", true, 0, 0),
+            DirEntry::local(&my_trash, true, 0, 0),
             DirEntry::local("@Recycle", true, 0, 0),
             DirEntry::local("正常文件.txt", false, 186, 0),
             DirEntry::local(".obsidian", true, 0, 0),
