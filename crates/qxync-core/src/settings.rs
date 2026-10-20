@@ -477,13 +477,16 @@ impl Settings {
             // ★ M23：Dolphin 集成开关。这里只记值；「挂载点必须已排除出 Baloo
             //   索引」的前置检查在 daemon 的 settings_save 里做（core 不知道挂载点）。
             "dolphin_tags" => self.dolphin_tags = b(v)?,
+            // ★ M24：文件图标角标开关。与 `dolphin_tags` 相互独立；前置检查同
+            //   前者（daemon 的 settings_save 做），这里只记值。
+            "dolphin_overlay" => self.dolphin_overlay = b(v)?,
             "language" => self.language = v.to_string(),
             "region" => self.region = v.to_string(),
             other => {
                 return Err(Error::Io(format!(
                     "未知设置键 {other:?}（可用：proxy.mode/server/port/auth/user/password、\
                      free.auto/mode/below_pct/every_hours、startup、notifications、debug_log、\
-                     close_to_tray、dolphin_tags、language、region）"
+                     close_to_tray、dolphin_tags、dolphin_overlay、language、region）"
                 )))
             }
         }
@@ -596,6 +599,23 @@ mod tests {
         assert!(!s.free_space.auto);
         assert_eq!(s.version, 1);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ★ M24 回归：CLI `settings --set dolphin_overlay=...` 曾报「未知设置键」——
+    /// 字段加了、GUI / IPC 路径都通了，但 `set_kv` 的键表漏了这一条 arm
+    /// （同一批改动里 `dolphin_tags` 有、`dolphin_overlay` 没有）。
+    #[test]
+    fn set_kv_covers_both_dolphin_switches() {
+        let mut s = Settings::default();
+        assert!(!s.dolphin_tags && !s.dolphin_overlay, "两个开关默认关");
+        s.set_kv("dolphin_tags", "true").unwrap();
+        s.set_kv("dolphin_overlay", "on").unwrap();
+        assert!(s.dolphin_tags && s.dolphin_overlay);
+        s.set_kv("dolphin_overlay", "false").unwrap();
+        assert!(!s.dolphin_overlay, "必须能关回去");
+
+        let e = s.set_kv("dolphin_ovrlay", "true").unwrap_err().to_string();
+        assert!(e.contains("dolphin_overlay"), "报错要列出可用键: {e}");
     }
 
     #[test]

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`qxync settings --set dolphin_overlay=...` failed with "unknown setting key"**:
+  when M24 added the field, the `Settings::set_kv` key table was not extended —
+  the GUI checkbox and IPC `settings_save` worked, only the CLI-direct path was
+  rejected by core's key validation. Added the missing arm plus a regression test;
+  the "available keys" error message now lists `dolphin_overlay` too.
+
 ## [0.7.2] - 2026-10-20
 
 ### Added
