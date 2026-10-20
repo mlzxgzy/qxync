@@ -7,7 +7,8 @@
 //!
 //! 本模块只做**纯读取与判定**（不写任何配置）：
 //!
-//! * [`BalooConfig::load`]：读 `~/.config/baloofilerc`；
+//! * [`BalooConfig::load`]：读 baloofilerc（`$XDG_CONFIG_HOME` 优先，缺省
+//!   `~/.config` —— 与 balooctl/KConfig 的写入位置对齐）；
 //! * [`BalooConfig::is_excluded`]：路径（或其祖先）是否在排除列表里；
 //! * [`BalooConfig::would_index`]：Baloo 开着时**会不会真的索引这个路径**
 //!   （= 开启 Dolphin 集成的风险判定）；
@@ -24,7 +25,9 @@
 //! [General]
 //! dbVersion=2
 //! exclude filters=…              ← 文件名 glob，与目录排除无关
-//! exclude folders=/home/u/a,/home/u/b   ← 逗号分隔的绝对路径
+//! exclude folders[$e]=/mnt/a/,/mnt/b/   ← 逗号分隔的绝对路径。balooctl 实写
+//!                                   带键标记 [$e] 与尾斜杠（实测）；手写无标记
+//!                                   也常见，两种都解析
 //! folders=/home/u/docs           ← 非空 = 只索引这些目录（include 列表）
 //! ```
 //!
@@ -40,8 +43,27 @@
 
 use std::path::{Path, PathBuf};
 
-/// `~/.config/baloofilerc` 的路径。
+/// baloofilerc 的路径：KConfig 语义 —— `$XDG_CONFIG_HOME/baloofilerc` 优先
+/// （非空且为绝对路径时），缺省 `~/.config/baloofilerc`。
+///
+/// 必须与 balooctl 对齐：balooctl 写配置走 KConfig，实测（CachyOS /
+/// baloo 6.31，`XDG_CONFIG_HOME=/tmp/x balooctl6 config add excludeFolders …`）
+/// 写进的是 `$XDG_CONFIG_HOME/baloofilerc`。读侧若写死 `~/.config`，
+/// 在设了 `XDG_CONFIG_HOME` 的环境（如 fuse-matrix 为隔离凭据设的
+/// `$RUNDIR/config`）里两边看的就不是同一个文件 —— 门禁永远看不到
+/// balooctl 刚写入的排除项。
 pub fn config_path(home: &Path) -> PathBuf {
+    config_path_with(home, std::env::var_os("XDG_CONFIG_HOME").as_deref())
+}
+
+/// [`config_path`] 的可单测版本（不碰进程环境）。
+pub fn config_path_with(home: &Path, xdg_config_home: Option<&std::ffi::OsStr>) -> PathBuf {
+    if let Some(x) = xdg_config_home {
+        let p = PathBuf::from(x);
+        if p.is_absolute() {
+            return p.join("baloofilerc");
+        }
+    }
     home.join(".config").join("baloofilerc")
 }
 
@@ -87,7 +109,10 @@ impl BalooConfig {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
             };
-            let key = key.trim();
+            // KConfig 键可带扩展标记后缀：balooctl 实写 `exclude folders[$e]=…`
+            // （实测 CachyOS / baloo 6.31；`$e` = 值里展开变量）。剥掉 `[...]`
+            // 再匹配，否则 balooctl 写入的排除项一个都读不到。
+            let key = key.split('[').next().unwrap_or(key).trim();
             let value = value.trim();
             match (section.as_str(), key) {
                 ("Basic Settings", "Indexing-Enabled") => {
@@ -249,6 +274,44 @@ mod tests {
     fn tilde_and_home_var_are_expanded() {
         let c = cfg("[General]\nexclude folders=~/mnt,$HOME/mnt2\n");
         assert_eq!(c.exclude_folders, vec![p("/home/u/mnt"), p("/home/u/mnt2")]);
+    }
+
+    #[test]
+    fn parses_balooctl_written_format() {
+        // balooctl6 config add excludeFolders /tmp/x 实际写出的形状
+        // （CachyOS / baloo 6.31 实测）：键带 KConfig 扩展标记 [$e]、
+        // 值带尾部斜杠、多项逗号分隔。尾斜杠不产生 Path 组件，判定不受影响。
+        let c = cfg("[General]\nexclude folders[$e]=/tmp/x/,/home/u/mnt/\nfolders[$e]=/home/u/docs/\n");
+        assert_eq!(c.exclude_folders, vec![p("/tmp/x"), p("/home/u/mnt")]);
+        assert_eq!(c.include_folders, vec![p("/home/u/docs")]);
+        // 手写（无标记）格式照旧可读
+        let c = cfg("[General]\nexclude folders=/tmp/x\n");
+        assert_eq!(c.exclude_folders, vec![p("/tmp/x")]);
+    }
+
+    #[test]
+    fn config_path_respects_xdg_config_home() {
+        use std::ffi::OsStr;
+        let home = Path::new("/home/u");
+        // 未设 → ~/.config（真实用户环境的常态）
+        assert_eq!(
+            config_path_with(home, None),
+            p("/home/u/.config/baloofilerc")
+        );
+        // 设了且绝对 → $XDG_CONFIG_HOME 下（balooctl/KConfig 的写入位置）
+        assert_eq!(
+            config_path_with(home, Some(OsStr::new("/run/isolated/config"))),
+            p("/run/isolated/config/baloofilerc")
+        );
+        // 相对路径 / 空串 → KConfig 规定忽略，回落 ~/.config
+        assert_eq!(
+            config_path_with(home, Some(OsStr::new(""))),
+            p("/home/u/.config/baloofilerc")
+        );
+        assert_eq!(
+            config_path_with(home, Some(OsStr::new("relative/paths"))),
+            p("/home/u/.config/baloofilerc")
+        );
     }
 
     #[test]
