@@ -30,7 +30,23 @@
   限制（调研文档 §5）：状态不实时刷新（F5 / 重进目录）；依赖 Baloo 全局开关；
   进不了 `tags:` 虚拟目录；挂载点上加不了用户自己的标签（`setxattr` 有意不实现）。
 
-## [0.7.0] - 2026-10-20
+### 修复（M23 真机验证暴露）
+
+- **Baloo 配置读取不认 `XDG_CONFIG_HOME`**：balooctl 写配置走 KConfig 语义
+  （`$XDG_CONFIG_HOME/baloofilerc` 优先），而读侧写死了 `$HOME/.config` ——
+  设了 `XDG_CONFIG_HOME` 的环境里门禁永远看不到刚写入的排除项。真实用户
+  环境两者恰好一致所以此前未炸。现在读侧对齐 KConfig 语义（fuse-matrix
+  真机 9/9 全绿）；
+- **不认 balooctl 实写的键格式**：balooctl 写的是 `exclude folders[$e]=$HOME/…/`
+  （KConfig 扩展标记 + `$HOME` 变量形式 + 尾斜杠），精确匹配 `exclude folders`
+  一个条目都读不到。现在键匹配前剥 `[...]` 后缀（`$HOME` 展开与尾斜杠的组件
+  比较原本就有）。两个修复各带单测（baloo 12 例）；
+- **fuse-matrix 两处测试缺陷**（假失败的来源）：M23 段开跑不重置 `dolphin_tags`
+  → 上轮残留 true 时门禁断言被「只在关→开边沿拦」的产品语义静默吞掉；缓存
+  清理 `rm -f` 删不掉 host 子目录（M9 布局）→ 残留缓存让三个断言假失败。
+  基线对照（M23 之前的代码）确认其余失败为 WAN 环境固有，与本版本无关。
+
+## [0.7.1] - 2026-10-20
 
 ### 新增
 

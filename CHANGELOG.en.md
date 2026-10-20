@@ -36,7 +36,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on the global Baloo switch; not searchable via `tags:`; users cannot add their own
   tags on mountpoints (`setxattr` intentionally unimplemented).
 
-## [0.7.0] - 2026-10-20
+### Fixed (surfaced by real-machine verification of M23)
+
+- **Baloo config reader ignored `XDG_CONFIG_HOME`**: balooctl writes via KConfig
+  semantics (`$XDG_CONFIG_HOME/baloofilerc` takes precedence) while the reader
+  hardcoded `$HOME/.config` — in any environment with `XDG_CONFIG_HOME` set, the
+  gate could never see freshly written exclusions. Real user environments happen
+  to coincide (XDG unset), which is why it never blew up. The reader now mirrors
+  KConfig semantics (fuse-matrix on real hardware: 9/9 green);
+- **Did not parse the key format balooctl actually writes**: balooctl writes
+  `exclude folders[$e]=$HOME/…/` (KConfig expansion marker + `$HOME` variable
+  form + trailing slash); exact-match on `exclude folders` read zero entries.
+  Key matching now strips the `[...]` suffix (`$HOME` expansion and
+  component-wise trailing-slash comparison were already there). Both fixes carry
+  unit tests (baloo: 12 cases);
+- **Two fuse-matrix test defects** (sources of false failures): the M23 section
+  did not reset `dolphin_tags` at start — a stale `true` from a previous run let
+  the gate assertion be silently swallowed by the "only gate on the off→on edge"
+  product semantics; cache cleanup `rm -f` could not remove per-host
+  subdirectories (M9 layout) — leftover cache made three assertions fail
+  falsely. A baseline comparison (pre-M23 code) confirmed the remaining failures
+  are WAN-environment-inherent and unrelated to this release.
+
+## [0.7.1] - 2026-10-20
 
 ### Added
 
