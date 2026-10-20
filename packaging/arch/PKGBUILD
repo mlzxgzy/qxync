@@ -37,6 +37,9 @@ depends=(
 )
 provides=('qxync')
 conflicts=('qxync' 'qxync-git')
+# 角标插件是独立的源码包（KF6 插件 ABI 跟发行版绑定，预编译不了）。
+# 不装它 = 没有文件图标角标，其它功能完全不受影响。
+optdepends=('qxync-dolphin-overlay: Dolphin 文件图标上的水合状态角标（绿对钩 / 蓝云）')
 # ★ 与仓库口径一致：release 产物**有意不 strip**，带 line-tables-only 调试信息，
 # 用户报 bug 时贴出来的回溯才可读（见 Cargo.toml 的 [profile.release] 注释）。
 # `!debug` 同样必要：makepkg 默认会把调试信息切进单独的 -debug 包，那就白留了。
@@ -45,9 +48,9 @@ options=('!strip' '!debug')
 
 _triple='x86_64-unknown-linux-gnu'
 source=("qxync-${pkgver}-${_triple}.tar.gz::https://github.com/mlzxgzy/qxync/releases/download/v${pkgver}/qxync-${pkgver}-${_triple}.tar.gz")
-# ⚠️ 占位值：Release 产物由 CI 构建，本机算不出来。发版后跑一次 `updpkgsums`
-#    就会把这行换成真实值（发版清单 §6 有这一步）。
-sha256sums=('0000000000000000000000000000000000000000000000000000000000000000')
+# v0.7.2 的 Release 产物校验和（CI 用 ubuntu-22.04 打的同一个 tar.gz）。
+# 新版本发出去之后必须先 `updpkgsums` 再推 AUR（发版清单 §6 有这一步）。
+sha256sums=('87668651dfcd350faae283a344b367719c5907430d62a44ff88e4d216b141516')
 
 package() {
   local stem="qxync-${pkgver}-${_triple}"

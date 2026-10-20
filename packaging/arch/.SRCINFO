@@ -1,6 +1,6 @@
 pkgbase = qxync-bin
 	pkgdesc = QNAP Qsync client for Linux: FUSE on-demand sync + qxyncd daemon + Tauri GUI (prebuilt)
-	pkgver = 0.7.0
+	pkgver = 0.7.2
 	pkgrel = 1
 	url = https://github.com/mlzxgzy/qxync
 	install = qxync-bin.install
@@ -17,12 +17,13 @@ pkgbase = qxync-bin
 	depends = dbus
 	depends = libsoup3
 	depends = webkit2gtk-4.1
+	optdepends = qxync-dolphin-overlay: Dolphin 文件图标上的水合状态角标（绿对钩 / 蓝云）
 	provides = qxync
 	conflicts = qxync
 	conflicts = qxync-git
 	options = !strip
 	options = !debug
-	source = qxync-0.4.0-x86_64-unknown-linux-gnu.tar.gz::https://github.com/mlzxgzy/qxync/releases/download/v0.4.0/qxync-0.4.0-x86_64-unknown-linux-gnu.tar.gz
-	sha256sums = 0000000000000000000000000000000000000000000000000000000000000000
+	source = qxync-0.7.2-x86_64-unknown-linux-gnu.tar.gz::https://github.com/mlzxgzy/qxync/releases/download/v0.7.2/qxync-0.7.2-x86_64-unknown-linux-gnu.tar.gz
+	sha256sums = 87668651dfcd350faae283a344b367719c5907430d62a44ff88e4d216b141516
 
 pkgname = qxync-bin

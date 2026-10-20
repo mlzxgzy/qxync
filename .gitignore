@@ -55,3 +55,9 @@ crates/qxync-gui/gen/schemas/
 
 # ===== Dolphin 角标插件（contrib/dolphin/overlay）的 CMake 构建目录 =====
 contrib/dolphin/overlay/build/
+
+# ===== AUR 角标插件包（packaging/arch-dolphin-overlay）的 makepkg 产物 =====
+/packaging/arch-dolphin-overlay/src/
+/packaging/arch-dolphin-overlay/pkg/
+/packaging/arch-dolphin-overlay/*.pkg.tar.*
+/packaging/arch-dolphin-overlay/*.tar.gz
