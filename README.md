@@ -97,6 +97,23 @@ systemctl --user enable --now qxyncd
 和 Release 产物一样**有意不 strip**（用户报 bug 时回溯才可读），装完约 190 MB。依赖清单、
 打包方式与 lintian 预期告警等细节见 [`packaging/debian/README.md`](packaging/debian/README.md)。
 
+**Dolphin 角标插件（可选）**：deb 侧是**两个包**——插件 `.so` 的 ABI 绑 KIO 大版本，
+Debian / Ubuntu 矩阵横跨 KF5 / KF6 两个世代（Debian 12 / Ubuntu 22.04 / 24.04 的 Dolphin
+是 KF5，Debian 13 / Ubuntu 26.04 是 KF6）：
+
+| 下载这个 | 适用发行版 |
+|---|---|
+| `qxync-dolphin-overlay-kf5_<版本>-1_amd64.deb` | Debian 12、Ubuntu 22.04 / 24.04（KF5） |
+| `qxync-dolphin-overlay-kf6_<版本>-1_amd64.deb` | Debian 13、Ubuntu 26.04（KF6） |
+
+```bash
+sudo apt install ./qxync-dolphin-overlay-kf<5或6>_<版本>-1_amd64.deb
+```
+
+装完**重启 Dolphin**（插件只在创建视图时加载），再在 GUI「设置 → 高级」打开
+「在文件图标上显示状态角标」。拿不准自己的 Dolphin 是哪代？看
+`apt depends dolphin` 的输出里有 `kio6` 就是 KF6，只有 `kio` 就是 KF5。
+
 **从旧包升级**：以前装过 `qxync_<旧版本>-1~deb12_amd64.deb` / `qxync_<旧版本>-1~ubuntu22.04_amd64.deb`
 的，直接 `sudo apt install ./qxync_<版本>-1_amd64.deb` 即可 —— 按 dpkg 版本序 `<版本>-1` 大于
 `<旧版本>-1~deb12`（`~` 排在空串之前），apt 会正常升级；想先确认可以跑
