@@ -357,6 +357,12 @@ pub enum Request {
         #[serde(default)]
         now: Option<bool>,
     },
+    /// ★ M23：Baloo 索引状态检测（Dolphin 集成的前置条件）。
+    ///
+    /// 只读：解析 `~/.config/baloofilerc` + 对照当前所有挂载点，返回
+    /// 每个挂载点「是否已排除 / 会不会被索引 / 建议执行的排除命令」。
+    /// GUI 开 Dolphin 集成开关前先调它做预检。
+    BalooStatus,
     /// 干净退出：卸载所有挂载点、删 socket/pid。
     Shutdown,
 }
@@ -391,6 +397,7 @@ impl Request {
             Request::Decisions { .. } => "decisions",
             Request::FileStates { .. } => "file_states",
             Request::Space { .. } => "space",
+            Request::BalooStatus => "baloo_status",
             Request::Shutdown => "shutdown",
         }
     }
@@ -651,6 +658,14 @@ pub struct MountInfo {
     /// 这个挂载点对应的**那一个** NAS 文件夹。
     pub remote: String,
     pub readonly: bool,
+    /// ★ M23：Baloo 索引风险提示（**非阻塞**）。
+    ///
+    /// `Some(...)` = 这个挂载点会被 Baloo 索引（内容索引器会把占位符整个拉下来，
+    /// 与 Dolphin 集成开关无关 —— 挂载本身照常成功，但用户应该排除它）。
+    /// `None` = 安全（已排除 / Baloo 关 / 没装 Baloo）。
+    /// 老客户端忽略未知字段，不破坏兼容。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baloo_warning: Option<String>,
 }
 
 /// 三个持久化游标（M2c；对应 Windows 版注册表里的 `QSYNC_PROCESSED_MAX_*_LOG_INDEX_64`）。
@@ -1292,6 +1307,47 @@ pub struct SpaceData {
     /// 被安全检查链挡下的项（(`路径`, 原因)）—— **自动释放也不例外**。
     pub blocked: Vec<(String, String)>,
     pub note: Option<String>,
+}
+
+/// ★ M23：`baloo_status` 的返回 —— Dolphin 集成开关的前置检测。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BalooStatusData {
+    /// 找到的 `balooctl`（`balooctl6` 优先）；`None` = 系统没装 Baloo。
+    pub balooctl: Option<String>,
+    /// `~/.config/baloofilerc` 的路径（诊断用）。
+    pub config_path: String,
+    /// 配置文件是否存在（不存在 = Baloo 从没跑过，什么都不会被索引）。
+    pub config_exists: bool,
+    /// Baloo 全局索引开关（`Indexing-Enabled`；缺省视为开）。
+    ///
+    /// 关着时挂载点都「安全」，但 Dolphin 的 Tags 列也不显示 ——
+    /// GUI 要把这一点如实告诉用户，别让人以为开关坏了。
+    pub indexing_enabled: bool,
+    /// 当前 Dolphin 集成开关（`settings.dolphin_tags`）。
+    pub dolphin_tags: bool,
+    /// 每个挂载点的检测结论。
+    pub mounts: Vec<BalooMountInfo>,
+    /// `true` = 现在可以打开 Dolphin 集成（所有挂载点都不会被索引）。
+    ///
+    /// 没有挂载点时恒为 `true`（没有要保护的东西；之后挂载时 mount 会再查）。
+    pub can_enable: bool,
+}
+
+/// ★ M23：单个挂载点的 Baloo 检测结论。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BalooMountInfo {
+    pub mountpoint: String,
+    /// 路径（或祖先）在 `exclude folders` 里。
+    pub excluded: bool,
+    /// **危险**：Baloo 开着且真的会索引这个挂载点（= 会把占位符拉下来）。
+    pub indexed: bool,
+    /// 该挂载点当前是否真的在暴露 `user.xdg.tags`
+    /// （= 设置开了 **且** 这个挂载点安全；两个都满足才有 Tags）。
+    pub tags_active: bool,
+    /// 建议执行的排除命令（`balooctl6 config add excludeFolders <挂载点>`）。
+    pub exclude_cmd: String,
 }
 
 /// ★ M8.4：`decisions` 的返回。

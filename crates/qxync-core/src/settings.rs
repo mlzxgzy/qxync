@@ -255,6 +255,14 @@ pub struct Settings {
     /// ★ M8.4：托盘行为 —— 关闭主窗口时最小化到托盘（默认开）。
     #[serde(default = "yes")]
     pub close_to_tray: bool,
+    /// ★ M23：Dolphin 集成 —— 把水合状态暴露成 `user.xdg.tags` xattr，
+    /// Dolphin 自带的 Tags 列就能显示「仅在线 / 部分本地 / 已水合」。
+    ///
+    /// 默认关 = M23 之前的行为一字不变。**开启有前置条件**：每个挂载点都必须
+    /// 已排除出 Baloo 索引（否则内容索引器会把占位符整个拉下来，节省空间模式
+    /// 报废）—— daemon 在 `settings_save` 时强制检查，见 `baloo` 模块。
+    #[serde(default)]
+    pub dolphin_tags: bool,
 }
 
 fn one() -> u32 {
@@ -273,6 +281,7 @@ impl Default for Settings {
             region: String::new(),
             free_space: FreeSpaceSettings::default(),
             close_to_tray: true,
+            dolphin_tags: false,
         }
     }
 }
@@ -455,13 +464,16 @@ impl Settings {
             "notifications" => self.desktop_notifications = b(v)?,
             "debug_log" => self.debug_log = b(v)?,
             "close_to_tray" => self.close_to_tray = b(v)?,
+            // ★ M23：Dolphin 集成开关。这里只记值；「挂载点必须已排除出 Baloo
+            //   索引」的前置检查在 daemon 的 settings_save 里做（core 不知道挂载点）。
+            "dolphin_tags" => self.dolphin_tags = b(v)?,
             "language" => self.language = v.to_string(),
             "region" => self.region = v.to_string(),
             other => {
                 return Err(Error::Io(format!(
                     "未知设置键 {other:?}（可用：proxy.mode/server/port/auth/user/password、\
                      free.auto/mode/below_pct/every_hours、startup、notifications、debug_log、\
-                     close_to_tray、language、region）"
+                     close_to_tray、dolphin_tags、language、region）"
                 )))
             }
         }

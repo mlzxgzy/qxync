@@ -118,6 +118,7 @@ fn spawn_stub(
                         mountpoint: mountpoint.clone(),
                         remote: "/home".into(),
                         readonly: false,
+                        baloo_warning: None,
                     }]),
                     Request::Shutdown => {
                         // 模拟「收到停止请求 → 进程退出」：先杀掉假 daemon 进程，

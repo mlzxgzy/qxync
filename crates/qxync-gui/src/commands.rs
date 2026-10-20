@@ -1703,6 +1703,140 @@ pub async fn app_exe_path() -> Result<Value, String> {
     }
 }
 
+/// ★ M23：弹一个终端，把挂载点排除出 Baloo 索引的命令**自动执行**给用户看。
+///
+/// 为什么开终端而不是 GUI 里静默改配置：
+/// * 改的是**用户桌面环境**的配置（`baloofilerc`），动它应该让用户全程看得见；
+/// * `balooctl` 是 Baloo 自己的 CLI，走它 = 与 KDE 的读写路径完全一致
+///   （我们直接改文件反而可能与 Baloo 的缓存/守护状态打架）；
+/// * 命令失败（权限 / balooctl 行为变化）时用户当场看到错误，而不是一个
+///   「成功」的假按钮。
+///
+/// `--hold` 让终端在命令跑完后**留在原地**（用户能看到 `excludeFolders:` 的
+/// 最终列表），关掉窗口即退出。konsole 优先（KDE 原生），找不到再试
+/// `xdg-terminal-exec` / `xterm`；一个都没有 → 返回可复制的命令文本。
+#[tauri::command]
+pub async fn open_baloo_exclude(mountpoints: Vec<String>) -> Result<Value, String> {
+    let mounts: Vec<String> = mountpoints
+        .into_iter()
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty())
+        .collect();
+    if mounts.is_empty() {
+        return Err("mountpoints 不能为空".into());
+    }
+    let balooctl = qxync_core::baloo::find_balooctl()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "balooctl6".to_string());
+    // 逐个排除 + 最后列出排除清单（用户能当场核对结果）
+    let mut script = String::new();
+    for m in &mounts {
+        script.push_str(&format!(
+            "{} config add excludeFolders {} && ",
+            balooctl,
+            qxync_core::baloo::shell_quote(m)
+        ));
+    }
+    script.push_str(&format!(
+        "echo '--- 当前排除清单 ---' && {} config list excludeFolders",
+        balooctl
+    ));
+
+    // 终端候选：konsole（KDE 原生，--hold 保持窗口）→ xdg-terminal-exec → xterm
+    let candidates: Vec<(&str, Vec<String>)> = vec![
+        (
+            "konsole",
+            vec![
+                "--hold".into(),
+                "-e".into(),
+                "bash".into(),
+                "-c".into(),
+                script.clone(),
+            ],
+        ),
+        (
+            "xdg-terminal-exec",
+            vec!["bash".into(), "-c".into(), script.clone()],
+        ),
+        (
+            "xterm",
+            vec![
+                "-hold".into(),
+                "-e".into(),
+                "bash".into(),
+                "-c".into(),
+                script.clone(),
+            ],
+        ),
+    ];
+    let mut last_err = String::new();
+    for (prog, args) in &candidates {
+        match which_in_path(prog) {
+            Some(exe) => match spawn_detached_argv(&exe, args) {
+                Ok(()) => {
+                    return Ok(json!({
+                        "ok": true,
+                        "terminal": prog,
+                        "command": script,
+                        "mountpoints": mounts,
+                    }));
+                }
+                Err(e) => {
+                    last_err = format!("{prog} 启动失败: {e}");
+                    tracing::warn!("M23：{last_err}，试下一个终端");
+                }
+            },
+            None => continue,
+        }
+    }
+    Ok(json!({
+        "ok": false,
+        "error": if last_err.is_empty() {
+            "没找到可用的终端（konsole / xdg-terminal-exec / xterm）".into()
+        } else {
+            last_err
+        },
+        "command": script,
+        "mountpoints": mounts,
+    }))
+}
+
+/// 在 `PATH` 里找一个可执行文件（`which` 的最小实现；找不到返回 None）。
+fn which_in_path(prog: &str) -> Option<PathBuf> {
+    if prog.contains('/') {
+        return PathBuf::from(prog).is_file().then(|| PathBuf::from(prog));
+    }
+    std::env::var("PATH").ok()?.split(':').find_map(|dir| {
+        let cand = Path::new(dir).join(prog);
+        cand.is_file().then_some(cand)
+    })
+}
+
+/// 带参数列表拉起一个**脱离会话**的子进程（终端窗口不随 GUI 退出而消失）。
+///
+/// 与 [`spawn_detached`] 同一套 `setsid` 尽力而为语义（失败也照样拉起，
+/// 见那边的实测注释）；区别是这里收**多个参数**而不是单个路径。
+fn spawn_detached_argv(exe: &Path, args: &[String]) -> std::io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() != 0 {
+                tracing::debug!(
+                    "M23：setsid 失败（终端窗口将与 GUI 同会话）: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            Ok(())
+        });
+    }
+    cmd.spawn().map(|_| ())
+}
+
 /// ★ M8.4：隐藏主窗口（前端「最小化到托盘」按钮）。
 #[tauri::command]
 pub async fn window_hide(app: tauri::AppHandle) -> Result<Value, String> {

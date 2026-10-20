@@ -5,6 +5,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [中文](CHANGELOG.md) · [README](README.en.md) · [Acceptance log](docs/验收记录.md)
 
+## [Unreleased]
+
+### Added
+
+- **Dolphin integration: hydration state in the Tags column (M23)**: every file in a
+  mountpoint exposes its hydration state (online-only / partially local / hydrated)
+  as the freedesktop-standard `user.xdg.tags` xattr, and Dolphin's **built-in Tags
+  column** just shows it — no plugin, no Dolphin patch. Four parts:
+  * **Switch (off by default)**: new `dolphin_tags` in `settings.json`
+    (`qxync settings --set dolphin_tags=true` or GUI → Settings → Advanced);
+    while off, the xattr is not even listed — pre-M23 behavior is bit-for-bit unchanged;
+  * **Baloo gate**: before it can be turned on, the daemon verifies **every mountpoint
+    is excluded from Baloo indexing** (the content indexer reads files = hydration;
+    enabling tags without exclusion invites it to pull the whole NAS down). New
+    `qxync baloo-status`: Baloo installed / indexing switch / per-mount verdict and
+    the exclude command. Detection mirrors Baloo's own semantics: missing
+    `Indexing-Enabled` counts as on, exclusion covers self and descendants, the
+    include list intersects the mountpoint in both ancestor directions;
+  * **GUI one-click exclusion**: pre-check fails → confirm dialog → "open a terminal,
+    add exclusions automatically" → konsole (`--hold`) runs
+    `balooctl6 config add excludeFolders <mountpoint>` for each mount and lists the
+    final exclusion set; retry saving afterwards;
+  * **Hot toggle + per-mount effect**: the switch is an `Arc<AtomicBool>` shared with
+    FUSE — no remount needed; each mountpoint independently evaluates
+    "setting on && not indexable", so one non-excluded mount does not drag down the
+    others. `mount` responses carry a non-blocking `baloo_warning` (mount would be
+    indexed — independent of the switch, since Baloo reads files on its own).
+  Limitations (research doc §5): no live refresh (F5 / re-enter directory); depends
+  on the global Baloo switch; not searchable via `tags:`; users cannot add their own
+  tags on mountpoints (`setxattr` intentionally unimplemented).
+
 ## [0.7.0] - 2026-10-20
 
 ### Added

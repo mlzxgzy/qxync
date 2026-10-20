@@ -16,6 +16,7 @@
 //! * `versioning_lock` 可用，但这台 NAS 的 `versioning_support` 全为 0、
 //!   `versioning_stat_delta` 恒 `exist:0` → **增量链路服务端不可用**（M5 实测，见 `M5-SQLite与delta.md`）。
 
+pub mod baloo;
 pub mod config;
 pub mod connectivity;
 pub mod decisions;

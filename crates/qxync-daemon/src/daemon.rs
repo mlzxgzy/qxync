@@ -7,12 +7,12 @@ use qxync_client::peer::PeerEvent;
 use qxync_client::{Client, Session};
 use qxync_core::dehydrate::{Block, CacheLimit, Policy};
 use qxync_core::ipc::{
-    decode_line, encode_line, mask_sid, mask_token, CacheInfo, CursorInfo, DaemonInfo,
-    DecisionInfo, DecisionsData, DehydrateData, DiffData, ErrorKind, FileStateInfo, FileStatesData,
-    GetData, HydroStats, IpcError, JournalData, LinkInfo, LoginData, LsData, MountInfo,
-    OfflineInfo, PeerData, PingData, PutData, Request, RequestEnvelope, Response, RootsData,
-    RulesData, ServerInfo, SessionInfo, SettingsData, ShutdownData, SpaceData, StatusData,
-    StoreData, SyncCursors, SyncInfo, TaskInfo, TasksData, IPC_VERSION,
+    decode_line, encode_line, mask_sid, mask_token, BalooMountInfo, BalooStatusData, CacheInfo,
+    CursorInfo, DaemonInfo, DecisionInfo, DecisionsData, DehydrateData, DiffData, ErrorKind,
+    FileStateInfo, FileStatesData, GetData, HydroStats, IpcError, JournalData, LinkInfo, LoginData,
+    LsData, MountInfo, OfflineInfo, PeerData, PingData, PutData, Request, RequestEnvelope,
+    Response, RootsData, RulesData, ServerInfo, SessionInfo, SettingsData, ShutdownData, SpaceData,
+    StatusData, StoreData, SyncCursors, SyncInfo, TaskInfo, TasksData, IPC_VERSION,
 };
 use qxync_core::mounts::{MountRecord, MountsFile};
 use qxync_core::rules::Rules;
@@ -25,7 +25,7 @@ use qxync_fuse::upload::UploadQueue;
 use qxync_fuse::{CacheMode, FsHandle, HydroCounters, LocalView, MountHandle, PinMap, QxyncFs};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -238,6 +238,12 @@ pub(crate) struct MountEntry {
     /// 线程数、水合超时、删除上限这些从 `MountEntry` 里已经取不回来了（`MountEntry`
     /// 只留了同步引擎要用的 `cache_mode` / `conflict`）。
     rec: MountRecord,
+    /// ★ M23：该挂载点的 `user.xdg.tags` 暴露开关（与 FUSE 实例共享的**活开关**）。
+    ///
+    /// daemon 侧语义：`settings.dolphin_tags` **且** 该挂载点不会被 Baloo 索引
+    /// （见 [`refresh_dolphin_flags`]）。存句柄是为了 `settings_save` 时能热刷新
+    /// —— 不用重挂载。
+    dolphin_tags: Arc<AtomicBool>,
 }
 
 pub(crate) struct State {
@@ -761,6 +767,10 @@ async fn handle_idle_conn(
                         settings,
                         autostart_exe,
                     } => idle_settings_save(&paths, settings, autostart_exe),
+                    // ★ M23：Baloo 检测与 NAS 无关（读的是本机 baloofilerc），
+                    // 空转待命也要能答 —— GUI 的设置页（开关就住在那里）
+                    // 在还没配连接时就打开了。
+                    Request::BalooStatus => to_value(idle_baloo_status()),
                     Request::Shutdown => {
                         // 与同步模式一致：先回响应，再触发退出
                         let tx = shutdown.clone();
@@ -1523,6 +1533,7 @@ async fn dispatch(state: &Arc<State>, req: Request, shutdown: &mpsc::Sender<()>)
         } => decisions_cmd(state, &action, id, resolution).await,
         Request::FileStates { path } => file_states_cmd(state, path).await,
         Request::Space { now } => space_cmd(state, now.unwrap_or(false)).await,
+        Request::BalooStatus => baloo_status_cmd(state),
         Request::Peer {
             action,
             addr,
@@ -2443,6 +2454,15 @@ async fn mount(
     }
     let counters = Arc::new(HydroCounters::default());
     let fuse_client = Arc::new(fuse_client);
+    // ★ M23：挂载点级别的 Dolphin tags 开关（初值 = 设置开了 && 这个挂载点
+    // 不会被 Baloo 索引；两个条件缺一 tags 就不暴露，挂载本身照常）。
+    // 顺带做一次 Baloo 探测：无论 tags 开不开，挂载点会被索引都值得警告 ——
+    // Baloo 的内容索引与我们的开关无关，它自己就会把占位符拉下来。
+    let baloo_probe = BalooProbe::detect();
+    let baloo_indexed = baloo_probe.indexed(&mp);
+    let dolphin_flag = Arc::new(AtomicBool::new(
+        state.settings.lock().unwrap().dolphin_tags && !baloo_indexed,
+    ));
     let mut fs = QxyncFs::new(fuse_client.clone(), remote.clone(), cache.clone())
         .map_err(|e| IpcError::new(ErrorKind::Io, e.to_string()))?
         .with_hydrate_timeout(hydrate_timeout)
@@ -2461,7 +2481,11 @@ async fn mount(
         // 所以两边看到的仍是**同一个 SQLite 连接**，不会出现两个连接抢写锁。
         .with_nodes_store(Arc::new(state.sync_store.lock().unwrap().store.clone()))
         // ★ M20：离线时写路径进 outbox、读未水合区间立即 EIO、网络错误回写状态机。
-        .with_connectivity(state.connectivity.clone());
+        .with_connectivity(state.connectivity.clone())
+        // ★ M23：Dolphin 集成 —— 每个挂载点一个**活开关**（与 FUSE 共享），
+        // 初值在挂载成功前按「设置开了 && 不在 Baloo 索引范围内」算好；
+        // `settings_save` 之后由 [`refresh_dolphin_flags`] 热刷新。
+        .with_dolphin_tags(dolphin_flag.clone());
     if let Some(limit) = delete_limit {
         fs = fs.with_delete_limit(limit);
     }
@@ -2610,10 +2634,21 @@ async fn mount(
         ));
     }
 
+    // ★ M23：挂载点会被 Baloo 索引 → **非阻塞**警告（挂载照常成功）。
+    // 这与 Dolphin 集成开关无关：Baloo 的内容索引器自己就会读文件（= 水合），
+    // 挂载点没排除就该提醒。GUI / CLI 把它显示出来，用户自己决定排不排除。
+    let baloo_warning = baloo_indexed.then(|| {
+        format!(
+            "该挂载点会被 Baloo 索引（内容索引会把占位符整个拉到本地，与 Dolphin 集成开关无关）。\
+             建议排除：{}",
+            baloo_probe.exclude_cmd_for(&mp)
+        )
+    });
     let info = MountInfo {
         mountpoint: mp.clone(),
         remote: remote.clone(),
         readonly: !read_write,
+        baloo_warning,
     };
     // ★ M8.4：冲突策略（未知值落回默认；与 Task::normalize 同一套判定）
     let conflict = conflict
@@ -2652,6 +2687,7 @@ async fn mount(
             cache_mode: mode,
             conflict: conflict.clone(),
             rec: rec.clone(),
+            dolphin_tags: dolphin_flag,
         },
     );
     tracing::info!(
@@ -5280,6 +5316,28 @@ fn idle_settings_save(
     ))
 }
 
+/// ★ M23：空转待命时的 `baloo_status` —— 没有挂载点，检测的只有 Baloo 本身。
+///
+/// 开关可以在这一步先打开（`can_enable` 恒 true：没有要保护的挂载点）；
+/// 真正挂载时 `mount()` 会按「设置开了 && 不在索引范围内」再算一次。
+fn idle_baloo_status() -> BalooStatusData {
+    let probe = BalooProbe::detect();
+    let dolphin_tags = ConfigPaths::discover()
+        .ok()
+        .and_then(|p| Settings::load(&p).ok())
+        .map(|s| s.dolphin_tags)
+        .unwrap_or(false);
+    BalooStatusData {
+        balooctl: probe.balooctl.as_ref().map(|b| b.display().to_string()),
+        config_path: probe.config_path.display().to_string(),
+        config_exists: probe.config_exists,
+        indexing_enabled: probe.indexing_enabled(),
+        dolphin_tags,
+        mounts: Vec::new(),
+        can_enable: true,
+    }
+}
+
 fn settings_data(state: &Arc<State>, saved: bool, note: Option<String>) -> SettingsData {
     let paths = ConfigPaths::discover().ok();
     let s = state.settings.lock().unwrap().clone();
@@ -5323,18 +5381,53 @@ fn settings_save_cmd(
     mut s: Settings,
     autostart_exe: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
+    // ★ M23：**打开** Dolphin 集成的前置门禁 —— 每个挂载点都必须已排除出
+    // Baloo 索引。Baloo 的内容索引器读文件 = 水合，没排除就开 tags 等于
+    // 邀请它把整个 NAS 拉到本地。只在「关 → 开」的边沿拦：已经开着的人
+    // 保存别的设置（代理等）不该被一个无关的挂载点卡死 —— 那个挂载点的
+    // tags 标志本来就不会被点亮（mount 时按安全条件算过）。
+    let prev_dolphin = state.settings.lock().unwrap().dolphin_tags;
+    if s.dolphin_tags && !prev_dolphin {
+        let probe = BalooProbe::detect();
+        let bad: Vec<String> = state
+            .mounts
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|mp| probe.indexed(mp))
+            .map(|mp| mp.display().to_string())
+            .collect();
+        if !bad.is_empty() {
+            let cmds: Vec<String> = bad
+                .iter()
+                .map(|p| probe.exclude_cmd_for(std::path::Path::new(p)))
+                .collect();
+            return Err(IpcError::new(
+                ErrorKind::BadRequest,
+                format!(
+                    "打开 Dolphin 集成前，必须先把挂载点排除出 Baloo 索引\
+                     （否则内容索引器会把整个 NAS 拉到本地）：{}。\
+                     在终端执行：{}，然后重试。GUI 里会弹出一键执行的终端。",
+                    bad.join("、"),
+                    cmds.join(" && ")
+                ),
+            ));
+        }
+    }
     let paths = ConfigPaths::discover().map_err(core_err)?;
     let (saved_path, autostart_written, proxy) =
         save_settings_to_disk(&paths, &mut s, autostart_exe)?;
     *state.settings.lock().unwrap() = s.clone();
     *state.proxy.lock().unwrap() = proxy;
+    // ★ M23：设置落库后按新值刷新每个挂载点的 tags 暴露标志（热切换，不重挂载）。
+    refresh_dolphin_flags(state);
     journal_log(
         state,
         JournalEntry::ok(
             "settings",
             "",
             format!(
-                "设置已保存：代理={}，自动释放={}，开机自启={}，通知={}",
+                "设置已保存：代理={}，自动释放={}，开机自启={}，通知={}，Dolphin 集成={}",
                 s.proxy.mode,
                 if s.free_space.auto { "开" } else { "关" },
                 if s.launch_at_startup { "开" } else { "关" },
@@ -5342,7 +5435,8 @@ fn settings_save_cmd(
                     "开"
                 } else {
                     "关"
-                }
+                },
+                if s.dolphin_tags { "开" } else { "关" },
             ),
         ),
     );
@@ -5364,6 +5458,146 @@ fn default_gui_exe() -> Option<PathBuf> {
     let cur = std::env::current_exe().ok()?;
     let cand = cur.parent()?.join("qxync-gui");
     cand.is_file().then_some(cand)
+}
+
+// ------------------------------------------------------------ ★ M23 Dolphin 集成
+
+/// ★ M23：一次 Baloo 环境探测（配置文件 + balooctl），供门禁 / 状态 / 挂载警告共用。
+struct BalooProbe {
+    balooctl: Option<PathBuf>,
+    config_path: PathBuf,
+    config_exists: bool,
+    /// `None` = 没装 Baloo（balooctl 都没有 → 索引守护进程不存在，什么都不会被索引）。
+    cfg: Option<qxync_core::baloo::BalooConfig>,
+    home: PathBuf,
+}
+
+impl BalooProbe {
+    fn detect() -> Self {
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/"));
+        let balooctl = qxync_core::baloo::find_balooctl();
+        let cpath = qxync_core::baloo::config_path(&home);
+        let config_exists = cpath.exists();
+        let cfg = if let Ok(text) = std::fs::read_to_string(&cpath) {
+            Some(qxync_core::baloo::BalooConfig::parse(&text, &home))
+        } else if balooctl.is_some() {
+            // Baloo 装了但配置文件还没有（从没跑过）：首次运行默认索引整个家目录
+            Some(qxync_core::baloo::BalooConfig::parse("", &home))
+        } else {
+            None
+        };
+        Self {
+            balooctl,
+            config_path: cpath,
+            config_exists,
+            cfg,
+            home,
+        }
+    }
+
+    /// Baloo 全局索引开关是否开着（没装 = 关）。
+    fn indexing_enabled(&self) -> bool {
+        self.cfg
+            .as_ref()
+            .map(|c| c.indexing_enabled)
+            .unwrap_or(false)
+    }
+
+    /// 这个路径会不会**真的**被 Baloo 索引（= 会把占位符拉下来 = 危险）。
+    fn indexed(&self, mp: &Path) -> bool {
+        // balooctl 不在 = Baloo 没装，索引守护进程根本不存在
+        if self.balooctl.is_none() {
+            return false;
+        }
+        self.cfg
+            .as_ref()
+            .map(|c| c.would_index(mp, &self.home))
+            .unwrap_or(false)
+    }
+
+    /// 路径（或祖先）是否在排除列表里。
+    fn excluded(&self, mp: &Path) -> bool {
+        self.cfg
+            .as_ref()
+            .map(|c| c.is_excluded(mp))
+            .unwrap_or(false)
+    }
+
+    /// 给这个路径生成排除命令（balooctl 没找到时也给出可复制的标准命令）。
+    fn exclude_cmd_for(&self, mp: &Path) -> String {
+        match &self.balooctl {
+            Some(b) => qxync_core::baloo::exclude_cmd(b, mp),
+            None => format!(
+                "balooctl6 config add excludeFolders {}",
+                qxync_core::baloo::shell_quote(&mp.display().to_string())
+            ),
+        }
+    }
+}
+
+/// ★ M23：按「设置开关 && 该挂载点不会被 Baloo 索引」重算每个挂载点的
+/// `user.xdg.tags` 暴露标志。
+///
+/// 两个条件都满足才点亮 —— 不满足的挂载点 tags 静默不暴露，挂载本身照常
+/// （不能因为一个标签列把挂载搞没了）。`settings_save` 与 `mount` 之后调用。
+fn refresh_dolphin_flags(state: &Arc<State>) {
+    let want = state.settings.lock().unwrap().dolphin_tags;
+    let probe = BalooProbe::detect();
+    let mut n_on = 0usize;
+    let mut n_off = 0usize;
+    {
+        let g = state.mounts.lock().unwrap();
+        for (mp, m) in g.iter() {
+            let active = want && !probe.indexed(mp);
+            if active {
+                n_on += 1;
+            } else {
+                n_off += 1;
+            }
+            m.dolphin_tags.store(active, Ordering::Relaxed);
+        }
+    }
+    if want {
+        tracing::info!(
+            "M23 Dolphin 集成：设置=开，tags 暴露 {n_on} 个挂载点（{n_off} 个因 Baloo 未排除而不暴露）"
+        );
+    }
+}
+
+/// `Request::BalooStatus`：Baloo 索引状态检测（GUI 开 Dolphin 集成前的预检）。
+fn baloo_status_cmd(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
+    let probe = BalooProbe::detect();
+    let dolphin_tags = state.settings.lock().unwrap().dolphin_tags;
+    let mut mounts = Vec::new();
+    let mut can_enable = true;
+    {
+        let g = state.mounts.lock().unwrap();
+        for (mp, m) in g.iter() {
+            let excluded = probe.excluded(mp);
+            let indexed = probe.indexed(mp);
+            if indexed {
+                can_enable = false;
+            }
+            mounts.push(BalooMountInfo {
+                mountpoint: mp.display().to_string(),
+                excluded,
+                indexed,
+                tags_active: m.dolphin_tags.load(Ordering::Relaxed),
+                exclude_cmd: probe.exclude_cmd_for(mp),
+            });
+        }
+    }
+    to_value(BalooStatusData {
+        balooctl: probe.balooctl.as_ref().map(|b| b.display().to_string()),
+        config_path: probe.config_path.display().to_string(),
+        config_exists: probe.config_exists,
+        indexing_enabled: probe.indexing_enabled(),
+        dolphin_tags,
+        mounts,
+        can_enable,
+    })
 }
 
 /// `Request::Decisions`：冲突待裁决队列。

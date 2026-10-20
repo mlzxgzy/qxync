@@ -67,6 +67,8 @@ pub fn run() {
             commands::pick_file,
             commands::open_path,
             commands::open_url,
+            // ★ M23：Dolphin 集成 —— 弹终端自动执行 Baloo 排除命令
+            commands::open_baloo_exclude,
             commands::app_exe_path,
             commands::window_hide,
             commands::window_show,
