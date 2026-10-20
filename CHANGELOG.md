@@ -5,7 +5,7 @@
 
 [English](CHANGELOG.en.md) · [README](README.md) · [验收记录](docs/验收记录.md)
 
-## [0.7.0] - 2026-10-19
+## [0.7.0] - 2026-10-20
 
 ### 新增
 
@@ -89,18 +89,20 @@
 
 ```text
 cargo build --workspace                         ✅
-cargo test --workspace                          ✅
-  qxync-core   230 passed（含 connectivity / outbox 新用例）
-  qxync-daemon  68 passed（含回放计划 / 网络错误不丢行 / 不计次数）
-  qxync-fuse   101 passed（含队列离线闸门 / 离线 touch 更新 mtime / outbox 冻结队列 /
-                          真机验收后补的 3 个离线 FUSE 回归）
-  qxync-client   32 passed
+cargo test --workspace                          ✅ 476 passed / 0 failed
+  qxync-core   244（含 connectivity / outbox / listings 持久化 / alive_known 兼容）
+  qxync-daemon  68（含回放计划 / 网络错误不丢行 / 不计次数）
+  qxync-fuse   107（含队列离线闸门 / drain 闸门提前返回 / 离线重启装回视图 /
+                  认领 mtime 偏斜容差 / 真机验收后补的离线 FUSE 回归）
+  qxync-client 32 / cli 7 / gui 15 / proto-test 3
 cargo fmt --all --check                         ✅
 node xtask/tests/task-defaults.test.mjs         ✅ 24 passed
 xtask/tests/m20-offline.sh                      ✅ 9 passed（隔离 XDG，NAS 指向 127.0.0.1:9）
+xtask/tests/m21-offline-restart.sh              ✅ 19 passed（假 NAS + 真 FUSE）
   · 离线时 status 6ms 返回（< 5000ms 断言）
   · 缓冲区分类计数正确（待建目录 1 / 待改名 1）
   · 跨 daemon 重启行不丢、attempts 仍为 0
+  · 离线重启后挂载点恢复、ls 吃持久化清单、二次重启幂等
 ```
 
 **真机 FUSE 验收（2026-10-19 补做）**：
@@ -111,20 +113,27 @@ xtask/tests/m20-real-nas.sh                     ✅ 57 passed（真 NAS + 真挂
   · 离线 ls 新建目录、读缓存、读未水合（2ms EIO）；status 缓冲区计数、outbox attempts=0
   · daemon 离线重启：outbox 4 行不丢、attempts 仍 0
   · 恢复网络 3s 内：远端出现改名后的目录/文件与内容、旧名消失、删除生效、mtime 生效、清零
+xtask/tests/m21-real-nas.sh                     ✅ 43 passed（真 NAS + 真挂载 + 断网）
+  · 离线重启 daemon：挂载点 1 秒恢复（无 NAS / 无会话）
+  · ls 根/子目录/离线建的目录（清单来自 sync.db）；cat 水合认领 / 偏斜容差 / 自定义 cache-dir
+  · 第二次离线重启幂等；恢复网络后回放 + 上传全对、缓冲区清零
 ```
 
-验收中抓到并修复的两个真机问题见上面「修复」；仍存在的限制见下方「已知限制」。
+验收中抓到并修复的真机问题见上面「修复」与 M20/M21 里程碑文档；仍存在的限制见下方「已知限制」。
 
 ### 已知限制
 
 - 离线新建/改名的文件在同步落地前不会出现在「重新打开挂载点」的目录列表里
   （本地节点表是进程内状态）；但内容与操作都在持久化队列/outbox 里，不会丢。
   同一进程内它们是立即可见、可继续写入的（空清单快照 + 目录清单随改名搬迁）。
-- **离线重启 daemon 时，挂载点要等网络恢复后才恢复**（恢复挂载要先登录；登录需要网络）。
-  缓冲区、队列都不丢；联网后先回放 outbox、再补挂载点。
+  ★ M21 起已列过的目录、本地建的目录跨重启也可见（清单持久化）；只有「从没列过
+  也没本地建过」的目录要联网后由轮询补上。
+- ~~离线重启 daemon 时，挂载点要等网络恢复后才恢复~~ —— **M21 已修**（无会话挂载 +
+  持久化清单，离线重启 1 秒恢复）。
 - 回放改名的冲突处理固定走 `rename_remote` 语义（NAS 那份改名成冲突副本），
   暂不读取任务的 `conflict` 策略（离线时无法保证策略在回放时仍有效）。
-- 任务级 purge 暂不清理 outbox 行（与上传/删除队列一样按连接共享；连接级 purge 会整体删掉 `sync.db`）。
+- 任务级 purge 暂不清理 outbox / listings 行（与上传/删除队列一样按连接共享；
+  连接级 purge 会整体删掉 `sync.db`）。
 
 ## [0.6.8] - 2026-10-19
 
