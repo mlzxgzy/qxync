@@ -38,14 +38,18 @@ Dolphin **没有**「插件往列表里加一列」的接口（列是 `KFileItem
 
 依赖：Qt6 Core、KF6 KIO（Arch：`qt6-base kio cmake`）。
 
-### Arch Linux：装 AUR 包（最省事）
+### Arch Linux：装包（最省事）
 
 ```bash
+# AUR（注册好之后）：
 yay -S qxync-dolphin-overlay        # 源码包：在本机对着系统 KF6 现编，ABI 不会错
+# 或从 GitHub Release 下载预编译包（CI 与 AUR 同一份 PKGBUILD，KF6 系列内通用）：
+sudo pacman -U qxync-dolphin-overlay-<版本>-1-x86_64.pkg.tar.zst
 ```
 
 包定义在 [`packaging/arch-dolphin-overlay/`](../../../packaging/arch-dolphin-overlay)，
-装的位置与下面的「系统级」完全相同；装完重启 Dolphin 即可。
+装的位置与下面的「系统级」完全相同；装完重启 Dolphin 即可。装没装、Dolphin 会不会
+加载，`qxync baloo-status` 的「角标插件」一行会直接告诉你（M25 起主程序带检测）。
 
 ### 系统级（推荐 —— Dolphin 直接加载，不需要任何环境变量）
 

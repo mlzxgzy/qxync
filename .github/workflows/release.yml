@@ -1,8 +1,12 @@
 name: Release
 
-# 推 `v*` tag → 自动构建并挂到该 tag 的 Release，共 7 个资产：
+# 推 `v*` tag → 自动构建并挂到该 tag 的 Release，共 8 个资产：
 #   qxync-<版本>-x86_64-unknown-linux-gnu.tar.gz        （三个二进制 + 桌面项/图标/许可证/文档）
 #   qxync-bin-<版本>-1-x86_64.pkg.tar.zst                （Arch：真 makepkg 打，并逐项校验内容）
+#   qxync-dolphin-overlay-<版本>-1-x86_64.pkg.tar.zst    （Dolphin 角标插件：KF6 C++ 插件，
+#     └ 在 archlinux 容器里对着**当次 tag 的源码**现编 —— ABI 锚在 libKF6KIOCore.so.6，
+#       KF6 系列内向后兼容；KF7 出来要重编。AUR 账号注册好之前，这是插件的分发渠道
+#       （用户 pacman -U 装）；AUR 的 PKGBUILD 与这份是同一配方，CI 先替用户验一遍。）
 #   qxync_<版本>-1_amd64.deb                             （Debian 12+ / Ubuntu 22.04+ 通用 amd64）
 #     └ 从**同一份** tar.gz 重打包（不重新编译，二进制与 tar.gz 里逐字节同源），
 #       并在干净容器矩阵里 `apt-get install` 实装、逐项断言通过才发：
@@ -145,6 +149,54 @@ jobs:
             [ "$in_pkg" = "$on_disk" ] || { echo "❌ 包里的 $b 与 dist/$b 不一致"; exit 1; }
           done
           echo "✅ Arch 包内容检查通过（${pkgs[0]}）"
+
+      # ── Dolphin 角标插件包（qxync-dolphin-overlay）────────────────────────
+      # AUR 账号暂未注册，先把包挂到 Release（用户 `pacman -U` 装）；AUR 的
+      # PKGBUILD（packaging/arch-dolphin-overlay/）与这里是**同一份配方**，
+      # CI 每次发版先替用户验一遍 —— 将来推 AUR 就是原样上传。
+      # 源 = GitHub 生成的 tag 源码归档（AUR 用户将来下载的就是它，校验和一致）；
+      # 在 archlinux:base-devel 容器里对着**当次 tag 的源码**现编 —— KF6 C++ 插件
+      # 的 ABI 与发行版绑定（soname 锚在 libKF6KIOCore.so.6，KF6 系列内向后兼容）。
+      - name: 打 Dolphin 角标插件包（archlinux 容器，真 makepkg）
+        run: |
+          set -euo pipefail
+          # 源码归档下到工作区的临时目录（**不进 dist/** —— 那是要上传的产物目录，
+          # 别让源码归档混进 Release 资产），算出 sha256 后写进 PKGBUILD
+          # （提交里存的是上个 tag 的值，CI 每次现算覆盖）。
+          srcdir=".ci-overlay-src"
+          src="$srcdir/qxync-dolphin-overlay-${TAG#v}.tar.gz"
+          mkdir -p "$srcdir"
+          curl -fsSL -o "$src" "https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${TAG}.tar.gz"
+          sum="$(sha256sum "$src" | cut -d' ' -f1)"
+          sed -i "s/^sha256sums=.*/sha256sums=('$sum')/" packaging/arch-dolphin-overlay/PKGBUILD
+
+          docker run --rm \
+            --volume "$PWD:/work" \
+            --workdir /work \
+            --env HOST_UID="$(id -u)" \
+            --env HOST_GID="$(id -g)" \
+            --env HOME=/home/qxync-builder \
+            archlinux:base-devel \
+            bash -euxo pipefail -c '
+              # 插件要对着 KIO 的头文件现编（kio 连带拉全 Qt6 依赖）
+              pacman -Sy --noconfirm qt6-base kio cmake
+              getent group "$HOST_GID" >/dev/null || groupadd --gid "$HOST_GID" qxync-builder
+              useradd --create-home --uid "$HOST_UID" --gid "$HOST_GID" --shell /bin/bash qxync-builder
+              # SRCDEST 指到刚下载的归档：makepkg 复用它，不再下载
+              su qxync-builder -s /bin/bash -c "cd /work/packaging/arch-dolphin-overlay && SRCDEST=/work/.ci-overlay-src PKGDEST=/work/dist makepkg -f"
+            '
+
+          # 校验包内容：.PKGINFO + .so + 三个 SVG，缺一不可
+          mapfile -t opkgs < <(ls dist/qxync-dolphin-overlay-*.pkg.tar.zst)
+          [ "${#opkgs[@]}" -eq 1 ] || { echo "❌ 期望恰好一个 qxync-dolphin-overlay 包，实际 ${#opkgs[@]} 个"; exit 1; }
+          bsdtar -xOf "${opkgs[0]}" .PKGINFO | grep -qx "pkgname = qxync-dolphin-overlay"
+          for f in usr/lib/qt6/plugins/kf6/overlayicon/libqxync_overlay.so \
+                   usr/share/icons/hicolor/scalable/status/qxync-hydrated.svg \
+                   usr/share/icons/hicolor/scalable/status/qxync-placeholder.svg \
+                   usr/share/icons/hicolor/scalable/status/qxync-partial.svg; do
+            bsdtar -tf "${opkgs[0]}" | grep -qx "$f" || { echo "❌ 角标插件包里缺 $f"; exit 1; }
+          done
+          echo "✅ Dolphin 角标插件包检查通过（${opkgs[0]}）"
 
       # ── Debian / Ubuntu .deb（单包）────────────────────────────────────────
       # 与 Arch 包同一个来源：把上一步的 tar.gz 解包后重打包（**不重新编译**），

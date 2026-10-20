@@ -19,6 +19,19 @@
   老版本 daemon 下徽标保持原样。stderr 非终端（重定向/管道）时 CLI 不声明进度、
   daemon 不建通道不推行，`qxync get > log` 保持纯净。服务端 chunked（无
   Content-Length）时退化为「已下载 + 速度」，CLI 直连另用 `stat` 的远端大小兜底总量。
+- **角标插件安装检测（M25）**：主程序现在能回答「角标到底会不会显示」——
+  `qxync baloo_status`（IPC）新增 `overlay_plugin` 字段、`qxync baloo-status`
+  多一行「角标插件」（已装+路径 / 装在 `~/.local` 但 `QT_PLUGIN_PATH` 没包含
+  → Dolphin 不会加载 / 未装+装法提示）、GUI 设置 → 高级的检测表同步显示。
+  检测规则与 Qt 的插件查找对齐（`QT_PLUGIN_PATH` → 系统目录 → `~/.local`），
+  CLI 侧是**本地文件检查**，不依赖 daemon 版本；GUI 对老 daemon 的
+  「字段缺失」不显示该行（不误报「未安装」）。检测只提示不拦开关（xattr 无害）。
+- **发版流水线产出 `qxync-dolphin-overlay-<版本>-1-x86_64.pkg.tar.zst`**：
+  Dolphin 角标插件的 Arch 包（AUR 账号注册好之前的分发渠道，`pacman -U` 装）。
+  在 `archlinux:base-devel` 容器里对着**当次 tag 的源码归档**现编（与
+  `packaging/arch-dolphin-overlay/PKGBUILD` 同一份配方，CI 先替用户验一遍），
+  逐项校验包内容（.so + 三个 SVG）后挂到 Release。`check-version.py` 同时守
+  该 PKGBUILD 的 `pkgver` 与 tag 对齐。
 
 ### 修复
 

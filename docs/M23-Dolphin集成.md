@@ -318,6 +318,39 @@ user.qxync.overlay 不存在（= 角标开关关 / 挂载点会被索引）→ {
 实测（本机 Dolphin 26.08.2 / KF6 6.31）：开 → 绿对钩 + 蓝云；关 → 角标消失；
 再开 → 立刻恢复；Tags 列开关全程不受影响。
 
+### 8.6 插件安装检测与分发（M25）
+
+插件是**可选**组件（KF6 C++，不随 Rust 主程序发布），主程序要能回答
+「角标到底会不会显示」，而不是让开关悄悄变成无效操作。架构上主程序是
+状态的**源头**（daemon/FUSE 暴露 `user.qxync.overlay`），插件只是**渲染器**
+（把 xattr 翻译成图标名）—— 所以「把 Dolphin 特性都搬进插件包」做不到：
+Tags 列与 xattr 生成必须留在 daemon（FUSE 是 xattr 的服务端），插件包里
+只有那个 ~200 行的哑翻译器。能做、也做了的是**检测渲染器在不在**：
+
+| 层 | 行为 |
+|---|---|
+| core | `qxync_core::dolphin::detect_overlay_plugin()`：按 Qt 的插件查找顺序找 `libqxync_overlay.so` —— ① `QT_PLUGIN_PATH` 各条目 → ② 系统目录（`/usr/lib/qt6/plugins`、`/usr/lib64/...`、`/usr/lib/<triplet>/...`）→ ③ `~/.local/lib/qt6/plugins`（命中也标 `effective=false`：Qt 默认不扫家目录，没设 `QT_PLUGIN_PATH` 就是装了也不会加载） |
+| IPC | `baloo_status` 新增 `overlay_plugin`（`{path, effective}`，`None`=未安装；serde default，老 daemon 不发、新客户端要区分「字段缺失=旧 daemon」与「null=未装」） |
+| CLI | `qxync baloo-status` 多一行「角标插件」：已装（路径）/ 装了但不会被加载（建议系统级安装）/ 未装（装法提示）。**本地检测**，不依赖 daemon 版本 |
+| GUI | 设置 → 高级 → 检测表多一行「角标插件」；`undefined`（旧 daemon）不显示，别把「旧 daemon」误报成「未安装」 |
+| 开关 | 检测**只提示不拦截**：未装时角标开关仍可打开（xattr 无害，只是没人画） |
+
+分发（AUR 账号注册好之前）：
+
+* **Release 资产**：发版流水线在 `archlinux:base-devel` 容器里对着**当次 tag
+  的源码归档**现编 `qxync-dolphin-overlay-<版本>-1-x86_64.pkg.tar.zst`，逐项
+  校验内容（.so + 三个 SVG）后挂到 Release —— 用户 `pacman -U` 装；
+* **AUR（就绪待推）**：`packaging/arch-dolphin-overlay/PKGBUILD` 与 CI 用的是
+  **同一份配方**（CI 每次发版先替用户验一遍）；注册好账号后原样推
+  `ssh://aur@aur.archlinux.org/qxync-dolphin-overlay.git`，用户 `yay -S`；
+* ABI 边界：`.so` 链 `libKF6KIOCore.so.6` —— **KF6 系列内向后兼容**（Dolphin /
+  KF6 小版本升级不用重编），KF7 出来要重编；所以 Release 里的预编译包只在
+  「还是 KF6」的机器上可用，AUR 源码包永远本机现编、天然匹配。
+
+`check-version.py` 同时守 `packaging/arch-dolphin-overlay/PKGBUILD` 的
+`pkgver`（与 tag 对齐）；它的 `sha256sums` 指向 tag 源码归档，版本一升就过期
+—— CI 每次现算覆盖，推 AUR 前手工重算。
+
 ## 7. 与既有行为的关系
 
 * 开关默认关 → **M23 之前的行为一字不变**（xattr 名单、`getfattr`、Dolphin 全部照旧）；

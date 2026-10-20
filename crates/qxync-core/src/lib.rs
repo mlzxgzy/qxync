@@ -22,6 +22,7 @@ pub mod connectivity;
 pub mod decisions;
 pub mod dehydrate;
 pub mod delta;
+pub mod dolphin;
 pub mod encode;
 pub mod error;
 pub mod file_id;

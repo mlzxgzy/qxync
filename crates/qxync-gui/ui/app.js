@@ -5429,6 +5429,17 @@
             + (m.overlay_active === true ? ' · ' + T('baloo.overlay_on') : ''));
         }
       }
+      // ★ M25：角标插件状态（qxync-dolphin-overlay）。老版本 daemon 不发这个
+      //   字段（undefined）→ 不显示这一行，别把「旧 daemon」误报成「未安装」。
+      if (d.overlay_plugin !== undefined) {
+        if (isObj(d.overlay_plugin)) {
+          kvText(dl, '角标插件', d.overlay_plugin.effective === true
+            ? T('baloo.plugin_yes', { path: str(d.overlay_plugin.path) })
+            : T('baloo.plugin_ineffective', { path: str(d.overlay_plugin.path) }));
+        } else {
+          kvText(dl, '角标插件', T('baloo.plugin_no'));
+        }
+      }
       if (installed && d.indexing_enabled !== false
           && (d.dolphin_tags === true || d.dolphin_overlay === true)) {
         kvText(dl, '提示', T('baloo.tags_note'));
