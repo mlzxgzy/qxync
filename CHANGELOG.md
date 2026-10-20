@@ -30,6 +30,21 @@
   限制（调研文档 §5）：状态不实时刷新（F5 / 重进目录）；依赖 Baloo 全局开关；
   进不了 `tags:` 虚拟目录；挂载点上加不了用户自己的标签（`setxattr` 有意不实现）。
 
+- **Dolphin 角标：文件图标上的彩色水合状态（KOverlayIconPlugin）**：绿对钩 =
+  已水合、蓝云 = 仅在线、半满圆 = 部分本地，和 Windows 资源管理器 / CFA
+  （Cloud Files API）同一种表达。`contrib/dolphin/overlay/` 是独立 CMake 工程
+  （Qt6 Core + KF6 KIO），**不参与 cargo 构建**；只对 `fuse.qxync` 挂载点里的本地
+  文件读 xattr（其它路径一次都不读），开关与 Tags 列同源（`user.xdg.tags` 不存在
+  = 不画角标）。安装见该目录 README：系统级装 `/usr` 后 Dolphin 直接加载，用户级
+  要 `QT_PLUGIN_PATH`；Dolphin 重启后生效。详情视图 16px 图标下角标 8px（可辨认）。
+
+### 变更
+
+- **Tags 列的值从文字改成图标字符**：`user.xdg.tags` 现在写 `✓` / `☁` / `◐`
+  （原为 `已水合` / `仅在线` / `部分本地`）。Tags 列只能显示文字、字号与正文相同、
+  没有颜色 —— 中文词在满屏文件名里不显眼。机器可读状态仍看 `user.qxync.state`
+  （值没变）；有脚本解析过 tags 的需要跟着改（两个值都认的兼容映射在角标插件里）。
+
 ### 修复（M23 真机验证暴露）
 
 - **Baloo 配置读取不认 `XDG_CONFIG_HOME`**：balooctl 写配置走 KConfig 语义

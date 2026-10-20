@@ -281,7 +281,8 @@ mod tests {
         // balooctl6 config add excludeFolders /tmp/x 实际写出的形状
         // （CachyOS / baloo 6.31 实测）：键带 KConfig 扩展标记 [$e]、
         // 值带尾部斜杠、多项逗号分隔。尾斜杠不产生 Path 组件，判定不受影响。
-        let c = cfg("[General]\nexclude folders[$e]=/tmp/x/,/home/u/mnt/\nfolders[$e]=/home/u/docs/\n");
+        let c =
+            cfg("[General]\nexclude folders[$e]=/tmp/x/,/home/u/mnt/\nfolders[$e]=/home/u/docs/\n");
         assert_eq!(c.exclude_folders, vec![p("/tmp/x"), p("/home/u/mnt")]);
         assert_eq!(c.include_folders, vec![p("/home/u/docs")]);
         // 手写（无标记）格式照旧可读

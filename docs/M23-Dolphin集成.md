@@ -28,9 +28,13 @@ Dolphin；开关默认关，打开前 daemon 强制检查**每个挂载点都已
 ### 1.2 使用（Dolphin）
 
 1. 打开挂载点，右键列头 → 勾 **Tags**（一次性，Dolphin 按目录记忆）；
-2. Tags 列显示：`仅在线` / `部分本地` / `已水合`；目录无标签；
-3. F11 信息面板里也有同一行；
-4. 状态变化（读了文件 / 脱水了）→ **F5 或重进目录**才刷新（FUSE 服务端改 xattr
+2. Tags 列显示**图标字符**：`✓`（已水合）/ `☁`（仅在线）/ `◐`（部分本地），
+   目录无标签 —— 用字符而不是「已水合」这种词，是为了能在列里扫一眼而不是读字；
+3. 想要 CFA / Windows 资源管理器那种**文件图标上的彩色角标**（绿对钩 = 已水合、
+   蓝云 = 仅在线、半满圆 = 部分本地），装 `contrib/dolphin/overlay` 的
+   KOverlayIconPlugin（见 §8）——装上后不用勾 Tags 列也能看到状态；
+4. F11 信息面板里也有同一行；
+5. 状态变化（读了文件 / 脱水了）→ **F5 或重进目录**才刷新（FUSE 服务端改 xattr
    不触发 inotify，这是内核行为，调研文档 §5.1）。
 
 ### 1.3 CLI
@@ -100,7 +104,7 @@ include 空（默认索引整个家目录）→ 与家目录有交集 → 会索
 
 | 名字 | 值 | 说明 |
 |---|---|---|
-| `user.xdg.tags` | `仅在线` / `部分本地` / `已水合` / 空串 | **动态算的**，不落盘；目录 = 空串 |
+| `user.xdg.tags` | `✓` / `☁` / `◐` / 空串 | **动态算的**，不落盘；目录 = 空串。字符与语义的映射见评论区（`✓`=hydrated、`☁`=placeholder、`◐`=partial） |
 
 * 开关关 → `getxattr` 回 `ENODATA`、`listxattr` 名单不含它 —— Dolphin 的
   `queryAttributes` 当这个文件没有 Tags 属性，**M23 之前的行为一字不变**；
@@ -217,6 +221,71 @@ WAN 环境下 NAS 端 rename/删除判定的固有问题，与 M23 无关。
 * **标签是纯文本**：没有颜色、图标、排序权重；
 * **多连接 fanout**：GUI 保存设置广播到所有 daemon，预检只查当前连接 ——
   其它连接的挂载点若未排除，那台 daemon 的门禁会拒（fanout 结果里如实显示失败）。
+
+## 8. 角标插件（KOverlayIconPlugin，2026-10-20 追加）
+
+### 8.1 为什么又做插件
+
+Tags 列**只能显示文字/字符**：字号跟正文一样、没有颜色。真机上「已水合」这行字
+在满屏文件名里并不显眼（用户实测反馈：「看也看不太出来」）。要 CFA（Windows
+Cloud Files API）/ 资源管理器那种**文件图标上的彩色角标**，Dolphin 唯一开放的
+机制是 `KOverlayIconPlugin`：
+
+* Dolphin 源码 `src/kitemviews/kfileitemmodelrolesupdater.cpp` 从
+  **`<Qt 插件目录>/kf6/overlayicon`** 加载插件，`getOverlays(QUrl)` 返回图标名，
+  `src/kitemviews/kstandarditemlistwidget.cpp` 的 `drawOverlays()` 用
+  `QIcon::fromTheme(name)` 画在文件图标左下/右上/右下（最多 3 个，左上角留给
+  VCS 插件）；
+* 调研文档 §2.2.4 当时以「角标没有意义」为由排除 —— 那是针对「右键菜单看到状态」
+  的方案；现在需求变成「图标化显示」，它正是唯一可行解。
+
+### 8.2 实现
+
+`contrib/dolphin/overlay/`（独立 CMake 工程，不参与 Rust workspace，不进 cargo build）：
+
+| 文件 | 内容 |
+|---|---|
+| `qxync_overlay.cpp` | `KOverlayIconPlugin` 实现：`/proc/self/mounts` 找 `fuse.qxync` 挂载点（2 秒缓存）→ 只对挂载点内文件读 xattr → 返回图标名 |
+| `qxync_overlay.json` | 插件元数据（Id / Name / Version） |
+| `CMakeLists.txt` | Qt6 Core + KF6 KIO，装到 `lib/qt6/plugins/kf6/overlayicon` + hicolor 图标目录 |
+| `icons/qxync-*.svg` | 三个 16px 网格图标：绿圆白对钩 / 蓝云 / 半满圆 |
+| `README.md` | 构建、系统级/用户级安装、重启 Dolphin、排查、限制、卸载 |
+
+判定顺序（`getOverlays`）：
+
+```text
+URL 不是 file://                              → {}
+不在 fuse.qxync 挂载点下                      → {}   （一次 xattr 都不读）
+user.xdg.tags 不存在（= 开关关）或为空串（目录）→ {}
+user.qxync.state = hydrated                   → qxync-hydrated
+                  partial                     → qxync-partial
+                  placeholder                 → qxync-placeholder
+```
+
+**为什么读 `user.qxync.state` 而不是认 tags 字符**：语义与展示解耦 —— 以后改
+Tags 列的字面（或做本地化）不会让角标跟着坏；开关仍由 `user.xdg.tags` 是否
+存在表达（和 FUSE 同源，关掉开关角标立刻消失，不需要重装插件）。
+
+### 8.3 实测（本机，Dolphin 26.08.2 / KF6 6.31 / Wayland）
+
+* 插件被 Dolphin 进程实际加载，`getOverlays` 对打开目录里的两个文件各调用多次
+  （roles updater 会重解析），返回 `qxync-hydrated`；
+* **截图可见**：两个已水合文件左下角绿色对钩，目录与普通文件无角标；
+* 非挂载点路径（`/etc/hostname`）不读 xattr、直接返回空（日志验证）；
+* 图标在 8 / 16 / 22 / 32 / 64 px 下都渲染正常（`QIcon::fromTheme` 逐尺寸渲染检查）；
+* 开关关（`user.xdg.tags` ENODATA）→ 角标消失（插件只读、无状态）。
+
+### 8.4 安装与限制
+
+* 系统级：`sudo cmake --install build --prefix /usr` —— Dolphin 直接加载，**不需要
+  任何环境变量**（推荐，后续可进发行包）；
+* 用户级：装 `~/.local` 后要给 Dolphin 设 `QT_PLUGIN_PATH`（Qt 默认不搜
+  `~/.local/lib/qt6/plugins`，实测 `KPluginMetaData::findPlugins` 只认
+  `QCoreApplication::libraryPaths()`）；
+* Dolphin **在创建视图时**加载插件：已经开着的窗口不会热加载，重启 Dolphin 即可；
+* 详情视图默认 16px 图标 → 角标只有 8px（能认，但小）；把图标尺寸调到 22/32px
+  会得到 16/22px 角标；
+* 只支持本地 `file://`、KF6 Dolphin；最多 3 个角标；状态仍不实时推送（F5 刷新）。
 
 ## 7. 与既有行为的关系
 
