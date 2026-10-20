@@ -18,7 +18,14 @@
     SPDX-License-Identifier: MIT OR Apache-2.0
 */
 
+// KF5 的头文件在 KF5/KIOWidgets/ 下（KF6 直接在 include 根）；两个世代同一个接口。
+// qglobal.h 先行：QT_VERSION 宏要在条件 include 之前可用。
+#include <QtGlobal>
+#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
+#include <KF5/KIOWidgets/KOverlayIconPlugin>
+#else
 #include <KOverlayIconPlugin>
+#endif
 
 #include <QByteArray>
 #include <QElapsedTimer>

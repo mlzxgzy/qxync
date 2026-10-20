@@ -121,6 +121,25 @@ stack traces stay readable); the installed size is about 190 MB. See
 [`packaging/debian/README.md`](packaging/debian/README.md) for the dependency list, packaging
 details and the expected lintian warnings.
 
+**Dolphin overlay icon plugin (optional)**: on the Debian/Ubuntu side this ships as **two
+packages** — the plugin `.so`'s ABI is tied to the KIO major version, and the Debian/Ubuntu
+matrix spans the KF5 and KF6 generations (Dolphin on Debian 12 / Ubuntu 22.04 / 24.04 is KF5,
+on Debian 13 / Ubuntu 26.04 it is KF6):
+
+| Download this | For |
+|---|---|
+| `qxync-dolphin-overlay-kf5_<version>-1_amd64.deb` | Debian 12, Ubuntu 22.04 / 24.04 (KF5) |
+| `qxync-dolphin-overlay-kf6_<version>-1_amd64.deb` | Debian 13, Ubuntu 26.04 (KF6) |
+
+```bash
+sudo apt install ./qxync-dolphin-overlay-kf<5-or-6>_<version>-1_amd64.deb
+```
+
+**Restart Dolphin** after installing (plugins are only loaded when a view is created), then
+enable "Show status overlay icons on file icons" in the GUI (Settings → Advanced). Not sure
+which generation your Dolphin is? If `apt depends dolphin` lists `kio6`, it is KF6; if it only
+lists `kio`, it is KF5.
+
 **Upgrading from the old packages**: if you previously installed
 `qxync_<old-version>-1~deb12_amd64.deb` / `qxync_<old-version>-1~ubuntu22.04_amd64.deb`, just
 `sudo apt install ./qxync_<version>-1_amd64.deb` — by dpkg version ordering `<version>-1` is greater

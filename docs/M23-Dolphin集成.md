@@ -337,15 +337,29 @@ Tags 列与 xattr 生成必须留在 daemon（FUSE 是 xattr 的服务端），�
 
 分发（AUR 账号注册好之前）：
 
-* **Release 资产**：发版流水线在 `archlinux:base-devel` 容器里对着**当次 tag
+* **Release 资产（Arch）**：发版流水线在 `archlinux:base-devel` 容器里对着**当次 tag
   的源码归档**现编 `qxync-dolphin-overlay-<版本>-1-x86_64.pkg.tar.zst`，逐项
   校验内容（.so + 三个 SVG）后挂到 Release —— 用户 `pacman -U` 装；
+* **Release 资产（deb，两个包）**：Debian / Ubuntu 矩阵横跨 **KF5 / KF6 两个世代**
+  （Debian 12 / Ubuntu 22.04 / 24.04 的 Dolphin 是 KF5，Debian 13 / Ubuntu 26.04 是
+  KF6），而 `.so` 的 ABI 绑 KIO 大版本 —— 所以 deb 侧出
+  `qxync-dolphin-overlay-kf5_<版本>-1_amd64.deb`（ubuntu:22.04 基线编，KF5 5.92）
+  与 `qxync-dolphin-overlay-kf6_<版本>-1_amd64.deb`（debian:13 基线编，KIO 6.13）
+  两个包，KF 系列内向后兼容，合起来覆盖五个发行版。配方在
+  [`xtask/release/package-overlay-deb.sh`](../xtask/release/package-overlay-deb.sh)，
+  CI 每次发版在五个发行版容器里各装对应世代的包实装校验（插件目录正确 + `ldd`
+  零缺失）；插件能否被 Dolphin 加载由 QPluginLoader 语义保证 —— 本地已实测
+  `instance()` + `qobject_cast<KOverlayIconPlugin*>` 双世代通过（CI 跑不了图形
+  Dolphin）。KF5 侧注意：`KOverlayIconPlugin` 在 **KIOWidgets**（KF6 才挪进
+  KIOCore），CMake 的 KF5 分支链 `KF5::KIOWidgets`，`.so` 的 DT_NEEDED 与
+  dpkg-shlibdeps 算出的 `libkf5kiowidgets5` 依赖才正确；
 * **AUR（就绪待推）**：`packaging/arch-dolphin-overlay/PKGBUILD` 与 CI 用的是
   **同一份配方**（CI 每次发版先替用户验一遍）；注册好账号后原样推
   `ssh://aur@aur.archlinux.org/qxync-dolphin-overlay.git`，用户 `yay -S`；
-* ABI 边界：`.so` 链 `libKF6KIOCore.so.6` —— **KF6 系列内向后兼容**（Dolphin /
-  KF6 小版本升级不用重编），KF7 出来要重编；所以 Release 里的预编译包只在
-  「还是 KF6」的机器上可用，AUR 源码包永远本机现编、天然匹配。
+* ABI 边界：`.so` 链 `libKF6KIOCore.so.6`（kf6 包）/ `libKF5KIOWidgets.so.5`
+  （kf5 包）—— **同大版本内向后兼容**（Dolphin / KF 小版本升级不用重编），KF7
+  出来要重编；所以 Release 里的预编译包只在对应世代的机器上可用，AUR 源码包
+  永远本机现编、天然匹配。
 
 `check-version.py` 同时守 `packaging/arch-dolphin-overlay/PKGBUILD` 的
 `pkgver`（与 tag 对齐）；它的 `sha256sums` 指向 tag 源码归档，版本一升就过期

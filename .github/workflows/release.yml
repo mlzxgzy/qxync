@@ -1,12 +1,18 @@
 name: Release
 
-# 推 `v*` tag → 自动构建并挂到该 tag 的 Release，共 8 个资产：
+# 推 `v*` tag → 自动构建并挂到该 tag 的 Release，共 10 个资产：
 #   qxync-<版本>-x86_64-unknown-linux-gnu.tar.gz        （三个二进制 + 桌面项/图标/许可证/文档）
 #   qxync-bin-<版本>-1-x86_64.pkg.tar.zst                （Arch：真 makepkg 打，并逐项校验内容）
-#   qxync-dolphin-overlay-<版本>-1-x86_64.pkg.tar.zst    （Dolphin 角标插件：KF6 C++ 插件，
+#   qxync-dolphin-overlay-<版本>-1-x86_64.pkg.tar.zst    （Dolphin 角标插件 Arch 包：KF6 C++ 插件，
 #     └ 在 archlinux 容器里对着**当次 tag 的源码**现编 —— ABI 锚在 libKF6KIOCore.so.6，
 #       KF6 系列内向后兼容；KF7 出来要重编。AUR 账号注册好之前，这是插件的分发渠道
 #       （用户 pacman -U 装）；AUR 的 PKGBUILD 与这份是同一配方，CI 先替用户验一遍。）
+#   qxync-dolphin-overlay-kf5_<版本>-1_amd64.deb         （Dolphin 角标插件 deb：KF5 世代）
+#   qxync-dolphin-overlay-kf6_<版本>-1_amd64.deb         （Dolphin 角标插件 deb：KF6 世代）
+#     └ deb 矩阵横跨 KF5 / KF6 两个世代（Debian 12 / Ubuntu 22.04 / 24.04 的 Dolphin
+#       是 KF5；Debian 13 / Ubuntu 26.04 是 KF6），.so 的 ABI 绑 KIO 大版本，所以出
+#       两个包：kf5 在 ubuntu:22.04 基线编（KF5 5.92）、kf6 在 debian:13 基线编
+#       （KIO 6.13），KF 系列内向后兼容，两个包合盖五个发行版（实装校验同矩阵）。
 #   qxync_<版本>-1_amd64.deb                             （Debian 12+ / Ubuntu 22.04+ 通用 amd64）
 #     └ 从**同一份** tar.gz 重打包（不重新编译，二进制与 tar.gz 里逐字节同源），
 #       并在干净容器矩阵里 `apt-get install` 实装、逐项断言通过才发：
@@ -198,6 +204,81 @@ jobs:
           done
           echo "✅ Dolphin 角标插件包检查通过（${opkgs[0]}）"
 
+      # ── Dolphin 角标插件 .deb（qxync-dolphin-overlay-kf5 / -kf6）────────────
+      # 与 Arch 角标包同一份源码（tag 归档），但 deb 矩阵横跨 KF5/KF6 两个世代
+      # （debian:12 / ubuntu:22.04 / 24.04 的 Dolphin 是 KF5，debian:13 / 26.04
+      # 是 KF6），而 .so 的 ABI 绑 KIO 大版本 —— 所以出**两个包**，各自在世代里
+      # 最老的基线编译（kf5: ubuntu:22.04 的 KF5 5.92；kf6: debian:13 的 KIO 6.13），
+      # KF 系列内向后兼容，两个包合起来覆盖矩阵全部五个发行版。
+      # 配方与设计说明见 xtask/release/package-overlay-deb.sh（头注释）。
+      - name: 打 Dolphin 角标插件 .deb（kf5 @ ubuntu:22.04 + kf6 @ debian:13）
+        run: |
+          set -euo pipefail
+          # 源码归档复用 Arch 角标包那步下载的同一份（同源、离线）。
+          # 注意两边文件名不同：Arch 步骤是 qxync-dolphin-overlay-<版本>.tar.gz
+          # （makepkg 的 source 命名），脚本找 qxync-dolphin-overlay-src-<版本>.tar.gz。
+          mkdir -p dist/.overlay-src
+          cp ".ci-overlay-src/qxync-dolphin-overlay-${TAG#v}.tar.gz" \
+             "dist/.overlay-src/qxync-dolphin-overlay-src-${TAG#v}.tar.gz"
+          for spec in "5 ubuntu:22.04" "6 debian:13"; do
+            kf="${spec%% *}"; img="${spec##* }"
+            echo "══ 角标插件 deb：kf${kf} @ ${img} ══"
+            docker run --rm \
+              --volume "$PWD:/work" \
+              --workdir /work \
+              --env VERSION="${TAG#v}" \
+              --env QXYNC_OVERLAY_KF="$kf" \
+              --env HOST_UID="$(id -u)" \
+              --env HOST_GID="$(id -g)" \
+              --env QXNYC_APT_MIRROR="${APT_MIRROR:-}" \
+              "$img" \
+              bash -lc 'set -euo pipefail; bash xtask/release/apt-mirror.sh >/dev/null && bash xtask/release/package-overlay-deb.sh "$VERSION"'
+          done
+          ls -l dist/qxync-dolphin-overlay-kf*.deb
+
+      # 实装校验角标插件 deb：五个发行版各装对应世代的包（与主 deb 的矩阵一致）。
+      # 装上 + 插件目录正确 + ldd 无缺失 = 「依赖由本发行版解析」成立；插件能否被
+      # Dolphin 加载由 QPluginLoader 语义保证（CI 里跑不了图形 Dolphin；本地已实测
+      # 实例化 + qobject_cast<KOverlayIconPlugin*> 双世代通过，见 M23 文档 §8.7）。
+      - name: 实装校验角标插件 .deb（五发行版矩阵）
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          for spec in "kf5 debian:12" "kf5 ubuntu:22.04" "kf5 ubuntu:24.04" "kf6 debian:13" "kf6 ubuntu:26.04"; do
+            pkg="${spec%% *}"; image="${spec##* }"
+            deb="qxync-dolphin-overlay-${pkg}_${version}-1_amd64.deb"
+            [ -f "dist/$deb" ] || { echo "❌ 找不到 dist/$deb"; exit 1; }
+            echo "══ 实装校验：$image ← $deb ══"
+            docker run --rm \
+              --volume "$PWD:/work" \
+              --workdir /work \
+              --env DEBIAN_FRONTEND=noninteractive \
+              --env DEB_PATH="$deb" \
+              --env PKG="$pkg" \
+              --env QXNYC_APT_MIRROR="${APT_MIRROR:-}" \
+              "$image" \
+              bash -s <<'OVERLAY_INSTALL_CHECK' || { echo "❌ $image 角标插件实装失败"; exit 1; }
+          set -euo pipefail
+          bash xtask/release/apt-mirror.sh >/dev/null
+          apt-get update -qq
+          apt-get install -y -qq "./dist/$DEB_PATH" >/dev/null
+          so="$(dpkg -L "qxync-dolphin-overlay-$PKG" | grep 'libqxync_overlay.so$')"
+          [ -n "$so" ] || { echo "❌ dpkg -L 里没有 libqxync_overlay.so"; exit 1; }
+          case "$PKG" in
+            kf5) echo "$so" | grep -q "qt5/plugins/kf5/overlayicon/" || { echo "❌ 插件目录不对：$so"; exit 1; } ;;
+            kf6) echo "$so" | grep -q "qt6/plugins/kf6/overlayicon/" || { echo "❌ 插件目录不对：$so"; exit 1; } ;;
+          esac
+          missing="$(ldd "$so" 2>&1 | grep -c "not found" || true)"
+          [ "$missing" -eq 0 ] || { echo "❌ $PKG 插件有 $missing 个动态库缺失"; ldd "$so" 2>&1 | grep "not found"; exit 1; }
+          for icon in qxync-hydrated qxync-placeholder qxync-partial; do
+            dpkg -L "qxync-dolphin-overlay-$PKG" | grep -qx "/usr/share/icons/hicolor/scalable/status/${icon}.svg" \
+              || { echo "❌ 缺图标 ${icon}.svg"; exit 1; }
+          done
+          echo "✅ $DEB_PATH 实装校验通过（$so）"
+          OVERLAY_INSTALL_CHECK
+            echo "✅ $image 角标插件实装校验通过（$deb）"
+          done
+
       # ── Debian / Ubuntu .deb（单包）────────────────────────────────────────
       # 与 Arch 包同一个来源：把上一步的 tar.gz 解包后重打包（**不重新编译**），
       # 所以三个二进制与 tar.gz / Arch 包里的**逐字节同源**（由 package-deb.sh 保证）。
@@ -306,11 +387,12 @@ jobs:
           cat SHA256SUMS
 
       # 先留档到 Actions artifacts：万一后面的 Release 步骤失败，产物还能从这次 run 里取回。
+      # （.overlay-src 是角标插件包的源码归档缓存，构建中间产物 —— 移出去不进 artifact）
       - name: 留档到 Actions artifacts
         uses: actions/upload-artifact@v4
         with:
           name: qxync-${{ inputs.tag || github.ref_name }}-x86_64-unknown-linux-gnu
-          path: dist/
+          path: dist/*
           retention-days: 14
           if-no-files-found: error
 

@@ -5,6 +5,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [中文](CHANGELOG.md) · [README](README.en.md) · [Acceptance log](docs/验收记录.md)
 
+## [Unreleased]
+
+### Added
+
+- **Debian/Ubuntu packages for the Dolphin overlay icon plugin (kf5 / kf6)**: the
+  Debian/Ubuntu matrix spans the KF5 and KF6 generations (Dolphin on Debian 12 /
+  Ubuntu 22.04 / 24.04 is KF5; Debian 13 / Ubuntu 26.04 are KF6), and the plugin
+  `.so`'s ABI is tied to the KIO major version — one package cannot cover both.
+  The release pipeline now ships two assets:
+  `qxync-dolphin-overlay-kf5_<version>-1_amd64.deb` (built on the ubuntu:22.04
+  baseline) and `qxync-dolphin-overlay-kf6_<version>-1_amd64.deb` (built on the
+  debian:13 baseline); KF is backward-compatible within a major version, so the
+  two packages together cover all five matrix distros, install-verified by CI in
+  debian:12/13 and ubuntu:22.04/24.04/26.04 containers. The plugin source is now
+  **Qt5/Qt6 dual-compatible** (`KOverlayIconPlugin` is the same interface; on KF5
+  the header lives under `KF5/KIOWidgets/` and the interface symbol lives in
+  KIOWidgets — the CMake KF5 branch links `KF5::KIOWidgets` so `dpkg-shlibdeps`
+  computes the correct `libkf5kiowidgets5` dependency). `contrib/dolphin/overlay`
+  gained `-DQXYNC_KF_MAJOR=5|6` (defaults to 6; Arch / KF6 distro behavior is
+  unchanged). Verified locally: QPluginLoader loading (`instance()` +
+  `qobject_cast<KOverlayIconPlugin*>`) on both generations, and clean installs on
+  all five distros.
+
 ## [0.7.4] - 2026-10-20
 
 ### Fixed

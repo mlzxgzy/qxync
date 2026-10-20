@@ -5,6 +5,24 @@
 
 [English](CHANGELOG.en.md) · [README](README.md) · [验收记录](docs/验收记录.md)
 
+## [Unreleased]
+
+### 新增
+
+- **Dolphin 角标插件的 deb 分发（kf5 / kf6 两个包）**：Debian / Ubuntu 矩阵横跨
+  KF5 / KF6 两个世代（Debian 12 / Ubuntu 22.04 / 24.04 的 Dolphin 是 KF5，
+  Debian 13 / Ubuntu 26.04 是 KF6），插件 `.so` 的 ABI 绑 KIO 大版本，一个包
+  盖不住 —— 发版流水线新增两个资产：`qxync-dolphin-overlay-kf5_<版本>-1_amd64.deb`
+  （ubuntu:22.04 基线编）与 `qxync-dolphin-overlay-kf6_<版本>-1_amd64.deb`
+  （debian:13 基线编），KF 系列内向后兼容，合盖五个发行版，CI 每次发版在
+  debian:12 / 13、ubuntu:22.04 / 24.04 / 26.04 容器里实装校验。插件源码改为
+  **Qt5/Qt6 双兼容**（`KOverlayIconPlugin` 是同一接口；KF5 的头文件在
+  `KF5/KIOWidgets/` 下、接口实体也在 KIOWidgets —— CMake 的 KF5 分支链
+  `KF5::KIOWidgets`，`dpkg-shlibdeps` 才能算出 `libkf5kiowidgets5` 依赖）；
+  `contrib/dolphin/overlay` 的 CMake 加 `-DQXYNC_KF_MAJOR=5|6`（缺省 6，
+  Arch / KF6 发行版行为不变）。本地已实测双世代 QPluginLoader 加载
+  （`instance()` + `qobject_cast<KOverlayIconPlugin*>`）与五发行版实装全绿。
+
 ## [0.7.4] - 2026-10-20
 
 ### 修复

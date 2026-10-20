@@ -36,7 +36,8 @@ Dolphin **没有**「插件往列表里加一列」的接口（列是 `KFileItem
 
 ## 构建与安装
 
-依赖：Qt6 Core、KF6 KIO（Arch：`qt6-base kio cmake`）。
+依赖：Qt Core、KF KIO（**KF5 与 KF6 都支持**，见下）。Arch：`qt6-base kio cmake`；
+Debian/Ubuntu KF5 世代：`qtbase5-dev libkf5kio-dev cmake`。
 
 ### Arch Linux：装包（最省事）
 
@@ -51,16 +52,35 @@ sudo pacman -U qxync-dolphin-overlay-<版本>-1-x86_64.pkg.tar.zst
 装的位置与下面的「系统级」完全相同；装完重启 Dolphin 即可。装没装、Dolphin 会不会
 加载，`qxync baloo-status` 的「角标插件」一行会直接告诉你（M25 起主程序带检测）。
 
+### Debian / Ubuntu：装包
+
+Release 里有两个 deb（插件 `.so` 的 ABI 绑 KIO 大版本，而 Debian / Ubuntu 横跨
+KF5 / KF6 两个世代）：
+
+| 你的发行版 | 装 |
+|---|---|
+| Debian 12、Ubuntu 22.04 / 24.04（Dolphin 是 KF5） | `qxync-dolphin-overlay-kf5_<版本>-1_amd64.deb` |
+| Debian 13、Ubuntu 26.04（Dolphin 是 KF6） | `qxync-dolphin-overlay-kf6_<版本>-1_amd64.deb` |
+
+```bash
+sudo apt install ./qxync-dolphin-overlay-kf<5或6>_<版本>-1_amd64.deb
+```
+
+拿不准哪代：`apt depends dolphin` 输出里有 `kio6` 就是 KF6，只有 `kio` 就是 KF5。
+配方与设计说明见 [`xtask/release/package-overlay-deb.sh`](../../../xtask/release/package-overlay-deb.sh)。
+
 ### 系统级（推荐 —— Dolphin 直接加载，不需要任何环境变量）
 
 ```bash
 cd contrib/dolphin/overlay
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+# KF5 世代加 -DQXYNC_KF_MAJOR=5（缺省按 KF6 编）
 cmake --build build -j
 sudo cmake --install build --prefix /usr
 ```
 
-装到 `/usr/lib/qt6/plugins/kf6/overlayicon/libqxync_overlay.so` 和
+装到 `/usr/lib/qt6/plugins/kf6/overlayicon/libqxync_overlay.so`（KF5 则是
+`/usr/lib/qt5/plugins/kf5/overlayicon/`，Debian 系带 `x86_64-linux-gnu` 段）和
 `/usr/share/icons/hicolor/scalable/status/qxync-*.svg`。
 
 ### 用户级（不用 root，但要让 Dolphin 找得到插件）
@@ -98,11 +118,16 @@ QT_PLUGIN_PATH=$HOME/.local/lib/qt6/plugins dolphin
 * 角标大小跟 Dolphin 的图标尺寸走：详情视图默认 16 px 图标 → 8 px 角标（对钩/云
   还能认出来，但确实小）；想更明显就把图标尺寸调大（22/32 px → 16/22 px 角标）。
 * 最多 3 个角标；状态变化不会实时推送（F5 / 重进目录后更新，和 Tags 列一致）。
-* 只支持 KF6 / Qt6 的 Dolphin（本仓库的目标环境）。
+* KF5 与 KF6 的 Dolphin 都支持（源码双兼容；`.so` 的 ABI 绑 KIO 大版本，所以
+  预编译包分 kf5 / kf6 两个，源码编译则永远本机匹配）。
 
 ## 卸载
 
 ```bash
+# KF6（Arch 等）：
 sudo rm /usr/lib/qt6/plugins/kf6/overlayicon/libqxync_overlay.so \
         /usr/share/icons/hicolor/scalable/status/qxync-{hydrated,placeholder,partial}.svg
+# KF5（Debian 12 / Ubuntu 22.04 / 24.04）：
+sudo rm /usr/lib/x86_64-linux-gnu/qt5/plugins/kf5/overlayicon/libqxync_overlay.so
+# 装了 deb / pacman 包的用包管理器卸（apt remove / pacman -R）
 ```
