@@ -52,3 +52,6 @@ crates/qxync-gui/gen/schemas/
 
 # ===== 研究留档（QNAP 教程正文/截图，版权属 QNAP，仅供本地比对，不提交）=====
 .research/
+
+# ===== Dolphin 角标插件（contrib/dolphin/overlay）的 CMake 构建目录 =====
+contrib/dolphin/overlay/build/

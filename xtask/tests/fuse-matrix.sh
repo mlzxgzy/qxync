@@ -749,14 +749,14 @@ if "$QS" mount "$MNT23" --remote "${QXNYC_REMOTE_ROOT:-/home}" --cache-dir "$CAC
     save_dolphin true >/dev/null 2>&1
   fi
 
-  # ---- M23-3 开了之后：占位符 → 仅在线；水合 → 已水合；名单包含
-  check "$([ "$(xdg_tags "$M23/hello.txt")" = "仅在线" ] && echo 0 || echo 1)" \
-    "M23-3 开关开 → 占位符的 tags = 仅在线"
+  # ---- M23-3 开了之后：占位符 → ☁；水合 → ✓；名单包含
+  check "$([ "$(xdg_tags "$M23/hello.txt")" = "☁" ] && echo 0 || echo 1)" \
+    "M23-3 开关开 → 占位符的 tags = ☁（云）"
   check "$([ "$(xdg_listed "$M23/hello.txt")" = 1 ] && echo 0 || echo 1)" \
     "M23-3b 开关开 → listxattr 名单含 user.xdg.tags"
   cat "$M23/hello.txt" >/dev/null 2>&1
-  check "$([ "$(xdg_tags "$M23/hello.txt")" = "已水合" ] && echo 0 || echo 1)" \
-    "M23-3c 水合后 tags = 已水合"
+  check "$([ "$(xdg_tags "$M23/hello.txt")" = "✓" ] && echo 0 || echo 1)" \
+    "M23-3c 水合后 tags = ✓（对钩）"
   # 目录：xattr 存在但为空（Dolphin 显示无标签）
   check "$([ "$(xdg_tags "$M23")" = "" ] && echo 0 || echo 1)" \
     "M23-3d 目录的 tags = 空串（不水合，无标签）"

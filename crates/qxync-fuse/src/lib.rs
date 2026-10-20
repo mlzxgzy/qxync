@@ -3261,7 +3261,9 @@ impl QxyncFs {
                     .unwrap_or_else(|| "unspecified".to_string()),
             ),
             // ★ M23：Dolphin 的 Tags 列（freedesktop 标准 xattr，逗号分隔的标签串）。
-            // 值是**动态算的**（不落盘）：水合状态 → 中文标签；目录不水合 → 空串。
+            // 值是**动态算的**（不落盘）：水合状态 → 图标字符（✓ / ☁ / ◐），
+            // 目录不水合 → 空串。用字符而不是中文，是因为 Tags 列只能显示文字，
+            // 一两个图标字符比「已水合」这种词更容易一眼扫出来。
             // 开关关闭时回 None（ENODATA）—— 与 listxattr 不列它保持一致，
             // Dolphin 的 queryAttributes 就当这个文件没有 Tags 属性。
             "user.xdg.tags" => {
@@ -3270,9 +3272,9 @@ impl QxyncFs {
                 }
                 Some(match (is_dir, state) {
                     (true, _) => String::new(),
-                    (false, "placeholder") => "仅在线".into(),
-                    (false, "partial") => "部分本地".into(),
-                    (false, "hydrated") => "已水合".into(),
+                    (false, "placeholder") => "\u{2601}".into(),
+                    (false, "partial") => "\u{25D0}".into(),
+                    (false, "hydrated") => "\u{2713}".into(),
                     (false, _) => String::new(),
                 })
             }
@@ -7136,14 +7138,11 @@ mod tests {
         // 开关开：三态逐一对上
         flag.store(true, Ordering::Relaxed);
         set_state(0.0);
-        assert_eq!(fs.xattr_value(ino, "user.xdg.tags"), Some("仅在线".into()));
+        assert_eq!(fs.xattr_value(ino, "user.xdg.tags"), Some("☁".into()));
         set_state(0.5);
-        assert_eq!(
-            fs.xattr_value(ino, "user.xdg.tags"),
-            Some("部分本地".into())
-        );
+        assert_eq!(fs.xattr_value(ino, "user.xdg.tags"), Some("◐".into()));
         set_state(1.0);
-        assert_eq!(fs.xattr_value(ino, "user.xdg.tags"), Some("已水合".into()));
+        assert_eq!(fs.xattr_value(ino, "user.xdg.tags"), Some("✓".into()));
         assert!(fs.xattr_names().contains("user.xdg.tags"));
         // 名单末尾仍带 NUL（内核 fuse_verify_xattr_list 的铁则）
         assert!(fs.xattr_names().ends_with('\0'));
