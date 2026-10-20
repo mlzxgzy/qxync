@@ -7,6 +7,13 @@
 
 ## [Unreleased]
 
+### 修复
+
+- **`qxync settings --set dolphin_overlay=...` 报「未知设置键」**：M24 新增字段时
+  漏了 `Settings::set_kv` 的键表 —— GUI 勾选与 IPC `settings_save` 都正常，只有
+  CLI 直连设置被挡在 core 的键校验上。补上这条 arm 并加回归测试，报错的「可用键」
+  清单也同步列出 `dolphin_overlay`。
+
 ## [0.7.2] - 2026-10-20
 
 ### 新增
