@@ -602,15 +602,18 @@
               </p>
               <label class="check"><input type="checkbox" id="s-notifications"> 显示桌面通知（Show desktop notifications）</label>
               <p class="hint">同步出错时发一条系统通知（经 <code>org.freedesktop.Notifications</code>）；关掉就完全不发。</p>
-              <!-- ★ M23/M24：Dolphin 集成 —— 两条独立通道：Tags 列（user.xdg.tags）与文件角标（user.qxync.overlay） -->
+              <!-- ★ M23/M24/M25：Dolphin 集成 —— 两条独立通道：Tags 列（user.xdg.tags，无需插件）与文件角标（user.qxync.overlay，需装 qxync-dolphin-overlay 插件包） -->
               <label class="check"><input type="checkbox" id="s-dolphin-tags"> 在 Dolphin 里显示水合状态（Tags 列）</label>
-              <label class="check"><input type="checkbox" id="s-dolphin-overlay"> 在文件图标上显示状态角标（需装 contrib/dolphin/overlay 插件）</label>
+              <label class="check"><input type="checkbox" id="s-dolphin-overlay"> 在文件图标上显示状态角标（需装 qxync-dolphin-overlay 插件包）</label>
               <p class="hint" data-i18n="adv.dolphin_hint">
                 两个开关相互独立，可只开一个，默认都关。Tags 列：把图标字符（✓ 已水合 / ☁ 仅在线 / ◐ 部分本地）
-                写进 user.xdg.tags。文件角标：装了 <code>contrib/dolphin/overlay</code> 的 KOverlayIconPlugin 插件后，
-                Dolphin 在文件图标上画彩色角标（绿对钩 / 蓝云），读的是 user.qxync.overlay。
+                写进 user.xdg.tags，Dolphin 内置列直接显示，不需要装任何插件。文件角标：需要装
+                <code>qxync-dolphin-overlay</code> 插件包（KOverlayIconPlugin，只支持 KDE Dolphin），
+                Dolphin 才会在文件图标上画彩色角标（绿对钩 / 蓝云），读的是 user.qxync.overlay ——
+                装没装、会不会加载，看下面检测表里的「角标插件」一行。
                 两者前置条件相同：挂载点必须已排除出 Baloo 索引（否则索引器会把整个 NAS 拉到本地）。
                 状态都不实时刷新（F5 / 重进目录后更新）。
+              </p>
               <dl class="kv" id="dolphin-kv"></dl>
               <div class="btn-row">
                 <button type="button" id="btn-advanced-save" class="primary">保存高级设置</button>

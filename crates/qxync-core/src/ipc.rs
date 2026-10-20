@@ -1376,12 +1376,31 @@ pub struct BalooStatusData {
     pub dolphin_tags: bool,
     /// ★ M24：当前 Dolphin **角标**开关（`settings.dolphin_overlay`）。
     pub dolphin_overlay: bool,
+    /// ★ M25：角标插件（`qxync-dolphin-overlay`）的检测结果（`None` = 未安装）。
+    ///
+    /// 老版本 daemon **不发这个字段**（serde default → 反序列化成 `None`）；
+    /// 客户端要区分「字段缺失（旧 daemon，未知）」与「值为 null（新 daemon，
+    /// 未安装）」—— GUI 对 `undefined` 不显示这一行，JSON 客户端同理。
+    pub overlay_plugin: Option<OverlayPluginInfo>,
     /// 每个挂载点的检测结论。
     pub mounts: Vec<BalooMountInfo>,
     /// `true` = 现在可以打开 Dolphin 集成（所有挂载点都不会被索引）。
     ///
     /// 没有挂载点时恒为 `true`（没有要保护的东西；之后挂载时 mount 会再查）。
     pub can_enable: bool,
+}
+
+/// ★ M25：`baloo_status` 里的角标插件（`qxync-dolphin-overlay`）检测结果。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OverlayPluginInfo {
+    /// `libqxync_overlay.so` 的路径。
+    pub path: String,
+    /// Dolphin 真的会加载它（系统插件目录 / `QT_PLUGIN_PATH` 命中）。
+    ///
+    /// `false` = 装在 `~/.local` 但 `QT_PLUGIN_PATH` 没包含该目录 ——
+    /// Dolphin 不会加载，角标不会显示。
+    pub effective: bool,
 }
 
 /// ★ M23：单个挂载点的 Baloo 检测结论。

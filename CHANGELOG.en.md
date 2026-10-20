@@ -26,6 +26,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and pushes nothing — `qxync get > log` stays clean. Chunked responses without
   Content-Length degrade to "downloaded + speed"; the CLI-direct path
   additionally uses the `stat` size as a total fallback.
+- **Overlay plugin detection (M25)**: the app can now answer "will badges actually
+  show?" — `baloo_status` (IPC) gains an `overlay_plugin` field, `qxync baloo-status`
+  prints a "overlay plugin" line (installed + path / installed under `~/.local`
+  without `QT_PLUGIN_PATH` → Dolphin will not load it / not installed + how to
+  install), and the GUI settings → advanced status table shows the same. Detection
+  follows Qt's plugin lookup order (`QT_PLUGIN_PATH` → system dirs → `~/.local`);
+  the CLI side is a **local file check** that does not depend on the daemon
+  version, and the GUI hides the row when an old daemon omits the field (instead
+  of misreporting "not installed"). Detection only informs — the switch stays
+  usable (the xattr is harmless without a renderer).
+- **Release pipeline now ships `qxync-dolphin-overlay-<version>-1-x86_64.pkg.tar.zst`**:
+  the Arch package for the Dolphin badge plugin (the distribution channel until
+  an AUR account is registered; install with `pacman -U`). Built from **that
+  tag's source archive** inside an `archlinux:base-devel` container — the same
+  recipe as `packaging/arch-dolphin-overlay/PKGBUILD`, so CI validates it before
+  users build it — with package contents checked item by item (.so + three SVGs)
+  before it is attached to the Release. `check-version.py` now also guards that
+  PKGBUILD's `pkgver` against the tag.
 
 ### Fixed
 

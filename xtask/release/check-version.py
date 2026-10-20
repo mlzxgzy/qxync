@@ -26,6 +26,8 @@ ROOT = Path(__file__).resolve().parents[2]
 CARGO_TOML = ROOT / "Cargo.toml"
 TAURI_CONF = ROOT / "crates" / "qxync-gui" / "tauri.conf.json"
 PKGBUILD = ROOT / "packaging" / "arch" / "PKGBUILD"
+# ★ M25：Dolphin 角标插件的 AUR/Release 包（KF6 C++ 插件，源码包）。
+OVERLAY_PKGBUILD = ROOT / "packaging" / "arch-dolphin-overlay" / "PKGBUILD"
 
 
 def fail(msg: str) -> None:
@@ -66,9 +68,14 @@ def tauri_version() -> str:
 
 def pkgbuild_text() -> str | None:
     """AUR PKGBUILD 的正文；文件不存在返回 None（只警告，不拦发版）。"""
-    if not PKGBUILD.is_file():
+    return pkgbuild_text_at(PKGBUILD)
+
+
+def pkgbuild_text_at(path: Path) -> str | None:
+    """任意 PKGBUILD 的正文；文件不存在返回 None（只警告，不拦发版）。"""
+    if not path.is_file():
         return None
-    return PKGBUILD.read_text(encoding="utf-8")
+    return path.read_text(encoding="utf-8")
 
 
 def pkgbuild_version(text: str) -> str | None:
@@ -98,11 +105,17 @@ def main() -> int:
     tauri_v = tauri_version()
     pkg_text = pkgbuild_text()
     pkg_v = pkgbuild_version(pkg_text) if pkg_text else None
+    ov_text = pkgbuild_text_at(OVERLAY_PKGBUILD)
+    ov_v = pkgbuild_version(ov_text) if ov_text else None
 
     print(f"tag                     = {tag}  →  {tag_version}")
     print(f"Cargo.toml (workspace)  = {cargo_v}")
     print(f"tauri.conf.json         = {tauri_v}")
     print(f"arch/PKGBUILD pkgver    = {pkg_v if pkg_v else '（没有这个文件 / 没有 pkgver）'}")
+    print(
+        f"arch-dolphin-overlay pkgver = "
+        f"{ov_v if ov_v else '（没有这个文件 / 没有 pkgver）'}"
+    )
 
     bad = []
     if cargo_v != tag_version:
@@ -117,6 +130,15 @@ def main() -> int:
         warn(f"{PKGBUILD.relative_to(ROOT)} 里找不到 pkgver，跳过 AUR 包版本检查")
     elif pkg_v != tag_version:
         bad.append(f"packaging/arch/PKGBUILD 的 pkgver 是 {pkg_v}，与 tag {tag} 不符")
+    # ★ M25：角标插件包（Release 资产 + 将来的 AUR 包）—— pkgver 同样必须与 tag 对齐
+    if ov_text is None:
+        warn(f"{OVERLAY_PKGBUILD.relative_to(ROOT)} 不存在，跳过角标插件包版本检查")
+    elif ov_v is None:
+        warn(f"{OVERLAY_PKGBUILD.relative_to(ROOT)} 里找不到 pkgver，跳过角标插件包版本检查")
+    elif ov_v != tag_version:
+        bad.append(
+            f"packaging/arch-dolphin-overlay/PKGBUILD 的 pkgver 是 {ov_v}，与 tag {tag} 不符"
+        )
 
     if bad:
         for b in bad:
@@ -124,7 +146,7 @@ def main() -> int:
         print(
             "   发版前先把各处对齐（tag 是唯一真值）：Cargo.toml 的 "
             "[workspace.package].version、crates/qxync-gui/tauri.conf.json 的 version、"
-            "packaging/arch/PKGBUILD 的 pkgver。",
+            "packaging/arch/PKGBUILD 与 packaging/arch-dolphin-overlay/PKGBUILD 的 pkgver。",
             file=sys.stderr,
         )
         return 1
@@ -134,6 +156,14 @@ def main() -> int:
             "packaging/arch/PKGBUILD 的 sha256sums 还是占位值 —— Release 发出来之后在 "
             "packaging/arch/ 下跑 `updpkgsums`（再 `makepkg --printsrcinfo > .SRCINFO`）"
             "才能推 AUR。"
+        )
+    # 角标插件包的 sha256sums 指向 **tag 源码归档**（GitHub 生成）：版本一升就过期。
+    # Release 流水线会现算覆盖（CI 里 makepkg 前先 sed），但推 AUR 前必须手工更新。
+    if ov_text is not None and not pkgbuild_sums_are_placeholder(ov_text):
+        warn(
+            "packaging/arch-dolphin-overlay/PKGBUILD 的 sha256sums 若还是上个 tag 源码归档的"
+            "值，推 AUR 前要重算（curl 下载该 tag 的归档后 sha256sum，或 updpkgsums）；"
+            "Release 流水线不受影响（CI 每次现算覆盖）。"
         )
 
     print(f"✅ 各处版本一致：{tag_version}")
