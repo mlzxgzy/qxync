@@ -1326,6 +1326,8 @@ pub struct BalooStatusData {
     pub indexing_enabled: bool,
     /// 当前 Dolphin 集成开关（`settings.dolphin_tags`）。
     pub dolphin_tags: bool,
+    /// ★ M24：当前 Dolphin **角标**开关（`settings.dolphin_overlay`）。
+    pub dolphin_overlay: bool,
     /// 每个挂载点的检测结论。
     pub mounts: Vec<BalooMountInfo>,
     /// `true` = 现在可以打开 Dolphin 集成（所有挂载点都不会被索引）。
@@ -1346,6 +1348,8 @@ pub struct BalooMountInfo {
     /// 该挂载点当前是否真的在暴露 `user.xdg.tags`
     /// （= 设置开了 **且** 这个挂载点安全；两个都满足才有 Tags）。
     pub tags_active: bool,
+    /// ★ M24：该挂载点当前是否真的在暴露 `user.qxync.overlay`（角标）。
+    pub overlay_active: bool,
     /// 建议执行的排除命令（`balooctl6 config add excludeFolders <挂载点>`）。
     pub exclude_cmd: String,
 }

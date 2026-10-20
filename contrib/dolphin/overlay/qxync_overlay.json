@@ -2,7 +2,7 @@
     "KPlugin": {
         "Id": "qxync_overlay",
         "Name": "qxync 水合状态角标",
-        "Description": "在 Dolphin 的文件图标上显示 qxync 的水合状态（仅在线 / 部分本地 / 已水合）",
+        "Description": "在 Dolphin 的文件图标上显示 qxync 的水合状态（绿对钩=已水合 / 蓝云=仅在线 / 半满圆=部分本地）；需要在设置里打开「文件图标角标」开关",
         "Version": "0.7.2",
         "License": "MIT"
     }

@@ -5082,6 +5082,7 @@
     var nt = $('s-notifications'); if (nt) { nt.checked = s.desktop_notifications !== false; }
     // ★ M23：Dolphin 集成开关 + Baloo 检测结果（设置页打开时顺手刷一次）
     var dt = $('s-dolphin-tags'); if (dt) { dt.checked = s.dolphin_tags === true; }
+    var dti = $('s-dolphin-overlay'); if (dti) { dti.checked = s.dolphin_overlay === true; }
     refreshBalooStatus();
 
     // ---- 释放空间
@@ -5139,6 +5140,8 @@
     s.desktop_notifications = isOn('s-notifications', true);
     // ★ M23：Dolphin 集成开关（保存前的 Baloo 门禁在 doAdvancedSave 里做）
     s.dolphin_tags = isOn('s-dolphin-tags', false);
+    // ★ M24：文件图标角标开关（与 Tags 列独立；需要先装 contrib/dolphin/overlay 插件）
+    s.dolphin_overlay = isOn('s-dolphin-overlay', false);
     return s;
   }
 
@@ -5219,11 +5222,17 @@
   }
 
   function doAdvancedSave() {
-    var s = collectAdvanced(currentSettings());
-    // ★ M23：勾了 Dolphin 集成 → 保存前先做 Baloo 预检。
+    var prev = currentSettings();
+    var wasTags = prev.dolphin_tags === true;
+    var wasOverlay = prev.dolphin_overlay === true;
+    var s = collectAdvanced(prev);
+    // ★ M23/M24：任一 Dolphin 开关「关 → 开」→ 保存前先做 Baloo 预检。
     //   daemon 的 settings_save 里有同样的门禁（CLI / 竞态兜底），这里做是为了
     //   能在**保存失败之前**给出「弹终端一键排除」的引导，而不是一句报错。
-    if (s.dolphin_tags === true) {
+    //   只在「关→开」边沿拦：默认就开着的开关（或保存别的设置）不该每次被卡。
+    var turningOn = (s.dolphin_tags === true && !wasTags)
+      || (s.dolphin_overlay === true && !wasOverlay);
+    if (turningOn) {
       return ipc({ method: 'baloo_status' }).then(function (r) {
         if (!r.ok) {
           // 检测本身失败（daemon 没跑 / 老版本 daemon 不认识这个方法）：
@@ -5307,10 +5316,13 @@
           var label = m.indexed === true ? '⚠️ ' + T('baloo.mount_indexed')
             : (m.excluded === true ? '✅ ' + T('baloo.mount_excluded')
             : '✅ ' + T('baloo.mount_safe'));
-          kvText(dl, str(m.mountpoint), label + (m.tags_active === true ? ' · ' + T('baloo.tags_on') : ''));
+          kvText(dl, str(m.mountpoint), label
+            + (m.tags_active === true ? ' · ' + T('baloo.tags_on') : '')
+            + (m.overlay_active === true ? ' · ' + T('baloo.overlay_on') : ''));
         }
       }
-      if (installed && d.indexing_enabled !== false && d.dolphin_tags === true) {
+      if (installed && d.indexing_enabled !== false
+          && (d.dolphin_tags === true || d.dolphin_overlay === true)) {
         kvText(dl, '提示', T('baloo.tags_note'));
       }
       return r;

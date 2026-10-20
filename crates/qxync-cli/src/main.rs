@@ -990,10 +990,10 @@ async fn main() -> Result<()> {
                 // ★ M23：直连写文件绕过了 daemon 的 Baloo 门禁 —— 这里必须把
                 //   前置条件说清楚，否则用户开了 dolphin_tags 却没排除索引，
                 //   daemon 重启后 tags 不会生效（挂载时按安全条件算过）。
-                if st.dolphin_tags {
+                if st.dolphin_tags || st.dolphin_overlay {
                     eprintln!(
-                        "⚠️ dolphin_tags=true：开启前每个挂载点必须已排除出 Baloo 索引，\
-                         否则内容索引器会把整个 NAS 拉到本地（且 tags 不会生效）。\
+                        "⚠️ dolphin_tags / dolphin_overlay=true：开启前每个挂载点必须已\
+                         排除出 Baloo 索引，否则内容索引器会把整个 NAS 拉到本地（且不会生效）。\
                          排除：balooctl6 config add excludeFolders <挂载点>"
                     );
                 }
@@ -2035,12 +2035,9 @@ fn print_settings(st: &Settings, paths: &ConfigPaths, json: bool, saved: bool) -
         if st.close_to_tray { "开" } else { "关" }
     );
     println!(
-        "Dolphin   : {}（user.xdg.tags；开启前挂载点须排除出 Baloo 索引，见 `qxync baloo-status`）",
-        if st.dolphin_tags {
-            "集成开"
-        } else {
-            "集成关"
-        }
+        "Dolphin   : Tags 列={} 角标={}（user.xdg.tags / user.qxync.overlay；开启前挂载点须排除出 Baloo 索引，见 `qxync baloo-status`）",
+        if st.dolphin_tags { "开" } else { "关" },
+        if st.dolphin_overlay { "开" } else { "关" }
     );
     println!(
         "释放空间  : {}（{}{}）",
@@ -2099,12 +2096,9 @@ fn print_settings_data(d: &SettingsData) {
         if st.close_to_tray { "开" } else { "关" }
     );
     println!(
-        "Dolphin   : {}（user.xdg.tags；开启前挂载点须排除出 Baloo 索引，见 `qxync baloo-status`）",
-        if st.dolphin_tags {
-            "集成开"
-        } else {
-            "集成关"
-        }
+        "Dolphin   : Tags 列={} 角标={}（user.xdg.tags / user.qxync.overlay；开启前挂载点须排除出 Baloo 索引，见 `qxync baloo-status`）",
+        if st.dolphin_tags { "开" } else { "关" },
+        if st.dolphin_overlay { "开" } else { "关" }
     );
     println!(
         "释放空间  : {}（{}）",
@@ -2194,8 +2188,9 @@ fn print_baloo_status(d: &qxync_core::ipc::BalooStatusData) {
         }
     );
     println!(
-        "Dolphin 集成: {}（dolphin_tags）",
-        if d.dolphin_tags { "开" } else { "关" }
+        "Dolphin   : Tags 列={}（dolphin_tags） 角标={}（dolphin_overlay）",
+        if d.dolphin_tags { "开" } else { "关" },
+        if d.dolphin_overlay { "开" } else { "关" }
     );
     if d.mounts.is_empty() {
         println!("挂载点    : （无 —— 开关可以先打开，挂载时会再检查）");
@@ -2211,10 +2206,11 @@ fn print_baloo_status(d: &qxync_core::ipc::BalooStatusData) {
             } else {
                 "✅ 不会被索引"
             },
-            if m.tags_active {
-                " · Tags 已生效"
-            } else {
-                ""
+            match (m.tags_active, m.overlay_active) {
+                (true, true) => " · Tags+角标已生效",
+                (true, false) => " · Tags 已生效",
+                (false, true) => " · 角标已生效",
+                (false, false) => "",
             }
         );
         if m.indexed {

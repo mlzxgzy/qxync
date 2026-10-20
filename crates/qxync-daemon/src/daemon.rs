@@ -244,6 +244,11 @@ pub(crate) struct MountEntry {
     /// （见 [`refresh_dolphin_flags`]）。存句柄是为了 `settings_save` 时能热刷新
     /// —— 不用重挂载。
     dolphin_tags: Arc<AtomicBool>,
+    /// ★ M24：该挂载点的 Dolphin **角标**开关（`user.qxync.overlay`，与 FUSE 共享）。
+    ///
+    /// 语义同 `dolphin_tags`：`settings.dolphin_overlay` **且** 该挂载点不会被
+    /// Baloo 索引；两个开关彼此独立，可以只开其中一个。
+    dolphin_overlay: Arc<AtomicBool>,
 }
 
 pub(crate) struct State {
@@ -2460,9 +2465,13 @@ async fn mount(
     // Baloo 的内容索引与我们的开关无关，它自己就会把占位符拉下来。
     let baloo_probe = BalooProbe::detect();
     let baloo_indexed = baloo_probe.indexed(&mp);
-    let dolphin_flag = Arc::new(AtomicBool::new(
-        state.settings.lock().unwrap().dolphin_tags && !baloo_indexed,
-    ));
+    let (want_tags, want_overlay) = {
+        let s = state.settings.lock().unwrap();
+        (s.dolphin_tags, s.dolphin_overlay)
+    };
+    let dolphin_flag = Arc::new(AtomicBool::new(want_tags && !baloo_indexed));
+    // ★ M24：角标开关独立（`user.qxync.overlay`），判定条件与 tags 相同。
+    let overlay_flag = Arc::new(AtomicBool::new(want_overlay && !baloo_indexed));
     let mut fs = QxyncFs::new(fuse_client.clone(), remote.clone(), cache.clone())
         .map_err(|e| IpcError::new(ErrorKind::Io, e.to_string()))?
         .with_hydrate_timeout(hydrate_timeout)
@@ -2485,7 +2494,9 @@ async fn mount(
         // ★ M23：Dolphin 集成 —— 每个挂载点一个**活开关**（与 FUSE 共享），
         // 初值在挂载成功前按「设置开了 && 不在 Baloo 索引范围内」算好；
         // `settings_save` 之后由 [`refresh_dolphin_flags`] 热刷新。
-        .with_dolphin_tags(dolphin_flag.clone());
+        .with_dolphin_tags(dolphin_flag.clone())
+        // ★ M24：角标开关独立注入（`user.qxync.overlay`，供贡献插件读）。
+        .with_dolphin_overlay(overlay_flag.clone());
     if let Some(limit) = delete_limit {
         fs = fs.with_delete_limit(limit);
     }
@@ -2688,6 +2699,7 @@ async fn mount(
             conflict: conflict.clone(),
             rec: rec.clone(),
             dolphin_tags: dolphin_flag,
+            dolphin_overlay: overlay_flag,
         },
     );
     tracing::info!(
@@ -5322,17 +5334,18 @@ fn idle_settings_save(
 /// 真正挂载时 `mount()` 会按「设置开了 && 不在索引范围内」再算一次。
 fn idle_baloo_status() -> BalooStatusData {
     let probe = BalooProbe::detect();
-    let dolphin_tags = ConfigPaths::discover()
+    let (dolphin_tags, dolphin_overlay) = ConfigPaths::discover()
         .ok()
         .and_then(|p| Settings::load(&p).ok())
-        .map(|s| s.dolphin_tags)
-        .unwrap_or(false);
+        .map(|s| (s.dolphin_tags, s.dolphin_overlay))
+        .unwrap_or((false, false));
     BalooStatusData {
         balooctl: probe.balooctl.as_ref().map(|b| b.display().to_string()),
         config_path: probe.config_path.display().to_string(),
         config_exists: probe.config_exists,
         indexing_enabled: probe.indexing_enabled(),
         dolphin_tags,
+        dolphin_overlay,
         mounts: Vec::new(),
         can_enable: true,
     }
@@ -5386,8 +5399,12 @@ fn settings_save_cmd(
     // 邀请它把整个 NAS 拉到本地。只在「关 → 开」的边沿拦：已经开着的人
     // 保存别的设置（代理等）不该被一个无关的挂载点卡死 —— 那个挂载点的
     // tags 标志本来就不会被点亮（mount 时按安全条件算过）。
-    let prev_dolphin = state.settings.lock().unwrap().dolphin_tags;
-    if s.dolphin_tags && !prev_dolphin {
+    let (prev_dolphin, prev_overlay) = {
+        let prev = state.settings.lock().unwrap();
+        (prev.dolphin_tags, prev.dolphin_overlay)
+    };
+    // ★ M24：角标开关与 tags 共用同一道门禁（都只在「关 → 开」边沿拦）。
+    if (s.dolphin_tags && !prev_dolphin) || (s.dolphin_overlay && !prev_overlay) {
         let probe = BalooProbe::detect();
         let bad: Vec<String> = state
             .mounts
@@ -5427,7 +5444,7 @@ fn settings_save_cmd(
             "settings",
             "",
             format!(
-                "设置已保存：代理={}，自动释放={}，开机自启={}，通知={}，Dolphin 集成={}",
+                "设置已保存：代理={}，自动释放={}，开机自启={}，通知={}，Dolphin Tags={}，Dolphin 角标={}",
                 s.proxy.mode,
                 if s.free_space.auto { "开" } else { "关" },
                 if s.launch_at_startup { "开" } else { "关" },
@@ -5437,6 +5454,7 @@ fn settings_save_cmd(
                     "关"
                 },
                 if s.dolphin_tags { "开" } else { "关" },
+                if s.dolphin_overlay { "开" } else { "关" },
             ),
         ),
     );
@@ -5543,33 +5561,48 @@ impl BalooProbe {
 /// 两个条件都满足才点亮 —— 不满足的挂载点 tags 静默不暴露，挂载本身照常
 /// （不能因为一个标签列把挂载搞没了）。`settings_save` 与 `mount` 之后调用。
 fn refresh_dolphin_flags(state: &Arc<State>) {
-    let want = state.settings.lock().unwrap().dolphin_tags;
+    let (want_tags, want_overlay) = {
+        let s = state.settings.lock().unwrap();
+        (s.dolphin_tags, s.dolphin_overlay)
+    };
     let probe = BalooProbe::detect();
-    let mut n_on = 0usize;
-    let mut n_off = 0usize;
+    let (mut tags_on, mut tags_off) = (0usize, 0usize);
+    let (mut ov_on, mut ov_off) = (0usize, 0usize);
     {
         let g = state.mounts.lock().unwrap();
         for (mp, m) in g.iter() {
-            let active = want && !probe.indexed(mp);
-            if active {
-                n_on += 1;
-            } else {
-                n_off += 1;
-            }
-            m.dolphin_tags.store(active, Ordering::Relaxed);
+            let safe = !probe.indexed(mp);
+            let tags_active = want_tags && safe;
+            let ov_active = want_overlay && safe;
+            tags_on += usize::from(tags_active);
+            tags_off += usize::from(!tags_active);
+            ov_on += usize::from(ov_active);
+            ov_off += usize::from(!ov_active);
+            m.dolphin_tags.store(tags_active, Ordering::Relaxed);
+            m.dolphin_overlay.store(ov_active, Ordering::Relaxed);
         }
     }
-    if want {
+    if want_tags || want_overlay {
         tracing::info!(
-            "M23 Dolphin 集成：设置=开，tags 暴露 {n_on} 个挂载点（{n_off} 个因 Baloo 未排除而不暴露）"
+            "M23/M24 Dolphin 集成：Tags={}（{tags_on} 个挂载点生效 / {tags_off} 个未生效），\
+             角标={}（{ov_on} / {ov_off}）",
+            if want_tags { "开" } else { "关" },
+            if want_overlay { "开" } else { "关" },
         );
     }
 }
 
 /// `Request::BalooStatus`：Baloo 索引状态检测（GUI 开 Dolphin 集成前的预检）。
+///
+/// ★ M24：顺带**热刷新一次挂载点标志** —— 用户可能在终端里手动排除了 Baloo，
+/// 点 GUI 的「重新检测 Baloo」就该让 Tags / 角标立刻生效，而不是等重挂载。
 fn baloo_status_cmd(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
+    refresh_dolphin_flags(state);
     let probe = BalooProbe::detect();
-    let dolphin_tags = state.settings.lock().unwrap().dolphin_tags;
+    let (dolphin_tags, dolphin_overlay) = {
+        let s = state.settings.lock().unwrap();
+        (s.dolphin_tags, s.dolphin_overlay)
+    };
     let mut mounts = Vec::new();
     let mut can_enable = true;
     {
@@ -5585,6 +5618,7 @@ fn baloo_status_cmd(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
                 excluded,
                 indexed,
                 tags_active: m.dolphin_tags.load(Ordering::Relaxed),
+                overlay_active: m.dolphin_overlay.load(Ordering::Relaxed),
                 exclude_cmd: probe.exclude_cmd_for(mp),
             });
         }
@@ -5595,6 +5629,7 @@ fn baloo_status_cmd(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
         config_exists: probe.config_exists,
         indexing_enabled: probe.indexing_enabled(),
         dolphin_tags,
+        dolphin_overlay,
         mounts,
         can_enable,
     })
