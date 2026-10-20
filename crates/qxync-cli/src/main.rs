@@ -4,9 +4,11 @@
 //! 「登录 → 列举 → stat → 下载 → 上传 → 建目录」这条链，作为 M0 的验收工具。
 
 mod ipc_client;
+mod progress;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use progress::DownloadProgress;
 use qxync_client::Client;
 use qxync_core::ipc::{
     socket_path_for, CacheInfo, CursorInfo, DecisionsData, DehydrateData, ErrorKind,
@@ -919,7 +921,14 @@ async fn main() -> Result<()> {
             let (client, _) = connect(&cli, true).await?;
             let dest = out.clone().unwrap_or_else(|| PathBuf::from(name));
             let expected = client.stat(dir, name).await?.map(|e| e.filesize);
-            let written = client.download_to_file(dir, name, &dest).await?;
+            // ★ M26：下载超过 3 秒才亮进度行（快下载输出零变化）；
+            //   stat 拿到的远端大小做总量兜底（服务端 chunked 时 Content-Length 缺失）。
+            let prog = DownloadProgress::new(name).with_total_hint(expected);
+            let res = client
+                .download_to_file_with_progress(dir, name, &dest, Some(&|w, t| prog.update(w, t)))
+                .await;
+            prog.finish();
+            let written = res?;
             if let Some(exp) = expected {
                 if exp != written {
                     // 铁则 1 的前置检查：长度不符绝不能当成功
@@ -1685,7 +1694,17 @@ async fn route_via_daemon(
             }
         }
         Cmd::Get { dir, name, .. } => {
-            let d: GetData = ipc_client::call(&socket, req).await?;
+            // ★ M26：经 daemon 也要进度 —— 信封声明 progress:true，daemon 在下载
+            //   期间往同一条 socket 推进度行，这里原地刷新（老 daemon 自动退化）。
+            //   stderr 非终端时 enabled()=false：不声明、daemon 不推行，输出零变化。
+            let prog = DownloadProgress::new(name);
+            let res: Result<GetData, _> =
+                ipc_client::call_with_progress(&socket, req, prog.enabled(), |p| {
+                    prog.update(p.written, p.total)
+                })
+                .await;
+            prog.finish();
+            let d = res?;
             println!(
                 "✅ {dir}/{name} -> {}  ({} 字节，经 daemon)",
                 d.dest.display(),

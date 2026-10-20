@@ -460,6 +460,104 @@
   /** 当前连接的 ipc —— 「文件 / 诊断 / 当前连接的同步动作」都走它。 */
   function ipc(req) { return ipcFor(currentId(), req); }
 
+  /** ★ M26：带进度行的 ipc（当前只有 `get` 用）。
+   *
+   * 走 Rust 命令 `ipc_call_with_progress`（信封声明 progress:true，daemon 在下载
+   * 期间往同一条 socket 推进度行）；每行经 Tauri 事件 `progress://download` 回到
+   * 这里喂给 `onProgress({written,total})`。返回形状与 [`ipcFor`] 完全一致。
+   * 老 daemon 不推进度行 → 只是收不到事件，调用照常完成。 */
+  function ipcForWithProgress(linkId, req, onProgress) {
+    var id = str(linkId) || 'default';
+    if (isObj(req) && req.v === undefined) { req.v = 1; }
+    var unlisten = null;
+    var done = false;
+    function settle() {
+      if (done) { return; }
+      done = true;
+      if (isFn(unlisten)) { try { unlisten(); } catch (e) { /* 拆监听失败不影响结果 */ } }
+    }
+    if (tauri && tauri.event && isFn(tauri.event.listen)) {
+      tauri.event.listen('progress://download', function (ev) {
+        if (isFn(onProgress) && isObj(ev) && isObj(ev.payload)) {
+          onProgress(ev.payload);
+        }
+      }).then(function (fn) {
+        if (done) { try { fn(); } catch (e) { } }   // 竞态：调用已结束，立刻拆掉
+        else { unlisten = fn; }
+      });
+    }
+    return call('ipc_call_with_progress', { linkId: id, req: req }).then(function (r) {
+      settle();
+      var res = r.raw;
+      if (!r.ok) { return { ok: false, error: r.error, kind: r.kind, linkId: id }; }
+      if (isObj(res) && res.ok === true) {
+        return { ok: true, data: res.data, raw: res, linkId: id };
+      }
+      var msg = (isObj(res) && isObj(res.error)) ? str(res.error.message) : '调用失败';
+      return { ok: false, error: msg, raw: res, linkId: id };
+    }, function (e) {
+      settle();
+      throw e;
+    });
+  }
+
+  // ------------------------------------------------- ★ M26 下载进度（GUI）
+  // 与 CLI（crates/qxync-cli/src/progress.rs）同一套规则：3 秒静默期（快下载
+  // 零打扰）→ 10 Hz 刷新 → 3 秒滑窗速度 → 剩余时间。挂点选「进行中…」徽标：
+  // 下载中用户还要浏览文件列表，新开弹窗/遮罩反而挡操作。
+  function fmtEta(secs) {
+    if (!isFinite(secs) || secs < 0) { return '—'; }
+    if (secs < 60) { return Math.round(secs) + 's'; }
+    if (secs < 3600) { return Math.floor(secs / 60) + 'm' + pad2(Math.floor(secs % 60)) + 's'; }
+    return Math.floor(secs / 3600) + 'h' + pad2(Math.floor((secs % 3600) / 60)) + 'm';
+  }
+
+  /** 一次下载的进度行。`busyEl` 是 #files-busy 徽标；`total=0` 表示未知总量。 */
+  function makeDownloadProgress(busyEl) {
+    var start = Date.now();
+    var samples = [];      // [t, written]，只留最近 3 秒（滑窗速度）
+    var lastDraw = 0;
+    var shown = false;
+
+    function speed(now) {
+      if (samples.length < 2) { return 0; }
+      var dt = (now - samples[0][0]) / 1000;
+      if (dt < 0.001) { return 0; }
+      return Math.max(0, (samples[samples.length - 1][1] - samples[0][1]) / dt);
+    }
+
+    function draw(now, written, total) {
+      if (!busyEl) { return; }
+      var v = speed(now);
+      if (total > 0) {
+        var pct = Math.min(100, written / total * 100);
+        var eta = (v > 0 && written < total) ? ' · 剩余 ' + fmtEta((total - written) / v) : '';
+        busyEl.textContent = '⬇ ' + pct.toFixed(1) + '% · ' + humanSize(written)
+          + '/' + humanSize(total) + ' · ' + humanSize(v) + '/s' + eta;
+      } else {
+        busyEl.textContent = '⬇ 已下载 ' + humanSize(written) + ' · ' + humanSize(v) + '/s';
+      }
+    }
+
+    return {
+      /** 喂一次采样（progress://download 事件）。必须廉价：高频调用。 */
+      update: function (written, total) {
+        var now = Date.now();
+        samples.push([now, written]);
+        while (samples.length > 1 && now - samples[0][0] > 3000) { samples.shift(); }
+        if (now - start < 3000) { return; }            // 3 秒静默期：快下载零打扰
+        if (shown && now - lastDraw < 100) { return; } // 10 Hz 节流
+        shown = true;
+        lastDraw = now;
+        draw(now, written, total);
+      },
+      /** 下载结束（成功/失败都调）：把徽标还原成通用文案（随后 setBusy 会隐藏它）。 */
+      finish: function () {
+        if (busyEl) { busyEl.textContent = T('busy.text'); }
+      }
+    };
+  }
+
   /** 并行 fanout 同一个请求到多个连接：返回 [{id, link, running, r}]（顺序与入参一致）。 */
   function fanout(req, targets) {
     var ts = targets || fanoutTargets();
@@ -4461,17 +4559,24 @@
     if (!requireDaemon()) { return; }
     var base = state.home || '';
     var guess = base ? pathJoin(base, e.filename) : e.filename;
-    openModal('下载到本地', 'NAS：' + pathJoin(state.files.dir, e.filename) + '（大文件可能较久，daemon 超时 600s）', guess)
+    // ★ M26：下载超过 3 秒会在「进行中…」徽标上亮进度（百分比/速度/剩余时间），
+    //   快下载与老版本 daemon（不推进度行）看到的都还是原来的「进行中…」。
+    openModal('下载到本地', 'NAS：' + pathJoin(state.files.dir, e.filename) + '（大文件可能较久；超过 3 秒显示下载进度）', guess)
       .then(function (dest) {
         if (!dest) { return null; }
         var target = str(dest).trim();
         if (!target) { return null; }
+        var prog = makeDownloadProgress($('files-busy'));
         return withBusy({
           spinners: ['files-busy'],
           buttons: btn ? [btn] : []
         }, function () {
-          return ipc({ method: 'get', dir: state.files.dir, name: str(e.filename), dest: target });
+          return ipcForWithProgress(currentId(), { method: 'get', dir: state.files.dir, name: str(e.filename), dest: target }, function (p) {
+            // total 为 null（服务端 chunked 无 Content-Length）→ 0 = 未知总量
+            prog.update(num(p.written, 0), p.total == null ? 0 : num(p.total, 0));
+          });
         }).then(function (r) {
+          prog.finish();
           if (r.ok) {
             var d = isObj(r.data) ? r.data : {};
             logOk('下载完成：' + str(d.dest) + '（' + humanSize(d.bytes) + '）');
@@ -4479,6 +4584,9 @@
             logErr('下载失败：' + str(r.error));
           }
           return r;
+        }, function (err) {
+          prog.finish();
+          throw err;
         });
       });
   }

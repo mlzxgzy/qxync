@@ -428,9 +428,17 @@ impl Request {
 }
 
 /// 请求信封：`{"v":1,"method":"status", ...}`（`method` 与参数同层）。
+///
+/// ★ M26：`progress` 是**客户端能力声明** —— 置 true 表示「这条连接上的调用方
+/// 认识进度行」。daemon 看到它才会在长任务（当前只有 `get`）期间往同一条
+/// socket 推 [`ProgressLine`]。缺省 false：老 CLI / GUI 不声明 → daemon 一个
+/// 进度行都不发，行为与 M25 及以前**一字不变**（serde 对未知字段宽容，
+/// 新 CLI 打老 daemon 也一样安全 —— 老 daemon 忽略这个字段）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestEnvelope {
     pub v: u32,
+    #[serde(default)]
+    pub progress: bool,
     #[serde(flatten)]
     pub req: Request,
 }
@@ -439,9 +447,49 @@ impl RequestEnvelope {
     pub fn new(req: Request) -> Self {
         Self {
             v: IPC_VERSION,
+            progress: false,
             req,
         }
     }
+
+    /// 声明「我认识进度行」的信封（CLI 的 `get` 用）。
+    pub fn with_progress(req: Request) -> Self {
+        Self {
+            v: IPC_VERSION,
+            progress: true,
+            req,
+        }
+    }
+}
+
+// ---------------------------------------------------------------- 进度行
+
+/// 一条进度推送：`{"v":1,"progress":{"written":..,"total":..}}`。
+///
+/// `total` 缺失 = 服务端没给 `Content-Length`（chunked），展示侧按「未知总量」处理。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProgressData {
+    pub written: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
+}
+
+/// 进度行的完整线格式（与 [`Response`] 同一条 socket 上混发）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProgressLine {
+    pub v: u32,
+    pub progress: ProgressData,
+}
+
+/// 连接上可能读到的一行：进度行或最终响应。
+///
+/// unagged 反序列化先试 [`ConnLine::Progress`]（要求 `progress` 字段存在），
+/// 再试 [`ConnLine::Resp`]（要求 `ok` 字段存在）—— 两种线格式没有歧义。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum ConnLine {
+    Progress(ProgressLine),
+    Resp(Response),
 }
 
 // ---------------------------------------------------------------- 响应
@@ -474,7 +522,7 @@ impl ErrorKind {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IpcError {
     pub kind: ErrorKind,
     pub message: String,
@@ -489,7 +537,7 @@ impl IpcError {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Response {
     pub v: u32,
     pub ok: bool,
@@ -1408,6 +1456,19 @@ pub fn decode_line<T: serde::de::DeserializeOwned>(line: &[u8]) -> Result<T, ser
     serde_json::from_str(s.trim())
 }
 
+/// ★ M26：读一行，是进度行就取出 [`ProgressData`]，是最终响应就返回 `None`。
+///
+/// 给 CLI 的进度感知读循环用（见 `qxync-cli/src/ipc_client.rs`）。解析失败
+/// 原样上抛 —— 线上只该有两种形状，第三种就是协议坏了。
+pub fn conn_line_from_line(line: &[u8]) -> Result<Option<ProgressData>, serde_json::Error> {
+    let s = std::str::from_utf8(line).unwrap_or("");
+    let parsed: ConnLine = serde_json::from_str(s.trim())?;
+    Ok(match parsed {
+        ConnLine::Progress(ProgressLine { progress, .. }) => Some(progress),
+        ConnLine::Resp(_) => None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1494,6 +1555,56 @@ mod tests {
         let back: RequestEnvelope = decode_line(&line).unwrap();
         assert_eq!(back.req, req.req);
         assert_eq!(back.v, IPC_VERSION);
+    }
+
+    /// ★ M26：进度行的线格式与两种兼容场景。
+    #[test]
+    fn progress_lines_and_envelope_flag() {
+        // 1) 进度行 ↔ ConnLine 往返（total 有/无两种形态）
+        let p = ProgressLine {
+            v: IPC_VERSION,
+            progress: ProgressData {
+                written: 1024,
+                total: Some(4096),
+            },
+        };
+        let line = encode_line(&p).unwrap();
+        let back: ConnLine = decode_line(&line).unwrap();
+        assert_eq!(back, ConnLine::Progress(p));
+
+        let p2 = ProgressLine {
+            v: IPC_VERSION,
+            progress: ProgressData {
+                written: 7,
+                total: None,
+            },
+        };
+        let line2 = encode_line(&p2).unwrap();
+        // total 缺失时线格式里就不该有这个字段（GUI/脚本按 key 探测）
+        assert!(!String::from_utf8(line2.clone()).unwrap().contains("total"));
+        let back2: ConnLine = decode_line(&line2).unwrap();
+        assert_eq!(back2, ConnLine::Progress(p2));
+
+        // 2) 最终响应也能从 ConnLine 解出（同一条 socket 上混发不歧义）
+        let r = Response::ok(serde_json::json!({ "bytes": 1 }));
+        let back3: ConnLine = decode_line(&encode_line(&r).unwrap()).unwrap();
+        assert_eq!(back3, ConnLine::Resp(r));
+
+        // 3) 老客户端的线格式（没有 progress 字段）→ 缺省 false
+        let old: RequestEnvelope =
+            serde_json::from_str(r#"{"v":1,"method":"ls","path":"/home"}"#).unwrap();
+        assert!(!old.progress, "老线格式必须解出 progress=false");
+
+        // 4) 新客户端声明进度 → true，且不影响请求参数本身
+        let e = RequestEnvelope::with_progress(Request::Get {
+            dir: "/home".into(),
+            name: "a.bin".into(),
+            dest: "/tmp/a.bin".into(),
+        });
+        assert!(e.progress);
+        let back4: RequestEnvelope = decode_line(&encode_line(&e).unwrap()).unwrap();
+        assert!(back4.progress);
+        assert_eq!(back4.req, e.req);
     }
 
     #[test]

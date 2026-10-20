@@ -26,6 +26,10 @@ use tauri::{AppHandle, Emitter};
 /// 事件名：托盘 → 主窗口。`://` 在 Tauri 的事件名白名单里（字母数字 + `-` `/` `:` `_`）。
 pub const ACTION_EVENT: &str = "tray://action";
 
+/// ★ M26：下载进度事件名（Rust 命令 `ipc_call_with_progress` → 前端）。
+/// payload：`{written, total}`（`total` 可为 null —— 服务端 chunked 时未知）。
+pub const PROGRESS_EVENT: &str = "progress://download";
+
 /// 托盘图标 id（仅用于日志/调试；同进程只有一个托盘）。
 const TRAY_ID: &str = "qxync-tray";
 const MENU_OPEN: &str = "tray-open";
