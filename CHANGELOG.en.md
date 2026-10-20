@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-10-20
+
+### Added
+
+- **Dolphin badges: colored hydration state on file icons (M24, optional plugin +
+  independent switch)**: green check = hydrated, blue cloud = online-only, half
+  circle = partially local — the same visual language as Windows Explorer / CFA
+  (Cloud Files API). `contrib/dolphin/overlay/` is a standalone CMake project
+  (Qt6 Core + KF6 KIO, **not part of the cargo build** and not shipped in release
+  artifacts) that draws `KOverlayIconPlugin` badges in the file icon's bottom-left
+  corner; it reads xattrs only for local files under a `fuse.qxync` mount (zero
+  reads elsewhere). This badge mechanism **only exists in Dolphin / KDE**, so it
+  is an **independent** switch `settings.dolphin_overlay` (off by default, GUI →
+  Settings → Advanced): on → FUSE exposes `user.qxync.overlay`
+  (`placeholder` / `partial` / `hydrated`, empty string for directories) and the
+  plugin picks the icon; off → the attribute is absent (`ENODATA`) and no badge is
+  drawn. Both switches share the Baloo gate and per-mount evaluation, toggle hot
+  without remounting; `baloo_status` also refreshes the per-mount flags (after
+  manually excluding Baloo in a terminal, "recheck" takes effect immediately).
+  With the default 16 px icons in Details view the badge is 8 px (legible; zoom
+  the icon size in for larger badges).
+
+### Changed
+
+- **Tags column values changed from words to icon characters**: `user.xdg.tags`
+  now writes `✓` / `☁` / `◐` (was `已水合` / `仅在线` / `部分本地`). Tags can only
+  display text, at body font size and without color — the Chinese words were hard
+  to spot among a screen full of file names. Machine-readable state is still
+  `user.qxync.state` (unchanged); scripts that parsed the tags need updating
+  (the badge plugin now reads the dedicated `user.qxync.overlay` instead, so it is
+  unaffected).
+
+## [0.7.1] - 2026-10-20
+
 ### Added
 
 - **Dolphin integration: hydration state in the Tags column (M23)**: every file in a
@@ -35,32 +69,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Limitations (research doc §5): no live refresh (F5 / re-enter directory); depends
   on the global Baloo switch; not searchable via `tags:`; users cannot add their own
   tags on mountpoints (`setxattr` intentionally unimplemented).
-
-### Fixed (surfaced by real-machine verification of M23)
-
-- **Baloo config reader ignored `XDG_CONFIG_HOME`**: balooctl writes via KConfig
-  semantics (`$XDG_CONFIG_HOME/baloofilerc` takes precedence) while the reader
-  hardcoded `$HOME/.config` — in any environment with `XDG_CONFIG_HOME` set, the
-  gate could never see freshly written exclusions. Real user environments happen
-  to coincide (XDG unset), which is why it never blew up. The reader now mirrors
-  KConfig semantics (fuse-matrix on real hardware: 9/9 green);
-- **Did not parse the key format balooctl actually writes**: balooctl writes
-  `exclude folders[$e]=$HOME/…/` (KConfig expansion marker + `$HOME` variable
-  form + trailing slash); exact-match on `exclude folders` read zero entries.
-  Key matching now strips the `[...]` suffix (`$HOME` expansion and
-  component-wise trailing-slash comparison were already there). Both fixes carry
-  unit tests (baloo: 12 cases);
-- **Two fuse-matrix test defects** (sources of false failures): the M23 section
-  did not reset `dolphin_tags` at start — a stale `true` from a previous run let
-  the gate assertion be silently swallowed by the "only gate on the off→on edge"
-  product semantics; cache cleanup `rm -f` could not remove per-host
-  subdirectories (M9 layout) — leftover cache made three assertions fail
-  falsely. A baseline comparison (pre-M23 code) confirmed the remaining failures
-  are WAN-environment-inherent and unrelated to this release.
-
-## [0.7.1] - 2026-10-20
-
-### Added
 
 - **Offline-restartable daemon (M21)**: restarting the daemon while offline (or booting
   after a power cut) restores the mount **immediately** (measured 1s on real hardware)
@@ -187,6 +195,28 @@ fixed (see Fixed above and the M20/M21 milestone docs).
   conflict copy); the task's `conflict` strategy is not consulted during replay.
 - Task-level purge does not clean outbox / listings rows (shared per link, like the
   upload/delete queues; a link-level purge removes the whole `sync.db`).
+
+### Fixed (surfaced by real-machine verification of M23)
+
+- **Baloo config reader ignored `XDG_CONFIG_HOME`**: balooctl writes via KConfig
+  semantics (`$XDG_CONFIG_HOME/baloofilerc` takes precedence) while the reader
+  hardcoded `$HOME/.config` — in any environment with `XDG_CONFIG_HOME` set, the
+  gate could never see freshly written exclusions. Real user environments happen
+  to coincide (XDG unset), which is why it never blew up. The reader now mirrors
+  KConfig semantics (fuse-matrix on real hardware: 9/9 green);
+- **Did not parse the key format balooctl actually writes**: balooctl writes
+  `exclude folders[$e]=$HOME/…/` (KConfig expansion marker + `$HOME` variable
+  form + trailing slash); exact-match on `exclude folders` read zero entries.
+  Key matching now strips the `[...]` suffix (`$HOME` expansion and
+  component-wise trailing-slash comparison were already there). Both fixes carry
+  unit tests (baloo: 12 cases);
+- **Two fuse-matrix test defects** (sources of false failures): the M23 section
+  did not reset `dolphin_tags` at start — a stale `true` from a previous run let
+  the gate assertion be silently swallowed by the "only gate on the off→on edge"
+  product semantics; cache cleanup `rm -f` could not remove per-host
+  subdirectories (M9 layout) — leftover cache made three assertions fail
+  falsely. A baseline comparison (pre-M23 code) confirmed the remaining failures
+  are WAN-environment-inherent and unrelated to this release.
 
 ## [0.6.8] - 2026-10-19
 
@@ -1595,6 +1625,9 @@ Verified on **QNAP TS-464C / QTS 5.2.9 / Qsync QPKG 5.0.0.7 (build 20260723)**.
 - Acceptance results were split out of the README into [`docs/验收记录.md`](docs/验收记录.md).
 - Dual-licensed under **MIT OR Apache-2.0** (`LICENSE-MIT` / `LICENSE-APACHE`).
 
+[0.7.2]: https://github.com/mlzxgzy/qxync/compare/v0.7.1...v0.7.2
+[0.7.1]: https://github.com/mlzxgzy/qxync/compare/v0.7.0...v0.7.1
+[0.7.0]: https://github.com/mlzxgzy/qxync/compare/v0.6.8...v0.7.0
 [0.6.4]: https://github.com/mlzxgzy/qxync/compare/v0.6.3...v0.6.4
 [0.6.3]: https://github.com/mlzxgzy/qxync/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/mlzxgzy/qxync/compare/v0.6.1...v0.6.2

@@ -7,6 +7,34 @@
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-10-20
+
+### 新增
+
+- **Dolphin 角标：文件图标上的彩色水合状态（M24，可选插件 + 独立开关）**：
+  绿对钩 = 已水合、蓝云 = 仅在线、半满圆 = 部分本地，和 Windows 资源管理器 /
+  CFA（Cloud Files API）同一种表达。`contrib/dolphin/overlay/` 是独立 CMake 工程
+  （Qt6 Core + KF6 KIO，**不参与 cargo 构建**、不进 release 产物），在 Dolphin
+  的文件图标左下角画 `KOverlayIconPlugin` 角标；只对 `fuse.qxync` 挂载点里的
+  本地文件读 xattr（其它路径一次都不读）。这种角标机制**只有 Dolphin / KDE 支持**，
+  所以做成与 Tags 列**相互独立**的开关 `settings.dolphin_overlay`（默认关，
+  GUI 设置 → 高级）：开关开 → FUSE 暴露 `user.qxync.overlay`
+  （placeholder / partial / hydrated，目录为空串），插件据此选图标；开关关 →
+  属性不存在（ENODATA），插件不画角标。两个开关共用 Baloo 前置门禁与「按挂载点
+  判定」，热切换不重挂载；`baloo_status` 顺带热刷新挂载点标志（在终端手动排除
+  Baloo 后点「重新检测」即生效）。详情视图 16px 图标下角标 8px（可辨认，放大
+  图标尺寸会更大）。
+
+### 变更
+
+- **Tags 列的值从文字改成图标字符**：`user.xdg.tags` 现在写 `✓` / `☁` / `◐`
+  （原为 `已水合` / `仅在线` / `部分本地`）。Tags 列只能显示文字、字号与正文相同、
+  没有颜色 —— 中文词在满屏文件名里不显眼。机器可读状态仍看 `user.qxync.state`
+  （值没变）；有脚本解析过 tags 的需要跟着改（角标插件已改读专用的
+  `user.qxync.overlay`，不受影响）。
+
+## [0.7.1] - 2026-10-20
+
 ### 新增
 
 - **Dolphin 集成：水合状态进 Tags 列（M23）**：挂载点里每个文件把水合状态
@@ -29,41 +57,6 @@
     提醒，与开关无关 —— Baloo 自己就会读文件）。
   限制（调研文档 §5）：状态不实时刷新（F5 / 重进目录）；依赖 Baloo 全局开关；
   进不了 `tags:` 虚拟目录；挂载点上加不了用户自己的标签（`setxattr` 有意不实现）。
-
-- **Dolphin 角标：文件图标上的彩色水合状态（KOverlayIconPlugin）**：绿对钩 =
-  已水合、蓝云 = 仅在线、半满圆 = 部分本地，和 Windows 资源管理器 / CFA
-  （Cloud Files API）同一种表达。`contrib/dolphin/overlay/` 是独立 CMake 工程
-  （Qt6 Core + KF6 KIO），**不参与 cargo 构建**；只对 `fuse.qxync` 挂载点里的本地
-  文件读 xattr（其它路径一次都不读），开关与 Tags 列同源（`user.xdg.tags` 不存在
-  = 不画角标）。安装见该目录 README：系统级装 `/usr` 后 Dolphin 直接加载，用户级
-  要 `QT_PLUGIN_PATH`；Dolphin 重启后生效。详情视图 16px 图标下角标 8px（可辨认）。
-
-### 变更
-
-- **Tags 列的值从文字改成图标字符**：`user.xdg.tags` 现在写 `✓` / `☁` / `◐`
-  （原为 `已水合` / `仅在线` / `部分本地`）。Tags 列只能显示文字、字号与正文相同、
-  没有颜色 —— 中文词在满屏文件名里不显眼。机器可读状态仍看 `user.qxync.state`
-  （值没变）；有脚本解析过 tags 的需要跟着改（两个值都认的兼容映射在角标插件里）。
-
-### 修复（M23 真机验证暴露）
-
-- **Baloo 配置读取不认 `XDG_CONFIG_HOME`**：balooctl 写配置走 KConfig 语义
-  （`$XDG_CONFIG_HOME/baloofilerc` 优先），而读侧写死了 `$HOME/.config` ——
-  设了 `XDG_CONFIG_HOME` 的环境里门禁永远看不到刚写入的排除项。真实用户
-  环境两者恰好一致所以此前未炸。现在读侧对齐 KConfig 语义（fuse-matrix
-  真机 9/9 全绿）；
-- **不认 balooctl 实写的键格式**：balooctl 写的是 `exclude folders[$e]=$HOME/…/`
-  （KConfig 扩展标记 + `$HOME` 变量形式 + 尾斜杠），精确匹配 `exclude folders`
-  一个条目都读不到。现在键匹配前剥 `[...]` 后缀（`$HOME` 展开与尾斜杠的组件
-  比较原本就有）。两个修复各带单测（baloo 12 例）；
-- **fuse-matrix 两处测试缺陷**（假失败的来源）：M23 段开跑不重置 `dolphin_tags`
-  → 上轮残留 true 时门禁断言被「只在关→开边沿拦」的产品语义静默吞掉；缓存
-  清理 `rm -f` 删不掉 host 子目录（M9 布局）→ 残留缓存让三个断言假失败。
-  基线对照（M23 之前的代码）确认其余失败为 WAN 环境固有，与本版本无关。
-
-## [0.7.1] - 2026-10-20
-
-### 新增
 
 - **离线可重启 daemon（M21）**：断网时重启 daemon（或断电后开机），挂载点**立即**
   恢复（真机实测 1 秒）且离线可用 —— 不再「等联网登录成功才恢复」。分四块：
@@ -190,6 +183,22 @@ xtask/tests/m21-real-nas.sh                     ✅ 43 passed（真 NAS + 真挂
   暂不读取任务的 `conflict` 策略（离线时无法保证策略在回放时仍有效）。
 - 任务级 purge 暂不清理 outbox / listings 行（与上传/删除队列一样按连接共享；
   连接级 purge 会整体删掉 `sync.db`）。
+
+### 修复（M23 真机验证暴露）
+
+- **Baloo 配置读取不认 `XDG_CONFIG_HOME`**：balooctl 写配置走 KConfig 语义
+  （`$XDG_CONFIG_HOME/baloofilerc` 优先），而读侧写死了 `$HOME/.config` ——
+  设了 `XDG_CONFIG_HOME` 的环境里门禁永远看不到刚写入的排除项。真实用户
+  环境两者恰好一致所以此前未炸。现在读侧对齐 KConfig 语义（fuse-matrix
+  真机 9/9 全绿）；
+- **不认 balooctl 实写的键格式**：balooctl 写的是 `exclude folders[$e]=$HOME/…/`
+  （KConfig 扩展标记 + `$HOME` 变量形式 + 尾斜杠），精确匹配 `exclude folders`
+  一个条目都读不到。现在键匹配前剥 `[...]` 后缀（`$HOME` 展开与尾斜杠的组件
+  比较原本就有）。两个修复各带单测（baloo 12 例）；
+- **fuse-matrix 两处测试缺陷**（假失败的来源）：M23 段开跑不重置 `dolphin_tags`
+  → 上轮残留 true 时门禁断言被「只在关→开边沿拦」的产品语义静默吞掉；缓存
+  清理 `rm -f` 删不掉 host 子目录（M9 布局）→ 残留缓存让三个断言假失败。
+  基线对照（M23 之前的代码）确认其余失败为 WAN 环境固有，与本版本无关。
 
 ## [0.6.8] - 2026-10-19
 
@@ -1328,6 +1337,9 @@ NAS 设置名 `QSYNC_FOLDERPAIR_USE_SPACE_SAVING`、Windows 客户端注册表�
 - 验收结论从 README 抽出为 [`docs/验收记录.md`](docs/验收记录.md)。
 - 采用 **MIT OR Apache-2.0** 双许可（`LICENSE-MIT` / `LICENSE-APACHE`）。
 
+[0.7.2]: https://github.com/mlzxgzy/qxync/compare/v0.7.1...v0.7.2
+[0.7.1]: https://github.com/mlzxgzy/qxync/compare/v0.7.0...v0.7.1
+[0.7.0]: https://github.com/mlzxgzy/qxync/compare/v0.6.8...v0.7.0
 [0.6.4]: https://github.com/mlzxgzy/qxync/compare/v0.6.3...v0.6.4
 [0.6.3]: https://github.com/mlzxgzy/qxync/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/mlzxgzy/qxync/compare/v0.6.1...v0.6.2
