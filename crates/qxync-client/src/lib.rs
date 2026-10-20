@@ -846,6 +846,22 @@ impl Client {
         name: &str,
         dest: &std::path::Path,
     ) -> Result<u64> {
+        self.download_to_file_with_progress(dir, name, dest, None)
+            .await
+    }
+
+    /// [`Client::download_to_file`] 的进度版：每收到一个网络分片就回调
+    /// `(已写入字节, 总字节)`。`total` 取自 `Content-Length` 响应头，
+    /// 服务端走 chunked 编码（无该头）时为 `None` —— 展示侧要能处理「未知总量」。
+    ///
+    /// 回调在下载循环里**同步**调用，必须廉价（采样/渲染级别，不做 IO）。
+    pub async fn download_to_file_with_progress(
+        &self,
+        dir: &str,
+        name: &str,
+        dest: &std::path::Path,
+        progress: Option<&(dyn Fn(u64, Option<u64>) + Send + Sync)>,
+    ) -> Result<u64> {
         let sid = self.require_sid()?.to_string();
         let url = self.url(
             "cgi-bin/filemanager/utilRequest.cgi",
@@ -869,11 +885,15 @@ impl Client {
         let tmp = std::path::PathBuf::from(format!("{}.qxync-part", dest.display()));
         let mut file = tokio::fs::File::create(&tmp).await?;
         let mut written: u64 = 0;
+        let total = resp.content_length();
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| Error::Transport(e.to_string()))?;
             tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
             written += chunk.len() as u64;
+            if let Some(cb) = progress {
+                cb(written, total);
+            }
         }
         tokio::io::AsyncWriteExt::flush(&mut file).await?;
         file.sync_all().await?;

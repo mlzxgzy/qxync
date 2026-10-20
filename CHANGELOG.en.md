@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`get` download progress: shown only after 3 seconds, fast downloads print
+  nothing new (M26)**: once a download exceeds 3 seconds, a single stderr line
+  is redrawn in place with "percent + bar + downloaded/total + speed (3-second
+  sliding window) + ETA"; downloads finishing within 3 seconds produce byte-
+  identical output to before. Both the direct and the via-daemon path are
+  covered: the daemon side is gated by a `progress:true` **capability flag** in
+  the request envelope (old clients don't set it → not a single progress line
+  is sent, behavior unchanged; new clients against an old daemon degrade
+  gracefully). Progress lines are multiplexed with the final response on the
+  same socket and **the timeout resets per line** (a flowing download is never
+  killed by the 600s cap). The GUI "download to local" action joins in: the
+  progress renders on the file page's "busy" badge instead of a blocking modal;
+  against an old daemon the badge just stays as before. When stderr is not a
+  terminal (redirect/pipe) the CLI omits the flag, the daemon builds no channel
+  and pushes nothing — `qxync get > log` stays clean. Chunked responses without
+  Content-Length degrade to "downloaded + speed"; the CLI-direct path
+  additionally uses the `stat` size as a total fallback.
+
 ### Fixed
 
 - **`qxync settings --set dolphin_overlay=...` failed with "unknown setting key"**:

@@ -42,6 +42,8 @@ pub fn run() {
             commands::app_info,
             commands::daemon_status,
             commands::ipc_call,
+            // ★ M26：带进度行的 IPC（GUI「下载到本地」）
+            commands::ipc_call_with_progress,
             commands::link_read,
             commands::link_save,
             commands::credential_save,

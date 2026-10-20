@@ -10,9 +10,10 @@ use qxync_core::ipc::{
     decode_line, encode_line, mask_sid, mask_token, BalooMountInfo, BalooStatusData, CacheInfo,
     CursorInfo, DaemonInfo, DecisionInfo, DecisionsData, DehydrateData, DiffData, ErrorKind,
     FileStateInfo, FileStatesData, GetData, HydroStats, IpcError, JournalData, LinkInfo, LoginData,
-    LsData, MountInfo, OfflineInfo, PeerData, PingData, PutData, Request, RequestEnvelope,
-    Response, RootsData, RulesData, ServerInfo, SessionInfo, SettingsData, ShutdownData, SpaceData,
-    StatusData, StoreData, SyncCursors, SyncInfo, TaskInfo, TasksData, IPC_VERSION,
+    LsData, MountInfo, OfflineInfo, PeerData, PingData, ProgressData, ProgressLine, PutData,
+    Request, RequestEnvelope, Response, RootsData, RulesData, ServerInfo, SessionInfo,
+    SettingsData, ShutdownData, SpaceData, StatusData, StoreData, SyncCursors, SyncInfo, TaskInfo,
+    TasksData, IPC_VERSION,
 };
 use qxync_core::mounts::{MountRecord, MountsFile};
 use qxync_core::rules::Rules;
@@ -64,6 +65,9 @@ const SESSION_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 const SESSION_REFRESH_DEDUP: Duration = Duration::from_secs(3);
 /// ★ M10：会话保活探测间隔（`QXNYC_SESSION_KEEPALIVE=0` 关掉）。
 const DEFAULT_KEEPALIVE_SECS: u64 = 120;
+/// ★ M26：`get` 进度行的推送节流 —— 与 CLI 侧重绘频率（10 Hz）对齐；
+/// 分片回调每个网络 chunk 都会触发，不节流会把 IPC 打成刷屏。
+const PROGRESS_PUSH_EVERY: Duration = Duration::from_millis(100);
 
 pub struct Options {
     pub link_id: String,
@@ -1364,7 +1368,26 @@ async fn handle_conn(
                 ErrorKind::BadVersion,
                 format!("协议版本 {} 不受支持（本进程支持 {IPC_VERSION}）", env.v),
             ),
-            Ok(env) => dispatch(&state, env.req, &shutdown).await,
+            // ★ M26：客户端声明认识进度行 → dispatch 期间把进度行混发到同一条
+            //   socket（最终响应仍是最后一行）。老客户端不声明 → 一个进度行
+            //   都不发，行为与 M25 及以前一字不变。
+            Ok(env) if env.progress => {
+                let (ptx, mut prx) = mpsc::channel::<ProgressData>(16);
+                let mut fut = Box::pin(dispatch(&state, env.req, &shutdown, Some(ptx)));
+                loop {
+                    tokio::select! {
+                        r = &mut fut => break r,
+                        Some(p) = prx.recv() => {
+                            let pl = ProgressLine {
+                                v: IPC_VERSION,
+                                progress: p,
+                            };
+                            wr.write_all(&encode_line(&pl)?).await?;
+                        }
+                    }
+                }
+            }
+            Ok(env) => dispatch(&state, env.req, &shutdown, None).await,
             Err(e) => Response::err(ErrorKind::BadRequest, format!("请求解析失败: {e}")),
         };
         wr.write_all(&encode_line(&resp)?).await?;
@@ -1372,7 +1395,12 @@ async fn handle_conn(
     Ok(())
 }
 
-async fn dispatch(state: &Arc<State>, req: Request, shutdown: &mpsc::Sender<()>) -> Response {
+async fn dispatch(
+    state: &Arc<State>,
+    req: Request,
+    shutdown: &mpsc::Sender<()>,
+    progress: Option<mpsc::Sender<ProgressData>>,
+) -> Response {
     tracing::debug!("← {}", req.method());
     let out: Result<serde_json::Value, IpcError> = match req {
         Request::Ping => to_value(PingData {
@@ -1399,7 +1427,7 @@ async fn dispatch(state: &Arc<State>, req: Request, shutdown: &mpsc::Sender<()>)
         Request::Logout => logout(state).await,
         Request::Ls { path } => ls(state, path).await,
         Request::Stat { dir, name } => stat(state, dir, name).await,
-        Request::Get { dir, name, dest } => get(state, dir, name, dest).await,
+        Request::Get { dir, name, dest } => get(state, dir, name, dest, progress).await,
         Request::Put { local, dest, name } => put(state, local, dest, name).await,
         Request::Mkdir { parent, name } => mkdir(state, parent, name).await,
         Request::Pin { path, state: pin } => pin_cmd(state, path, pin),
@@ -2045,10 +2073,34 @@ async fn get(
     dir: String,
     name: String,
     dest: PathBuf,
+    progress: Option<mpsc::Sender<ProgressData>>,
 ) -> Result<serde_json::Value, IpcError> {
     ensure_session(state).await?;
     let expected = with_client!(state, |c| c.stat(&dir, &name))?.map(|e| e.filesize);
-    let bytes = with_client!(state, |c| c.download_to_file(&dir, &name, &dest))?;
+    // ★ M26：客户端声明认识进度行才接回调（None = 老客户端，一个进度行不发）。
+    //   回调里节流 10 Hz + try_send：进度是**尽力而为**的展示信息，满了就丢，
+    //   绝不为它阻塞下载循环。
+    let cb: Option<Box<dyn Fn(u64, Option<u64>) + Send + Sync>> = match progress {
+        Some(tx) => Some(Box::new({
+            let last = std::sync::Mutex::new(Instant::now() - PROGRESS_PUSH_EVERY);
+            move |w: u64, t: Option<u64>| {
+                let mut g = last.lock().unwrap();
+                if g.elapsed() < PROGRESS_PUSH_EVERY {
+                    return;
+                }
+                *g = Instant::now();
+                drop(g);
+                let _ = tx.try_send(ProgressData {
+                    written: w,
+                    total: t,
+                });
+            }
+        })),
+        None => None,
+    };
+    let bytes = with_client!(state, |c| {
+        c.download_to_file_with_progress(&dir, &name, &dest, cb.as_deref())
+    })?;
     // 铁则 1 的前置校验：长度不符绝不当作成功
     if let Some(exp) = expected {
         if exp != bytes {

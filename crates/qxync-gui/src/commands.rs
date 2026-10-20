@@ -18,8 +18,8 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
-// ★ M8.4：`get_webview_window` 来自 `Manager`。
-use tauri::Manager as _;
+// ★ M8.4：`get_webview_window` 来自 `Manager`；★ M26：`emit` 来自 `Emitter`。
+use tauri::{Emitter as _, Manager as _};
 
 // ---------------------------------------------------------------- 工具
 
@@ -411,6 +411,50 @@ pub async fn ipc_call(link_id: Option<String>, req: Value) -> Value {
             format!("协议版本 {} 不受支持（本进程支持 {IPC_VERSION}）", env.v),
         ),
         Err(e) => ipc::err_response(ErrorKind::BadRequest, format!("请求解析失败: {e}")),
+    }
+}
+
+/// ★ M26：带进度行的 IPC（GUI 的「下载到本地」用）。
+///
+/// 与 [`ipc_call`] 同形，但信封声明 `progress: true`：daemon 在下载期间往同一条
+/// socket 推进度行，每行经 Tauri 事件 `progress://download` emit 给前端（payload
+/// `{written,total}`，`total` 可为 null —— 服务端 chunked 时未知）。最终响应仍是
+/// 返回值（前端只处理一种形状）。老 daemon 不发进度行 → 前端只是收不到事件，
+/// 下载照常完成。
+#[tauri::command]
+pub async fn ipc_call_with_progress(
+    app: tauri::AppHandle,
+    link_id: Option<String>,
+    req: Value,
+) -> Value {
+    let id = link_id
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "default".into());
+    let socket = ipc::socket_path_for(&id);
+    let env = match serde_json::from_value::<RequestEnvelope>(req) {
+        Ok(env) if env.v == IPC_VERSION => env,
+        Ok(env) => {
+            return ipc::err_response(
+                ErrorKind::BadVersion,
+                format!("协议版本 {} 不受支持（本进程支持 {IPC_VERSION}）", env.v),
+            )
+        }
+        Err(e) => return ipc::err_response(ErrorKind::BadRequest, format!("请求解析失败: {e}")),
+    };
+    let app = &app;
+    let r = ipc::call_with_progress(&socket, env.req, |p| {
+        // 进度是尽力而为的展示信息：emit 失败（窗口关了等）不该影响下载
+        let _ = app.emit(
+            crate::tray::PROGRESS_EVENT,
+            json!({ "written": p.written, "total": p.total }),
+        );
+    })
+    .await;
+    match r {
+        Ok(resp) => serde_json::to_value(resp).unwrap_or_else(|e| {
+            ipc::err_response(ErrorKind::Parse, format!("序列化响应失败: {e}"))
+        }),
+        Err(e) => ipc::err_response(e.kind, e.message),
     }
 }
 
