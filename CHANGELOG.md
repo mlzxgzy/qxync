@@ -5,6 +5,41 @@
 
 [English](CHANGELOG.en.md) · [README](README.md) · [验收记录](docs/验收记录.md)
 
+## [未发布]
+
+### 修复
+
+- **WPS 表格保存报「在替换目标文件时发生错误 (0x80000008)」—— FUSE 层补上
+  O_TMPFILE 与 link**：WPS（以及新版 LibreOffice、Qt 5.14+ 的 `QSaveFile`）的
+  原子保存是「`open(dir, O_TMPFILE)` 写内容 → `linkat(fd, "", dir, name,
+  AT_EMPTY_PATH)` 原子替换」，而 qxync 两个操作都不支持：fuser 0.17 的 opcode
+  枚举到 47 为止（内核协议 7.37 的 `FUSE_TMPFILE`=51 解析失败 → 回 ENOSYS →
+  内核转 `EOPNOTSUPP`），`link` 则压根没实现（fuser 默认回 `EPERM`）。真机诊断
+  （`wps_save_diag`）实测：`open(O_TMPFILE)` → errno 95、`link()` → errno 1，
+  而普通 rename（LibreOffice 的保存方式）一直正常。修复分三层：
+  - **vendor/fuser（本地补丁，`[patch.crates-io]`）**：opcode 枚举补
+    `FUSE_TMPFILE = 51`（顺带 `FUSE_STATX = 52` 显式回 ENOSYS，保持原状），
+    新增 `Operation::TmpFile` 解析（请求体 = `fuse_create_in`、无名字参数，
+    与 FUSE_CREATE 同构）与 `Filesystem::tmpfile()` 回调（默认 ENOSYS，
+    内核据此回 `EOPNOTSUPP` —— 与上游未打补丁时的行为一致）；
+  - **`tmpfile()` 实现**：建「未命名」节点（`Node.unnamed`：空 remote、不进
+    `by_remote`、不进目录清单、`mark_dirty` 只置脏不入队 —— 上传发生在 link
+    物化之后），缓存文件用 `tmpfile-<ino>.cache`；`release()` 时仍未命名 →
+    整个丢弃（节点 + 缓存）；
+  - **`link()` 实现**：对未命名节点 = **物化**（搬到目标名字、迁移缓存、进清单、
+    标脏上传 —— 正是 `linkat(AT_EMPTY_PATH)` 的语义）；对普通节点 = **复制语义**
+    （NAS 协议没有硬链接，与 CIFS 等网络文件系统同例：新节点 + 拷贝缓存 + 上传）。
+    目标已存在 → `EEXIST`（内核 VFS 通常已挡）。
+- **renameat2 的 flags 不再静默忽略**：原先 `RENAME_EXCHANGE` 被当普通 rename
+  执行（源名字的内容被覆盖而不是交换 = 静默数据丢失）。NAS 协议做不了原子交换
+  （3 步换名有中间态），按网络文件系统惯例（sshfs/CIFS 同样不支持）明确回
+  `EINVAL`；`RENAME_NOREPLACE` 目标已存在时回 `EEXIST`（内核通常已挡，兜底）。
+- **fuser 的诊断日志不再蒸发**：fuser 用 `log` crate 输出（「[Not Implemented]
+  link(...)」「Unknown FUSE opcode」等），而 daemon 只初始化 `tracing` ——
+  两者之间没有桥，**所有 fuser 层错误全部静默丢弃**（本次故障查了整轮日志零
+  线索的直接原因）。daemon 启动时装 `log` → `tracing` 桥（target=`fuser`），
+  以后这类问题日志里直接可见。
+
 ## [0.7.5] - 2026-10-21
 
 ### 新增

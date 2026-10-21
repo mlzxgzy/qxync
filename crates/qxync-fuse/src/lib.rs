@@ -635,6 +635,13 @@ struct Node {
     refreshing: bool,
     /// ★ M9：后台刷新连续失败次数；超过阈值就退回「丢掉旧内容、下次读按需水合」。
     refresh_attempts: u32,
+    /// ★ WPS 修复：`open(dir, O_TMPFILE)` 创建的「未命名」节点。
+    ///
+    /// 不在任何目录清单里、`by_remote` 里也没有它（`remote` 为空串），
+    /// 写入只落本地缓存；应用用 `linkat(fd, "", dir, name, AT_EMPTY_PATH)`
+    /// 给它命名（FUSE_LINK → [`QxyncFs::link`] 物化），或直接关闭丢弃。
+    /// WPS/LibreOffice 新版、Qt 5.14+ 的 QSaveFile 都用这个原子保存模式。
+    unnamed: bool,
 }
 
 impl Node {
@@ -3165,6 +3172,7 @@ impl QxyncFs {
             pending: None,
             refreshing: false,
             refresh_attempts: 0,
+        unnamed: false,
         };
         let mut nodes = HashMap::new();
         let mut by_remote = HashMap::new();
@@ -3902,6 +3910,7 @@ impl QxyncFs {
             pending: None,
             refreshing: false,
             refresh_attempts: 0,
+            unnamed: false,
         };
         node.refresh_file_id(&parent_remote);
         let (file_id, size, mtime, is_dir) = (
@@ -4357,6 +4366,13 @@ impl QxyncFs {
         let (remote, name, mtime, cache) = {
             let mut g = self.inner.lock().unwrap();
             let n = g.nodes.get_mut(&ino).ok_or(fuser::Errno::ENOENT)?;
+            // ★ WPS 修复：O_TMPFILE 的未命名节点不上传 —— 它还没有路径，
+            //   link 物化（[`QxyncFs::link`]）时才 mark_dirty 入队。
+            if n.unnamed {
+                n.set_dirty(true);
+                n.pending = None;
+                return Ok(());
+            }
             // ★ T8：标脏 → 未同步（`set_dirty` 同时置 `in_sync=false`）
             n.set_dirty(true);
             // 本地改动是权威：远端新内容的后台刷新意图作废
@@ -5455,6 +5471,271 @@ impl Filesystem for QxyncFs {
         );
     }
 
+    /// ★ WPS 修复：`open(dir, O_TMPFILE)` —— 创建「未命名」临时文件。
+    ///
+    /// WPS 表格的保存就是「O_TMPFILE 写内容 → linkat(AT_EMPTY_PATH) 原子替换」，
+    /// 原先 fuser 0.17 不认识 FUSE_TMPFILE(51)，内核回 EOPNOTSUPP，
+    /// 用户看到的就是「在替换目标文件时发生错误 (0x80000008)」。
+    ///
+    /// 这里只建节点 + 本地缓存（不进任何目录清单、不上传 NAS）；
+    /// 命名发生在 [`Self::link`]（linkat 物化），关闭未命名节点时在
+    /// [`Self::release`] 里丢弃。
+    fn tmpfile(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        _mode: u32,
+        _umask: u32,
+        _flags: i32,
+        reply: ReplyCreate,
+    ) {
+        if self.read_only {
+            return reply.error(fuser::Errno::EROFS);
+        }
+        // 父目录必须存在（与 create 同样的闸门）；排除/回收站路径对「未命名」
+        // 文件无意义 —— 它还没有路径，等 link 物化时再挡。
+        let parent_remote = {
+            let g = self.inner.lock().unwrap();
+            match g.nodes.get(&parent) {
+                Some(n) if n.attr.kind == FileType::Directory => n.remote.clone(),
+                _ => return reply.error(fuser::Errno::ENOENT),
+            }
+        };
+        let (ino, attr) = {
+            let mut g = self.inner.lock().unwrap();
+            let ino = INodeNo(g.next_ino);
+            g.next_ino += 1;
+            let mut attr = self.attr_from(ino, &DirEntry::local("", false, 0, 0));
+            attr.kind = FileType::RegularFile;
+            let node = Node {
+                ino,
+                parent,
+                name: String::new(),
+                // 空 remote：deny_hidden 对空路径放行（见 hide_reason），
+                // by_remote 里也**不**登记 —— 它还没有名字。
+                remote: String::new(),
+                attr,
+                cache: None,
+                chunks_done: Vec::new(),
+                file_id: ZERO_FILE_ID,
+                whole_xxhash: NO_HASH,
+                dirty: false,
+                remote_known: false,
+                in_sync: true,
+                progress: None,
+                open_count: 1,
+                last_access: SystemTime::now(),
+                op_lock: Arc::new(Mutex::new(())),
+                pending: None,
+                refreshing: false,
+                refresh_attempts: 0,
+                unnamed: true,
+            };
+            attr = node.attr;
+            g.nodes.insert(ino, node);
+            (ino, attr)
+        };
+        // 本地缓存文件用 ino 命名（不与任何 remote 路径冲突），
+        // link 物化时再搬到正式的缓存路径。
+        let cache = self.cache_dir.join(format!("tmpfile-{}.cache", u64::from(ino)));
+        if let Err(e) = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&cache)
+        {
+            tracing::error!("创建 O_TMPFILE 缓存失败 {}: {e}", cache.display());
+            let mut g = self.inner.lock().unwrap();
+            g.nodes.remove(&ino);
+            return reply.error(fuser::Errno::EIO);
+        }
+        {
+            let mut g = self.inner.lock().unwrap();
+            if let Some(n) = g.nodes.get_mut(&ino) {
+                n.cache = Some(cache);
+                n.chunks_done = vec![true]; // 0 字节文件：1 个空区间已就绪
+            }
+        }
+        let _ = parent_remote; // 诊断用：父目录 remote（未命名节点不使用）
+        tracing::debug!("tmpfile: ino={}", u64::from(ino));
+        reply.created(
+            &ENTRY_TTL,
+            &attr,
+            Generation(0),
+            fuser::FileHandle(u64::from(ino)),
+            FopenFlags::FOPEN_KEEP_CACHE,
+        );
+    }
+
+    /// ★ WPS 修复：`linkat(fd, "", dir, name, AT_EMPTY_PATH)` / `link(old, new)`。
+    ///
+    /// 两种形态：
+    /// * **物化未命名节点**（O_TMPFILE 的 linkat）：把节点搬到 `(newparent, newname)`，
+    ///   进目录清单 + 标脏上传 —— 这正是 WPS/QSaveFile 原子保存的最后一步；
+    /// * **普通硬链接**：NAS 协议没有硬链接，按网络文件系统的惯例做**复制语义**
+    ///   （新节点 + 拷贝缓存 + 标脏上传），POSIX 语义里 nlink 的共享在此不成立。
+    ///
+    /// 目标名字已存在 → EEXIST（内核 VFS 通常已挡掉，这里兜底）。
+    fn link(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        newparent: INodeNo,
+        newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        if self.read_only {
+            return reply.error(fuser::Errno::EROFS);
+        }
+        let Some(newname) = newname.to_str() else {
+            return reply.error(fuser::Errno::EINVAL);
+        };
+        if newname.is_empty() || newname.contains('/') {
+            return reply.error(fuser::Errno::EINVAL);
+        }
+        // 解析源节点 + 目标父目录
+        let (src, parent_remote) = {
+            let g = self.inner.lock().unwrap();
+            let Some(src) = g.nodes.get(&ino) else {
+                return reply.error(fuser::Errno::ENOENT);
+            };
+            if src.attr.kind != FileType::RegularFile {
+                return reply.error(fuser::Errno::EPERM);
+            }
+            let Some(p) = g.nodes.get(&newparent) else {
+                return reply.error(fuser::Errno::ENOENT);
+            };
+            if p.attr.kind != FileType::Directory {
+                return reply.error(fuser::Errno::ENOTDIR);
+            }
+            (src.clone(), p.remote.clone())
+        };
+        let new_remote = join_path(&parent_remote, newname);
+        // 写闸门：排除路径 / 回收站路径都不许落地（与 create/rename 同一套规则）
+        if let Err(e) = self.deny_hidden(&new_remote, false) {
+            return reply.error(e);
+        }
+        if let Err(e) = self.deny_trash(&new_remote, "链接到") {
+            return reply.error(e);
+        }
+        // 目标已存在 → EEXIST（POSIX link 语义）
+        {
+            let g = self.inner.lock().unwrap();
+            if g.by_remote.contains_key(&new_remote) {
+                return reply.error(fuser::Errno::EEXIST);
+            }
+        }
+
+        if src.unnamed {
+            // ① 物化：把未命名节点搬到正式名字（O_TMPFILE 的 linkat）
+            //    持节点操作锁再搬缓存 —— 不然并发 write 可能落在旧缓存路径上。
+            let op_lock = match self.op_lock(ino) {
+                Some(l) => l,
+                None => return reply.error(fuser::Errno::ENOENT),
+            };
+            let _guard = op_lock.lock().unwrap();
+            let new_cache = self.cache_path(&new_remote, newname);
+            if let Some(old_cache) = src.cache.clone() {
+                if old_cache != new_cache {
+                    if let Err(e) = std::fs::rename(&old_cache, &new_cache) {
+                        tracing::warn!(
+                            "物化 O_TMPFILE 缓存迁移失败 {} -> {}: {e}",
+                            old_cache.display(),
+                            new_cache.display()
+                        );
+                    }
+                }
+            }
+            {
+                let mut g = self.inner.lock().unwrap();
+                if let Some(n) = g.nodes.get_mut(&ino) {
+                    n.unnamed = false;
+                    n.parent = newparent;
+                    n.name = newname.to_string();
+                    n.remote = new_remote.clone();
+                    if n.cache.is_some() {
+                        n.cache = Some(new_cache);
+                    }
+                }
+                g.by_remote.insert(new_remote.clone(), ino);
+            }
+            // 进目录清单（与 create 相同的路径）
+            let node_now = self.node_by_remote(&new_remote);
+            if let Some(n) = &node_now {
+                let mut e = DirEntry::local(
+                    newname,
+                    false,
+                    n.attr.size,
+                    Self::epoch_of(n.attr.mtime),
+                );
+                e.file_id = n.file_id;
+                if let Some(entries) = listing_upsert(&self.inner, &parent_remote, &e) {
+                    persist_listing(self.nodes.as_ref(), &parent_remote, &entries);
+                }
+            }
+            // 标脏 → 上传到 NAS（物化出来的内容只在本地）
+            if let Err(e) = self.mark_dirty(ino) {
+                return reply.error(e);
+            }
+            tracing::info!(
+                "O_TMPFILE 物化: ino={} -> {new_remote}",
+                u64::from(ino)
+            );
+            let attr = { self.inner.lock().unwrap().nodes.get(&ino).map(|n| n.attr) };
+            match attr {
+                Some(a) => reply.entry(&ENTRY_TTL, &a, Generation(0)),
+                None => reply.error(fuser::Errno::ENOENT),
+            }
+        } else {
+            // ② 普通硬链接 → 复制语义（NAS 协议没有硬链接）
+            //    新节点 + 拷贝缓存内容 + 标脏上传。源节点不动。
+            let entry = DirEntry::local(
+                newname,
+                false,
+                src.attr.size,
+                Self::epoch_of(src.attr.mtime),
+            );
+            let node = self.insert_node_with(newparent, newname, &new_remote, &entry, false);
+            // 拷贝内容：先把源的水合齐（复制语义要完整内容），再复制缓存
+            let src_lock = match self.op_lock(ino) {
+                Some(l) => l,
+                None => return reply.error(fuser::Errno::ENOENT),
+            };
+            let _guard = src_lock.lock().unwrap();
+            if src.attr.size > 0 {
+                if let Err(e) = self.hydrate_all(ino, None) {
+                    return reply.error(e);
+                }
+            }
+            let dst_cache = match self.cache_file_for(node.ino) {
+                Ok(p) => p,
+                Err(e) => return reply.error(e),
+            };
+            if let Some(src_cache) = &src.cache {
+                if std::fs::copy(src_cache, &dst_cache).is_err() {
+                    return reply.error(fuser::Errno::EIO);
+                }
+                // 复制出来的内容 = 全部区间已就绪
+                let mut g = self.inner.lock().unwrap();
+                if let Some(n) = g.nodes.get_mut(&node.ino) {
+                    let want = n.chunk_count(self.chunk_size);
+                    n.chunks_done = vec![true; want];
+                    n.whole_xxhash = NO_HASH;
+                }
+            }
+            if let Err(e) = self.mark_dirty(node.ino) {
+                return reply.error(e);
+            }
+            tracing::info!("硬链接(复制语义): {} -> {new_remote}", src.remote);
+            let attr = { self.inner.lock().unwrap().nodes.get(&node.ino).map(|n| n.attr) };
+            match attr {
+                Some(a) => reply.entry(&ENTRY_TTL, &a, Generation(0)),
+                None => reply.error(fuser::Errno::ENOENT),
+            }
+        }
+    }
+
     fn mkdir(
         &self,
         _req: &Request,
@@ -5547,7 +5828,7 @@ impl Filesystem for QxyncFs {
         name: &OsStr,
         newparent: INodeNo,
         newname: &OsStr,
-        _flags: fuser::RenameFlags,
+        flags: fuser::RenameFlags,
         reply: ReplyEmpty,
     ) {
         if self.read_only {
@@ -5556,6 +5837,29 @@ impl Filesystem for QxyncFs {
         let (Some(name), Some(newname)) = (name.to_str(), newname.to_str()) else {
             return reply.error(fuser::Errno::EINVAL);
         };
+        // ★ WPS 修复的伴生补丁：renameat2 的 flags 原先被忽略 ——
+        //   RENAME_EXCHANGE 被当普通 rename 执行（源名字的内容被覆盖掉而不是
+        //   交换 = 静默数据丢失）。NAS 协议做不了原子交换（3 步换名有中间态），
+        //   按网络文件系统的惯例明确拒绝（sshfs/CIFS 同样不支持），
+        //   调用方（显式用 renameat2(EXCHANGE) 的程序本来就少）会拿到
+        //   EINVAL 而不是数据丢失。
+        if flags.contains(fuser::RenameFlags::RENAME_EXCHANGE) {
+            tracing::warn!("RENAME_EXCHANGE 不支持（NAS 协议无原子交换），返回 EINVAL");
+            return reply.error(fuser::Errno::EINVAL);
+        }
+        if flags.contains(fuser::RenameFlags::RENAME_NOREPLACE) {
+            let exists = {
+                let g = self.inner.lock().unwrap();
+                let Some(p) = g.nodes.get(&newparent) else {
+                    return reply.error(fuser::Errno::ENOENT);
+                };
+                let new = join_path(&p.remote, newname);
+                g.by_remote.contains_key(&new)
+            };
+            if exists {
+                return reply.error(fuser::Errno::EEXIST);
+            }
+        }
         let (old_remote, new_remote, parent_remote, newparent_remote, ino, dirty, is_dir) = {
             let g = self.inner.lock().unwrap();
             let (Some(p), Some(np)) = (g.nodes.get(&parent), g.nodes.get(&newparent)) else {
@@ -5956,12 +6260,29 @@ impl Filesystem for QxyncFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        let mut drop_unnamed = false;
         {
             let mut g = self.inner.lock().unwrap();
             if let Some(n) = g.nodes.get_mut(&ino) {
                 n.open_count = n.open_count.saturating_sub(1);
                 n.last_access = SystemTime::now();
+                // ★ WPS 修复：O_TMPFILE 的未命名节点关掉还没 link → 应用放弃了，
+                //   整个丢弃（节点 + 缓存）。不丢的话它会永远躺在节点表里。
+                if n.unnamed && n.open_count == 0 {
+                    drop_unnamed = true;
+                }
             }
+        }
+        if drop_unnamed {
+            let cache = {
+                let mut g = self.inner.lock().unwrap();
+                g.nodes.remove(&ino).and_then(|n| n.cache)
+            };
+            if let Some(c) = cache {
+                remove_cache_files(&c);
+            }
+            tracing::debug!("O_TMPFILE 未命名节点已丢弃: ino={}", u64::from(ino));
+            return reply.ok();
         }
         // ★ M9：关文件时把位图按**最终**的 size/mtime 落一次盘 ——
         //   本地改写过的文件在下次挂载时也能直接认领，不必重新拉一遍。
@@ -6537,6 +6858,7 @@ mod tests {
             pending: None,
             refreshing: false,
             refresh_attempts: 0,
+        unnamed: false,
         };
         assert_eq!(n.state_str(), "placeholder");
         n.chunks_done[0] = true;
@@ -7046,6 +7368,72 @@ mod tests {
         )
         .unwrap();
         assert!(h.has_pending("/home/a (conflicted copy from pc 2026-09-30).txt"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ WPS 修复：O_TMPFILE 的未命名节点 `mark_dirty` 只置脏、**不入队上传**
+    ///（它还没有路径；上传发生在 `link` 物化之后）。
+    /// 不挡这一层的话，write() 结尾的 mark_dirty 会把一个空路径作业塞进队列。
+    #[test]
+    fn wps_unnamed_node_mark_dirty_does_not_enqueue() {
+        let dir = std::env::temp_dir().join(format!("qxync-fuse-wps-unnamed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = Arc::new(Client::new(&test_link()).unwrap());
+        let q = UploadQueue::new(client.clone(), rt.handle().clone(), dir.join("queue")).unwrap();
+        let fs = QxyncFs::new(client, "/home", dir.join("cache"))
+            .unwrap()
+            .with_write_mode()
+            .with_upload_queue(q.clone());
+
+        // 手工造一个「未命名」节点（复刻 tmpfile() 的形态：空 remote、不在 by_remote）
+        let ino = {
+            let mut g = fs.inner.lock().unwrap();
+            let ino = INodeNo(g.next_ino);
+            g.next_ino += 1;
+            let mut attr = fs.attr_from(ino, &DirEntry::local("", false, 0, 0));
+            attr.kind = FileType::RegularFile;
+            let cache = dir.join("cache").join(format!("tmpfile-{ino}.cache"));
+            std::fs::create_dir_all(dir.join("cache")).unwrap();
+            std::fs::write(&cache, b"").unwrap();
+            g.nodes.insert(
+                ino,
+                Node {
+                    ino,
+                    parent: INodeNo::ROOT,
+                    name: String::new(),
+                    remote: String::new(),
+                    attr,
+                    cache: Some(cache),
+                    chunks_done: vec![true],
+                    file_id: ZERO_FILE_ID,
+                    whole_xxhash: NO_HASH,
+                    dirty: false,
+                    remote_known: false,
+                    in_sync: true,
+                    progress: None,
+                    open_count: 1,
+                    last_access: SystemTime::now(),
+                    op_lock: Arc::new(Mutex::new(())),
+                    pending: None,
+                    refreshing: false,
+                    refresh_attempts: 0,
+                    unnamed: true,
+                },
+            );
+            ino
+        };
+        // 未命名：mark_dirty 只置脏，不产生任何上传作业
+        fs.mark_dirty(ino).unwrap();
+        assert!(fs.inner.lock().unwrap().nodes.get(&ino).unwrap().dirty);
+        // 空路径不可能有作业（未命名节点没有 remote，has_pending("") 恒 false；
+        // 再确认整个队列对任何已知路径都没有作业）
+        let q = fs.upload.as_ref().unwrap();
+        assert!(!q.has_pending(""), "未命名节点不该入队上传");
+        assert!(!q.has_pending("/home"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -8722,6 +9110,7 @@ mod tests {
             pending: None,
             refreshing: false,
             refresh_attempts: 0,
+        unnamed: false,
         }
     }
 

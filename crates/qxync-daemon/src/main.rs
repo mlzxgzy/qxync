@@ -191,6 +191,14 @@ fn init_logging(
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level));
     let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
 
+    // ★ WPS 保存修复的伴生补丁：把 `log` crate 的记录桥接到 `tracing`。
+    //   fuser 用的是 `log`，而本程序只初始化 `tracing` —— 不桥接的话
+    //   fuser 的「[Not Implemented] link(...)」「Unknown FUSE opcode」
+    //   全部静默丢弃，故障无从诊断（真机 WPS 保存失败查了整轮日志零线索）。
+    let _ = log::set_logger(&FuserLogBridge);
+    // fuser 的告警按 tracing 的 WARN 对齐；别让 log 的全局级别把它挡掉。
+    log::set_max_level(log::LevelFilter::Warn);
+
     let log_dir = qxync_core::ipc::default_log_dir();
     match std::fs::create_dir_all(&log_dir) {
         Ok(()) => {
@@ -219,4 +227,30 @@ fn init_logging(
             Ok(None)
         }
     }
+}
+
+/// `log` → `tracing` 桥（只装一次，见 [`init_logging`]）。
+///
+/// fuser 0.17 的所有诊断（未实现的 FUSE 操作、未知 opcode、会话错误）
+/// 都走 `log` crate；不桥接 = 全部蒸发。目标统一加 `fuser` 前缀便于过滤。
+struct FuserLogBridge;
+impl log::Log for FuserLogBridge {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::Level::Warn
+    }
+    fn log(&self, record: &log::Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        match record.level() {
+            log::Level::Error => {
+                tracing::error!(target: "fuser", "{}", record.args())
+            }
+            log::Level::Warn => tracing::warn!(target: "fuser", "{}", record.args()),
+            log::Level::Info => tracing::info!(target: "fuser", "{}", record.args()),
+            log::Level::Debug => tracing::debug!(target: "fuser", "{}", record.args()),
+            log::Level::Trace => tracing::trace!(target: "fuser", "{}", record.args()),
+        }
+    }
+    fn flush(&self) {}
 }

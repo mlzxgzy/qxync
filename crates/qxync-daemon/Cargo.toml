@@ -26,4 +26,6 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-appender = "0.2"
+# ★ WPS 保存修复：fuser 的诊断走 `log` crate，桥到 tracing 才能进日志
+log = "0.4"
 libc = "0.2"
