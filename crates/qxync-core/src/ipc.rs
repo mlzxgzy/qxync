@@ -739,6 +739,7 @@ pub struct SyncCursors {
 /// `refreshed` 等曾被误写成「最近一次轮询的统计」—— 实际 daemon 每轮 `fetch_add`，
 /// 用户会看到「冲突 5000」以为现在积了 5000 条冲突。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SyncInfo {
     /// 轮询是否在跑。
     pub enabled: bool,
@@ -749,6 +750,11 @@ pub struct SyncInfo {
     pub last_poll_age_secs: u64,
     pub cursors: SyncCursors,
     pub baseline_entries: u64,
+    /// ★ 是否正在做「首次同步 / 太久没同步」的**全量列举**（整棵目录树，不受轮转窗口与常规
+    /// 单轮预算限制）。完成后自动恢复 `interval_secs` 的常规节奏。
+    pub full_sync_pending: bool,
+    /// 距离上次**完整跑完**一轮同步的秒数（`0` = 还没有过；「太久没同步」的判据来源）。
+    pub last_sync_ok_age_secs: u64,
     /// **累计**远端刷新次数（自 daemon 启动，只增不清）。
     pub refreshed: u64,
     pub conflicts: u64,

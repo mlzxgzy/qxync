@@ -223,6 +223,23 @@ GUI：三处「有删除被熔断挡住」告警一直亮着（问题恢复/放�
   * 覆盖测试：`generous_time_budget_scans_everything_in_one_round`（预算充足一轮
     全量、游标清空）、`tiny_time_budget_still_makes_progress`（1ns 预算下每轮推进
     一个、游标逐轮前进、未轮到的不误删）。
+* **首次同步 / 太久没同步 → 全量列举**（2026-10-21 真机反馈后补；详见
+  [M29](M29-首次同步与全量重扫.md)）：轮转窗口解决的是「稳态下每轮耗时可控」，
+  但它不该用在**第一次同步**上 —— 4964 个目录 × 每轮 ~171 个 = 29 轮 ≈ 24 分钟，
+  期间所有删除判定都被推迟，用户看到的是「永远在暂不判定」。
+  现在按挂载点记状态（`reconcile_full_done:<mountpoint>` / `reconcile_full_pending:<mountpoint>`）：
+  * **首次同步**（无 done 标记）→ 一轮 BFS 列完整棵树（每目录只列一次，不受轮转游标 /
+    常规单轮预算 / 2000 硬顶限制），完成后落 done，**恢复常规轮转与用户配置的间隔**；
+  * **太久没同步**（距上次**完整跑完**一轮 ≥ 1h，`sync_last_ok_unix` 判据）→ 按首次同步处理；
+  * **上次没列完**（崩溃 / 断网 / 预算用完）→ pending 标记，下轮继续；
+  * 全量单轮预算 1800s（`QXNYC_FULL_SCAN_BUDGET_SECS`），用完则轮询循环 2 秒后继续；
+    完成状态在**删除判定之前**落盘（删除熔断不该导致每轮重扫整棵树）；
+  * `QXNYC_FULL_SYNC=0` 可整体关掉（退回 v0.7.7 纯轮转，排障对比用）。
+  * 覆盖测试：`full_scan_plan_triggers_on_first_pending_or_stale`、
+    `full_scan_lists_whole_tree_in_one_round`、
+    `full_scan_budget_exhaustion_keeps_pending_and_retries`、
+    `full_scan_after_long_gap`、
+    `poll_once_records_last_success_and_resumes_normal_polling`。
 * **baseline 的删除/改名永远落不了盘**（pre-existing）：`persist()` 只按 mtime 取较新
   签名做增量合并，从**本轮快照**里删掉的条目会被内存里旧 `g.baseline` 复活 → 下一轮
   又写回库。于是「规则排除清理」「回收站清理」「已执行删除的 baseline」「改名迁移的

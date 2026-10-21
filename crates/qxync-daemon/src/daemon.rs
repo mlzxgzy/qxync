@@ -3397,9 +3397,25 @@ fn now_secs() -> u64 {
 /// 当前同步状态（`status` / `sync` 共用；计数器是**累计值**）。
 fn sync_info(state: &Arc<State>) -> SyncInfo {
     let snap = state.sync_stats.snapshot();
-    let (cursors, baseline_entries, note) = {
+    // ★ 全量同步是**按挂载点**记状态的（每个挂载点各自「首次 / 上次没列完」），
+    //   这里汇总给 status：任一挂载点在等全量 → `full_sync_pending=true`。
+    let mountpoints: Vec<String> = state
+        .mounts
+        .lock()
+        .unwrap()
+        .keys()
+        .map(|p| p.display().to_string())
+        .collect();
+    let (cursors, baseline_entries, note, full_sync_pending, last_ok) = {
         let g = state.sync_store.lock().unwrap();
-        (g.cursors, g.baseline.len(), None::<String>)
+        let (pending, last_ok) = sync::full_sync_status(&g, &mountpoints);
+        (
+            g.cursors,
+            g.baseline.len(),
+            None::<String>,
+            pending,
+            last_ok,
+        )
     };
     let interval = *state.sync_interval.lock().unwrap();
     SyncInfo {
@@ -3419,6 +3435,8 @@ fn sync_info(state: &Arc<State>) -> SyncInfo {
             log_missing_count: cursors.log_missing_count,
         },
         baseline_entries: baseline_entries as u64,
+        full_sync_pending,
+        last_sync_ok_age_secs: last_ok.map(|t| now_secs().saturating_sub(t)).unwrap_or(0),
         refreshed: snap.refreshed,
         conflicts: snap.conflicts,
         uploaded: snap.uploaded,
@@ -3493,6 +3511,34 @@ fn scan_budget_for(state: &State, manual: bool) -> Duration {
         return sync::SCAN_BUDGET_ONCE;
     }
     Duration::from_secs_f64(interval as f64 * sync::SCAN_BUDGET_RATIO_OF_INTERVAL)
+}
+
+/// 全量同步（首次 / 太久没同步 / 上次没列完）总开关；`QXNYC_FULL_SYNC=0` 关掉。
+///
+/// 关掉后行为与 v0.7.7 完全一致（纯轮转窗口），用于对比排障 —— 它不是给日常用的：
+/// 首次同步在 4964 个目录、30s 间隔、15s 预算下要 24 分钟才轮完一圈。
+fn full_sync_enabled() -> bool {
+    std::env::var("QXNYC_FULL_SYNC")
+        .map(|v| v.trim() != "0")
+        .unwrap_or(true)
+}
+
+/// 「太久没同步」阈值（`QXNYC_FULL_SYNC_AFTER_SECS`；`0` = 不因超时触发）。
+fn full_sync_stale_after() -> Duration {
+    let secs = std::env::var("QXNYC_FULL_SYNC_AFTER_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(sync::FULL_SYNC_STALE_AFTER.as_secs());
+    Duration::from_secs(secs)
+}
+
+/// 全量列举单轮预算（`QXNYC_FULL_SCAN_BUDGET_SECS`；`0` = 不限）。
+fn full_scan_budget() -> Duration {
+    let secs = std::env::var("QXNYC_FULL_SCAN_BUDGET_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(sync::FULL_SCAN_BUDGET.as_secs());
+    Duration::from_secs(secs)
 }
 
 // ---------------------------------------------------------------- ★ M20：离线 / 重连
@@ -3807,6 +3853,11 @@ async fn run_sync_once(state: &Arc<State>, manual: bool) -> Result<sync::SyncRep
     let mut cfg = state.sync_cfg.lock().unwrap().clone();
     // ★ 时间预算每轮推导（间隔可运行时调；手动一轮给足预算想全量）。
     cfg.scan_time_budget = scan_budget_for(state, manual);
+    // ★ 首次同步 / 太久没同步 / 上次没列完 → 全量列举（策略与阈值见 `sync::full_scan_plan`）。
+    //   `QXNYC_FULL_SYNC=0` 可整体关掉（退回纯轮转的旧行为，排障用）。
+    cfg.full_sync = full_sync_enabled();
+    cfg.full_sync_stale_after = full_sync_stale_after();
+    cfg.full_scan_budget = full_scan_budget();
     let user = state.link.user.clone();
     let link_id = state.link.id.clone();
     let report = sync::poll_once(
@@ -3920,6 +3971,10 @@ fn spawn_poller(state: Arc<State>, mut gen: EngineGen) -> tokio::task::JoinHandl
         // ★ M20：上一轮因为「离线缓冲没回放完」提前返回 → 下一圈不等完整间隔，
         // 2 秒后就重试（重登成功 / NAS 就绪后通常下一轮就能推进）。
         let mut retry_soon = false;
+        // ★ 全量同步的预算用完了（还有目录没列到）→ 下一圈 2 秒后就继续，
+        //   不等常规间隔（默认 30s / 用户可能配成 600s）。首次同步要尽快把缓存建起来。
+        //   注意只认「预算用完还有进展」：有目录列举失败时等常规间隔重试，不能 2 秒打一次 NAS。
+        let mut full_scan_next = false;
         loop {
             let secs = *state.sync_interval.lock().unwrap();
             let mut recovered = false;
@@ -3972,6 +4027,7 @@ fn spawn_poller(state: Arc<State>, mut gen: EngineGen) -> tokio::task::JoinHandl
                 tracing::info!("离线探活成功：先回放离线缓冲区，再补一轮对账");
                 recovered = true;
             } else if secs == 0 {
+                full_scan_next = false;
                 if !gen.sleep(Duration::from_secs(2)).await {
                     tracing::info!("变更轮询退出（同步引擎已换代）");
                     return;
@@ -3982,8 +4038,14 @@ fn spawn_poller(state: Arc<State>, mut gen: EngineGen) -> tokio::task::JoinHandl
                 //
                 // ★ M15/T6：多了一个「换代通知」分支 —— 它一到就退出，**不会**顺手续一轮，
                 //   否则新旧两代会同时对同一棵树做对账（同一处改动被判两次冲突）。
+                let wait = if full_scan_next {
+                    full_scan_next = false;
+                    Duration::from_secs(sync::FULL_SYNC_RETRY_SECS)
+                } else {
+                    Duration::from_secs(secs.clamp(1, 3600))
+                };
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(secs.clamp(1, 3600))) => {}
+                    _ = tokio::time::sleep(wait) => {}
                     _ = gen.changed() => {
                         tracing::info!("变更轮询退出（同步引擎已换代）");
                         return;
@@ -4021,6 +4083,9 @@ fn spawn_poller(state: Arc<State>, mut gen: EngineGen) -> tokio::task::JoinHandl
                     if r.offline_backlog_pending {
                         retry_soon = true;
                     }
+                    // ★ 全量同步没列完（预算用完、有进展）→ 下一圈 2 秒后继续。
+                    //   有目录列举失败时不会置位（见 `SyncReport::full_scan_retry_now`）。
+                    full_scan_next = r.full_scan_retry_now;
                     // ★ 会话失效自愈：`poll_once` 把错误塞进 report.errors 后仍返回 Ok，
                     //   所以下面 Err 分支的 `is_auth` 重登永远等不到。真机实测：
                     //   sid 过期后每 30s 一条 `qbox_get_max_log 失败: status=3`，
@@ -4050,6 +4115,7 @@ fn spawn_poller(state: Arc<State>, mut gen: EngineGen) -> tokio::task::JoinHandl
                 }
                 Err(e) => {
                     tracing::warn!("轮询失败: {}", e.message);
+                    full_scan_next = false;
                     *state.sync_stats.last_error.lock().unwrap() = Some(e.message.clone());
                     // ★ M10：会话失效 → 重登（`login_internal` 会把新 sid 推给挂载点）。
                     //   以前这里只是记一条错误，sid 死了就每一轮都失败。
