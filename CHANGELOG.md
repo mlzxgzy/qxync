@@ -5,7 +5,7 @@
 
 [English](CHANGELOG.en.md) · [README](README.md) · [验收记录](docs/验收记录.md)
 
-## [未发布]
+## [0.7.6] - 2026-10-21
 
 ### 修复
 
@@ -39,6 +39,20 @@
   两者之间没有桥，**所有 fuser 层错误全部静默丢弃**（本次故障查了整轮日志零
   线索的直接原因）。daemon 启动时装 `log` → `tracing` 桥（target=`fuser`），
   以后这类问题日志里直接可见。
+- **Dolphin 复制报「磁盘上没有足够的空间写入 …」—— 补上 `statfs`，回缓存盘
+  真实空间**：挂载点此前从未实现 `statfs`，走 fuser 默认值（blocks/bfree/bavail
+  全 0），`df` 显示 0 B 可用；而 Dolphin/KIO 在复制**前**会查目标挂载的可用空间
+  （`FileSystemFreeSpaceJob`，KDE bug 492108 里没回真实 statfs 的 davfs2 挂载
+  同症状），看到 0 直接判 `ERR_DISK_FULL`。写入实际落在本地缓存盘（空间充足），
+  `cp` / qxync put 不做 statvfs，所以「命令行可以、Dolphin 不行」。现在
+  `Filesystem::statfs` 对 cache_dir 跑 `statvfs(3)` 并映射到 FUSE 字段：
+  缓存目录尚未创建时沿祖先目录找第一个存在的（挂载早于建目录的竞态）；块粒度
+  优先 `f_frsize`（df 也按它算），为 0 时退回 `f_bsize`；`f_namemax` 为 0 时按
+  惯例兜底 255。**报缓存盘而不是 NAS**：写入最终落进 cache_dir，「往这个挂载点
+  写还剩多少」就是缓存盘剩余；NAS 侧配额不在 statfs 语义里，由上传失败回报。
+  量不到时维持旧行为（全 0）并留一条 warn，不编造数字。注意：挂载线程在
+  qxyncd 里，daemon reload（SIGHUP）只重载同步引擎，此修复要 stop/start
+  daemon（或重启）才生效。
 
 ## [0.7.5] - 2026-10-21
 
