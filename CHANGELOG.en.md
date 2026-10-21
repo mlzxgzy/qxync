@@ -74,9 +74,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     probe marks it offline and freezes the queues; the offline reason is stored
     separately (`offline_reason`) so it cannot be replaced by an unrelated local
     error recorded after the network one.
-  * Aborted rounds now also accumulate `refreshed/uploaded/conflicts/deleted/
-    deletes_blocked` (otherwise `status` and the journal disagree forever) and
-    record the device UIDs seen in the aborted batch. Two regressions added: a
+  * Network calls inside conflict handling (re-stat after an in-flight upload,
+    conflict-copy naming, the remote rename) now go through `NetGuard` too: transport failures are
+    probed and abort the round when the NAS is unreachable, instead of one
+    connect timeout per conflict and a final "online" verdict; a single failure
+    is still treated as a blip (debug + de-duplicated note). Alerts for ACL-hidden
+    directories ("listing says not found but stat says it exists") are capped at
+    3 **per round**; `stats.events` is now incremented only after a whole batch
+    has been applied, so a replayed batch is not counted twice. Aborted rounds
+    also accumulate `refreshed/uploaded/conflicts/deleted/deletes_blocked`
+    (otherwise `status` and the journal disagree forever) and record the device
+    UIDs seen in the aborted batch. Two regressions added: a
     `poll_once`-level "drop mid-batch → abort → replay the whole batch with the same
     cursor → every event Noop, nothing deleted, no second conflicted copy", and
     "a lucky probe followed by repeated failures re-probes and aborts".
