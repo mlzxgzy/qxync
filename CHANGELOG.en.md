@@ -5,6 +5,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [中文](CHANGELOG.md) · [README](README.en.md) · [Acceptance log](docs/验收记录.md)
 
+## [0.7.6] - 2026-10-21
+
+### Fixed
+
+- **WPS Spreadsheets failing to save with "an error occurred replacing the target
+  file (0x80000008)" — FUSE now implements O_TMPFILE and link**: the atomic
+  save used by WPS (and newer LibreOffice, and Qt 5.14+ `QSaveFile`) is
+  "write the content via `open(dir, O_TMPFILE)` → atomically replace the target
+  with `linkat(fd, "", dir, name, AT_EMPTY_PATH)`", and qxync supported
+  neither half: fuser 0.17's opcode enum stops at 47 (kernel protocol 7.37's
+  `FUSE_TMPFILE`=51 fails to parse → ENOSYS → the kernel surfaces
+  `EOPNOTSUPP`), and `link` was never implemented (fuser's default is `EPERM`).
+  Real-machine diagnostics (`wps_save_diag`) measured it directly:
+  `open(O_TMPFILE)` → errno 95, `link()` → errno 1, while plain rename
+  (LibreOffice's save path) always worked. The fix has three layers:
+  - **vendor/fuser (local patch via `[patch.crates-io]`)**: the opcode enum
+    gains `FUSE_TMPFILE = 51` (plus `FUSE_STATX = 52` explicitly returning
+    ENOSYS, preserving the status quo), a new `Operation::TmpFile` parse
+    (request body = `fuse_create_in`, no name argument — isomorphic to
+    FUSE_CREATE), and a `Filesystem::tmpfile()` callback (default ENOSYS, so
+    the kernel answers `EOPNOTSUPP` — identical to unpatched upstream);
+  - **`tmpfile()` implementation**: creates an "unnamed" node
+    (`Node.unnamed`: empty remote, absent from `by_remote` and directory
+    listings, `mark_dirty` flags dirty without enqueueing — the upload happens
+    after link materializes it); the cache file is `tmpfile-<ino>.cache`;
+    `release()` on a still-unnamed node discards it entirely (node + cache);
+  - **`link()` implementation**: on an unnamed node = **materialize** (move to
+    the target name, migrate the cache, enter the listing, mark dirty for
+    upload — exactly the `linkat(AT_EMPTY_PATH)` semantics); on a regular node
+    = **copy semantics** (NAS protocols have no hard links, same as CIFS and
+    other network filesystems: new node + copied cache + upload). Target
+    already exists → `EEXIST` (the kernel VFS usually filters this first).
+- **renameat2 flags are no longer silently ignored**: `RENAME_EXCHANGE` used
+  to be executed as a plain rename (the source name's content got overwritten
+  instead of swapped = silent data loss). NAS protocols cannot do an atomic
+  exchange (a 3-step rename has an intermediate state), so following network
+  filesystem convention (sshfs/CIFS likewise) it now returns `EINVAL`;
+  `RENAME_NOREPLACE` returns `EEXIST` when the target exists (usually already
+  blocked by the kernel; belt and braces).
+- **fuser's diagnostic logs no longer evaporate**: fuser logs through the
+  `log` crate ("[Not Implemented] link(...)", "Unknown FUSE opcode", …) while
+  the daemon only initializes `tracing` — with no bridge between them, **every
+  fuser-level error was silently dropped** (the direct reason a full log sweep
+  of this incident yielded zero clues). The daemon now installs a
+  `log` → `tracing` bridge at startup (target=`fuser`), so this class of
+  problem is visible in the logs from now on.
+- **Dolphin failing copies with "not enough free disk space" — statfs now
+  reports the cache disk's real space**: the mount never implemented `statfs`
+  and used fuser's defaults (blocks/bfree/bavail all 0), so `df` showed 0 B
+  available; Dolphin/KIO checks the target mount's free space *before*
+  copying (`FileSystemFreeSpaceJob`; KDE bug 492108 shows the same symptom for
+  a davfs2 mount that returns no real statfs) and sees 0 → `ERR_DISK_FULL`.
+  Writes actually land on the local cache disk (with plenty of space), and
+  `cp` / qxync put don't statvfs, hence "works from the command line, fails
+  in Dolphin". `Filesystem::statfs` now runs `statvfs(3)` against the
+  cache_dir and maps the result to FUSE fields: when the cache directory
+  doesn't exist yet it walks up ancestors to the first one that does (the
+  mount-before-mkdir race); block granularity prefers `f_frsize` (what `df`
+  uses too), falling back to `f_bsize` when 0; `f_namemax` falls back to the
+  conventional 255 instead of 0. **It reports the cache disk, not the NAS**:
+  writes ultimately land in cache_dir, so "how much is left when writing to
+  this mount" is the cache disk's free space; NAS-side quotas are not part of
+  statfs semantics and surface as upload failures instead. When nothing can be
+  measured it keeps the old behavior (all zeros) with a warn — no invented
+  numbers. Note: the mount thread lives in qxyncd and daemon reload (SIGHUP)
+  only reloads the sync engine, so this fix requires a daemon stop/start (or
+  reboot) to take effect.
+
 ## [0.7.5] - 2026-10-21
 
 ### Added

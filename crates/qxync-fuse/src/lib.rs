@@ -3172,7 +3172,7 @@ impl QxyncFs {
             pending: None,
             refreshing: false,
             refresh_attempts: 0,
-        unnamed: false,
+            unnamed: false,
         };
         let mut nodes = HashMap::new();
         let mut by_remote = HashMap::new();
@@ -5622,7 +5622,9 @@ impl Filesystem for QxyncFs {
         };
         // 本地缓存文件用 ino 命名（不与任何 remote 路径冲突），
         // link 物化时再搬到正式的缓存路径。
-        let cache = self.cache_dir.join(format!("tmpfile-{}.cache", u64::from(ino)));
+        let cache = self
+            .cache_dir
+            .join(format!("tmpfile-{}.cache", u64::from(ino)));
         if let Err(e) = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -5748,12 +5750,8 @@ impl Filesystem for QxyncFs {
             // 进目录清单（与 create 相同的路径）
             let node_now = self.node_by_remote(&new_remote);
             if let Some(n) = &node_now {
-                let mut e = DirEntry::local(
-                    newname,
-                    false,
-                    n.attr.size,
-                    Self::epoch_of(n.attr.mtime),
-                );
+                let mut e =
+                    DirEntry::local(newname, false, n.attr.size, Self::epoch_of(n.attr.mtime));
                 e.file_id = n.file_id;
                 if let Some(entries) = listing_upsert(&self.inner, &parent_remote, &e) {
                     persist_listing(self.nodes.as_ref(), &parent_remote, &entries);
@@ -5763,10 +5761,7 @@ impl Filesystem for QxyncFs {
             if let Err(e) = self.mark_dirty(ino) {
                 return reply.error(e);
             }
-            tracing::info!(
-                "O_TMPFILE 物化: ino={} -> {new_remote}",
-                u64::from(ino)
-            );
+            tracing::info!("O_TMPFILE 物化: ino={} -> {new_remote}", u64::from(ino));
             let attr = { self.inner.lock().unwrap().nodes.get(&ino).map(|n| n.attr) };
             match attr {
                 Some(a) => reply.entry(&ENTRY_TTL, &a, Generation(0)),
@@ -5813,7 +5808,14 @@ impl Filesystem for QxyncFs {
                 return reply.error(e);
             }
             tracing::info!("硬链接(复制语义): {} -> {new_remote}", src.remote);
-            let attr = { self.inner.lock().unwrap().nodes.get(&node.ino).map(|n| n.attr) };
+            let attr = {
+                self.inner
+                    .lock()
+                    .unwrap()
+                    .nodes
+                    .get(&node.ino)
+                    .map(|n| n.attr)
+            };
             match attr {
                 Some(a) => reply.entry(&ENTRY_TTL, &a, Generation(0)),
                 None => reply.error(fuser::Errno::ENOENT),
@@ -6971,7 +6973,7 @@ mod tests {
             pending: None,
             refreshing: false,
             refresh_attempts: 0,
-        unnamed: false,
+            unnamed: false,
         };
         assert_eq!(n.state_str(), "placeholder");
         n.chunks_done[0] = true;
@@ -7489,7 +7491,8 @@ mod tests {
     /// 不挡这一层的话，write() 结尾的 mark_dirty 会把一个空路径作业塞进队列。
     #[test]
     fn wps_unnamed_node_mark_dirty_does_not_enqueue() {
-        let dir = std::env::temp_dir().join(format!("qxync-fuse-wps-unnamed-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("qxync-fuse-wps-unnamed-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -9223,7 +9226,7 @@ mod tests {
             pending: None,
             refreshing: false,
             refresh_attempts: 0,
-        unnamed: false,
+            unnamed: false,
         }
     }
 
