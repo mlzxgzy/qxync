@@ -2785,6 +2785,11 @@ fn print_sync(s: &SyncInfo) {
     if let Some(r) = &s.delete_block_reason {
         println!("  ⚠️  {r}（`qxync sync --force-deletes` 放行）");
     }
+    if let Some(n) = &s.note {
+        // ★ M30：网络失败不再进「最近错误」（红字），而是「说明」里的一行
+        //   「已缓冲，等联网」——`qxync status` / `qxync sync` 也要能看到它。
+        println!("  说明    : {n}");
+    }
     if let Some(e) = &s.last_error {
         println!("  ⚠️  最近错误: {e}");
     }

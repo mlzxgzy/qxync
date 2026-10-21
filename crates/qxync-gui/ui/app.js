@@ -4770,6 +4770,8 @@
 
     clearAlerts('sync2-alerts');
     if (sy.last_error) { addAlert('sync2-alerts', '同步错误：' + String(sy.last_error)); }
+    // ★ M30：网络失败是「已缓冲，等联网」，不是同步错误 → 单独一行说明（黄色）。
+    if (sy.note) { addAlert('sync2-alerts', '说明：' + String(sy.note), 'warn'); }
     if (sy.delete_block_reason) {
       addAlert('sync2-alerts', T('sync.blocked_alert', { reason: String(sy.delete_block_reason) }),
         null, { label: T('sync.force_deletes'), onClick: doForceDeletes });

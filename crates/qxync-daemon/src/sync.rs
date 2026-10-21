@@ -80,6 +80,27 @@ impl MountView {
         let roots = self.view.remote_roots();
         self.rules.hides_in_roots(&roots, remote, is_dir)
     }
+
+    /// ★ M30：这一路同步的**展示名** —— 只用来回答「**哪一路**同步网络失败了」。
+    ///
+    /// 为什么不是路径：用户明确要求网络失败文案里**不出现本地/远端路径**
+    /// （真机那条错误把 `/home/.Qsync/2025/…` 和整条 URL 都打出来了，
+    /// 路径里还带着业务信息）。这里取挂载点目录名：任务默认挂在
+    /// `<cache>/<link>/<task>`，目录名就是任务名（真机 `…/default/qsync` → `qsync`）；
+    /// 非任务挂载退回远端根最后一段。**只打印这一段，不打印完整路径。**
+    pub fn label(&self) -> String {
+        self.mountpoint
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .or_else(|| {
+                self.remote_root
+                    .trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "同步".to_string())
+    }
 }
 
 /// 本进程的 uid（与 FUSE 侧 `deny_trash` 的 `trash_uid` 同口径）。
@@ -359,6 +380,12 @@ pub struct SyncReport {
     /// 再记一条完全无关的本地错误（例如「清除对账轮转游标失败」），状态栏就会显示成
     /// 「已离线：清除对账轮转游标失败」。
     pub offline_reason: Option<String>,
+    /// ★ M30：本轮的网络失败**签名是否变化**（新失败 / 失败变化 / 已恢复）。
+    ///
+    /// 与 [`SyncReport::delete_block_changed`] 同一套去重思路：断网/弱网会连续多轮
+    /// 命中同一条网络失败，每轮都写 journal 就是刷屏。只有签名变化（或恢复）才写。
+    /// 由 [`absorb_round`] 计算 —— journal 写入（`journal_record_sync`）读它。
+    pub network_failure_changed: bool,
     /// ★ 最近一次探活的结论（`None` = 本轮没探过）。
     ///
     /// 由 [`NetGuard`] 在真正探活时写入。轮询循环据此区分两种「网络错误」：
@@ -445,6 +472,12 @@ pub struct SyncStats {
     /// 上一轮的**熔断签名**（`数量|原因`）。只有签名变化才重新 WARN / 记 journal，
     /// 否则真机每 30s 一条的重复告警会把 1 万条的 journal 上限几天内冲掉。
     pub delete_block_sig: Mutex<Option<String>>,
+    /// ★ M30：上一轮的网络失败签名（`None` = 上一轮没有网络失败）。
+    ///
+    /// 断网往往持续多轮，而每轮都会记同一条「网络失败，已缓冲」——不签名去重的话，
+    /// journal（更新中心）每轮多一条，10 分钟就能把一小时的记录冲掉，用户看到的
+    /// 反而是「怎么还在报网络错误」。只有新失败 / 失败内容变了 / 恢复才写。
+    pub network_sig: Mutex<Option<String>>,
     pub last_note: Mutex<Option<String>>,
     pub devices: Mutex<BTreeMap<String, u64>>,
 }
@@ -707,7 +740,12 @@ impl NetGuard {
         }
         self.errors_recorded += 1;
         if self.errors_recorded <= MAX_NET_ERRORS_PER_ROUND {
-            report.network_error(e, format!("{context}: {e}"));
+            // ★ M30：网络类失败只说「哪一跳 + 已缓冲」，不拼 URL / 路径
+            //   （底层 `{e}` 已由 client 去掉 URL 与远端路径，见 qxync_client::http_error_text）。
+            report.network_error(
+                e,
+                format!("{context}: {e}；已缓冲本轮进度，网络恢复后自动继续"),
+            );
         } else {
             // ★ 配额之外连 WARN 都不打（`report.error` 无条件 WARN 会把这层配额架空）。
             report.transport_offline = true;
@@ -725,8 +763,11 @@ impl NetGuard {
 /// 为什么不能「每个目录/每个接口各记一条」：真机实测（2026-10-19 日志），一次断网在
 /// 一轮里被记成 `qbox_get_sync_log` + `qbox_get_device_config_list` +
 /// `qbox_query_notify` + 每个对账目录各一条，用户看到的是「程序到处报错」，
-/// 而事实只有一句「网络断了」。这里把网络类失败收敛成**一条**：带上 NAS 地址、
-/// 已做到哪一步、以及「恢复后会自动继续」。
+/// 而事实只有一句「网络断了」。这里把网络类失败收敛成**一条**：带上「哪一路同步 /
+/// 已做到哪一步」，以及「已缓冲，恢复后自动继续」。
+///
+/// ★ M30：**不再拼 NAS 地址/路径** —— 地址（含端口）对用户没有信息量却会在多连接时
+/// 造成「到底哪一路」的歧义；远端路径更不该出现在用户可见文案里。
 async fn record_net_error_or_abort(
     client: &Client,
     net: &mut NetGuard,
@@ -737,9 +778,11 @@ async fn record_net_error_or_abort(
     if e.is_offline() {
         net.failures_since_probe += 1;
         if !net.confirm_reachable(client, report).await {
+            // ★ M30：文案里**不带 NAS 地址/路径**（地址只剩 host:port，对用户没信息量，
+            //   却在多连接时造成「到底哪一路」的歧义）；「哪一路同步」由 context 里的
+            //   任务短名回答，`{e}` 也已由 client 去掉 URL/远端路径。
             let msg = format!(
-                "网络不可用：探测 NAS {} 失败，本轮轮询中止（{context}；本轮不判定任何远端缺失，恢复后自动继续）。底层错误：{e}",
-                client.link().base_url()
+                "网络不可用：探测 NAS 失败，本轮轮询中止（{context}；本轮不判定任何远端缺失，恢复后自动继续）。底层错误：{e}"
             );
             report.network_error(e, msg.clone());
             report.offline_reason = Some(msg);
@@ -1143,12 +1186,69 @@ pub async fn poll_once(
 /// 就被冲掉、真实历史反而没了。现在只有**签名变化**才置
 /// [`SyncReport::delete_block_changed`]（WARN / journal 据此只记一次），重复轮次降为 debug。
 pub fn absorb_round(stats: &SyncStats, report: &mut SyncReport, completed: bool) {
-    // 错误：本轮有错就更新（提前返回的轮次也一样 —— 用户要立刻看到最新的错）。
-    if let Some(e) = report.errors.last() {
-        *stats.last_error.lock().unwrap() = Some(e.clone());
+    // ★ M30：把**网络类**失败与**真正的同步错误**分开。
+    //
+    // 网络类（断网 / 闪断 / 反代 502）不是「同步坏了」，是「暂时连不上」：
+    // 上传/删除队列已经停在「等联网」，本轮没列到的目录下一轮自动重试，
+    // 数据一条不丢。把它写进 `last_error` 的后果是界面红字常驻、用户以为
+    // 同步永久坏了 —— 真机用户的原话就是「怎么还在报网络错误」。现在：
+    //   * `last_error` 只收**非网络**错误（业务 status / 会话 / 本地 IO）；
+    //   * 网络失败进 `last_note`（界面「说明（…）」行）：文案本身已经写明
+    //     「已缓冲本轮进度，网络恢复后自动继续」。
+    // ⚠️ 用**下标**取标记而不是 `zip`：手工构造的 `SyncReport`（测试、以及未来
+    //   可能新增的调用方）可能只有 `errors` 而没有 `error_is_network`；按 `zip`
+    //   截断会把「普通错误」当不存在，`last_error` 反而不更新。缺标记 = 非网络错误。
+    let is_net = |i: usize| report.error_is_network.get(i).copied().unwrap_or(false);
+    let hard_error = report
+        .errors
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(i, _)| !is_net(*i))
+        .map(|(_, e)| e.clone());
+    let network_error = report
+        .errors
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(i, _)| is_net(*i))
+        .map(|(_, e)| e.clone());
+    if let Some(e) = hard_error {
+        *stats.last_error.lock().unwrap() = Some(e);
     } else if completed {
-        // 完整跑完且零错误 → 之前那条错误已经过时了。
+        // 完整跑完且没有**非网络**错误 → 之前那条真错误已经过时了。
+        // （只有网络错误时也要清红字：那是「暂时连不上」，不是「同步坏了」。）
         *stats.last_error.lock().unwrap() = None;
+    }
+
+    // ★ 网络失败签名去重：断网常持续多轮，每轮都写 journal 就是「还在报网络错误」。
+    //   只有新失败 / 失败内容变了 / 已恢复才置 changed（journal 与 WARN 读它）。
+    {
+        // 只有「这轮真的碰到网络失败」或「这轮完整跑完（有资格宣布恢复）」才更新签名。
+        // 提前返回、连网络都没试过的轮次（例如离线缓冲还没回放完就跳过对账）不能把
+        // 上一轮的断网签名抹成 None —— 那会误写一条「网络已恢复」。
+        let sig = network_error
+            .as_ref()
+            .map(|m| format!("{}|{}", report.errors.len(), m));
+        let may_update = network_error.is_some() || completed;
+        let changed = if may_update {
+            let mut last = stats.network_sig.lock().unwrap();
+            if last.as_deref() == sig.as_deref() {
+                false
+            } else {
+                *last = sig;
+                true
+            }
+        } else {
+            false
+        };
+        report.network_failure_changed = changed;
+        if changed {
+            match &network_error {
+                Some(m) => tracing::warn!("同步网络失败（已缓冲，等联网）: {m}"),
+                None => tracing::info!("同步网络已恢复"),
+            }
+        }
     }
 
     if !completed {
@@ -1156,7 +1256,16 @@ pub fn absorb_round(stats: &SyncStats, report: &mut SyncReport, completed: bool)
     }
 
     // note：完整轮次**整体替换**（本轮没有 note 就清空），否则上一轮的提示会常驻。
-    *stats.last_note.lock().unwrap() = (!report.notes.is_empty()).then(|| report.notes.join("；"));
+    // ★ M30：网络失败也并进 note —— 界面（GUI「说明（…）」/ `qxync status`）据此
+    //   显示「网络失败，已缓冲」，而不是把它挂成同步错误。
+    let mut note = report.notes.join("；");
+    if let Some(m) = &network_error {
+        if !note.is_empty() {
+            note.push('；');
+        }
+        note.push_str(m);
+    }
+    *stats.last_note.lock().unwrap() = (!note.is_empty()).then_some(note);
 
     // 删除熔断告警：按签名（数量+原因）去重；本轮检查通过就清掉旧告警。
     let mut slot = stats.delete_block_reason.lock().unwrap();
@@ -1341,14 +1450,9 @@ async fn apply_event(
                     // ★ 一批事件可以上千条：网络中途断了还逐条 stat，就是上千次
                     //   connect timeout + 一屏错误。确认整台不可达 → 置中止标志，
                     //   调用方看到后立刻收手（已在处理的事件由游标保证可重放）。
-                    record_net_error_or_abort(
-                        client,
-                        net,
-                        report,
-                        &e,
-                        &format!("事件 stat {path} 失败"),
-                    )
-                    .await;
+                    // ★ M30：路径只进 debug 日志，用户可见文案只留「哪一步失败」。
+                    tracing::debug!("事件 stat {path} 失败: {e}");
+                    record_net_error_or_abort(client, net, report, &e, "事件 stat 失败").await;
                 }
                 return;
             }
@@ -1868,6 +1972,8 @@ async fn reconcile_view(
         view.mountpoint.display(),
         view.remote_root
     );
+    // ★ M30：错误文案里只出现这个「哪一路同步」的短名，不出现任何路径。
+    let label = view.label();
     let root = view.remote_root.trim_end_matches('/').to_string();
     let under_root = |p: &str| p == root || p.starts_with(&format!("{root}/"));
 
@@ -2087,9 +2193,12 @@ async fn reconcile_view(
                     if e.is_auth() {
                         report.auth_failed = true;
                     }
-                    report.error(format!(
-                        "对账：远端根 {dir} 列举返回不存在（{e}）→ 本轮不判定（按权限/会话/卸载处理）"
-                    ));
+                    // ★ M30：文案里不留路径（`dir` 只进 debug 日志）。
+                    tracing::debug!("对账：远端根 {dir} 列举返回不存在: {e}");
+                    report.error(
+                        "对账：远端根列举返回「不存在」→ 本轮不判定（按权限/会话/卸载处理）"
+                            .to_string(),
+                    );
                 } else {
                     match stat_path(client, &dir).await {
                         Ok(sig) if !sig.exists => {
@@ -2108,8 +2217,12 @@ async fn reconcile_view(
                             remote_map.insert(dir.clone(), sig);
                             tracing::debug!("对账：目录 {dir} 列举不可见但 stat 确认存在");
                             if net.count_hidden_visible() {
+                                // ★ M30：路径只进 debug，不进用户可见文案。
+                                tracing::debug!(
+                                    "对账列举 {dir} 说不存在（{e}），但 stat 显示仍存在"
+                                );
                                 report.error(format!(
-                                    "对账列举 {dir} 说不存在（{e}），但 stat 显示仍存在 → 本轮不删该目录、不判定其内容"
+                                    "对账列举有目录返回「不存在」但 stat 显示仍存在（{e}）→ 本轮不删该目录、不判定其内容"
                                 ));
                             } else {
                                 tracing::debug!(
@@ -2127,8 +2240,9 @@ async fn reconcile_view(
                             // ★ 与 `Err(e)` 分支同一口径（M2）：stat 的网络失败也可能是
                             //   「整台断了」的第一现场，同样要探活/中止，而不是每个目录
                             //   各记一条、各等一次超时。非网络错误（status/会话）照常记。
+                            tracing::debug!("对账列举 {dir} 失败（{e}），stat 确认也失败");
                             let ctx = format!(
-                                "对账列举 {dir} 失败（{e}），stat 确认也失败（第 {attempted}/{total_dirs} 个目录）→ 本轮不判定该目录及其内容"
+                                "同步「{label}」对账列举失败（stat 确认也失败，第 {attempted}/{total_dirs} 个目录）→ 本轮不判定该目录及其内容"
                             );
                             if record_net_error_or_abort(client, net, report, &e2, &ctx).await {
                                 offline_abort = true;
@@ -2149,8 +2263,10 @@ async fn reconcile_view(
                 //   * 探活也失败 → 剩下 N 个目录挨个试只是把同一条错误刷 N 遍
                 //     （每次还要等 connect timeout），立刻中止本轮；
                 //   * 探活通过 → 闪断，继续列（错误受整轮配额限制，别刷屏）。
+                // ★ M30：路径只进 debug 日志；用户可见文案只说「哪一路同步、第几个目录」。
+                tracing::debug!("对账列举 {dir} 失败（第 {attempted}/{total_dirs} 个目录）: {e}");
                 let ctx = format!(
-                    "对账列举 {dir} 失败（第 {attempted}/{total_dirs} 个目录，已列 {scanned} 个，剩余目录等网络恢复后再列）"
+                    "同步「{label}」对账列举失败（第 {attempted}/{total_dirs} 个目录，已列 {scanned} 个）"
                 );
                 if record_net_error_or_abort(client, net, report, &e, &ctx).await {
                     offline_abort = true;
@@ -5088,7 +5204,7 @@ mod tests {
         );
         assert!(
             report.errors[0].contains("网络不可用"),
-            "错误要说人话（网络不可用 + NAS 地址 + 已做到哪一步）: {report:?}"
+            "错误要说人话（网络不可用 + 已做到哪一步；★M30 起不带 NAS 地址/路径）: {report:?}"
         );
         assert_eq!(report.deleted, 0, "列举失败时不许删任何东西");
         assert!(
@@ -5155,6 +5271,12 @@ mod tests {
         stat_fail: BTreeSet<String>,
         /// `stat` 这些完整路径 → JSON `status`
         stat_status: BTreeMap<String, i64>,
+        /// ★ M30：`get_list` 这些路径的**前 N 次请求直接断开连接**（不回包）。
+        ///
+        /// 模拟真机上最常见的一次性传输失败：NAS 的 nginx 回收了 keep-alive
+        /// 空闲连接，而客户端连接池复用了那条已关闭的连接。客户端对幂等 GET
+        /// 的有限重试应当把它吸收掉（不产生用户可见错误）；重试用尽才记一条。
+        drop_n_for_path: BTreeMap<String, usize>,
         /// ★ 只服务前 N 条连接，之后**接受即丢弃**（不回包）——模拟「对账中途整台 NAS 断网」。
         ///
         /// 丢弃而不是关闭 listener：让探活也拿到一个确定的网络层失败，不依赖内核
@@ -5210,6 +5332,7 @@ mod tests {
             existing_entries,
             stat_fail,
             stat_status,
+            drop_n_for_path,
             refuse_after,
             max_log,
             events,
@@ -5227,6 +5350,7 @@ mod tests {
         let stat_status = Arc::new(stat_status);
         let max_log = Arc::new(max_log);
         let events = Arc::new(events);
+        let drop_budget = Arc::new(Mutex::new(drop_n_for_path));
         let handle = tokio::spawn(async move {
             let mut accepted = 0usize;
             loop {
@@ -5251,6 +5375,7 @@ mod tests {
                 let stat_status = stat_status.clone();
                 let max_log = max_log.clone();
                 let events = events.clone();
+                let drop_budget = drop_budget.clone();
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 8192];
                     let mut req = Vec::new();
@@ -5273,6 +5398,18 @@ mod tests {
                         .map(|(k, v)| (k.to_string(), percent_decode(v)))
                         .collect();
                     let func = params.get("func").map(String::as_str).unwrap_or("");
+                    // ★ M30：模拟「对端提前关连接」——直接 return（socket drop，不回包）。
+                    if func == "get_list" {
+                        if let Some(path) = params.get("path") {
+                            let mut budget = drop_budget.lock().unwrap();
+                            if let Some(left) = budget.get_mut(path) {
+                                if *left > 0 {
+                                    *left -= 1;
+                                    return;
+                                }
+                            }
+                        }
+                    }
                     let (code, body) = if func == "qbox_get_max_log" && max_log.is_some() {
                         // ★ poll_once 模式：max_log / sync_log / config log 按真机形状应答。
                         let n = max_log.unwrap_or(0);
@@ -6163,6 +6300,122 @@ mod tests {
         let _ = std::fs::remove_dir_all(&work);
     }
 
+    /// ★ M30：**一次闪断不该被用户看到**。NAS 的 nginx 回收 keep-alive 空闲连接时，
+    /// 对端会直接断开；客户端对幂等 GET 的有限重试应当吸收这次抖动 —— 本轮零错误、
+    /// 目录照常列出。真机现场（2026-10-21 12:32）：`get_list /home/.Qsync` 报
+    /// `error sending request`，而同一时刻探活是通的，正是这一类。
+    #[tokio::test]
+    async fn transient_connection_drop_is_retried_silently() {
+        use qxync_core::DirEntry;
+        let home = HOME_ROOT;
+        let f = format!("{home}/f.txt");
+        let listings: BTreeMap<String, Vec<DirEntry>> = BTreeMap::from([(
+            home.to_string(),
+            vec![DirEntry::local("f.txt", false, 10, 100)],
+        )]);
+        let (host, port, _seen, srv) = spawn_nas_server(MockNasSpec {
+            listings,
+            // 根目录第一次请求被对端断开；客户端重试后第二次成功。
+            drop_n_for_path: BTreeMap::from([(home.to_string(), 1)]),
+            ..Default::default()
+        })
+        .await;
+
+        let work = tmpdir("reconcile-transient-drop");
+        let view = FakeLocal::new(home, work.join("stash"));
+        view.add_file(&f, 10, 100, false, None);
+        let mut baseline = Baseline::default();
+        baseline.put(f.clone(), Sig::file(10, 100));
+        let store = Mutex::new(SyncState::load(work.join("state")).unwrap());
+        let mv = mount_view(view.clone(), home, "/tmp/reconcile-transient-drop");
+        let client = client_for(&host, port);
+        let mut report = SyncReport::default();
+        reconcile_view(
+            &client,
+            &mv,
+            &SyncConfig::default(),
+            &mut baseline,
+            &mut report,
+            &store,
+            &mut NetGuard::default(),
+        )
+        .await;
+
+        assert!(
+            report.errors.is_empty(),
+            "一次闪断应被重试吸收，不该报错: {report:?}"
+        );
+        assert!(!report.transport_offline, "重试成功 = 在线，不该置离线标志");
+        assert_eq!(report.dirs_scanned, 1, "重试后根目录必须列成功: {report:?}");
+        assert!(view.node(&f).is_some(), "文件还在（没被当成远端删除）");
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// ★ M30：重试用尽后仍然失败 → 只留**一条**「已缓冲、等联网」的说明，
+    /// 且**不含本地路径 / 远端路径 / URL / sid**。
+    ///
+    /// 修前真机日志（2026-10-21）：
+    /// `对账列举 /home/.Qsync/2025/11-公安大赛/… 失败: 网络错误: get_list /home/…:
+    ///  error sending request for url (https://qnap…/qsyncsrv.cgi?func=get_list&sid=…&path=%2Fhome%2F…)`
+    /// —— 路径、sid、查询串全在用户可见文案里。
+    #[tokio::test]
+    async fn exhausted_network_failure_has_no_paths_or_url() {
+        use qxync_core::DirEntry;
+        let home = HOME_ROOT;
+        let f = format!("{home}/f.txt");
+        let listings: BTreeMap<String, Vec<DirEntry>> = BTreeMap::from([(
+            home.to_string(),
+            vec![DirEntry::local("f.txt", false, 10, 100)],
+        )]);
+        let (host, port, _seen, srv) = spawn_nas_server(MockNasSpec {
+            listings,
+            // 远超重试次数：每次列举都被对端断开（重试用尽 → 必须如实记一条）。
+            drop_n_for_path: BTreeMap::from([(home.to_string(), 99)]),
+            ..Default::default()
+        })
+        .await;
+
+        let work = tmpdir("reconcile-no-paths");
+        let view = FakeLocal::new(home, work.join("stash"));
+        view.add_file(&f, 10, 100, false, None);
+        let mut baseline = Baseline::default();
+        baseline.put(f.clone(), Sig::file(10, 100));
+        let store = Mutex::new(SyncState::load(work.join("state")).unwrap());
+        let mv = mount_view(view.clone(), home, "/tmp/reconcile-no-paths");
+        let client = client_for(&host, port);
+        let mut report = SyncReport::default();
+        reconcile_view(
+            &client,
+            &mv,
+            &SyncConfig::default(),
+            &mut baseline,
+            &mut report,
+            &store,
+            &mut NetGuard::default(),
+        )
+        .await;
+
+        assert_eq!(report.errors.len(), 1, "同一断点只记一条: {report:?}");
+        let msg = &report.errors[0];
+        assert!(msg.contains("已缓冲"), "要说清现在在等联网: {msg}");
+        assert!(msg.contains("同步「"), "要指出**哪一路**同步失败了: {msg}");
+        assert!(!msg.contains(".Qsync"), "不能出现远端路径: {msg}");
+        assert!(!msg.contains("/tmp/"), "不能出现本地路径: {msg}");
+        assert!(
+            !msg.contains("https://") && !msg.contains("sid="),
+            "不能出现 URL / sid: {msg}"
+        );
+        assert!(!msg.contains('?'), "不能出现查询串: {msg}");
+        assert!(
+            !report.aborted_offline,
+            "探活通着（只是这一条被丢）→ 不能中止整轮: {report:?}"
+        );
+        assert!(view.node(&f).is_some(), "没列到的目录不能判远端缺失");
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
     /// ★ M4/H1：`poll_once` 级接线 + **重放幂等** —— 批中途中止后，整批事件会在下一轮
     /// 重放（游标只推进到「已完整应用的那一批」），重放绝不能重复刷新/删除/造冲突。
     ///
@@ -6275,11 +6528,15 @@ mod tests {
             "★ 中止轮次也要把已落地的计数累计进 status（L2：否则丢一轮）"
         );
         assert!(
+            snap.last_error.is_none(),
+            "★ M30：网络类失败不再进「最近错误」红字（它是「暂时连不上」不是「同步坏了」）: {:?}",
             snap.last_error
+        );
+        assert!(
+            r1.offline_reason
                 .as_deref()
-                .is_some_and(|e| e.contains("网络不可用")),
-            "本轮错误要立刻可见: {:?}",
-            snap.last_error
+                .is_some_and(|s| s.contains("网络不可用")),
+            "「连不上」的结论由 offline_reason / 连通性状态表达: {r1:?}"
         );
         assert_eq!(
             snap.delete_block_reason.as_deref(),
@@ -6870,6 +7127,52 @@ mod tests {
         assert_eq!(
             r.error_is_network[19], true,
             "第 20 条是网络错误（30 条里第 19 个是偶数下标）"
+        );
+    }
+
+    /// ★ M30：网络类失败只进「说明」（`last_note`），**不进**「最近错误」
+    /// （`last_error`）—— 断网不是「同步出错」，是「暂时连不上」，上传/删除队列
+    /// 已停在等联网、没列到的目录下轮自动重试，用户不该看到常驻红字。
+    ///
+    /// 同时钉住 journal 去重：同一断网持续多轮只算**一次**签名变化（否则更新中心
+    /// 每 30s 多一条「网络失败」，正是用户抱怨的「怎么还在报」）。
+    #[test]
+    fn network_failures_are_buffered_as_note_not_error() {
+        let stats = SyncStats::default();
+        let msg = "同步「qsync」对账列举失败（第 1/497 个目录，已列 0 个）: 网络错误: 请求发送失败；已缓冲本轮进度，网络恢复后自动继续";
+        let net = CoreError::Transport("连接被重置".into());
+
+        // ① 第一次断网：note 里出现「已缓冲」，红字（last_error）不出现
+        let mut r = SyncReport::default();
+        r.network_error(&net, msg);
+        absorb_round(&stats, &mut r, true);
+        assert!(
+            r.network_failure_changed,
+            "第一次断网要算一次签名变化（写 journal）"
+        );
+        assert!(
+            stats.snapshot().last_error.is_none(),
+            "断网不是同步错误，不该进 last_error: {:?}",
+            stats.snapshot().last_error
+        );
+        let note = stats.snapshot().last_note.unwrap_or_default();
+        assert!(note.contains("已缓冲"), "说明里要写清在等联网: {note}");
+        assert!(!note.contains(".Qsync"), "说明里不能出现路径: {note}");
+
+        // ② 同一断网的下一轮：签名没变 → journal 不重复写
+        let mut r2 = SyncReport::default();
+        r2.network_error(&net, msg);
+        absorb_round(&stats, &mut r2, true);
+        assert!(!r2.network_failure_changed, "同一条断网重复轮次不重复记");
+
+        // ③ 网络恢复：没有错误 → 签名变化（用来写一条「网络已恢复」），说明清空
+        let mut r3 = SyncReport::default();
+        absorb_round(&stats, &mut r3, true);
+        assert!(r3.network_failure_changed, "恢复也要有一个签名变化");
+        assert!(
+            stats.snapshot().last_note.is_none(),
+            "恢复后说明不该常驻: {:?}",
+            stats.snapshot().last_note
         );
     }
 
