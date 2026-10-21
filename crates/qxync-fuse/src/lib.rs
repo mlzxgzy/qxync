@@ -16,7 +16,7 @@
 use fuser::{
     Config, FileAttr, FileType, Filesystem, FopenFlags, Generation, INodeNo, OpenAccMode,
     ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
-    ReplyWrite, ReplyXattr, Request, TimeOrNow,
+    ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
 };
 
 /// ★ M11：删除队列（unlink/rmdir 异步入队 + 同目录攒批推送）。
@@ -5032,11 +5032,96 @@ fn read_exact_at(path: &Path, offset: u64, size: usize) -> Result<Vec<u8>, fuser
     Ok(buf)
 }
 
+/// 一次 `statvfs` 里 `statfs` 要回的字段（块数按 `frsize` 计）。
+#[derive(Debug, Clone, Copy)]
+struct FsStats {
+    blocks: u64,
+    bfree: u64,
+    bavail: u64,
+    files: u64,
+    ffree: u64,
+    bsize: u32,
+    namelen: u32,
+    frsize: u32,
+}
+
+/// `statvfs(3)` 取 `path` 所在文件系统的统计，映射成 FUSE `statfs` 的字段。
+///
+/// `path` 还没建出来时沿父目录往上找第一个存在的（挂载早于缓存目录创建的竞态）。
+fn fs_stats(path: &Path) -> Option<FsStats> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let dir = path
+        .ancestors()
+        .find(|p| !p.as_os_str().is_empty() && p.exists())?;
+    let c = CString::new(dir.as_os_str().as_bytes()).ok()?;
+    // SAFETY: 与 qxync-core::freespace::statvfs 同理 —— statvfs 只写我们提供的结构体，
+    // 失败时返回非 0，我们不读未初始化内存。
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    // POSIX 优先用 `f_frsize` 当块粒度（df 也按它算），为 0 时退回 `f_bsize`。
+    let frsize = if st.f_frsize > 0 {
+        st.f_frsize as u64
+    } else {
+        st.f_bsize as u64
+    };
+    if frsize == 0 {
+        return None;
+    }
+    let clamp32 = |v: u64| v.min(u32::MAX as u64) as u32;
+    // 有的文件系统不回 `f_namemax`（0）；文件名上限按 FUSE 惯例退 255，别回 0。
+    let namelen = if st.f_namemax > 0 {
+        clamp32(st.f_namemax as u64)
+    } else {
+        255
+    };
+    Some(FsStats {
+        blocks: st.f_blocks as u64,
+        bfree: st.f_bfree as u64,
+        bavail: st.f_bavail as u64,
+        files: st.f_files as u64,
+        ffree: st.f_ffree as u64,
+        bsize: clamp32(frsize),
+        namelen,
+        frsize: clamp32(frsize),
+    })
+}
+
 impl Filesystem for QxyncFs {
     fn init(&mut self, _req: &Request, config: &mut fuser::KernelConfig) -> std::io::Result<()> {
         // 与 Qsync 的 128 KiB 水合粒度对齐（M2 已按这个粒度发 Range 请求）
         let _ = config.set_max_readahead(128 * 1024);
         Ok(())
+    }
+
+    /// ★ 报**本地缓存盘**的空间，而不是 fuser 默认的全 0。
+    ///
+    /// 不实现的话 `statvfs(2)` 拿到 `blocks=bfree=bavail=0`：`df` 显示 0 B，而
+    /// Dolphin/KIO 在复制前会按目标挂载的可用空间检查（KDE bug 492108 里的 davfs2
+    /// 就是没回真实 statfs 的 FUSE 例子），看到 0 直接报 `ERR_DISK_FULL` ——
+    /// 「磁盘上没有足够的空间写入 file:///…」，可 `cp` / `qxync put` 不做这个检查，
+    /// 所以命令行照常能写。这就是「cmd 可以、Dolphin 不行」的全部原因。
+    ///
+    /// 为什么报缓存盘：挂载点的写入最终落进 `cache_dir`（水合内容也在那里），
+    /// 「往这个挂载点写还剩多少」= 缓存盘剩余，这才是诚实的数字；NAS 侧配额
+    /// 不在 statfs 语义里表达（由上传失败回报）。
+    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
+        match fs_stats(&self.cache_dir) {
+            Some(s) => reply.statfs(
+                s.blocks, s.bfree, s.bavail, s.files, s.ffree, s.bsize, s.namelen, s.frsize,
+            ),
+            // 量不到就维持旧行为（全 0），不编造数字；留一条日志好排查。
+            None => {
+                tracing::warn!(
+                    "statfs: 量不到缓存盘空间，回退为 0 cache_dir={}",
+                    self.cache_dir.display()
+                );
+                reply.statfs(0, 0, 0, 0, 0, 512, 255, 0)
+            }
+        }
     }
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
@@ -6652,6 +6737,34 @@ fn verify_one(cache: &Path, name: &str, repair: bool, rep: &mut VerifyReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ★ 修复 Dolphin「磁盘上没有足够的空间」：statfs 必须回真实空间，不能沿用
+    /// fuser 默认的全 0（0 B 可用 → KIO 的复制前检查直接判 `ERR_DISK_FULL`）。
+    #[test]
+    fn fs_stats_reports_real_space() {
+        let s = fs_stats(Path::new("/")).expect("根文件系统一定量得到");
+        assert!(s.bsize > 0, "块大小不能是 0");
+        assert!(s.frsize > 0);
+        assert!(s.blocks > 0, "总块数不能是 0，否则 df/Dolphin 还是 0 B");
+        assert!(s.bavail <= s.bfree, "非特权可用不该超过全部空闲");
+        assert!(s.bfree <= s.blocks);
+        assert!(
+            s.namelen >= 255,
+            "文件名长度上限至少 255（实为 {})",
+            s.namelen
+        );
+    }
+
+    /// 缓存目录还没建出来时，要沿父目录往上找，不能直接失败。
+    #[test]
+    fn fs_stats_walks_up_to_existing_parent() {
+        let missing = std::env::temp_dir()
+            .join("qxync-statfs-not-exist")
+            .join("a")
+            .join("b");
+        let s = fs_stats(&missing).expect("父目录存在就能量");
+        assert!(s.blocks > 0);
+    }
 
     /// ★ M11：回收站段识别 —— 认得该认的，**且不误伤正常文件**。
     #[test]
