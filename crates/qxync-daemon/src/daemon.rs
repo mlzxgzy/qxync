@@ -3640,10 +3640,14 @@ async fn flush_offline_backlog(state: &Arc<State>, client: &Arc<qxync_client::Cl
     }
 }
 
-/// 离线时的短探活：5 秒超时打一次 `max_log`。
+/// 离线时的短探活：5 秒超时对 `base_url` 发一次 GET（[`Client::probe_network`]）。
 ///
 /// 返回 `true` = 网络恢复（服务端回了话，哪怕只是 sid 失效 —— 那也能走正常轮询
 /// 去重登）。`false` = 仍然连不上。
+///
+/// ★ 注意语义：**任何 HTTP 回应都算通**（4xx/5xx 也算），用的是 `probe_network`
+/// 而不是 `probe_reachable`（后者需要 sid，且把 4/5 也算通）。轮询里「断网先探活、
+/// 确认不可达才中止」用的也是这同一个判据，别改成另一套。
 async fn probe_online(state: &Arc<State>) -> bool {
     // ★ 不依赖会话：断网时登录要等 20s connect timeout，先登录再探活会把
     //   3 秒的恢复检测拖成 20 多秒。任何一个 HTTP 回应都说明网络通了。
@@ -3742,6 +3746,21 @@ fn offline_info(state: &Arc<State>) -> Option<OfflineInfo> {
     }
 }
 
+/// ★ M3：本轮的结论是否应把连通性置「离线」——**探活结论优先**。
+///
+/// * `Some(false)` → 确认不可达：离线（冻结上传/删除队列）；
+/// * `Some(true)`  → 网络通着、只是丢了请求 / 服务端业务故障（CGI 500、WAF 403）：
+///   保持在线，错误照常记进 journal / last_error；
+/// * `None`（本轮没探活）→ 维持旧行为：真遇到网络错误才离线。
+///
+/// 单列成纯函数是为了能直接钉住这三态（`SyncReport` 本身不需要起 daemon）。
+fn round_marks_offline(report: &sync::SyncReport) -> bool {
+    match report.probe_reachable {
+        Some(reachable) => !reachable,
+        None => report.transport_offline,
+    }
+}
+
 /// 跑一轮同步（拉事件 + baseline 对账）。
 async fn run_sync_once(state: &Arc<State>, manual: bool) -> Result<sync::SyncReport, IpcError> {
     // ★ 串行化「一整轮」：见 [`State::sync_run`] 的字段注释。
@@ -3789,14 +3808,24 @@ async fn run_sync_once(state: &Arc<State>, manual: bool) -> Result<sync::SyncRep
     .await;
     // ★ M20：用本轮结论刷新连通性。网络错误 → 离线（队列会停）；正常跑完 →
     // 在线，并唤醒可能还在闸门上等的上传/删除 worker。
-    if report.transport_offline {
-        // ★ 取**最后**一条而不是第一条：网络确认不可达时，最后一条是那句
-        //   「网络不可用：探测 NAS … 失败，本轮……中止」，比第一条单点失败
-        //   （可能只是 `qbox_get_sync_log` 的瞬时错误）更接近用户要知道的结论。
+    //
+    // ★ M3：**探活结论优先**。「这轮遇到过网络错误」（`transport_offline`）不等于
+    //   「网络断了」：`qsync_func` 把任何 HTTP 非 2xx 都映射成 `Transport`，而
+    //   `probe_network` 只要 base_url 有回应就算通 —— CGI 持续 500 / WAF 403 / NAS
+    //   封了客户端 IP 这类故障，探活永远成功。旧逻辑会因此把 daemon 长期钉在离线态、
+    //   上传/删除长期冻结，界面上只剩一句「网络不可用」。
+    //   现在三态：
+    //   * `Some(false)` → 确认不可达：置离线（冻结队列）；
+    //   * `Some(true)`  → 通着、只是丢了请求（或服务端业务故障）：保持在线、照常记错误；
+    //   * `None`（本轮没探活）→ 维持旧行为，只在真遇到网络错误时置离线。
+    if round_marks_offline(&report) {
+        // ★ 优先用中止那条写下的 `offline_reason`（L1）：`errors.last()` 可能在网络
+        //   错误之后又记了一条无关的本地错误（如「清除对账轮转游标失败」），
+        //   状态栏就会显示成「已离线：清除对账轮转游标失败」。
         let reason = report
-            .errors
-            .last()
-            .cloned()
+            .offline_reason
+            .clone()
+            .or_else(|| report.errors.last().cloned())
             .unwrap_or_else(|| "网络请求失败".to_string());
         state.connectivity.mark_offline(reason);
     } else {
@@ -6405,6 +6434,35 @@ mod tests {
         assert_eq!(offline_probe_secs(300), 10);
         assert_eq!(offline_probe_secs(301), 30, "离线超过 5 分钟退到 30 秒");
         assert_eq!(offline_probe_secs(86_400), 30, "有上限，不会无限放大");
+    }
+
+    /// ★ M3：连通性由**探活结论**决定，而不是「本轮是否遇到过网络错误」。
+    ///
+    /// 关键一行是第一个：`CGI 持续 500 / WAF 403` 时 `transport_offline` 为真、
+    /// 但探活可达 —— 旧逻辑会在这里置离线（上传/删除长期冻结），现在必须保持在线。
+    #[test]
+    fn round_marks_offline_prefers_the_probe_result() {
+        use crate::sync::SyncReport;
+        let mut r = SyncReport {
+            transport_offline: true,
+            probe_reachable: Some(true),
+            ..Default::default()
+        };
+        assert!(
+            !round_marks_offline(&r),
+            "★ 探活说可达（HTTP 500/403 这类业务故障）→ 不许置离线冻结队列"
+        );
+        r.probe_reachable = Some(false);
+        assert!(round_marks_offline(&r), "探活失败 → 确认不可达，置离线");
+        r.probe_reachable = Some(true);
+        r.transport_offline = false;
+        assert!(!round_marks_offline(&r));
+        // 本轮没探活 → 维持旧行为：遇到过网络错误就离线
+        r.probe_reachable = None;
+        r.transport_offline = true;
+        assert!(round_marks_offline(&r));
+        r.transport_offline = false;
+        assert!(!round_marks_offline(&r));
     }
 
     fn client_with_sid(sid: Option<&str>) -> Arc<Client> {

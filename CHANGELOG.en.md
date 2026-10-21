@@ -41,13 +41,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **aborted immediately**, with exactly one error that names the NAS, says how far
   the round got and that it resumes automatically, and skips the remaining mount
   views and the decision-queue sweep; if the probe succeeds the failure was a
-  single dropped request (a blip) → the round continues, but transport list errors
-  are capped at 3 per round (the rest go to debug). Aborted rounds are absorbed as
-  **incomplete** (stale warnings are not cleared), and cursors for already-applied
-  events are persisted as usual (no replay). Offline-recovery probing also backs
+  single dropped request (a blip) → the round continues, but transport failures
+  are capped at 3 per round, shared by the event and reconcile phases (the rest go
+  to debug). Aborted rounds are absorbed as
+  **incomplete** (stale warnings are not cleared). Event cursors only advance to
+  the **last fully applied batch** — the batch in flight is replayed in full on the
+  next round, and that is safe because `apply_event` / `apply_decision` are
+  idempotent (pinned by the regression test
+  `poll_once_abort_mid_batch_then_replay_is_idempotent`; see the review-fix entry
+  below). Offline-recovery probing also backs
   off now: still every 3 s right after a drop (5-second unplugs recover instantly),
   10 s after 30 s offline and 30 s after 5 minutes (a NAS that is off overnight is
   no longer a stress test target).
+- **Review fixes: the probe result is no longer "decided once per round", and a
+  blip with a successful probe no longer pins the daemon offline**:
+  * **The probe result now expires** (10 s) and is **re-probed after 3 consecutive
+    transport failures**. The old code reused the first `true` for the whole round;
+    on a flaky link a lucky 5 s probe followed by a full outage made the remaining
+    events stat one by one and wait out one connect timeout each (a round could
+    stall for tens of minutes while holding the `sync_run` lock). Worst case is now
+    about a minute before the round is re-confirmed and aborted. Transport failures
+    during the event phase now share **the same** 3-per-round error quota as the
+    reconcile phase (events used to have no cap at all, and the quota used to be
+    per view). Reconcile's "listing returned 4/5/6 and stat failed too" and
+    "re-stat inside conflict handling" follow the same rule (the latter is treated
+    as a blip and retried next round).
+  * **Connectivity is decided by the probe result**: `qsync_func` maps any non-2xx
+    HTTP response to `Transport`, while the probe only requires "base_url answered"
+    — so a persistent CGI 500 / WAF 403 / NAS blocking the client IP used to leave
+    the daemon **stuck offline with uploads and deletes frozen**. Now a reachable
+    probe keeps the daemon online (errors are still recorded) and only a failed
+    probe marks it offline and freezes the queues; the offline reason is stored
+    separately (`offline_reason`) so it cannot be replaced by an unrelated local
+    error recorded after the network one.
+  * Aborted rounds now also accumulate `refreshed/uploaded/conflicts/deleted/
+    deletes_blocked` (otherwise `status` and the journal disagree forever) and
+    record the device UIDs seen in the aborted batch. Two regressions added: a
+    `poll_once`-level "drop mid-batch → abort → replay the whole batch with the same
+    cursor → every event Noop, nothing deleted, no second conflicted copy", and
+    "a lucky probe followed by repeated failures re-probes and aborts".
 
 ## [0.7.4] - 2026-10-20
 
