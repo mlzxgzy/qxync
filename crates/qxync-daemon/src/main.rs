@@ -185,7 +185,6 @@ fn init_logging(
     link_id: &str,
 ) -> Result<Option<tracing_appender::non_blocking::WorkerGuard>> {
     use tracing_subscriber::layer::SubscriberExt as _;
-    use tracing_subscriber::util::SubscriberInitExt as _;
 
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level));
@@ -200,33 +199,44 @@ fn init_logging(
     log::set_max_level(log::LevelFilter::Warn);
 
     let log_dir = qxync_core::ipc::default_log_dir();
-    match std::fs::create_dir_all(&log_dir) {
-        Ok(()) => {
-            let appender = tracing_appender::rolling::daily(&log_dir, log_prefix_for(link_id));
+    // ★ 日志文件建不出来时**绝不能 panic**：daemon 化后 fd 0/1/2 都指向
+    //   /dev/null，启动期 panic = 用户只看到「socket 未就绪」且日志零线索
+    //   （xv 真机排查过一整轮）。`rolling::daily()` 内部是 `.expect()` → panic，
+    //   所以这里用 builder 拿 `Result`，失败就退到只写 stderr。
+    let appender = std::fs::create_dir_all(&log_dir).ok().and_then(|()| {
+        tracing_appender::rolling::RollingFileAppender::builder()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix(log_prefix_for(link_id))
+            .build(&log_dir)
+            .ok()
+    });
+    let (file_layer, guard) = match appender {
+        Some(appender) => {
             let (nb, guard) = tracing_appender::non_blocking(appender);
-            let file_layer = tracing_subscriber::fmt::layer()
+            let layer = tracing_subscriber::fmt::layer()
                 .with_ansi(false)
                 .with_writer(nb);
-            tracing_subscriber::registry()
-                .with(filter)
-                .with(stderr_layer)
-                .with(file_layer)
-                .init();
-            Ok(Some(guard))
+            (Some(layer), Some(guard))
         }
-        Err(e) => {
-            // 退到只写 stderr（例如 state 目录不可写）
-            tracing_subscriber::registry()
-                .with(filter)
-                .with(stderr_layer)
-                .init();
-            eprintln!(
-                "⚠️ 日志目录不可写({}): {e}，只输出到 stderr",
-                log_dir.display()
-            );
-            Ok(None)
+        None => {
+            eprintln!("⚠️ 日志目录不可写({})，只输出到 stderr", log_dir.display());
+            (None, None)
         }
-    }
+    };
+
+    // ★ 不能用 `SubscriberInitExt::init()`/`try_init()`：tracing-subscriber
+    //   的默认 feature 带 `tracing-log`，init 内部还会调 `LogTracer::init()`
+    //   去占 `log` 全局 logger —— 而本进程在上面已用 `log::set_logger`
+    //   装了自己的 fuser 桥，于是 SetLoggerError → **启动即 panic**；
+    //   daemon 化后 stderr 指向 /dev/null，用户只看到「socket 未就绪」。
+    //   直接设全局 subscriber 即可；log → tracing 的桥由 FuserLogBridge 负责。
+    let subscriber = tracing_subscriber::registry()
+        .with(filter)
+        .with(stderr_layer)
+        .with(file_layer);
+    tracing::subscriber::set_global_default(subscriber)
+        .map_err(|e| anyhow::anyhow!("设置全局 tracing subscriber 失败: {e}"))?;
+    Ok(guard)
 }
 
 /// `log` → `tracing` 桥（只装一次，见 [`init_logging`]）。
