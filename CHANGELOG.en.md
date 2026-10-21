@@ -5,7 +5,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [中文](CHANGELOG.md) · [README](README.en.md) · [Acceptance log](docs/验收记录.md)
 
-## [Unreleased]
+## [0.7.8] - 2026-10-21
 
 ### Added
 
@@ -70,10 +70,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Verification
 
-- `cargo test --workspace` green (5 new full-sync tests + 1 `#[ignore]` read-only
-  real-NAS smoke test; M30 adds 3 tests: retry absorbs a blip / copy has no paths, URL or
-  sid / network failures only go to the note);
-- `cargo fmt --check` clean; `cargo check --workspace --all-targets` has no errors.
+- `cargo test --workspace --locked` green (**534 passed / 0 failed / 22 ignored**; 5 new
+  full-sync tests + 1 `#[ignore]` read-only real-NAS smoke test; M30 adds 3 tests: retry
+  absorbs a blip / copy has no paths, URL or sid / network failures only go to the note);
+- `cargo fmt --all --check` clean; `python3 xtask/release/check-version.py v0.7.8` passes.
 
 ## [0.7.7] - 2026-10-21
 
