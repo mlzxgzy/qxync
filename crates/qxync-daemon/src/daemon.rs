@@ -3751,7 +3751,8 @@ fn offline_info(state: &Arc<State>) -> Option<OfflineInfo> {
 /// * `Some(false)` → 确认不可达：离线（冻结上传/删除队列）；
 /// * `Some(true)`  → 网络通着、只是丢了请求 / 服务端业务故障（CGI 500、WAF 403）：
 ///   保持在线，错误照常记进 journal / last_error；
-/// * `None`（本轮没探活）→ 维持旧行为：真遇到网络错误才离线。
+/// * `None` → **防御性兜底**（生产里不可达：唯一置 `transport_offline` 的路径都会先
+///   探活并写入 `probe_reachable`）：维持旧行为，真遇到网络错误才离线。
 ///
 /// 单列成纯函数是为了能直接钉住这三态（`SyncReport` 本身不需要起 daemon）。
 fn round_marks_offline(report: &sync::SyncReport) -> bool {
@@ -3759,6 +3760,18 @@ fn round_marks_offline(report: &sync::SyncReport) -> bool {
         Some(reachable) => !reachable,
         None => report.transport_offline,
     }
+}
+
+/// 离线原因：优先用中止时写下的 `offline_reason`，否则退回最后一条错误。
+///
+/// 为什么不能只用 `errors.last()`：网络错误之后还可能记一条完全无关的本地错误
+/// （如「清除对账轮转游标失败」），状态栏就会显示成「已离线：清除对账轮转游标失败」。
+fn offline_reason_for(report: &sync::SyncReport) -> String {
+    report
+        .offline_reason
+        .clone()
+        .or_else(|| report.errors.last().cloned())
+        .unwrap_or_else(|| "网络请求失败".to_string())
 }
 
 /// 跑一轮同步（拉事件 + baseline 对账）。
@@ -3814,20 +3827,13 @@ async fn run_sync_once(state: &Arc<State>, manual: bool) -> Result<sync::SyncRep
     //   `probe_network` 只要 base_url 有回应就算通 —— CGI 持续 500 / WAF 403 / NAS
     //   封了客户端 IP 这类故障，探活永远成功。旧逻辑会因此把 daemon 长期钉在离线态、
     //   上传/删除长期冻结，界面上只剩一句「网络不可用」。
-    //   现在三态：
+    //   现在三态（同 [`round_marks_offline`]）：
     //   * `Some(false)` → 确认不可达：置离线（冻结队列）；
     //   * `Some(true)`  → 通着、只是丢了请求（或服务端业务故障）：保持在线、照常记错误；
-    //   * `None`（本轮没探活）→ 维持旧行为，只在真遇到网络错误时置离线。
+    //   * `None` → 防御性兜底（生产里不可达），只在真遇到网络错误时置离线。
     if round_marks_offline(&report) {
-        // ★ 优先用中止那条写下的 `offline_reason`（L1）：`errors.last()` 可能在网络
-        //   错误之后又记了一条无关的本地错误（如「清除对账轮转游标失败」），
-        //   状态栏就会显示成「已离线：清除对账轮转游标失败」。
-        let reason = report
-            .offline_reason
-            .clone()
-            .or_else(|| report.errors.last().cloned())
-            .unwrap_or_else(|| "网络请求失败".to_string());
-        state.connectivity.mark_offline(reason);
+        // ★ 优先用中止那条写下的 `offline_reason`（L1）：见 [`offline_reason_for`]。
+        state.connectivity.mark_offline(offline_reason_for(&report));
     } else {
         state.connectivity.mark_online();
         wake_mount_queues(state);
@@ -6457,12 +6463,36 @@ mod tests {
         r.probe_reachable = Some(true);
         r.transport_offline = false;
         assert!(!round_marks_offline(&r));
-        // 本轮没探活 → 维持旧行为：遇到过网络错误就离线
+        // 本轮没探活（防御性兜底，生产不可达）→ 维持旧行为：遇到过网络错误就离线
         r.probe_reachable = None;
         r.transport_offline = true;
         assert!(round_marks_offline(&r));
         r.transport_offline = false;
         assert!(!round_marks_offline(&r));
+    }
+
+    /// ★ L1：离线原因优先用中止那条，不被网络错误之后记的本地错误顶掉。
+    #[test]
+    fn offline_reason_prefers_the_abort_message() {
+        use crate::sync::SyncReport;
+        let mut r = SyncReport {
+            offline_reason: Some("网络不可用：探测 NAS … 失败，本轮轮询中止".into()),
+            errors: vec!["清除对账轮转游标失败".into()],
+            aborted_offline: true,
+            ..Default::default()
+        };
+        assert!(
+            offline_reason_for(&r).contains("网络不可用"),
+            "状态栏要显示真正的原因，而不是后面那条无关的本地错误"
+        );
+        r.offline_reason = None;
+        assert_eq!(
+            offline_reason_for(&r),
+            "清除对账轮转游标失败",
+            "没有专因时退回最后一条"
+        );
+        r.errors.clear();
+        assert_eq!(offline_reason_for(&r), "网络请求失败");
     }
 
     fn client_with_sid(sid: Option<&str>) -> Arc<Client> {

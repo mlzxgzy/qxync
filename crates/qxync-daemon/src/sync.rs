@@ -156,7 +156,7 @@ const PROBE_TTL: Duration = Duration::from_secs(10);
 /// 而不是把一整批事件跑完。
 const REPROBE_AFTER_FAILURES: usize = 3;
 
-/// 每个视图里，「列举说不存在但 stat 说存在」这类 ACL 隐藏目录的告警上限。
+/// 一轮里，「列举说不存在但 stat 说存在」这类 ACL 隐藏目录的告警上限。
 ///
 /// 这类目录（真机 `/Download` / `/homes`）会**永久**命中，逐目录 WARN 等于每轮刷屏；
 /// 前 3 个照实记，其余降 debug（数目仍体现在 `list_failures` 与 note 里）。
@@ -507,10 +507,23 @@ impl SyncState {
 struct NetGuard {
     /// 上次探活结论与时间（`None` = 本轮还没探过）。
     probe: Option<(bool, Instant)>,
-    /// 自上次探活以来连续遇到多少次网络层失败（用来触发强制重探）。
+    /// 自上次探活以来又遇到多少次网络层失败（用来触发强制重探）。
     failures_since_probe: usize,
     /// 本轮已经记过多少条网络类错误（配额，其余降 debug）。
     errors_recorded: usize,
+    /// 「列举说不存在但 stat 说存在」这类 ACL 隐藏目录的告警预算（整轮共享）。
+    hidden_visible_errors: usize,
+}
+
+/// 探活结论是否该刷新（纯函数，便于单测 TTL 与失败计数两条判据）。
+///
+/// `elapsed` = 上次探活距今（`None` = 还没探过）；`failures_since_probe` = 上次探活
+/// 之后又失败了几次。
+fn probe_should_refresh(elapsed: Option<Duration>, failures_since_probe: usize) -> bool {
+    match elapsed {
+        None => true,
+        Some(d) => d >= PROBE_TTL || failures_since_probe >= REPROBE_AFTER_FAILURES,
+    }
 }
 
 impl NetGuard {
@@ -519,13 +532,8 @@ impl NetGuard {
     /// 探活结论同时写进 `report.probe_reachable`，轮询循环据此决定要不要把整个
     /// daemon 标成离线（见 [`SyncReport::probe_reachable`]）。
     async fn confirm_reachable(&mut self, client: &Client, report: &mut SyncReport) -> bool {
-        let stale = match self.probe {
-            None => true,
-            Some((_, at)) => {
-                at.elapsed() >= PROBE_TTL || self.failures_since_probe >= REPROBE_AFTER_FAILURES
-            }
-        };
-        if !stale {
+        let elapsed = self.probe.map(|(_, at)| at.elapsed());
+        if !probe_should_refresh(elapsed, self.failures_since_probe) {
             return self.probe.is_some_and(|(v, _)| v);
         }
         let v = client.probe_network(OFFLINE_PROBE_TIMEOUT).await;
@@ -538,6 +546,12 @@ impl NetGuard {
             if v { "可达" } else { "不可达" }
         );
         v
+    }
+
+    /// 是否还能记一条 ACL 隐藏目录告警（整轮最多 [`MAX_HIDDEN_VISIBLE_ERRORS`] 条）。
+    fn count_hidden_visible(&mut self) -> bool {
+        self.hidden_visible_errors += 1;
+        self.hidden_visible_errors <= MAX_HIDDEN_VISIBLE_ERRORS
     }
 
     /// 记一条网络类错误：配额内正常记（WARN + journal），超了只降 debug。
@@ -723,10 +737,9 @@ pub async fn poll_once(
                     report.note(format!("qbox_get_sync_log lower={lower} 没有新事件"));
                     break;
                 }
-                report.events += batch.events.len() as u64;
-                stats
-                    .events
-                    .fetch_add(batch.events.len() as u64, Ordering::Relaxed);
+                // ★ 计数放在**整批应用完之后**（见循环后面的累加）：中止的批会被下一轮
+                //   整批重放，若在取批时就 +=，同一个事件会在 `stats.events` 里计两次，
+                //   中止轮次里没处理的事件也会被算成「已拉取处理」。
                 let mut uids: Vec<String> = Vec::new();
                 for ev in &batch.events {
                     if let Some(u) = &ev.device_uid {
@@ -762,6 +775,10 @@ pub async fn poll_once(
                         return report;
                     }
                 }
+                report.events += batch.events.len() as u64;
+                stats
+                    .events
+                    .fetch_add(batch.events.len() as u64, Ordering::Relaxed);
                 stats.record_devices(&uids);
                 for u in uids {
                     if !report.devices.contains(&u) {
@@ -1190,6 +1207,7 @@ async fn apply_event(
             baseline,
             report,
             state_store,
+            net,
         )
         .await;
         return;
@@ -1780,9 +1798,6 @@ async fn reconcile_view(
     let mut attempted = 0usize;
     // ★ 网络探活与错误配额由 `poll_once` 建一份贯穿整轮（含事件阶段），
     //   这里不再各自计数/探活 —— 见 [`NetGuard`]。
-    // ★ 「列举说不存在但 stat 说存在」这种 ACL 隐藏目录的告警同样要限流：
-    //   永久隐藏的目录每轮都会命中，逐目录 WARN 就退回了「一遇到问题就报错」。
-    let mut hidden_visible_errors = 0usize;
     // ★ 确认整台 NAS 不可达 → 本轮对账到此为止（不再列剩余目录，也不做任何判定）。
     let mut offline_abort = false;
     for dir in &scan_window {
@@ -1847,8 +1862,7 @@ async fn reconcile_view(
                             list_failures += 1;
                             remote_map.insert(dir.clone(), sig);
                             tracing::debug!("对账：目录 {dir} 列举不可见但 stat 确认存在");
-                            hidden_visible_errors += 1;
-                            if hidden_visible_errors <= MAX_HIDDEN_VISIBLE_ERRORS {
+                            if net.count_hidden_visible() {
                                 report.error(format!(
                                     "对账列举 {dir} 说不存在（{e}），但 stat 显示仍存在 → 本轮不删该目录、不判定其内容"
                                 ));
@@ -1869,7 +1883,7 @@ async fn reconcile_view(
                             //   「整台断了」的第一现场，同样要探活/中止，而不是每个目录
                             //   各记一条、各等一次超时。非网络错误（status/会话）照常记。
                             let ctx = format!(
-                                "对账列举 {dir} 失败（{e}），stat 确认也失败（第 {attempted}/{total_dirs} 个目录）"
+                                "对账列举 {dir} 失败（{e}），stat 确认也失败（第 {attempted}/{total_dirs} 个目录）→ 本轮不判定该目录及其内容"
                             );
                             if record_net_error_or_abort(client, net, report, &e2, &ctx).await {
                                 offline_abort = true;
@@ -2108,9 +2122,29 @@ async fn reconcile_view(
         match d {
             Decision::DeleteLocal => deletes.push(path.clone()),
             _ => {
-                apply_decision(client, view, path, d, remote, baseline, report, state_store).await;
+                apply_decision(
+                    client,
+                    view,
+                    path,
+                    d,
+                    remote,
+                    baseline,
+                    report,
+                    state_store,
+                    net,
+                )
+                .await;
+                // ★ 冲突处理里重新 stat 确认整台不可达：剩下的候选不再逐个判
+                //   （每次要白等一次 connect timeout），连同删除保护一起等网络恢复。
+                if report.aborted_offline {
+                    break;
+                }
             }
         }
+    }
+    if report.aborted_offline {
+        report.note("对账因网络不可用中止（候选判定阶段）；剩余条目本轮暂不判定（不按缺失删本地）");
+        return;
     }
     // 只在「确实有东西被推迟」或「有目录列举失败」时说明；单纯轮转不是告警，
     // 不往 `last_note` 里常驻一条看似出错的提示。
@@ -2352,6 +2386,7 @@ async fn apply_decision(
     baseline: &mut Baseline,
     report: &mut SyncReport,
     state_store: &Mutex<SyncState>,
+    net: &mut NetGuard,
 ) {
     match d {
         Decision::Noop => {}
@@ -2401,7 +2436,17 @@ async fn apply_decision(
                 baseline.put(path, remote);
                 return;
             }
-            resolve_conflict(client, view, path, remote, baseline, report, state_store).await;
+            resolve_conflict(
+                client,
+                view,
+                path,
+                remote,
+                baseline,
+                report,
+                state_store,
+                net,
+            )
+            .await;
         }
         Decision::DeleteLocal => {
             // 调用方统一做删除保护，这里不应到达
@@ -2430,6 +2475,7 @@ async fn resolve_conflict(
     baseline: &mut Baseline,
     report: &mut SyncReport,
     state_store: &Mutex<SyncState>,
+    net: &mut NetGuard,
 ) {
     // ★ 实测踩过：本地 4 MiB 改动还在上传时判定冲突，冲突副本还没传完，
     //   在途的「原名上传」就把远端改回了本地内容 —— 冲突副本白做、远端变更丢失。
@@ -2446,9 +2492,23 @@ async fn resolve_conflict(
             let r2 = match stat_path(client, path).await {
                 Ok(s) => s,
                 Err(e) => {
-                    // ★ M2：上游刚 stat 成功过一次，这次失败基本等于闪断。冲突多时
-                    //   每条一个 WARN 正是「刷屏」的形态；记 debug + 一条去重提示，
-                    //   下轮自然重试（真正的断网会由对账/事件那条路确认并中止）。
+                    // ★ M2：上游刚 stat 成功过一次，**单次**失败按闪断处理（debug +
+                    //   去重提示，下轮重试）。但网络层错误也可能是「整台断了」的第一
+                    //   现场 —— 交给 `NetGuard` 探活，确认不可达就置中止标志；否则
+                    //   每个冲突都要白等一次 connect timeout，一轮能挂半小时，而且
+                    //   最后还会被判成「在线」。
+                    if e.is_offline()
+                        && record_net_error_or_abort(
+                            client,
+                            net,
+                            report,
+                            &e,
+                            "冲突处理：重新 stat 失败",
+                        )
+                        .await
+                    {
+                        return;
+                    }
                     tracing::debug!("冲突前重新 stat {path} 失败（按闪断处理，推迟到下一轮）: {e}");
                     report.note("冲突处理：在途上传结束后重新 stat 失败（网络抖动）→ 推迟到下一轮");
                     return;
@@ -2532,14 +2592,29 @@ async fn resolve_conflict(
         // ---- NAS 上那份改名成冲突副本，本地内容占原名
         CONFLICT_RENAME_REMOTE => {
             let (dir, name) = split_path(path);
-            let chosen = match pick_conflict_name(client, &dir, &name, report).await {
+            let chosen = match pick_conflict_name(client, &dir, &name, report, net).await {
                 Some(c) => c,
                 None => return,
             };
             if let Err(e) = client.rename(&dir, &name, &chosen).await {
-                report.error(format!(
-                    "{path}: 远端改名成 {chosen} 失败（策略：重命名 NAS 上的文件）: {e}"
-                ));
+                // ★ M2：改名也是网络调用 —— 断网时每个冲突各等一次 connect timeout
+                //   同样是「一屏错误 + 长阻塞」。网络层失败交给 `NetGuard` 探活/中止；
+                //   业务错误（权限/不存在）照实记一条。
+                if e.is_offline()
+                    && record_net_error_or_abort(client, net, report, &e, "冲突处理：远端改名失败")
+                        .await
+                {
+                    return;
+                }
+                if e.is_offline() {
+                    tracing::debug!(
+                        "{path}: 远端改名成 {chosen} 失败（按闪断处理，下轮重试）: {e}"
+                    );
+                } else {
+                    report.error(format!(
+                        "{path}: 远端改名成 {chosen} 失败（策略：重命名 NAS 上的文件）: {e}"
+                    ));
+                }
                 return;
             }
             let conflict_remote = join(&dir, &chosen);
@@ -2592,9 +2667,22 @@ async fn resolve_conflict(
                     finish_decision(state_store, path);
                 }
                 Some("keep_both") => {
-                    rename_local_copy(client, view, path, remote, baseline, report, local.mtime)
-                        .await;
-                    finish_decision(state_store, path);
+                    // ★ 做成了才清裁决：没做成（网络抖动 / 落盘失败）就留着，下轮重试，
+                    //   否则用户的「保留双方」选择会被悄悄丢掉。
+                    if rename_local_copy(
+                        client,
+                        view,
+                        path,
+                        remote,
+                        baseline,
+                        report,
+                        local.mtime,
+                        net,
+                    )
+                    .await
+                    {
+                        finish_decision(state_store, path);
+                    }
                 }
                 _ => {
                     // 入队（同路径只保留一条；每轮都冲突也只记一条）
@@ -2638,7 +2726,17 @@ async fn resolve_conflict(
         }
         // ---- 默认：重命名本地文件（M2c 的原始行为）
         _ => {
-            rename_local_copy(client, view, path, remote, baseline, report, local.mtime).await;
+            let _ = rename_local_copy(
+                client,
+                view,
+                path,
+                remote,
+                baseline,
+                report,
+                local.mtime,
+                net,
+            )
+            .await;
         }
     }
 }
@@ -2971,6 +3069,7 @@ async fn pick_conflict_name(
     dir: &str,
     name: &str,
     report: &mut SyncReport,
+    net: &mut NetGuard,
 ) -> Option<String> {
     let device = hostname();
     let date = today();
@@ -2980,8 +3079,15 @@ async fn pick_conflict_name(
             Ok(None) => break,
             Ok(Some(_)) => chosen = conflict_name_with_seq(name, &device, &date, seq),
             Err(e) => {
-                // ★ M2：同样按闪断处理 —— 每个冲突一条 WARN 的形态不再要；
-                //   真正的不可达由事件/对账那条路确认并中止本轮。
+                // ★ M2：单次失败按闪断处理（每个冲突一条 WARN 的形态不要）；但网络层
+                //   错误交给 `NetGuard` 探活 —— 确认不可达就中止本轮，别让每个冲突
+                //   各等一次 connect timeout。
+                if e.is_offline()
+                    && record_net_error_or_abort(client, net, report, &e, "冲突副本取名 stat 失败")
+                        .await
+                {
+                    return None;
+                }
                 tracing::debug!("冲突副本取名失败（stat {dir}/{chosen}，按闪断处理）: {e}");
                 report.note("冲突副本取名：stat 失败（网络抖动）→ 本轮跳过该冲突，下轮重试");
                 return None;
@@ -3036,23 +3142,26 @@ async fn rename_local_copy(
     baseline: &mut Baseline,
     report: &mut SyncReport,
     local_mtime: i64,
-) {
+    net: &mut NetGuard,
+) -> bool {
     let (dir, name) = split_path(path);
-    let Some(chosen) = pick_conflict_name(client, &dir, &name, report).await else {
-        return;
+    // ★ 返回 `false` = 本轮没做成（网络抖动/落盘失败）：调用方**不能**当成已完成去清
+    //   用户裁决 —— 否则「keep_both」的裁决会在冲突没处理时被删掉。
+    let Some(chosen) = pick_conflict_name(client, &dir, &name, report, net).await else {
+        return false;
     };
     // ① 先把本地内容复制到 stash（下一步失效缓存会把它删掉）
     let stash = match view.view.stash_conflict(path, &chosen) {
         Ok(p) => p,
         Err(e) => {
             report.error(format!("{path} 冲突副本落盘失败: {e}"));
-            return;
+            return false;
         }
     };
     // ② 冲突副本入队上传
     if let Err(e) = view.view.enqueue_upload(&dir, &chosen, stash, local_mtime) {
         report.error(format!("冲突副本 {dir}/{chosen} 入队失败: {e}"));
-        return;
+        return false;
     }
     // ③ 原始路径以远端为准：刷新元数据 + 丢弃本地内容
     view.view
@@ -3071,6 +3180,7 @@ async fn rename_local_copy(
     {
         tracing::debug!("冲突副本 write_log 失败（不影响）: {e}");
     }
+    true
 }
 
 // ---------------------------------------------------------------- 工具
@@ -5811,7 +5921,7 @@ mod tests {
         }
 
         // ---- 第 1 轮：只服务 max_log / sync_log / 事件 1 的 stat，之后整台「断网」
-        let (host, port, _seen, srv) = spawn_nas_server(MockNasSpec {
+        let (host, port, seen, srv) = spawn_nas_server(MockNasSpec {
             listings: listings.clone(),
             existing_entries: existing.clone(),
             max_log: Some(2),
@@ -5881,6 +5991,18 @@ mod tests {
             old,
             "事件 2 本轮没处理，不能被半批污染"
         );
+        // ★ 用实际请求序列钉住「中止发生在事件 2 的 stat」：只有事件 1 的 stat 到达了
+        //   服务端（`refuse_after=3` 精确对应 max_log/sync_log/stat(e1) 三个连接）。
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen.iter().filter(|p| p.starts_with("stat:")).count(),
+            1,
+            "第 1 轮只处理到事件 1 的 stat（事件 2 的连接被丢）: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|p| *p == format!("stat:{e1}")),
+            "事件 1 的 stat 必须真的发出过: {seen:?}"
+        );
         srv.abort();
 
         // ---- 第 2 轮：网络恢复，用同一份状态重来 —— 整批重放，事件 1 必须是 Noop
@@ -5922,6 +6044,25 @@ mod tests {
         assert_eq!(r3.deleted, 0);
         srv.abort();
         let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// ★ O2：探活刷新判据（纯函数）—— TTL 过期或「自上次探活后又失败 3 次」都刷新。
+    #[test]
+    fn probe_should_refresh_on_ttl_or_repeated_failures() {
+        assert!(probe_should_refresh(None, 0), "还没探过 → 必须探");
+        assert!(!probe_should_refresh(Some(Duration::from_secs(9)), 0));
+        assert!(
+            probe_should_refresh(Some(Duration::from_secs(10)), 0),
+            "TTL 到期（10s）→ 必须刷新"
+        );
+        assert!(
+            !probe_should_refresh(Some(Duration::ZERO), 2),
+            "两次孤立失败仍可信缓存"
+        );
+        assert!(
+            probe_should_refresh(Some(Duration::ZERO), 3),
+            "自上次探活后连续 3 次失败 → 必须重探（弱网侥幸通过后的补救）"
+        );
     }
 
     /// ★ M1 回归：探活**侥幸通过**后链路继续恶化时，连续失败到阈值必须**重新探活**
