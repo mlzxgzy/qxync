@@ -1926,6 +1926,27 @@ pub async fn tray_emit(app: tauri::AppHandle, action: String) -> Result<Value, S
     Ok(json!({"ok": true, "action": action, "event": crate::tray::ACTION_EVENT, "target": "main"}))
 }
 
+/// ★ M28：把托盘切到指定状态（前端聚合所有连接的连通性/错误后调用）。
+///
+/// * `status`：`ok`（绿）/ `offline`（红，探活失败）/ `warning`（黄，网络通着但有事）。
+///   拼错按 `ok` 处理并记日志 —— 前端是唯一调用方，协议错不该让托盘停在旧状态。
+/// * `note`：追加进 tooltip 的说明（如「3 项删除被熔断挡住」），可空。
+/// * 验收脚本打的就是真实链路：这个命令 → [`tray::set_status`] → SNI `set_icon`。
+#[tauri::command]
+pub async fn tray_set_status(
+    app: tauri::AppHandle,
+    status: String,
+    note: String,
+) -> Result<Value, String> {
+    let parsed = crate::tray::TrayStatus::from_protocol(&status);
+    if parsed.is_none() {
+        tracing::warn!("★ M28：tray_set_status 收到未知状态 {status:?}，按 ok 处理");
+    }
+    let st = parsed.unwrap_or(crate::tray::TrayStatus::Ok);
+    crate::tray::set_status(&app, st, &note);
+    Ok(json!({"ok": true, "status": status, "note": note}))
+}
+
 // ---------------------------------------------------------------- 单元测试
 
 #[cfg(test)]

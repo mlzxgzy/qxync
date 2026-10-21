@@ -252,6 +252,13 @@ pub struct SyncReport {
     pub devices: Vec<String>,
     pub notes: Vec<String>,
     pub errors: Vec<String>,
+    /// 与 `errors` **逐条对齐**的「是不是网络类错误」标记。
+    ///
+    /// 为什么单列而不是让调用方拿字符串去猜：断网/波动不是「同步出错」，是「暂时
+    /// 连不上」—— GUI 的桌面通知和错误列表要把它**排除**（托盘颜色已经表达了），
+    /// 而这个判据只有记错误的那一刻知道（`CoreError::is_offline`），事后从文本里
+    /// 猜会漏（消息措辞会变）。与 `errors` 一样只保留前 20 条。
+    pub error_is_network: Vec<bool>,
 }
 
 impl SyncReport {
@@ -262,20 +269,25 @@ impl SyncReport {
         }
     }
     pub fn error(&mut self, s: impl Into<String>) {
-        let s = s.into();
-        tracing::warn!("同步引擎: {s}");
-        if self.errors.len() < 20 {
-            self.errors.push(s);
-        }
+        self.push_error(s, false);
     }
     /// ★ M20：记一条**网络**错误 —— 顺带置离线标志（业务错误不算）。
     ///
     /// 判据只留一处：[`CoreError::is_offline`]。
     pub fn network_error(&mut self, e: &CoreError, msg: impl Into<String>) {
+        self.push_error(msg, e.is_offline());
         if e.is_offline() {
             self.transport_offline = true;
         }
-        self.error(msg);
+    }
+    /// `error` / `network_error` 的共同落点：`errors` 与 `error_is_network` 同步增长。
+    fn push_error(&mut self, s: impl Into<String>, is_network: bool) {
+        let s = s.into();
+        tracing::warn!("同步引擎: {s}");
+        if self.errors.len() < 20 {
+            self.errors.push(s);
+            self.error_is_network.push(is_network);
+        }
     }
     /// 记一条「跳过一个事件」并归类原因（见 `events_skipped_reasons`）。
     fn skip(&mut self, reason: &'static str) {
@@ -6525,6 +6537,37 @@ mod tests {
             delete_block_reason: Some(reason.into()),
             ..Default::default()
         }
+    }
+
+    /// ★ M28：`errors` 与 `error_is_network` 必须逐条对齐（含 20 条截断）——
+    /// journal 分类（warn/error）按下标取，错位会把普通错误降级成「网络抖动」
+    /// （不弹窗、不进错误列表），或反过来给网络错误弹窗。
+    #[test]
+    fn error_is_network_stays_aligned_with_errors() {
+        let mut r = SyncReport::default();
+        // 混着记：普通 error / 网络 network_error / 再普通
+        r.error("普通错误A");
+        r.network_error(&CoreError::Transport("断网".into()), "网络不可用：探测失败");
+        r.error("普通错误B");
+        assert_eq!(r.errors.len(), 3);
+        assert_eq!(r.error_is_network, vec![false, true, false]);
+
+        // 截断也要对齐：超过 20 条后两个向量一起停
+        for i in 0..30 {
+            if i % 2 == 0 {
+                r.network_error(&CoreError::Transport("断网".into()), format!("网络错误{i}"));
+            } else {
+                r.error(format!("普通错误{i}"));
+            }
+        }
+        assert_eq!(r.errors.len(), 20, "errors 截到 20 条");
+        assert_eq!(r.error_is_network.len(), 20, "标记向量必须同步截断");
+        // 截断后仍保持逐条对齐（抽查首尾）
+        assert_eq!(r.error_is_network[0], false, "第一条还是原来的普通错误A");
+        assert_eq!(
+            r.error_is_network[19], true,
+            "第 20 条是网络错误（30 条里第 19 个是偶数下标）"
+        );
     }
 
     /// ★ 真机事故：同一批 526 项删除每 30s 刷一条 WARN + 一条 journal，连续 13 小时。

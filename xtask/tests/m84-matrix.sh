@@ -581,6 +581,27 @@ else
   Q umount "$MNT3" >/dev/null 2>&1; Q task rm m84tri >/dev/null 2>&1
 fi
 
+# ---------------------------------------------------------------- 7.5 M28：托盘状态点 + 网络错误降噪（源文本级，无 GUI 也能跑）
+echo "== 7.5 M28：托盘状态点 + 网络错误降噪"
+if node xtask/tests/m28-tray-status.test.mjs >"$RUNDIR/m28-source-test.log" 2>&1; then
+  check 0 "★ M28 源文本级测试全过（托盘三色判据 / 网络错误识别 / 冲突通知过滤）"
+else
+  check 1 "★ M28 源文本级测试有失败（见 $RUNDIR/m28-source-test.log）"
+  tail -6 "$RUNDIR/m28-source-test.log" || true
+fi
+# Rust 侧：托盘状态协议 + 图标资源（无窗口也能跑，不依赖 DISPLAY/dbus）
+if cargo test -p qxync-gui --lib -- tray:: >/dev/null 2>&1; then
+  check 0 "★ M28 托盘状态协议/图标资源单测全过（三色 PNG 编译期校验）"
+else
+  check 1 "★ M28 托盘单测失败（cargo test -p qxync-gui --lib -- tray::）"
+fi
+# daemon 侧：网络错误降 warn 后，error 过滤必须查不到它
+if cargo test -p qxync-core --lib -- journal >/dev/null 2>&1; then
+  check 0 "★ M28 journal warn 档位测试全过（网络错误不进 error 列表）"
+else
+  check 1 "★ M28 journal 测试失败（cargo test -p qxync-core --lib -- journal）"
+fi
+
 # ---------------------------------------------------------------- 8. 收尾清理
 echo "== 8. 清理 NAS 测试产物 =="
 start_daemon "" ""; login
