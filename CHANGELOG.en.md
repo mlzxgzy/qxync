@@ -28,6 +28,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `qobject_cast<KOverlayIconPlugin*>`) on both generations, and clean installs on
   all five distros.
 
+### Fixed
+
+- **No more "error on every problem" while offline: probe first, report once, stop
+  the round**: real-machine logs showed a single network drop producing one WARN /
+  journal error each for `qbox_get_sync_log`, `qbox_get_device_config_list`,
+  `qbox_query_notify` and **every directory** of the reconcile pass — each failure
+  also waiting out its own connect timeout, so the user saw "the program is
+  erroring everywhere" when the only fact was "the network is down". Now any
+  **transport** failure first spends 5 s probing the NAS (`Client::probe_network`,
+  no session needed): if the probe fails too, the NAS is unreachable → the round is
+  **aborted immediately**, with exactly one error that names the NAS, says how far
+  the round got and that it resumes automatically, and skips the remaining mount
+  views and the decision-queue sweep; if the probe succeeds the failure was a
+  single dropped request (a blip) → the round continues, but transport list errors
+  are capped at 3 per round (the rest go to debug). Aborted rounds are absorbed as
+  **incomplete** (stale warnings are not cleared), and cursors for already-applied
+  events are persisted as usual (no replay). Offline-recovery probing also backs
+  off now: still every 3 s right after a drop (5-second unplugs recover instantly),
+  10 s after 30 s offline and 30 s after 5 minutes (a NAS that is off overnight is
+  no longer a stress test target).
+
 ## [0.7.4] - 2026-10-20
 
 ### Fixed

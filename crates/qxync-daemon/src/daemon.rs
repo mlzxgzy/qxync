@@ -3658,12 +3658,27 @@ async fn probe_online(state: &Arc<State>) -> bool {
 /// ★ M20：登录失败的连通性分类 —— `Transport` 才进离线，业务错误不算。
 ///
 /// 场景：daemon 已配置但 NAS 关机 / 断网，启动自动登录就失败。分类之后
-/// 轮询器才会切到 3 秒短探活（否则要等一个完整的轮询间隔才知道网络回来了）。
+/// 轮询器才会切到短探活（否则要等一个完整的轮询间隔才知道网络回来了）。
 fn note_login_failure_connectivity(state: &State, e: &IpcError) {
     if e.kind == ErrorKind::Transport {
         state
             .connectivity
             .mark_offline(format!("登录时网络不可用: {}", e.message));
+    }
+}
+
+/// 离线探活间隔（秒）—— 刚断网时 3 秒（恢复要快），离线越久越慢。
+///
+/// 恒定 3 秒在「NAS 关机一整夜 / 宽带断了一下午」的场景里就是拿死掉的地址做压力
+/// 测试（一分钟 20 次连接）；而一上来就 30 秒又会让「拔网线 5 秒」这种常见抖动多等
+/// 半分钟。所以按**已离线时长**分三档：前 30 秒 3s、前 5 分钟 10s、之后 30s。
+/// 恢复后连通性置在线，计时自动归零（`Connectivity::mark_offline` 只在状态
+/// 切换时重置 `since`，重复失败不会把「已离线 10 分钟」刷新回 0）。
+fn offline_probe_secs(offline_secs: u64) -> u64 {
+    match offline_secs {
+        0..=30 => 3,
+        31..=300 => 10,
+        _ => 30,
     }
 }
 
@@ -3775,9 +3790,12 @@ async fn run_sync_once(state: &Arc<State>, manual: bool) -> Result<sync::SyncRep
     // ★ M20：用本轮结论刷新连通性。网络错误 → 离线（队列会停）；正常跑完 →
     // 在线，并唤醒可能还在闸门上等的上传/删除 worker。
     if report.transport_offline {
+        // ★ 取**最后**一条而不是第一条：网络确认不可达时，最后一条是那句
+        //   「网络不可用：探测 NAS … 失败，本轮……中止」，比第一条单点失败
+        //   （可能只是 `qbox_get_sync_log` 的瞬时错误）更接近用户要知道的结论。
         let reason = report
             .errors
-            .first()
+            .last()
             .cloned()
             .unwrap_or_else(|| "网络请求失败".to_string());
         state.connectivity.mark_offline(reason);
@@ -3871,18 +3889,31 @@ fn spawn_poller(state: Arc<State>, mut gen: EngineGen) -> tokio::task::JoinHandl
             let secs = *state.sync_interval.lock().unwrap();
             let mut recovered = false;
             let hurry = std::mem::take(&mut retry_soon);
-            // ★ M20：**已知离线 → 3 秒短探活**，不等 30s/600s 的完整轮询间隔。
+            // ★ M20：**已知离线 → 短探活**，不等 30s/600s 的完整轮询间隔。
             //   探活成功立刻回放离线缓冲区并补一轮对账，然后回到正常节奏。
             //   注意这里不看 `secs`：即使把轮询间隔设成 0（暂停自动对账），
             //   离线的发送队列也需要一个恢复检测，否则离线缓冲区永远不会被推上去。
+            //
+            //   ★ 探活间隔按**已离线时长**退避（3s → 10s → 30s）：拔网线 5 秒这种
+            //     常见抖动仍能秒级恢复；而 NAS 关机一整夜时，恒定 3 秒就是拿死掉的
+            //     地址做压力测试（一分钟 20 次连接）。
             if hurry {
                 if !gen.sleep(Duration::from_secs(3)).await {
                     tracing::info!("变更轮询退出（同步引擎已换代）");
                     return;
                 }
             } else if !state.connectivity.is_online() {
+                let snap = state.connectivity.snapshot();
+                // `since_unix == 0` = 还没有起点（`mark_offline` 在状态切换后才写它，
+                // 这里读到极小的竞态窗口）→ 按「刚断」处理，别把首次探活退成 30 秒。
+                let offline_secs = if snap.since_unix > 0 {
+                    (now_secs() as i64 - snap.since_unix).max(0) as u64
+                } else {
+                    0
+                };
+                let wait = Duration::from_secs(offline_probe_secs(offline_secs));
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+                    _ = tokio::time::sleep(wait) => {}
                     _ = gen.changed() => {
                         tracing::info!("变更轮询退出（同步引擎已换代）");
                         return;
@@ -6360,6 +6391,21 @@ async fn space_cmd(state: &Arc<State>, now: bool) -> Result<serde_json::Value, I
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ★ 离线探活退避：刚断网要快（3s），离线越久越慢（10s → 30s）。
+    ///
+    /// 边界值钉住，防止以后有人把分档改坏：恒定 3 秒 = 拿死掉的地址做压力测试，
+    /// 一上来 30 秒 = 「拔网线 5 秒」要等半分钟才恢复。
+    #[test]
+    fn offline_probe_backoff_keeps_early_recovery_fast() {
+        assert_eq!(offline_probe_secs(0), 3, "刚断开要秒级探活");
+        assert_eq!(offline_probe_secs(1), 3);
+        assert_eq!(offline_probe_secs(30), 3);
+        assert_eq!(offline_probe_secs(31), 10, "离线超过 30 秒开始放缓");
+        assert_eq!(offline_probe_secs(300), 10);
+        assert_eq!(offline_probe_secs(301), 30, "离线超过 5 分钟退到 30 秒");
+        assert_eq!(offline_probe_secs(86_400), 30, "有上限，不会无限放大");
+    }
 
     fn client_with_sid(sid: Option<&str>) -> Arc<Client> {
         let link = LinkConfig {

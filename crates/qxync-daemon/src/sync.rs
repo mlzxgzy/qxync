@@ -126,6 +126,19 @@ pub const SCAN_BUDGET_RATIO_OF_INTERVAL: f64 = 0.5;
 /// `sync --once` / GUI「立即同步」的时间预算（手动场景就是想全量，给足但不无限）。
 pub const SCAN_BUDGET_ONCE: Duration = Duration::from_secs(600);
 
+/// 遇到网络错误后**确认 NAS 到底连不连得上**的探活超时。
+///
+/// 与 M20 离线恢复的短探活同一量级（5 秒）：足够区分「整台不可达」与「这一条请求
+/// 被丢」，又不会让一次抖动把一轮轮询拖很久。见 [`record_net_error_or_abort`]。
+const OFFLINE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 一轮对账里，**网络层**列举失败最多记几条错误（其余的降级为 debug）。
+///
+/// 为什么要有上限：探活说「可达」时说明只是单条请求失败，继续列剩下的目录是对的；
+/// 但真机上一次弱网抖动可以让几十个目录轮流失败 —— 每条都 WARN + 进 journal，
+/// 用户看到的是「程序到处报错」，而真正的事实只有一句「网络在抖」。
+const MAX_LIST_ERRORS_PER_ROUND: usize = 3;
+
 impl Default for SyncConfig {
     fn default() -> Self {
         Self {
@@ -190,6 +203,13 @@ pub struct SyncReport {
     /// 轮询循环据此把连通性状态机置为离线、切到「短探活」节奏；上传/删除队列
     /// 也会同时停在「等联网」。
     pub transport_offline: bool,
+    /// ★ 本轮是否因为**确认 NAS 连不上**而提前中止（对账没跑完）。
+    ///
+    /// 与 [`SyncReport::transport_offline`] 的区别：后者只说「这轮遇到过网络错误」，
+    /// 轮次仍可能把剩下的目录/阶段跑完 —— 那正是「一次断网刷一屏错误」的来源；
+    /// 这个标志表示「探活确认整台不可达 → 剩下的先不做」，`poll_once` 据此跳过
+    /// 其余视图与待裁决巡检，并按**未完成轮次**并入长期状态（不清旧告警）。
+    pub aborted_offline: bool,
     pub baseline_entries: usize,
     pub dirs_scanned: usize,
     pub devices: Vec<String>,
@@ -438,6 +458,72 @@ impl SyncState {
 
 // ---------------------------------------------------------------- 主循环
 
+/// 一次网络错误之后：探一次「NAS 到底连不连得上」，结论整轮复用。
+///
+/// * `true` = 网络层通着（服务端回 4xx/5xx 也算通）→ 这条错误是**单次**失败；
+/// * `false` = 连接都建不起来 → 整台不可达。
+///
+/// 一轮只探一次：抖动不会因为多探几次变得通，而每次探活本身也要等超时。
+async fn nas_reachable(client: &Client, probe: &mut Option<bool>) -> bool {
+    match *probe {
+        Some(v) => v,
+        None => {
+            let v = client.probe_network(OFFLINE_PROBE_TIMEOUT).await;
+            *probe = Some(v);
+            tracing::debug!(
+                "网络错误后探活 {}：{}（这决定本轮继续还是中止）",
+                client.link().base_url(),
+                if v { "可达" } else { "不可达" }
+            );
+            v
+        }
+    }
+}
+
+/// 记录一次取数失败：**网络错误先探活**，确认整台不可达就中止本轮。
+///
+/// 返回 `true` = 已中止（调用方立刻收尾并 `return report`，不要继续后面的阶段）。
+///
+/// 为什么不能「每个目录/每个接口各记一条」：真机实测（2026-10-19 日志），一次断网在
+/// 一轮里被记成 `qbox_get_sync_log` + `qbox_get_device_config_list` +
+/// `qbox_query_notify` + 每个对账目录各一条，用户看到的是「程序到处报错」，
+/// 而事实只有一句「网络断了」。这里把网络类失败收敛成**一条**：带上 NAS 地址、
+/// 已做到哪一步、以及「恢复后会自动继续」。
+async fn record_net_error_or_abort(
+    client: &Client,
+    probe: &mut Option<bool>,
+    report: &mut SyncReport,
+    e: &CoreError,
+    context: &str,
+) -> bool {
+    if e.is_offline() && !nas_reachable(client, probe).await {
+        let msg = format!(
+            "网络不可用：探测 NAS {} 失败，本轮轮询中止（{context}；本轮不判定任何远端缺失，恢复后自动继续）。底层错误：{e}",
+            client.link().base_url()
+        );
+        report.network_error(e, msg);
+        report.aborted_offline = true;
+        return true;
+    }
+    report.network_error(e, format!("{context}: {e}"));
+    false
+}
+
+/// 中止一轮时的收尾：处理到哪就落盘到哪（事件不重放），长期状态按**未完成轮次**并入。
+///
+/// 「没检查过」≠「检查通过」：不能因为这一轮没跑完就清掉上一轮的真实告警。
+fn finish_aborted_round(
+    store: &Mutex<SyncState>,
+    cursors: &Cursors,
+    baseline: &Baseline,
+    stats: &SyncStats,
+    report: &mut SyncReport,
+) {
+    report.baseline_entries = baseline.len();
+    persist(store, cursors, baseline);
+    absorb_round(stats, report, false);
+}
+
 /// 跑一轮：拉事件 + 对账全部挂载视图。
 pub async fn poll_once(
     client: &Client,
@@ -463,6 +549,11 @@ pub async fn poll_once(
     stats.polls.fetch_add(1, Ordering::Relaxed);
     stats.last_poll_unix.store(now_secs(), Ordering::Relaxed);
 
+    // ★ 本轮「NAS 到底连不连得上」的探活结论（一次探活，整轮复用）。
+    //   见 [`record_net_error_or_abort`]：确认不可达就中止本轮，别把同一个网络错误
+    //   在每个接口、每个目录上各刷一遍。
+    let mut net_probe: Option<bool> = None;
+
     // ---- ① 取 max_log；回退 → 游标归零 + 全量重扫
     let max: MaxLog = match client.max_log().await {
         Ok(m) => m,
@@ -478,7 +569,15 @@ pub async fn poll_once(
             if max_log_failure_is_session_loss(&e) {
                 report.auth_failed = true;
             }
-            report.network_error(&e, format!("qbox_get_max_log 失败: {e}"));
+            record_net_error_or_abort(
+                client,
+                &mut net_probe,
+                &mut report,
+                &e,
+                "qbox_get_max_log 失败",
+            )
+            .await;
+            // 第一跳就失败：无论探活结论如何，本轮都没有对账可言。
             // 本轮没跑到对账 → completed=false：只更新「当前错误」，不清任何陈旧告警。
             absorb_round(stats, &mut report, false);
             return report;
@@ -550,8 +649,15 @@ pub async fn poll_once(
                         &mut baseline,
                         &mut report,
                         store,
+                        &mut net_probe,
                     )
                     .await;
+                    // ★ 整台 NAS 已确认不可达：这一批剩下的事件不再逐条等超时。
+                    //   游标没推进 → 下一轮重放（`apply_event` 的判定是幂等的）。
+                    if report.aborted_offline {
+                        finish_aborted_round(store, &cursors, &baseline, stats, &mut report);
+                        return report;
+                    }
                 }
                 stats.record_devices(&uids);
                 for u in uids {
@@ -584,7 +690,18 @@ pub async fn poll_once(
                 if e.is_auth() {
                     report.auth_failed = true;
                 }
-                report.network_error(&e, format!("qbox_get_sync_log lower={lower} 失败: {e}"));
+                if record_net_error_or_abort(
+                    client,
+                    &mut net_probe,
+                    &mut report,
+                    &e,
+                    &format!("qbox_get_sync_log lower={lower} 失败"),
+                )
+                .await
+                {
+                    finish_aborted_round(store, &cursors, &baseline, stats, &mut report);
+                    return report;
+                }
                 break;
             }
         }
@@ -609,7 +726,18 @@ pub async fn poll_once(
                 if e.is_auth() {
                     report.auth_failed = true;
                 }
-                report.network_error(&e, format!("qbox_get_device_config_list 失败: {e}"));
+                if record_net_error_or_abort(
+                    client,
+                    &mut net_probe,
+                    &mut report,
+                    &e,
+                    "qbox_get_device_config_list 失败",
+                )
+                .await
+                {
+                    finish_aborted_round(store, &cursors, &baseline, stats, &mut report);
+                    return report;
+                }
             }
         }
     }
@@ -631,7 +759,18 @@ pub async fn poll_once(
                 if e.is_auth() {
                     report.auth_failed = true;
                 }
-                report.network_error(&e, format!("qbox_query_notify 失败: {e}"));
+                if record_net_error_or_abort(
+                    client,
+                    &mut net_probe,
+                    &mut report,
+                    &e,
+                    "qbox_query_notify 失败",
+                )
+                .await
+                {
+                    finish_aborted_round(store, &cursors, &baseline, stats, &mut report);
+                    return report;
+                }
             }
         }
     }
@@ -639,6 +778,18 @@ pub async fn poll_once(
     // ---- ④ baseline 对账（兜底：我们自己的写操作不产生事件）
     for view in views {
         reconcile_view(client, view, cfg, &mut baseline, &mut report, store).await;
+        // ★ 对账中途确认整台 NAS 不可达：其余视图列下去只会重复同一个错误
+        //   （每个目录还要各自等一次连接超时）。剩下的等网络恢复再扫。
+        if report.aborted_offline {
+            break;
+        }
+    }
+
+    // ★ 网络不可用 → 本轮到此为止：巡检要 stat（只会「查不到」+ 白等超时），
+    //   计数器也不再把未完成的轮次当成完整轮次（吸收时 completed=false）。
+    if report.aborted_offline {
+        finish_aborted_round(store, &cursors, &baseline, stats, &mut report);
+        return report;
     }
 
     // ---- ④' 冲突待裁决队列巡检（把已经不该留着的行清掉）
@@ -845,6 +996,7 @@ async fn apply_event(
     baseline: &mut Baseline,
     report: &mut SyncReport,
     state_store: &Mutex<SyncState>,
+    net_probe: &mut Option<bool>,
 ) {
     if !ev.has_usable_path() {
         // 真机实测：删除事件的 filepath 是空的 → 只能靠对账发现
@@ -897,7 +1049,17 @@ async fn apply_event(
                     if e.is_auth() {
                         report.auth_failed = true;
                     }
-                    report.network_error(&e, format!("事件 stat {path} 失败: {e}"));
+                    // ★ 一批事件可以上千条：网络中途断了还逐条 stat，就是上千次
+                    //   connect timeout + 一屏错误。确认整台不可达 → 置中止标志，
+                    //   调用方看到后立刻收手（已在处理的事件由游标保证可重放）。
+                    record_net_error_or_abort(
+                        client,
+                        net_probe,
+                        report,
+                        &e,
+                        &format!("事件 stat {path} 失败"),
+                    )
+                    .await;
                 }
                 return;
             }
@@ -1502,6 +1664,12 @@ async fn reconcile_view(
     let mut rotating_listed = 0usize;
     let mut budget_exhausted = false;
     let mut attempted = 0usize;
+    // ★ 本轮「NAS 到底连不连得上」的探活结论（见 [`nas_reachable`]）与本轮网络类
+    //   列举失败计数（错误最多记 [`MAX_LIST_ERRORS_PER_ROUND`] 条，其余降 debug）。
+    let mut net_probe: Option<bool> = None;
+    let mut transport_failures = 0usize;
+    // ★ 确认整台 NAS 不可达 → 本轮对账到此为止（不再列剩余目录，也不做任何判定）。
+    let mut offline_abort = false;
     for dir in &scan_window {
         if dir != &root
             && rotating_listed >= 1
@@ -1592,7 +1760,35 @@ async fn reconcile_view(
                 if e.is_auth() {
                     report.auth_failed = true;
                 }
-                report.network_error(&e, format!("对账列举 {dir} 失败: {e}"));
+                if e.is_offline() {
+                    transport_failures += 1;
+                    // ★ 先分清「整台连不上」和「这一条被丢了」：
+                    //   * 探活也失败 → 剩下 N 个目录挨个试只是把同一条错误刷 N 遍
+                    //     （每次还要等 connect timeout），立刻中止本轮；
+                    //   * 探活通过 → 只是闪断，继续列（但错误最多记 3 条，别刷屏）。
+                    if !nas_reachable(client, &mut net_probe).await {
+                        let msg = format!(
+                            "网络不可用：探测 NAS {} 失败，本轮对账在第 {attempted}/{total_dirs} 个目录中止\
+                             （已列 {scanned} 个，剩余目录等网络恢复后再列；本轮不判定任何远端缺失）。\
+                             底层错误：{e}",
+                            client.link().base_url()
+                        );
+                        report.network_error(&e, msg);
+                        report.aborted_offline = true;
+                        offline_abort = true;
+                        break;
+                    }
+                    if transport_failures <= MAX_LIST_ERRORS_PER_ROUND {
+                        report.network_error(&e, format!("对账列举 {dir} 失败: {e}"));
+                    } else {
+                        report.transport_offline = true;
+                        tracing::debug!(
+                            "对账列举 {dir} 失败（本轮网络类错误已记满 {MAX_LIST_ERRORS_PER_ROUND} 条，降为 debug）: {e}"
+                        );
+                    }
+                } else {
+                    report.network_error(&e, format!("对账列举 {dir} 失败: {e}"));
+                }
             }
         }
         if dir != &root {
@@ -1640,6 +1836,18 @@ async fn reconcile_view(
             cfg.max_dirs_per_poll,
             scan_window.len()
         ));
+    }
+
+    // ★ 已确认整台 NAS 不可达：本轮到此为止。
+    //
+    //   没列到的目录本来就不会被判定（`observed_dirs` 安全阀），但继续往下走还会
+    //   产生 stat / 改名 / 上传等网络调用，每一次都要白等超时，而结论不会变。
+    //   游标已按「最后一个尝试过的目录」推进，网络恢复后从那里续扫。
+    if offline_abort {
+        report.note(format!(
+            "对账因网络不可用中止（已列 {scanned}/{total_dirs} 个目录）；未列到的目录下条目本轮暂不判定（不按缺失删本地）"
+        ));
+        return;
     }
 
     // ★ M7 + M11+：被排除路径（用户规则 / 回收站）的 baseline 条目直接清掉 ——
@@ -4298,6 +4506,9 @@ mod tests {
             peer_name: None,
         };
         let client = Client::new(&link).expect("构造 client 不该需要联网");
+        // ★ 必须塞一个 sid：否则 `list` 在 require_sid 就回 Auth，根本走不到网络层
+        //   —— 这条用例测的是「连不上」，不是「没登录」。
+        client.set_sid("test-sid");
         let mv = MountView {
             mountpoint: PathBuf::from("/tmp/reconcile-defer"),
             remote_root: HOME_ROOT.to_string(),
@@ -4313,6 +4524,19 @@ mod tests {
         assert!(
             !report.errors.is_empty(),
             "列举失败必须如实记错误: {report:?}"
+        );
+        assert!(
+            report.aborted_offline,
+            "探活也连不上 → 必须确认「整台不可达」并中止本轮: {report:?}"
+        );
+        assert_eq!(
+            report.errors.len(),
+            1,
+            "确认不可达后只记**一条**错误，不能每个目录各刷一条: {report:?}"
+        );
+        assert!(
+            report.errors[0].contains("网络不可用"),
+            "错误要说人话（网络不可用 + NAS 地址 + 已做到哪一步）: {report:?}"
         );
         assert_eq!(report.deleted, 0, "列举失败时不许删任何东西");
         assert!(
@@ -4379,6 +4603,11 @@ mod tests {
         stat_fail: BTreeSet<String>,
         /// `stat` 这些完整路径 → JSON `status`
         stat_status: BTreeMap<String, i64>,
+        /// ★ 只服务前 N 条连接，之后**接受即丢弃**（不回包）——模拟「对账中途整台 NAS 断网」。
+        ///
+        /// 丢弃而不是关闭 listener：让探活也拿到一个确定的网络层失败，不依赖内核
+        /// 什么时候真正停掉监听。
+        refuse_after: Option<usize>,
     }
 
     /// 极简 NAS HTTP 服务：实现对账用到的 `get_list` 与 `stat` 两跳。
@@ -4421,6 +4650,7 @@ mod tests {
             existing_entries,
             stat_fail,
             stat_status,
+            refuse_after,
         } = spec;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -4434,10 +4664,19 @@ mod tests {
         let stat_fail = Arc::new(stat_fail);
         let stat_status = Arc::new(stat_status);
         let handle = tokio::spawn(async move {
+            let mut accepted = 0usize;
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else {
                     return;
                 };
+                // ★ 模拟对账中途整台断网：前 N 条连接正常服务，之后接受即丢弃。
+                //   客户端因此拿到的是网络层错误（连接被关），探活也一样 —— 正是
+                //   「该中止本轮」的判据。
+                if refuse_after.is_some_and(|limit| accepted >= limit) {
+                    drop(sock);
+                    continue;
+                }
+                accepted += 1;
                 let seen = seen_task.clone();
                 let listings = listings.clone();
                 let fail = fail.clone();
@@ -4624,6 +4863,7 @@ mod tests {
 
         // ---- ① 正常事件：路径映射正确、三方一致 → Noop，且请求里是单前缀路径
         let mut r1 = SyncReport::default();
+        let mut probe1 = None;
         let ev = mk_event("/share/homes/test1/.Qsync/2026/28-比赛项目/01配置备份/防火墙配置.txt");
         apply_event(
             &client,
@@ -4634,6 +4874,7 @@ mod tests {
             &mut baseline,
             &mut r1,
             &store,
+            &mut probe1,
         )
         .await;
         assert!(r1.errors.is_empty(), "不该有错误: {:?}", r1.errors);
@@ -4658,6 +4899,7 @@ mod tests {
 
         // ---- ② 事件指向「看不到」的路径：跳过、不记错误（旧实现会刷一条 error）
         let mut r2 = SyncReport::default();
+        let mut probe2 = None;
         let ev2 = mk_event("/share/homes/test1/.Qsync/2026/已删除.txt");
         apply_event(
             &client,
@@ -4668,6 +4910,7 @@ mod tests {
             &mut baseline,
             &mut r2,
             &store,
+            &mut probe2,
         )
         .await;
         assert_eq!(r2.events_skipped, 1, "看不到的路径只跳过: {r2:?}");
@@ -4685,6 +4928,73 @@ mod tests {
         assert!(
             !r2.auth_failed,
             "status=5 是「路径不存在」的常规出口，不能因此重登（否则真机撞失败登录封锁）"
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// ★ 事件流中途断网：`apply_event` 的 stat 遇网络错误 → 探活确认整台不可达 →
+    /// 置中止标志。调用方（批循环）据此立刻收手，不再给剩下的上千条事件各等一次
+    /// connect timeout、各记一条错误。
+    #[tokio::test]
+    async fn apply_event_aborts_after_confirming_nas_unreachable() {
+        let work = tmpdir("event-offline-abort");
+        let view = FakeLocal::new(HOME_ROOT, work.join("stash"));
+        let store = Mutex::new(SyncState::load(work.join("state")).unwrap());
+        let mut baseline = Baseline::default();
+        let mv = mount_view(view, HOME_ROOT, "/tmp/event-offline-abort");
+        let cfg = SyncConfig::default();
+        let link = LinkConfig {
+            id: "t".into(),
+            host: "127.0.0.1".into(),
+            port: 1, // 必然 connection refused
+            https: false,
+            insecure: true,
+            user: "test1".into(),
+            ipv4_only: false,
+            exclude: Vec::new(),
+            filter_temp: true,
+            peer_listen: None,
+            peer_name: None,
+        };
+        let client = Client::new(&link).unwrap();
+        client.set_sid("test-sid");
+        let ev = qxync_core::sync::SyncEvent {
+            log_id: 1,
+            action: qxync_core::sync::ACTION_UPSERT_FILE,
+            isfolder: 2,
+            filepath: "/share/homes/test1/x/y.txt".into(),
+            old_filepath: String::new(),
+            exist: true,
+            mtime: 1792368403,
+            size: 3,
+            device: Some("win-pc".into()),
+            device_uid: None,
+            user: Some("test1".into()),
+        };
+        let mut report = SyncReport::default();
+        let mut probe = None;
+        apply_event(
+            &client,
+            std::slice::from_ref(&mv),
+            &ev,
+            &cfg,
+            "test1",
+            &mut baseline,
+            &mut report,
+            &store,
+            &mut probe,
+        )
+        .await;
+
+        assert!(
+            report.aborted_offline,
+            "事件 stat 确认不可达必须中止，不能继续给剩下的事件挨个等超时: {report:?}"
+        );
+        assert_eq!(report.errors.len(), 1, "只记一条: {report:?}");
+        assert!(
+            report.errors[0].contains("网络不可用"),
+            "{:?}",
+            report.errors
         );
         let _ = std::fs::remove_dir_all(&work);
     }
@@ -5089,6 +5399,80 @@ mod tests {
         assert!(
             report.errors.iter().any(|x| x.contains("对账列举")),
             "失败必须如实记错误: {report:?}"
+        );
+        assert!(
+            !report.aborted_offline,
+            "探活显示 NAS 可达（HTTP 500 只是单条失败）→ 不许中止整轮: {report:?}"
+        );
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// ★ 断网发生在**对账中途**：根目录列成功，之后整台 NAS 连不上。
+    ///
+    /// 旧行为：剩下每个目录各记一条 WARN、各等一次连接超时，一轮里同一个「网络错误」
+    /// 刷一屏；新行为：探活确认不可达 → 立刻收手、只记**一条**，且本轮不做任何判定。
+    #[tokio::test]
+    async fn reconcile_stops_at_first_unreachable_and_reports_once() {
+        use qxync_core::DirEntry;
+        let home = HOME_ROOT;
+        let a = format!("{home}/a");
+        let b = format!("{home}/b");
+        let mut listings: BTreeMap<String, Vec<DirEntry>> = BTreeMap::new();
+        listings.insert(
+            home.to_string(),
+            vec![
+                DirEntry::local("a", true, 0, 0),
+                DirEntry::local("b", true, 0, 0),
+            ],
+        );
+        listings.insert(a.clone(), vec![DirEntry::local("f.txt", false, 10, 100)]);
+        listings.insert(b.clone(), vec![DirEntry::local("g.txt", false, 10, 100)]);
+        // 只服务根目录那一次列举，之后所有连接（含探活）都被丢弃。
+        let (host, port, _seen, srv) = spawn_nas_server(MockNasSpec {
+            listings,
+            refuse_after: Some(1),
+            ..Default::default()
+        })
+        .await;
+
+        let work = tmpdir("reconcile-abort-midway");
+        let view = FakeLocal::new(home, work.join("stash"));
+        let mut baseline = Baseline::default();
+        for p in [format!("{a}/f.txt"), format!("{b}/g.txt")] {
+            view.add_file(&p, 10, 100, false, None);
+            baseline.put(p, Sig::file(10, 100));
+        }
+        let store = Mutex::new(SyncState::load(work.join("state")).unwrap());
+        let mv = mount_view(view.clone(), home, "/tmp/reconcile-abort-midway");
+        let client = client_for(&host, port);
+        let cfg = SyncConfig::default();
+        let mut report = SyncReport::default();
+        reconcile_view(&client, &mv, &cfg, &mut baseline, &mut report, &store).await;
+
+        assert!(
+            report.aborted_offline,
+            "确认整台不可达必须中止本轮: {report:?}"
+        );
+        assert_eq!(
+            report.dirs_scanned, 1,
+            "只列了根就收手，不能把剩下的目录挨个试一遍: {report:?}"
+        );
+        assert_eq!(report.errors.len(), 1, "一条断网只准记一条错误: {report:?}");
+        assert!(
+            report.errors[0].contains("网络不可用"),
+            "错误要说人话: {:?}",
+            report.errors
+        );
+        assert_eq!(report.deleted, 0, "中止的轮次不许删任何东西");
+        assert!(
+            view.node(&format!("{a}/f.txt")).is_some()
+                && view.node(&format!("{b}/g.txt")).is_some(),
+            "没列到的目录不能判定为远端删除"
+        );
+        assert!(
+            report.notes.iter().any(|n| n.contains("暂不判定")),
+            "要向用户说明为什么这轮没判定: {report:?}"
         );
         srv.abort();
         let _ = std::fs::remove_dir_all(&work);
