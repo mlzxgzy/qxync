@@ -5,7 +5,7 @@
 
 [English](CHANGELOG.en.md) · [README](README.md) · [验收记录](docs/验收记录.md)
 
-## [Unreleased]
+## [0.7.5] - 2026-10-21
 
 ### 新增
 
