@@ -5,6 +5,32 @@
 
 [English](CHANGELOG.en.md) · [README](README.md) · [验收记录](docs/验收记录.md)
 
+## [0.7.7] - 2026-10-21
+
+### 修复
+
+- **v0.7.6 的 daemon 二进制启动即 panic：`log` 桥与 `LogTracer` 抢全局
+  logger（CLI / GUI 本身正常，但没有 daemon 一切功能不可用）**。v0.7.6 为把
+  fuser 的诊断日志接进 daemon 日志，在 `init_logging()` 里先
+  `log::set_logger(&FuserLogBridge)`，随后
+  `tracing_subscriber::registry().init()` —— 而 `init()`（默认 feature 含
+  `tracing-log`）内部还会调 `LogTracer::init()` 去占 `log` 全局 logger，
+  两者撞车 → `SetLoggerError` → `.expect()` panic。daemon 化后 fd 0/1/2 已
+  指向 `/dev/null`，panic 无声无息：用户只看到 `qxync daemon start` 报
+  「qxyncd 已派生但 socket 未就绪」、日志零线索。
+  - 改用 `tracing::subscriber::set_global_default()`，绕开 `init()` 内置的
+    `LogTracer`；`log` → `tracing` 桥继续由 `FuserLogBridge` 负责，fuser 的
+    诊断日志照常可见；
+  - **日志文件初始化失败不再 panic**：`tracing_appender::rolling::daily()`
+    内部 `.expect()` 在日志文件建不出来时同样会 panic（同样被 `/dev/null`
+    吞掉）—— 改用 builder 拿 `Result`，失败降级为只写 stderr（并在 stderr
+    上留一条警告）；
+  - 新增 `crates/qxync-daemon/tests/logging_init.rs` 防复发：`--print-config`
+    存活回归（启动含日志初始化并正常退出）+ 日志目录不可写时降级 stderr。
+- **v0.7.6 的 Release 资产（`qxyncd`）作废，本版重新构建全部资产**：同一
+  缺陷使 v0.7.6 的 `qxyncd` 无法启动，Release 包里的整套程序不可用；已装
+  v0.7.6 的用户请直接升级到 v0.7.7。
+
 ## [0.7.6] - 2026-10-21
 
 ### 修复

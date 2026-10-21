@@ -5,6 +5,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [中文](CHANGELOG.md) · [README](README.en.md) · [Acceptance log](docs/验收记录.md)
 
+## [0.7.7] - 2026-10-21
+
+### Fixed
+
+- **The v0.7.6 daemon binary panics at startup: the `log` bridge and
+  `LogTracer` both claim the global logger (the CLI / GUI themselves are fine,
+  but nothing works without the daemon)**. To route fuser's diagnostics into
+  the daemon log, v0.7.6 added `log::set_logger(&FuserLogBridge)` in
+  `init_logging()` before `tracing_subscriber::registry().init()` — and
+  `init()` (default features include `tracing-log`) calls `LogTracer::init()`
+  internally to claim the global `log` logger, so the two collide →
+  `SetLoggerError` → `.expect()` panic. After daemonization fds 0/1/2 already
+  point at `/dev/null`, so the panic was silent: users only saw
+  `qxync daemon start` report "qxyncd spawned but the socket never became
+  ready", with zero log clues.
+  - switch to `tracing::subscriber::set_global_default()`, bypassing the
+    built-in `LogTracer`; the log → tracing bridge stays with `FuserLogBridge`,
+    so fuser diagnostics remain visible;
+  - **log file initialization no longer panics**:
+    `tracing_appender::rolling::daily()` panics internally via `.expect()`
+    when the log file cannot be created (and that panic is swallowed by
+    `/dev/null` too) — use the builder to get a `Result` instead, degrading to
+    stderr-only (with a warning on stderr);
+  - new `crates/qxync-daemon/tests/logging_init.rs` regression guard:
+    `--print-config` survival (starts with logging initialization and exits
+    cleanly) + stderr degradation when the log directory is not writable.
+- **The v0.7.6 release assets are superseded and fully rebuilt in this
+  version**: the same defect made the v0.7.6 `qxyncd` unable to start, so the
+  released bundle was unusable; users on v0.7.6 should upgrade to v0.7.7.
+
 ## [0.7.6] - 2026-10-21
 
 ### Fixed
