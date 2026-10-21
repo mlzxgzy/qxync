@@ -5,7 +5,7 @@
 
 [English](CHANGELOG.en.md) · [README](README.md) · [验收记录](docs/验收记录.md)
 
-## [未发布]
+## [0.7.8] - 2026-10-21
 
 ### 新增
 
@@ -54,9 +54,10 @@
 
 ### 验证
 
-- `cargo test --workspace` 全绿（新增 5 个全量同步用例 + 1 个 `#[ignore]` 真机只读冒烟；
-  M30 新增 3 个用例：闪断重试吸收 / 文案不含路径 URL sid / 网络失败只进说明）；
-- `cargo fmt --check` 干净；`cargo check --workspace --all-targets` 无错误。
+- `cargo test --workspace --locked` 全绿（**534 通过 / 0 失败 / 22 忽略**；新增 5 个全量同步
+  用例 + 1 个 `#[ignore]` 真机只读冒烟；M30 新增 3 个用例：闪断重试吸收 / 文案不含路径
+  URL sid / 网络失败只进说明）；
+- `cargo fmt --all --check` 干净；`python3 xtask/release/check-version.py v0.7.8` 通过。
 
 ## [0.7.7] - 2026-10-21
 

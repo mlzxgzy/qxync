@@ -234,7 +234,7 @@ GUI：三处「有删除被熔断挡住」告警一直亮着（问题恢复/放�
   * **上次没列完**（崩溃 / 断网 / 预算用完）→ pending 标记，下轮继续；
   * 全量单轮预算 1800s（`QXNYC_FULL_SCAN_BUDGET_SECS`），用完则轮询循环 2 秒后继续；
     完成状态在**删除判定之前**落盘（删除熔断不该导致每轮重扫整棵树）；
-  * `QXNYC_FULL_SYNC=0` 可整体关掉（退回 v0.7.7 纯轮转，排障对比用）。
+  * `QXNYC_FULL_SYNC=0` 可整体关掉（退回 v0.7.8 之前的纯轮转，排障对比用）。
   * 覆盖测试：`full_scan_plan_triggers_on_first_pending_or_stale`、
     `full_scan_lists_whole_tree_in_one_round`、
     `full_scan_budget_exhaustion_keeps_pending_and_retries`、
