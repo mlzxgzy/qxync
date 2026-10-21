@@ -10,6 +10,15 @@ members = [
     "crates/qxync-proto-test",
 ]
 
+# ★ WPS 保存修复：上游 fuser 0.17 的 opcode 枚举到 47 为止，内核发来
+# FUSE_TMPFILE(51) 时解析失败 → 回 ENOSYS → open(O_TMPFILE) 拿到 EOPNOTSUPP，
+# WPS 的「O_TMPFILE + linkat」原子保存直接报「在替换目标文件时发生错误」。
+# 这里用本地补丁版（vendor/fuser）：补上 FUSE_TMPFILE 解析 + Filesystem::tmpfile。
+# 上游修复合入发布版后可移除。
+[patch.crates-io]
+fuser = { path = "vendor/fuser" }
+
+
 [workspace.package]
 version = "0.7.5"
 edition = "2021"

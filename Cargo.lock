@@ -1174,8 +1174,6 @@ dependencies = [
 [[package]]
 name = "fuser"
 version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80a5eca878900c2e39e9e52fd797954b7fc39eeefc8558257114bfea6a698fcf"
 dependencies = [
  "bitflags 2.13.2",
  "libc",
@@ -3169,6 +3167,7 @@ dependencies = [
  "anyhow",
  "clap",
  "libc",
+ "log",
  "qxync-client",
  "qxync-core",
  "qxync-fuse",
