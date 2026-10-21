@@ -117,6 +117,19 @@ pub struct SyncConfig {
     /// `0` = 不限。默认 2000：真机 1439 目录在 600s 间隔下时间预算内就能全量，
     /// 硬顶只是兜底；旧默认 200 会把这种场景硬掰成 8 轮轮转（删除延迟 80 分钟）。
     pub max_dirs_per_poll: usize,
+    /// ★ 是否启用「首次同步 / 太久没同步 / 上次没列完 → 全量列举」策略。
+    ///
+    /// 默认 `false`：保持旧行为（纯轮转），供单测/嵌入方按需开启 —— 现有那批
+    /// 「轮转窗口」回归用例依赖默认值不变。daemon 的 `run_sync_once` 会打开它。
+    pub full_sync: bool,
+    /// 「太久没同步」的阈值：距上次**完整跑完**一轮同步超过这个时长 → 按首次同步处理。
+    /// `Duration::ZERO` = 不因超时触发（首次同步 / 上次没列完仍然照常触发）。
+    pub full_sync_stale_after: Duration,
+    /// 全量列举**单轮**的时间预算（只在全量模式下生效；常规轮转仍用 [`Self::scan_time_budget`]）。
+    ///
+    /// `Duration::ZERO` = 不限。默认 [`FULL_SCAN_BUDGET`]：整棵树一轮列完的余量很大，
+    /// 但不会因为目录数爆炸把单轮无限拖长（预算用完下轮 2 秒后继续）。
+    pub full_scan_budget: Duration,
 }
 
 /// 时间预算占轮询间隔的比例（daemon 默认推导用）。
@@ -125,6 +138,110 @@ pub struct SyncConfig {
 pub const SCAN_BUDGET_RATIO_OF_INTERVAL: f64 = 0.5;
 /// `sync --once` / GUI「立即同步」的时间预算（手动场景就是想全量，给足但不无限）。
 pub const SCAN_BUDGET_ONCE: Duration = Duration::from_secs(600);
+
+// ---------------------------------------------------------------- ★ 首次 / 全量同步
+
+/// 距上次成功同步超过这个时长 → 视为「没同步过」：做一次**全量列举**（与首次同步同一条路径）。
+///
+/// 为什么是 1 小时：本引擎的变更发现主路径是「列目录 + baseline 差集」（真机上
+/// `qbox_get_sync_log` 基本是死的，恒 `-17`）。隔得越久，本地 baseline 与远端的差距越可能
+/// 超出一次轮转周期的修正能力；休眠/离线超过 1 小时回来，按首次同步重新对齐一遍，
+/// 比等 4964 个目录 × 每轮 171 个 ≈ 24 分钟的轮转周期更符合直觉，也更快。
+///
+/// `QXNYC_FULL_SYNC_AFTER_SECS` 可覆盖（`0` = 不因超时触发）。
+pub const FULL_SYNC_STALE_AFTER: Duration = Duration::from_secs(3600);
+
+/// 全量列举**单轮**的时间预算（首次同步 / 太久没同步 / 上次没列完时的一整棵树）。
+///
+/// 走 BFS：从已知目录出发，把列举中新出现的子目录**接着入队**，一轮列出整棵树（每个目录
+/// 只列一次），而不是等下一轮再从已知目录推进。真机量级参考：4964 个目录 × 约 90ms/次
+/// ≈ 7.5 分钟；1800s 是 4 倍余量。预算用完 → 收手、保留「全量未完成」标记，
+/// 轮询循环 2 秒后继续（[`FULL_SYNC_RETRY_SECS`]）。
+pub const FULL_SCAN_BUDGET: Duration = Duration::from_secs(1800);
+
+/// 全量同步没列完时，轮询循环下一轮等多久（不等常规间隔：首次同步要尽快把缓存建起来）。
+pub const FULL_SYNC_RETRY_SECS: u64 = 2;
+
+/// meta：上次**完整跑完**一轮同步的 unix 秒（link 级，「太久没同步」的判据）。
+pub const META_LAST_OK_UNIX: &str = "sync_last_ok_unix";
+
+/// meta：这个挂载点的全量列举**未完成**（进程重启 / 断网 / 预算用完都会留下它）。
+pub fn full_pending_key(mountpoint: &str) -> String {
+    format!("reconcile_full_pending:{mountpoint}")
+}
+
+/// meta：这个挂载点**完成过**一次全量列举（首次同步完成的标记）。
+pub fn full_done_key(mountpoint: &str) -> String {
+    format!("reconcile_full_done:{mountpoint}")
+}
+
+/// 全量列举的触发判定（纯函数，不碰 IO，便于单测）。
+///
+/// 三条触发理由（按优先级）：
+/// 1. **上次没列完**（`pending`）：崩溃/断网/预算用完留下的标记 —— 宁可重扫，不可漏；
+/// 2. **首次同步**（`full_done == false`）：这个挂载点还没有完整列举过一次，
+///    本地缓存是空的，此时轮转窗口只是在「慢慢建索引」；
+/// 3. **太久没同步**（距上次成功轮询超过 `stale_after`）：baseline 已经不可信，
+///    按首次同步处理。
+///
+/// 返回 `Some(原因)` = 本轮做全量；`None` = 走常规轮转。
+pub fn full_scan_plan(
+    pending: bool,
+    full_done: bool,
+    last_ok_unix: Option<u64>,
+    now: u64,
+    stale_after: Duration,
+) -> Option<String> {
+    if pending {
+        return Some("上次全量同步没有列完，本轮继续".to_string());
+    }
+    if !full_done {
+        return Some("首次同步：这个挂载点还没有完整列举过".to_string());
+    }
+    if stale_after > Duration::ZERO {
+        if let Some(ok) = last_ok_unix {
+            let age = now.saturating_sub(ok);
+            if age >= stale_after.as_secs() {
+                return Some(format!(
+                    "距上次成功同步 {}（超过 {}），按首次同步处理",
+                    human_age(age),
+                    human_age(stale_after.as_secs())
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// 全量同步状态（`status` / `sync` 展示用）：（是否有挂载点正在全量, 上次成功同步的 unix 秒）。
+pub fn full_sync_status(state: &SyncState, mountpoints: &[String]) -> (bool, Option<u64>) {
+    let last_ok = state
+        .store
+        .meta(META_LAST_OK_UNIX)
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    let pending = mountpoints.iter().any(|mp| {
+        state
+            .store
+            .meta(&full_pending_key(mp))
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some("1")
+    });
+    (pending, last_ok)
+}
+
+/// 人类可读的时长（日志 / 说明文案用：`95` → `1 分钟`）。
+fn human_age(secs: u64) -> String {
+    match secs {
+        0..=59 => format!("{secs} 秒"),
+        60..=3599 => format!("{} 分钟", secs / 60),
+        3600..=86_399 => format!("{} 小时 {} 分钟", secs / 3600, (secs % 3600) / 60),
+        _ => format!("{} 天", secs / 86_400),
+    }
+}
 
 /// 遇到网络错误后**确认 NAS 到底连不连得上**的探活超时。
 ///
@@ -171,6 +288,9 @@ impl Default for SyncConfig {
             own_devices: Vec::new(),
             scan_time_budget: Duration::ZERO,
             max_dirs_per_poll: 2000,
+            full_sync: false,
+            full_sync_stale_after: FULL_SYNC_STALE_AFTER,
+            full_scan_budget: FULL_SCAN_BUDGET,
         }
     }
 }
@@ -249,6 +369,16 @@ pub struct SyncReport {
     pub probe_reachable: Option<bool>,
     pub baseline_entries: usize,
     pub dirs_scanned: usize,
+    /// ★ 本轮有挂载点走了**全量列举**（首次同步 / 太久没同步 / 上次没列完）。
+    pub full_scan: bool,
+    /// ★ 全量列举本轮**没**把队列列完、但还有进展（预算用完）→ 轮询循环 2 秒后再来。
+    ///
+    /// 与「有目录列举失败」区分：后者等常规间隔重试，不能 2 秒一次地打 NAS。
+    pub full_scan_retry_now: bool,
+    /// 全量列举本轮列过的目录数（跨挂载点累加，日志/说明用）。
+    pub full_scan_dirs: usize,
+    /// 全量列举本轮**新发现**的目录数（初始已知目录之外，跨挂载点累加）。
+    pub full_scan_discovered: usize,
     pub devices: Vec<String>,
     pub notes: Vec<String>,
     pub errors: Vec<String>,
@@ -939,6 +1069,21 @@ pub async fn poll_once(
     report.baseline_entries = baseline.len();
     persist(store, &cursors, &baseline);
 
+    // ★ 「上次成功同步」时间：`full_scan_plan` 的「太久没同步」判据。
+    //   只有走到这里（本轮完整跑完：事件 + 对账 + 巡检）才更新 —— 提前返回的轮次
+    //   （断网 / 服务端未就绪 / 离线缓冲没清）没有完整对账，不该把时间拨到现在。
+    {
+        let now = now_secs().to_string();
+        if let Err(e) = store
+            .lock()
+            .unwrap()
+            .store
+            .set_meta(META_LAST_OK_UNIX, &now)
+        {
+            report.error(format!("记录上次成功同步时间失败: {e}"));
+        }
+    }
+
     // 计数器
     stats
         .refreshed
@@ -957,7 +1102,7 @@ pub async fn poll_once(
     //   （见 [`finish_aborted_round`] 与 max_log 失败那一支）。
     absorb_round(stats, &mut report, true);
     tracing::info!(
-        "同步轮询: max_log={} events={} refreshed={} uploaded={} conflicts={} deleted={} blocked={} baseline={} dirs={}",
+        "同步轮询: max_log={} events={} refreshed={} uploaded={} conflicts={} deleted={} blocked={} baseline={} dirs={} full_scan={} full_dirs={}",
         report.max_log,
         report.events,
         report.refreshed,
@@ -966,7 +1111,9 @@ pub async fn poll_once(
         report.deleted,
         report.deletes_blocked,
         report.baseline_entries,
-        report.dirs_scanned
+        report.dirs_scanned,
+        report.full_scan,
+        report.full_scan_dirs
     );
     report
 }
@@ -1768,18 +1915,78 @@ async fn reconcile_view(
     //   至少轮到一次；时间预算让「间隔够长」的场景直接退化成每轮全量。
     //   远端根恒定参与 —— 顶层变化与根下的文件必须每轮都看得见。
     let total_dirs = dirs.len();
-    let cursor_key = format!("reconcile_scan_cursor:{}", view.mountpoint.display());
+    let mp = view.mountpoint.display().to_string();
+    let cursor_key = format!("reconcile_scan_cursor:{mp}");
+    let full_pending = full_pending_key(&mp);
+    let full_done = full_done_key(&mp);
+
+    // ★ 首次同步 / 太久没同步 / 上次没列完 → 本轮做**全量列举**：
+    //   BFS 从已知目录出发，把列举中新出现的子目录接着入队，一轮列出整棵树（每个目录只列
+    //   一次）；不读轮转游标、不受常规单轮预算（间隔 × 50%）截断 —— 那套是给「日常轮询」
+    //   控制单轮耗时用的，用在首次同步上只会把建索引拖成几十轮。
+    //
+    //   触发状态按**挂载点**落在 meta（进程重启/断网后接得上）；完成时清 pending、写 done。
+    let full_reason: Option<String> = if cfg.full_sync {
+        let (pending, done, last_ok) = {
+            let g = state_store.lock().unwrap();
+            let pending = g.store.meta(&full_pending).ok().flatten().as_deref() == Some("1");
+            let done = g.store.meta(&full_done).ok().flatten().is_some();
+            let last_ok = g
+                .store
+                .meta(META_LAST_OK_UNIX)
+                .ok()
+                .flatten()
+                .and_then(|v| v.trim().parse::<u64>().ok());
+            (pending, done, last_ok)
+        };
+        full_scan_plan(
+            pending,
+            done,
+            last_ok,
+            now_secs(),
+            cfg.full_sync_stale_after,
+        )
+    } else {
+        None
+    };
+    let full = full_reason.is_some();
+    if full {
+        // 先落「进行中」：中途崩溃/断网，下轮继续按全量重来（宁可重扫，不可漏）。
+        if let Err(e) = state_store
+            .lock()
+            .unwrap()
+            .store
+            .set_meta(&full_pending, "1")
+        {
+            report.error(format!("记录全量同步状态失败: {e}"));
+        }
+        // 旧轮转游标对全量 BFS 没有意义；留着会让全量完成后的下一轮白转一圈。
+        if let Err(e) = state_store.lock().unwrap().store.delete_meta(&cursor_key) {
+            report.error(format!("清除对账轮转游标失败: {e}"));
+        }
+    }
     // ★ 游标**恒定读**（一次 meta 查表，便宜）：游标存在 ⟺ 上轮没列全 —— 可能是
     //   目录数超硬顶，也可能是时间预算耗尽。读不到（含首次）就从头开始。
-    let start_after = match state_store.lock().unwrap().store.meta(&cursor_key) {
-        Ok(v) => v,
-        Err(e) => {
-            report.error(format!("读取对账轮转游标失败: {e}"));
-            None
+    let start_after = if full {
+        None
+    } else {
+        match state_store.lock().unwrap().store.meta(&cursor_key) {
+            Ok(v) => v,
+            Err(e) => {
+                report.error(format!("读取对账轮转游标失败: {e}"));
+                None
+            }
         }
     };
-    let (scan_window, _planned_next) =
-        dirs_for_round(&dirs, &root, cfg.max_dirs_per_poll, start_after.as_deref());
+    // 全量模式的起点 = 当前已知的全部目录（挂载视图节点 + baseline 的父目录）；
+    // 常规模式 = 轮转窗口。两者都从远端根开始（`dirs` 里必然有根）。
+    let mut scan_window: Vec<String> = if full {
+        dirs.iter().cloned().collect()
+    } else {
+        dirs_for_round(&dirs, &root, cfg.max_dirs_per_poll, start_after.as_deref()).0
+    };
+    // 已入队目录（BFS 去重：同一个目录可能既是 baseline 父目录、又被别的目录列举出来）。
+    let mut queued: BTreeSet<String> = scan_window.iter().cloned().collect();
 
     // 列每个目录 → 远端子项签名表
     let mut remote_map: BTreeMap<String, Sig> = BTreeMap::new();
@@ -1802,6 +2009,12 @@ async fn reconcile_view(
     //   600ms）会让根吃光预算、轮转目录一个都列不到、游标也存不下 —— v0.6.4
     //   修过的饿死换个马甲回来。至少推进一个 = 游标每轮前进，最慢也能转完一圈。
     let scan_started = Instant::now();
+    // 常规轮转用「间隔 × 50%」；全量列举用 [`SyncConfig::full_scan_budget`]（余量大得多）。
+    let scan_budget = if full {
+        cfg.full_scan_budget
+    } else {
+        cfg.scan_time_budget
+    };
     // 本轮**尝试过**的最后一个轮转目录（游标按它推进；列举失败的目录也算
     // 「到过这里」——下轮从它之后续扫，回绕一圈后自然会再试它）。
     let mut last_listed: Option<String> = None;
@@ -1812,32 +2025,52 @@ async fn reconcile_view(
     //   这里不再各自计数/探活 —— 见 [`NetGuard`]。
     // ★ 确认整台 NAS 不可达 → 本轮对账到此为止（不再列剩余目录，也不做任何判定）。
     let mut offline_abort = false;
-    for dir in &scan_window {
-        if dir != &root
+    // ★ 用「索引 + 可增长的窗口」而不是 `for`：全量模式要把列举中新发现的子目录
+    //   接着入队（BFS），一轮列完整棵树；常规模式窗口固定，行为与旧实现一致。
+    let mut window_idx = 0usize;
+    while window_idx < scan_window.len() {
+        let dir = scan_window[window_idx].clone();
+        window_idx += 1;
+        if dir != root
             && rotating_listed >= 1
-            && cfg.scan_time_budget > Duration::ZERO
-            && scan_started.elapsed() >= cfg.scan_time_budget
+            && scan_budget > Duration::ZERO
+            && scan_started.elapsed() >= scan_budget
         {
             budget_exhausted = true;
             tracing::debug!(
-                "对账时间预算 {:?} 耗尽：本轮列了 {attempted}/{total_dirs} 个目录，下轮从游标续扫",
-                cfg.scan_time_budget
+                "对账时间预算 {scan_budget:?} 耗尽：本轮列了 {attempted}/{total_dirs} 个目录，{}",
+                if full {
+                    "下轮继续全量"
+                } else {
+                    "下轮从游标续扫"
+                }
             );
             break;
         }
         attempted += 1;
-        match client.list(dir).await {
+        match client.list(&dir).await {
             Ok(entries) => {
                 scanned += 1;
                 observed_dirs.insert(dir.clone());
                 // ★ M9：把这份 NAS 文件列表推给挂载视图 —— 「映射」就是它的本地物化。
                 //   之后 `readdir`/`lookup` 都吃快照，不再每次往 NAS 跑（ls 不再等网）。
-                view.view.apply_listing(dir, &entries);
+                view.view.apply_listing(&dir, &entries);
                 for e in &entries {
-                    let path = join(dir, &e.filename);
+                    let path = join(&dir, &e.filename);
                     // ★ M7：排除 / 临时文件不进远端签名表 —— 既不水合也不登记 baseline
                     if view.hidden(&path, e.isfolder).is_some() {
                         continue;
+                    }
+                    // ★ 全量同步：新出现的子目录**接着入队**（BFS）—— 一轮列完整棵树，
+                    //   而不是等下一轮再从「已知目录」往前推进（那样一棵三层树要好几轮，
+                    //   每轮还要把已列过的目录重列一遍）。
+                    if full
+                        && e.isfolder
+                        && path != root
+                        && under_root(&path)
+                        && queued.insert(path.clone())
+                    {
+                        scan_window.push(path.clone());
                     }
                     remote_map.insert(path, Sig::from_entry(e));
                 }
@@ -1849,7 +2082,7 @@ async fn reconcile_view(
                 //   明确说「不存在」（占位条目 exist=0）才敢把该目录当已删除；stat 说存在
                 //   或 stat 也报错 → 按「没看到」处理（该目录本轮不判定；4/5 触发重登）。
                 //   远端根例外：**挂载根不可能凭空消失**，4/5/6 一律按权限/会话/卸载处理。
-                if dir == &root {
+                if dir == root {
                     list_failures += 1;
                     if e.is_auth() {
                         report.auth_failed = true;
@@ -1858,11 +2091,11 @@ async fn reconcile_view(
                         "对账：远端根 {dir} 列举返回不存在（{e}）→ 本轮不判定（按权限/会话/卸载处理）"
                     ));
                 } else {
-                    match stat_path(client, dir).await {
+                    match stat_path(client, &dir).await {
                         Ok(sig) if !sig.exists => {
                             observed_dirs.insert(dir.clone());
                             tracing::debug!("对账：目录已不存在（stat 已确认）{dir}");
-                            view.view.drop_listing(dir);
+                            view.view.drop_listing(&dir);
                         }
                         Ok(sig) => {
                             // stat 确认目录**还存在**：把它记进 remote_map。
@@ -1925,19 +2158,34 @@ async fn reconcile_view(
                 }
             }
         }
-        if dir != &root {
+        if dir != root {
             rotating_listed += 1;
             last_listed = Some(dir.clone());
         }
     }
     report.dirs_scanned += scanned;
+    if full {
+        report.full_scan = true;
+        report.full_scan_dirs = report.full_scan_dirs.saturating_add(attempted);
+        report.full_scan_discovered = report
+            .full_scan_discovered
+            .saturating_add(scan_window.len().saturating_sub(total_dirs));
+    }
     // ★ 游标维护（时间预算版）：
     //   本轮把计划窗口列完、且窗口覆盖全部目录 → **清游标**（下轮从头全量）；
     //   否则（硬顶截断 / 预算耗尽）→ 游标 = 本轮尝试过的最后一个目录。
     //   「列完全部」时必须清掉旧游标：不清的话下轮带着游标进轮转模式，白转一圈。
     //   进度保证（每轮至少列一个轮转目录）确保没列全时 `last_listed` 必然有值。
-    let covered_all = !budget_exhausted && scan_window.len() >= total_dirs;
-    if covered_all {
+    //   ★ 全量模式不用轮转游标（每次都从「已知目录全集」重新 BFS），开轮已清掉。
+    let covered_all = if full {
+        // 全量：队列里每个目录都认真列过才算一趟完整列举（预算截断 / 断网都算没列完）。
+        !budget_exhausted && !offline_abort && attempted >= scan_window.len()
+    } else {
+        !budget_exhausted && scan_window.len() >= total_dirs
+    };
+    if full {
+        // 全量模式：在「删除判定之前」写完成/未完成状态（见下面的全量收尾块）。
+    } else if covered_all {
         if let Err(e) = state_store.lock().unwrap().store.delete_meta(&cursor_key) {
             report.error(format!("清除对账轮转游标失败: {e}"));
         }
@@ -1959,14 +2207,24 @@ async fn reconcile_view(
         ));
     }
     if budget_exhausted {
+        partial_why.push(if full {
+            format!(
+                "全量同步时间预算 {:?} 用尽：本轮列了 {attempted}/{} 个目录，下轮继续",
+                scan_budget,
+                scan_window.len()
+            )
+        } else {
+            format!(
+                "时间预算 {:?} 用完：本轮列了 {attempted}/{total_dirs} 个目录，下轮从游标续扫",
+                scan_budget
+            )
+        });
+    } else if !full && scan_window.len() < total_dirs {
+        // 只有「预算没用完、纯被硬顶截断」才报硬顶：预算先到的时候窗口里的
+        // 2000 个大部分根本没列到，再把「按轮转列了 2000 个」写进说明就是假话
+        // （真机说明里 171 和 2000 同时出现，用户第一眼就看出矛盾）。
         partial_why.push(format!(
-            "对账时间预算 {:?} 耗尽：本轮列了 {attempted}/{total_dirs} 个目录，下轮从游标续扫",
-            cfg.scan_time_budget
-        ));
-    }
-    if scan_window.len() < total_dirs {
-        partial_why.push(format!(
-            "目录数 {total_dirs} 超过单轮硬顶 {}（本轮按轮转列了 {} 个）",
+            "目录数 {total_dirs} 超过单轮硬顶 {}：本轮按轮转列了 {} 个，下轮从游标续扫",
             cfg.max_dirs_per_poll,
             scan_window.len()
         ));
@@ -1980,10 +2238,18 @@ async fn reconcile_view(
     //   目录**（失败的那个目录本身体现在「尝试过才失败」这一层，游标停在它之前 →
     //   下轮从它之后续扫、回绕一圈必然重试它）；若中止发生在根或窗口未截断，则走
     //   上面的 `covered_all` 清游标 / 旧游标原封不动 —— 三种都**不会漏目录**。
+    //   ★ 全量模式下 `pending` 标记已经在开轮落盘，这里直接返回 = 下轮继续全量。
     if offline_abort {
-        report.note(format!(
-            "对账因网络不可用中止（已列 {scanned}/{total_dirs} 个目录）；未列到的目录下条目本轮暂不判定（不按缺失删本地）"
-        ));
+        if full {
+            report.note(format!(
+                "全量同步因网络不可用中止（已列 {scanned}/{} 个目录）；下轮继续，未列到的目录下条目本轮暂不判定（不按缺失删本地）",
+                scan_window.len()
+            ));
+        } else {
+            report.note(format!(
+                "对账因网络不可用中止（已列 {scanned}/{total_dirs} 个目录）；未列到的目录下条目本轮暂不判定（不按缺失删本地）"
+            ));
+        }
         return;
     }
 
@@ -2175,6 +2441,43 @@ async fn reconcile_view(
             continue;
         }
         baseline.put(path.clone(), *sig);
+    }
+
+    // ---- ★ 全量列举收尾（按挂载点落 meta）
+    //
+    // 放在「删除判定之前」：删除被熔断挡住，不该让「整棵目录树已经列完了」这件事不算数
+    // —— 否则熔断期间每轮都会重做一次全量 BFS（几千次列举），拿一次用户决策换持续整树扫描。
+    if let Some(reason) = &full_reason {
+        if covered_all {
+            let now = now_secs();
+            {
+                let g = state_store.lock().unwrap();
+                if let Err(e) = g.store.set_meta(&full_done, &now.to_string()) {
+                    report.error(format!("记录全量同步完成时间失败: {e}"));
+                }
+                if let Err(e) = g.store.delete_meta(&full_pending) {
+                    report.error(format!("清除全量同步标记失败: {e}"));
+                }
+            }
+            let discovered = scan_window.len().saturating_sub(total_dirs);
+            report.note(format!(
+                "全量同步完成：{reason}；本轮列了 {attempted} 个目录（其中新发现 {discovered} 个），登记 baseline {} 项；之后按常规间隔轮询",
+                baseline.len()
+            ));
+        } else {
+            // 预算用完（还有目录没列到）→ 让轮询循环 2 秒后立刻继续，别等常规间隔；
+            // 有目录列举失败 → 等常规间隔重试（不能 2 秒一次地打 NAS）。
+            report.full_scan_retry_now = budget_exhausted && !offline_abort;
+            let why = if budget_exhausted {
+                format!("本轮时间预算 {:?} 用完", cfg.full_scan_budget)
+            } else {
+                format!("{list_failures} 个目录本轮没列成")
+            };
+            report.note(format!(
+                "全量同步未完成：{reason}；本轮列了 {attempted}/{} 个目录（{why}），下轮继续",
+                scan_window.len()
+            ));
+        }
     }
     // ★ 删除保护：一次对账的删除量超过阈值就整批挡住
     if !deletes.is_empty() {
@@ -6831,5 +7134,488 @@ mod tests {
         assert_eq!(rows.len(), 1, "网络错误绝不能丢 outbox 行");
         assert_eq!(rows[0].attempts, 0, "网络错误不能消耗重试次数");
         assert_eq!(rows[0].path, "/home/offline-dir");
+    }
+
+    // ------------------------------------------------- ★ 首次 / 全量同步
+
+    /// 触发判定：只有「首次 / 上次没列完 / 太久没同步」三种情况才做全量；
+    /// 其余（含阈值 0 = 不因超时触发）走常规轮转。
+    #[test]
+    fn full_scan_plan_triggers_on_first_pending_or_stale() {
+        let stale = Duration::from_secs(3600);
+        let now = 1_000_000u64;
+
+        // 首次同步：没有 done 标记
+        let r = full_scan_plan(false, false, None, now, stale).expect("首次必须全量");
+        assert!(r.contains("首次同步"), "{r}");
+
+        // 上次没列完：pending 的优先级最高（哪怕刚刚同步过）
+        let r =
+            full_scan_plan(true, true, Some(now - 5), now, stale).expect("pending 必须继续全量");
+        assert!(r.contains("没有列完"), "{r}");
+
+        // 太久没同步：done 有，但上次成功距今 2h > 阈值 1h
+        let r = full_scan_plan(false, true, Some(now - 7200), now, stale).expect("超阈值必须全量");
+        assert!(r.contains("按首次同步处理"), "{r}");
+
+        // 刚同步过 → 常规轮转
+        assert!(full_scan_plan(false, true, Some(now - 30), now, stale).is_none());
+        // 阈值 0 = 不因超时触发（首次 / 未完成仍然触发）
+        assert!(full_scan_plan(false, true, Some(1), now, Duration::ZERO).is_none());
+        // 旧库升级：done 有、还没有 last_ok → 不因超时触发（只做过一次全量）
+        assert!(full_scan_plan(false, true, None, now, stale).is_none());
+    }
+
+    /// 首次同步：**一轮**把整棵树列完 —— BFS 跟随列举中新发现的子目录，
+    /// 每个目录只列一次（旧行为要按层分好几轮，每轮还要把已列过的目录重列一遍）。
+    #[tokio::test]
+    async fn full_scan_lists_whole_tree_in_one_round() {
+        use qxync_core::DirEntry;
+        let home = HOME_ROOT;
+        let d = |p: &str| format!("{home}/{p}");
+        // 三层树：root/{a,b}、a/{a1,a2}、b/b1
+        let listings: BTreeMap<String, Vec<DirEntry>> = BTreeMap::from([
+            (
+                home.to_string(),
+                vec![
+                    DirEntry::local("a", true, 0, 0),
+                    DirEntry::local("b", true, 0, 0),
+                    DirEntry::local("root.txt", false, 3, 100),
+                ],
+            ),
+            (
+                d("a"),
+                vec![
+                    DirEntry::local("a1", true, 0, 0),
+                    DirEntry::local("a2", true, 0, 0),
+                    DirEntry::local("f.txt", false, 4, 110),
+                ],
+            ),
+            (
+                d("b"),
+                vec![
+                    DirEntry::local("b1", true, 0, 0),
+                    DirEntry::local("g.txt", false, 5, 120),
+                ],
+            ),
+            (d("a/a1"), vec![DirEntry::local("deep.txt", false, 6, 130)]),
+            (d("a/a2"), Vec::new()),
+            (d("b/b1"), vec![DirEntry::local("h.txt", false, 7, 140)]),
+        ]);
+        let all_dirs = [
+            home.to_string(),
+            d("a"),
+            d("a/a1"),
+            d("a/a2"),
+            d("b"),
+            d("b/b1"),
+        ];
+        let (host, port, seen, srv) = spawn_listing_server(listings, BTreeSet::new()).await;
+
+        let work = tmpdir("full-scan-one-round");
+        // 真实「第一次同步」形态：挂载视图只有根节点、baseline 空
+        let view = FakeLocal::new(home, work.join("stash"));
+        let store = Mutex::new(SyncState::load(work.join("state")).unwrap());
+        let mv = mount_view(view.clone(), home, "/tmp/full-scan-one-round");
+        let mp = mv.mountpoint.display().to_string();
+        let client = client_for(&host, port);
+        let cfg = SyncConfig {
+            full_sync: true,
+            ..Default::default()
+        };
+        let mut baseline = Baseline::default();
+        let mut report = SyncReport::default();
+        reconcile_view(
+            &client,
+            &mv,
+            &cfg,
+            &mut baseline,
+            &mut report,
+            &store,
+            &mut NetGuard::default(),
+        )
+        .await;
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(report.full_scan, "首次同步必须走全量: {report:?}");
+        assert_eq!(report.dirs_scanned, 6, "一轮列完 6 个目录: {report:?}");
+        assert_eq!(report.full_scan_dirs, 6, "{report:?}");
+        assert_eq!(
+            report.full_scan_discovered, 5,
+            "根之外新发现 5 个目录: {report:?}"
+        );
+        assert!(!report.full_scan_retry_now, "跑完了就不该要求立刻重来");
+
+        // BFS 不重复列目录：每个目录在服务端只被列举一次
+        let seen = seen.lock().unwrap().clone();
+        for dir in &all_dirs {
+            assert_eq!(
+                seen.iter().filter(|p| *p == dir).count(),
+                1,
+                "目录 {dir} 必须且只能列一次: {seen:?}"
+            );
+        }
+
+        // 文件（以及目录条目）全部登记进 baseline —— 本地缓存/基线就是「有缓存了」
+        for f in [
+            "root.txt",
+            "a/f.txt",
+            "a/a1/deep.txt",
+            "b/g.txt",
+            "b/b1/h.txt",
+        ] {
+            assert!(
+                baseline.get(&d(f)).exists,
+                "远端文件 {f} 必须登记 baseline: {:?}",
+                baseline.entries.keys().collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(
+            baseline.len(),
+            10,
+            "5 个目录条目 + 5 个文件都登记进 baseline（根由挂载点本身代表）"
+        );
+
+        // 完成状态落盘：pending 清掉、done 落下；轮转游标不参与全量
+        {
+            let g = store.lock().unwrap();
+            assert_eq!(
+                g.store.meta(&full_pending_key(&mp)).unwrap(),
+                None,
+                "全量完成后 pending 必须清掉（否则每轮都重扫整棵树）"
+            );
+            assert!(
+                g.store.meta(&full_done_key(&mp)).unwrap().is_some(),
+                "完成标记要落盘（首次同步只做一次）"
+            );
+            assert_eq!(
+                g.store
+                    .meta(&format!("reconcile_scan_cursor:{mp}"))
+                    .unwrap(),
+                None,
+                "全量模式不写轮转游标"
+            );
+        }
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|n| n.contains("全量同步完成") && n.contains("之后按常规间隔轮询")),
+            "完成说明要告诉用户「回到常规节奏」: {:?}",
+            report.notes
+        );
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// 全量预算用完：保留 pending、要求轮询循环立刻继续；下一轮读到 pending 接着全量并完成。
+    #[tokio::test]
+    async fn full_scan_budget_exhaustion_keeps_pending_and_retries() {
+        use qxync_core::DirEntry;
+        let home = HOME_ROOT;
+        let remote_dirs: Vec<String> = (0..6).map(|i| format!("{home}/d{i}")).collect();
+        let mut listings: BTreeMap<String, Vec<DirEntry>> = BTreeMap::new();
+        listings.insert(
+            home.to_string(),
+            remote_dirs
+                .iter()
+                .map(|d| DirEntry::local(d.rsplit('/').next().unwrap(), true, 0, 0))
+                .collect(),
+        );
+        for d in &remote_dirs {
+            listings.insert(d.clone(), vec![DirEntry::local("f.txt", false, 1, 10)]);
+        }
+        let (host, port, _seen, srv) = spawn_listing_server(listings, BTreeSet::new()).await;
+
+        let work = tmpdir("full-scan-budget");
+        let view = FakeLocal::new(home, work.join("stash"));
+        for d in &remote_dirs {
+            view.add_dir(d);
+        }
+        let store = Mutex::new(SyncState::load(work.join("state")).unwrap());
+        let mv = mount_view(view.clone(), home, "/tmp/full-scan-budget");
+        let mp = mv.mountpoint.display().to_string();
+        let client = client_for(&host, port);
+        let mut baseline = Baseline::default();
+
+        // ---- 第 1 轮：1ns 预算 → 根 + 一个目录后收手
+        let tight = SyncConfig {
+            full_sync: true,
+            full_scan_budget: Duration::from_nanos(1),
+            ..Default::default()
+        };
+        let mut r1 = SyncReport::default();
+        reconcile_view(
+            &client,
+            &mv,
+            &tight,
+            &mut baseline,
+            &mut r1,
+            &store,
+            &mut NetGuard::default(),
+        )
+        .await;
+        assert!(r1.full_scan, "首次同步必须走全量: {r1:?}");
+        assert!(
+            r1.full_scan_retry_now,
+            "预算用完但还有目录 → 下轮立刻继续（不等常规间隔）: {r1:?}"
+        );
+        assert_eq!(r1.full_scan_dirs, 2, "根 + 一个目录（进度保证）: {r1:?}");
+        assert!(
+            r1.notes.iter().any(|n| n.contains("全量同步未完成")),
+            "{:?}",
+            r1.notes
+        );
+        {
+            let g = store.lock().unwrap();
+            assert_eq!(
+                g.store.meta(&full_pending_key(&mp)).unwrap().as_deref(),
+                Some("1"),
+                "没列完必须留 pending（下轮接着来）"
+            );
+            assert_eq!(
+                g.store
+                    .meta(&format!("reconcile_scan_cursor:{mp}"))
+                    .unwrap(),
+                None,
+                "全量模式不写轮转游标"
+            );
+        }
+
+        // ---- 第 2 轮：默认预算充足（pending 触发）→ 列完、落完成标记
+        let roomy = SyncConfig {
+            full_sync: true,
+            ..Default::default()
+        };
+        let mut r2 = SyncReport::default();
+        reconcile_view(
+            &client,
+            &mv,
+            &roomy,
+            &mut baseline,
+            &mut r2,
+            &store,
+            &mut NetGuard::default(),
+        )
+        .await;
+        assert!(r2.full_scan, "pending 还在 → 继续全量: {r2:?}");
+        assert!(!r2.full_scan_retry_now, "{r2:?}");
+        assert_eq!(r2.dirs_scanned, 7, "根 + 6 个目录: {r2:?}");
+        {
+            let g = store.lock().unwrap();
+            assert_eq!(g.store.meta(&full_pending_key(&mp)).unwrap(), None);
+            assert!(g.store.meta(&full_done_key(&mp)).unwrap().is_some());
+        }
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// 太久没同步：done 有、上次成功已超阈值 → 再次全量（按首次同步处理）。
+    #[tokio::test]
+    async fn full_scan_after_long_gap() {
+        use qxync_core::DirEntry;
+        let home = HOME_ROOT;
+        let path = format!("{home}/f.txt");
+        let listings = BTreeMap::from([(
+            home.to_string(),
+            vec![DirEntry::local("f.txt", false, 1, 10)],
+        )]);
+        let (host, port, _seen, srv) = spawn_listing_server(listings, BTreeSet::new()).await;
+
+        let work = tmpdir("full-scan-stale");
+        let view = FakeLocal::new(home, work.join("stash"));
+        view.add_file(&path, 1, 10, false, None);
+        let store = Mutex::new(SyncState::load(work.join("state")).unwrap());
+        let mp = "/tmp/full-scan-stale";
+        {
+            let g = store.lock().unwrap();
+            g.store.set_meta(&full_done_key(mp), "1").unwrap();
+            g.store
+                .set_meta(
+                    META_LAST_OK_UNIX,
+                    &(now_secs().saturating_sub(7200)).to_string(),
+                )
+                .unwrap();
+        }
+        let mut baseline = Baseline::default();
+        baseline.put(path.clone(), Sig::file(1, 10));
+        let mv = mount_view(view.clone(), home, mp);
+        let client = client_for(&host, port);
+        let cfg = SyncConfig {
+            full_sync: true,
+            full_sync_stale_after: Duration::from_secs(3600),
+            ..Default::default()
+        };
+        let mut report = SyncReport::default();
+        reconcile_view(
+            &client,
+            &mv,
+            &cfg,
+            &mut baseline,
+            &mut report,
+            &store,
+            &mut NetGuard::default(),
+        )
+        .await;
+
+        assert!(
+            report.full_scan,
+            "距上次成功 2h > 1h → 必须重新全量: {report:?}"
+        );
+        assert!(
+            report.notes.iter().any(|n| n.contains("按首次同步处理")),
+            "{:?}",
+            report.notes
+        );
+        assert!(
+            report.notes.iter().any(|n| n.contains("全量同步完成")),
+            "{:?}",
+            report.notes
+        );
+        // 干净文件不能被「远端没列到」误删（全量把根列到了）
+        assert!(view.node(&path).is_some());
+        assert!(baseline.get(&path).exists);
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// `poll_once` 级接线：完整跑完 → 记录「上次成功同步」；全量完成清 pending、落 done；
+    /// 下一轮回到**常规轮转**（不再全量）。
+    #[tokio::test]
+    async fn poll_once_records_last_success_and_resumes_normal_polling() {
+        use qxync_core::DirEntry;
+        let home = HOME_ROOT;
+        let listings = BTreeMap::from([(
+            home.to_string(),
+            vec![DirEntry::local("f.txt", false, 1, 10)],
+        )]);
+        let (host, port, _seen, srv) = spawn_nas_server(MockNasSpec {
+            listings,
+            max_log: Some(0),
+            ..Default::default()
+        })
+        .await;
+
+        let work = tmpdir("poll-full-done");
+        let view = FakeLocal::new(home, work.join("stash"));
+        let store = Mutex::new(SyncState::load(work.join("state")).unwrap());
+        let mp = "/tmp/poll-full-done";
+        let views = vec![mount_view(view.clone(), home, mp)];
+        let client = client_for(&host, port);
+        let cfg = SyncConfig {
+            full_sync: true,
+            ..Default::default()
+        };
+        let stats = SyncStats::default();
+
+        let r1 = poll_once(&client, &views, &store, &cfg, &stats, "default", "test1").await;
+        assert!(r1.errors.is_empty(), "{:?}", r1.errors);
+        assert!(r1.full_scan, "首次轮询必须走全量: {r1:?}");
+        assert!(r1.full_scan_dirs >= 1, "{r1:?}");
+        {
+            let g = store.lock().unwrap();
+            assert_eq!(g.store.meta(&full_pending_key(mp)).unwrap(), None);
+            assert!(g.store.meta(&full_done_key(mp)).unwrap().is_some());
+            let last_ok = g
+                .store
+                .meta(META_LAST_OK_UNIX)
+                .unwrap()
+                .and_then(|v| v.parse::<u64>().ok());
+            assert!(
+                last_ok.is_some_and(|t| t > 0),
+                "完整跑完一轮必须记录「上次成功同步」"
+            );
+            assert!(
+                g.baseline.get(&format!("{home}/f.txt")).exists,
+                "首次同步要把远端文件登记进 baseline"
+            );
+        }
+
+        // 第 2 轮：pending 已清、done 已落、last_ok 是刚刚 → 回到常规轮转
+        let r2 = poll_once(&client, &views, &store, &cfg, &stats, "default", "test1").await;
+        assert!(!r2.full_scan, "全量完成后必须恢复常规轮转: {r2:?}");
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// ★ 真机冒烟（`#[ignore]`，需要 `QXNYC_TEST_HOST` / `QXNYC_TEST_USER` /
+    /// `QXNYC_TEST_PASSWORD`，开了 2SV 再加 `QXNYC_TEST_TOTP_SECRET`）：
+    /// 首次同步的 BFS 在**真实 NAS** 上确实会顺着新发现的子目录继续列，并且到点收手。
+    ///
+    /// 只读：新出现的条目只登记进内存 baseline，不写 NAS、不删任何东西。
+    /// 根用 `QXNYC_TEST_BOOTSTRAP_ROOT`（默认 `/home/.Qsync`），
+    /// 预算用 `QXNYC_TEST_BOOTSTRAP_BUDGET` 秒（默认 120）。
+    #[tokio::test]
+    #[ignore]
+    async fn full_scan_real_nas_bootstrap_progress() {
+        let Some(client) = logged_in().await else {
+            println!("跳过：没有 QXNYC_TEST_* 环境变量");
+            return;
+        };
+        let root = std::env::var("QXNYC_TEST_BOOTSTRAP_ROOT")
+            .unwrap_or_else(|_| "/home/.Qsync".to_string());
+        let budget_secs = std::env::var("QXNYC_TEST_BOOTSTRAP_BUDGET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(120u64);
+
+        let work = tmpdir("full-scan-real");
+        let view = FakeLocal::new(&root, work.join("stash"));
+        let store = Mutex::new(SyncState::load(work.join("state")).unwrap());
+        let mv = mount_view(view.clone(), &root, "/tmp/full-scan-real");
+        let mp = mv.mountpoint.display().to_string();
+        let cfg = SyncConfig {
+            full_sync: true,
+            full_scan_budget: Duration::from_secs(budget_secs),
+            ..Default::default()
+        };
+        let mut baseline = Baseline::default();
+        let mut report = SyncReport::default();
+        let t0 = Instant::now();
+        reconcile_view(
+            &client,
+            &mv,
+            &cfg,
+            &mut baseline,
+            &mut report,
+            &store,
+            &mut NetGuard::default(),
+        )
+        .await;
+        let elapsed = t0.elapsed();
+
+        println!(
+            "真机首次同步 {:.0}s：列目录 {}（新发现 {}）、baseline {} 条、中止={}、错误 {:?}、notes {:?}",
+            elapsed.as_secs_f64(),
+            report.dirs_scanned,
+            report.full_scan_discovered,
+            baseline.len(),
+            report.aborted_offline,
+            report.errors,
+            report.notes
+        );
+
+        assert!(!report.aborted_offline, "网络异常会让冒烟结论不可信");
+        assert!(report.full_scan, "首次同步必须走全量: {report:?}");
+        assert!(report.dirs_scanned >= 2, "至少列到根与子目录: {report:?}");
+        assert!(
+            report.full_scan_discovered > 0,
+            "真实目录树必须发现新目录（BFS 生效）: {report:?}"
+        );
+        // 预算内没列完 → 必须要求轮询循环立刻继续（否则首次同步要等常规间隔）。
+        if report.full_scan_retry_now {
+            assert_eq!(
+                store
+                    .lock()
+                    .unwrap()
+                    .store
+                    .meta(&full_pending_key(&mp))
+                    .unwrap()
+                    .as_deref(),
+                Some("1"),
+                "全量未完成必须留 pending（下轮接着来）"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&work);
     }
 }

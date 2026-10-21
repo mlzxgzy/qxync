@@ -2725,6 +2725,16 @@ fn print_dehydrate(d: &DehydrateData, dry_run: bool) {
     }
 }
 
+/// 「多久以前」的人话（`status` / `sync` 展示用：`95` → `1 分钟`）。
+fn human_age_secs(secs: u64) -> String {
+    match secs {
+        0..=59 => format!("{secs} 秒"),
+        60..=3599 => format!("{} 分钟", secs / 60),
+        3600..=86_399 => format!("{} 小时 {} 分钟", secs / 3600, (secs % 3600) / 60),
+        _ => format!("{} 天", secs / 86_400),
+    }
+}
+
 /// 变更发现状态（`qxync sync` / `status` 共用）。
 fn print_sync(s: &SyncInfo) {
     println!(
@@ -2734,6 +2744,18 @@ fn print_sync(s: &SyncInfo) {
         s.polls,
         s.last_poll_age_secs
     );
+    if s.full_sync_pending {
+        println!(
+            "  全量同步: 进行中（首次同步 / 太久没同步；完成后恢复每 {}s 轮询）",
+            s.interval_secs
+        );
+    }
+    if s.last_sync_ok_age_secs > 0 {
+        println!(
+            "  上次成功: {}前（完整跑完一轮对账）",
+            human_age_secs(s.last_sync_ok_age_secs)
+        );
+    }
     println!(
         "  游标    : notify={} config={} global_notify={} max_log_seen={}（日志空 -17 × {}）",
         s.cursors.notify,

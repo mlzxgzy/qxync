@@ -5,6 +5,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [中文](CHANGELOG.md) · [README](README.en.md) · [Acceptance log](docs/验收记录.md)
 
+## [Unreleased]
+
+### Added
+
+- **First sync / a long time without syncing now runs a full enumeration
+  ([M29](docs/M29-首次同步与全量重扫.md))**. Change detection is actually driven by
+  "list directories + diff against baseline" (on real hardware `qbox_get_sync_log`
+  keeps returning `-17`), yet the old code pushed the **very first sync** through the
+  same rotation window: 4964 directories × ~171 per round = 29 rounds (~24 minutes),
+  with every entry deferred as "not judged this round". State is now tracked per mount:
+  - **First sync** (no `reconcile_full_done:<mountpoint>`) → **one BFS pass over the
+    whole tree** (each directory listed exactly once; not truncated by the rotation
+    cursor, the normal per-round budget, or the 2000-directory hard cap). On completion
+    the done marker is written and **normal rotation with the configured interval
+    resumes automatically**;
+  - **Long gap** (no *fully completed* round for ≥ 1 hour; `sync_last_ok_unix` is only
+    updated when events + reconciliation + sweep all finish, so offline/suspend time is
+    not papered over) → treated as a first sync;
+  - **Previous pass not finished** (crash / network loss / budget exhausted) →
+    `reconcile_full_pending` marker, continued on the next round; when the budget is
+    exhausted the poll loop retries in **2 seconds** instead of the 30s/600s interval.
+  - Full-pass budget is 1800s (`QXNYC_FULL_SCAN_BUDGET_SECS`, `0` = unlimited);
+    `QXNYC_FULL_SYNC_AFTER_SECS` adjusts the staleness threshold (`0` = never trigger on
+    time alone); `QXNYC_FULL_SYNC=0` restores the old behaviour for troubleshooting.
+  - Visibility: `SyncInfo` gains `full_sync_pending` / `last_sync_ok_age_secs`; `qxync
+    status` / `qxync sync` and the GUI sync summary show "full sync in progress (first /
+    long gap)" and "last successful sync N ago".
+  - Measured read-only on the real 5362-directory account: ~10.9 directories/s
+    (92 ms each), so one full pass takes ~8–9 minutes — instead of a 24-minute rotation
+    during which deletions cannot be judged.
+
+### Verification
+
+- `cargo test --workspace` green (5 new full-sync tests + 1 `#[ignore]` read-only
+  real-NAS smoke test);
+- `cargo fmt --check` clean; `cargo check --workspace --all-targets` has no errors.
+
 ## [0.7.7] - 2026-10-21
 
 ### Fixed

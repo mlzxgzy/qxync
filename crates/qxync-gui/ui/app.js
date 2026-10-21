@@ -2895,6 +2895,15 @@
       kvText(sum, '删除被挡（累计）', num(sy.deletes_blocked, 0));
       kvText(sum, 'events', num(sy.events, 0));
       kvText(sum, 'baseline_entries', num(sy.baseline_entries, 0));
+      // ★ 首次同步 / 太久没同步 → 引擎正在把整棵目录树列一遍（建本地缓存/基线）。
+      //   它不是错误，但会让「每轮只扫一小部分」看起来像卡住 —— 明确告诉用户，
+      //   并说明完成后自动恢复常规间隔。
+      if (sy.full_sync_pending) {
+        kvText(sum, '全量同步', '进行中（首次 / 太久没同步）', 'val-warn');
+      }
+      if (num(sy.last_sync_ok_age_secs, 0) > 0) {
+        kvText(sum, '上次成功同步', humanDuration(sy.last_sync_ok_age_secs) + '前');
+      }
       if (sy.last_error) {
         addAlert('sync-alerts', '同步错误：' + String(sy.last_error));
       }
