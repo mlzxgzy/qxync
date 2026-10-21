@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Tray status dot + quieter network errors + conflict notification (M28)**:
+  network drops and blips no longer pop a desktop notification or appear in the
+  error list — transport errors are written to the journal as `warn`
+  (`kind=network`; still visible in the all-levels view), leaving notifications
+  and the error list for real sync errors. Connection health is now expressed by
+  a **status dot in the bottom-right corner of the tray icon**: 🟢 all good /
+  🔴 probe confirmed the NAS unreachable / 🟡 network fine but there is an error
+  or a delete-block; with no daemon running the icon stays plain (no false
+  alarm). The tooltip follows ("在线" / "离线: …" / "注意: …"), and the SNI icon
+  is only touched when the state actually changes (no D-Bus churn). A newly
+  detected sync conflict ("both sides changed" entries only; queue sweeps do
+  not count) now raises a desktop notification, honoring the
+  desktop-notifications setting. The home page and task cards no longer stack a
+  "sync error" red line while the offline banner is up; they say "network is
+  down — local changes are queued and will sync automatically". The
+  classification is a structured flag (`SyncReport.error_is_network`, aligned
+  with `errors` including the 20-entry cap), not text sniffing; older daemons
+  are covered by a front-end text fallback. See
+  `docs/M28-托盘状态与错误降噪.md`.
+
 - **Debian/Ubuntu packages for the Dolphin overlay icon plugin (kf5 / kf6)**: the
   Debian/Ubuntu matrix spans the KF5 and KF6 generations (Dolphin on Debian 12 /
   Ubuntu 22.04 / 24.04 is KF5; Debian 13 / Ubuntu 26.04 are KF6), and the plugin

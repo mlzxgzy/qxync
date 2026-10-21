@@ -76,6 +76,8 @@ pub fn run() {
             commands::window_show,
             commands::app_quit,
             commands::tray_emit,
+            // ★ M28：托盘状态点（前端聚合连通性后下发）
+            commands::tray_set_status,
         ])
         // 托盘放在 setup：配置里的主窗口已经建好，`emit_to("main", ...)` 一定有目标。
         .setup(|app| {

@@ -395,6 +395,15 @@ impl JournalEntry {
         Self::new(kind, path, detail, "error")
     }
 
+    /// ★ M28：网络类错误（断网 / 波动 / 探活失败）。
+    ///
+    /// 与 `error` 的区别：这不是「同步出错」，是「暂时连不上」—— GUI 的错误列表
+    /// （`level=error`）和桌面通知都**不**包含它（托盘红点已经表达了），但 journal
+    /// 全量视图（`level=all`）仍可查，诊断不丢。
+    pub fn warn(kind: &str, path: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self::new(kind, path, detail, "warn")
+    }
+
     pub fn blocked(kind: &str, path: impl Into<String>, detail: impl Into<String>) -> Self {
         Self::new(kind, path, detail, "blocked")
     }
@@ -726,6 +735,9 @@ impl Store {
                 sql.push_str(" AND status = 'blocked'");
             } else if l == "ok" {
                 sql.push_str(" AND status = 'ok'");
+            } else if l == "warn" {
+                // ★ M28：网络类错误降级后的档位（GUI 的「文件更新中心」筛「警告」用）。
+                sql.push_str(" AND status = 'warn'");
             }
         }
         if let Some(q) = query {
@@ -2007,21 +2019,35 @@ mod tests {
             "/home/pin.bin",
             "被 pin 挡下",
         ));
-        assert_eq!(s.journal_add_batch(&rows).unwrap(), 12);
+        // ★ M28：网络类错误降级后的档位（断网/波动不进错误列表、不弹窗）
+        rows.push(JournalEntry::warn(
+            "network",
+            "",
+            "网络不可用：探测 NAS 失败，本轮轮询中止",
+        ));
+        assert_eq!(s.journal_add_batch(&rows).unwrap(), 13);
         assert_eq!(s.journal_add_batch(&[]).unwrap(), 0, "空批次是 no-op");
-        assert_eq!(s.journal_count().unwrap(), 12);
+        assert_eq!(s.journal_count().unwrap(), 13);
 
         // 倒序（最新在前）
         let all = s.journal_list(100, None, None, None).unwrap();
-        assert_eq!(all.len(), 12);
-        assert_eq!(all[0].kind, "dehydrate", "最新的在最前");
+        assert_eq!(all.len(), 13);
+        assert_eq!(all[0].kind, "network", "最新的在最前");
 
         // level 过滤
         let errs = s.journal_list(100, None, None, Some("error")).unwrap();
         assert_eq!(errs.len(), 1);
         assert_eq!(errs[0].path, "/home/fail.txt");
+        assert!(
+            errs.iter().all(|e| e.kind != "network"),
+            "★ 网络错误是 warn 级，error 过滤必须查不到它（不进错误列表/不弹窗的根基）"
+        );
         let blk = s.journal_list(100, None, None, Some("blocked")).unwrap();
         assert_eq!(blk.len(), 1);
+        // ★ M28：warn 档位能单独筛出来（诊断用），且与 error 互不混入
+        let warns = s.journal_list(100, None, None, Some("warn")).unwrap();
+        assert_eq!(warns.len(), 1);
+        assert_eq!(warns[0].kind, "network");
 
         // 子串查询（path 与 detail 都匹配）
         assert_eq!(
@@ -2044,10 +2070,15 @@ mod tests {
         let c = s.journal_counts().unwrap();
         assert_eq!(c.get("ok").copied().unwrap_or(0), 10);
         assert_eq!(c.get("error").copied().unwrap_or(0), 1);
+        assert_eq!(
+            c.get("warn").copied().unwrap_or(0),
+            1,
+            "M28：warn 档要进计数分组"
+        );
 
         // 轮转：按条数只留 5 条
         let removed = s.journal_trim(5, 0).unwrap();
-        assert_eq!(removed, 7);
+        assert_eq!(removed, 8);
         assert_eq!(s.journal_count().unwrap(), 5);
         assert!(
             s.journal_list(100, None, None, None)

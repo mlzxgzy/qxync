@@ -114,6 +114,7 @@
     settingsError: '',
     rowMenuTrigger: null, // 右键菜单的焦点来处（关闭时还回去）
     lastErrorKey: '',     // 已通知过的错误条目（去重，按「连接:条目」）
+    lastConflictKey: '',  // ★ M28：已通知过的冲突条目（去重，独立于错误键）
     errorTick: 0,         // 轮询计数器（每 3 次查一遍错误列表）
     rowMenu: null,        // 右键菜单当前作用的条目
     trayAction: '',       // 最近一次托盘动作（自检/排查用）
@@ -1223,8 +1224,16 @@
       return { mark: '⏸', tone: 'warn', text: T('task.state_no_task') };
     }
     if (sy) {
-      if (sy.last_error) {
+      // ★ M28：离线时 `last_error` 多半就是那条「网络不可用」—— 托盘红点和首页
+      //   离线横幅已经表达了，卡片不再叠一条「同步出错」。
+      var conn = (s && isObj(s.connectivity)) ? s.connectivity : null;
+      var offline = !!(conn && conn.known === true && conn.online === false);
+      if (sy.last_error && !offline) {
         return { mark: '⚠️', tone: 'err', text: T('task.state_sync_error', { msg: String(sy.last_error) }) };
+      }
+      // 离线但本地还有攒着的改动：如实说「等联网」，比「已同步」诚实。
+      if (offline) {
+        return { mark: '⚠️', tone: 'warn', text: T('task.state_offline') };
       }
       if (sy.delete_block_reason) {
         return { mark: '⚠️', tone: 'warn', text: T('task.state_delete_blocked'), blocked: true };
@@ -1545,6 +1554,8 @@
   function statusMark(st) {
     if (st === 'error') { return '❌'; }
     if (st === 'blocked') { return '⛔'; }
+    // ★ M28：网络类错误（断网/波动）—— 不是「同步出错」，托盘红点已表达。
+    if (st === 'warn') { return '⚠️'; }
     return '✅';
   }
 
@@ -1652,7 +1663,7 @@
       setListState('journal-empty', 'loading', T('journal.loading'));
       return;
     }
-    var total = 0, ok = 0, err = 0, blocked = 0;
+    var total = 0, ok = 0, err = 0, blocked = 0, warn = 0;
     var cleared = true;
     var cleanDirs = true;
     for (var bi = 0; bi < ls.length; bi++) {
@@ -1663,10 +1674,11 @@
       ok += num(c.ok, 0);
       err += num(c.error, 0);
       blocked += num(c.blocked, 0);
+      warn += num(c.warn, 0);
       if (!bucket.data.cleared) { cleared = false; }
       if ((bucket.data.entries || []).length) { cleanDirs = false; }
     }
-    setText('journal-count', T('journal.counts', { total: total, ok: ok, error: err, blocked: blocked }));
+    setText('journal-count', T('journal.counts', { total: total, ok: ok, warn: warn, error: err, blocked: blocked }));
     if (list.length === 0) {
       setListState('journal-empty', 'empty', (cleared && cleanDirs) ? T('journal.cleared') : T('journal.empty_filtered'));
     } else {
@@ -2613,7 +2625,11 @@
         // ★ M20：离线横幅必须**先于** sync 判空 —— 离线时 sync 信息也可能缺，
         // 但用户最想知道的是「我的改动还在不在、什么时候能同步」。
         var conn = (s && isObj(s.connectivity)) ? s.connectivity : null;
-        if (conn && conn.known === true && conn.online === false) {
+        // ★ M28：离线时 `last_error` 多半就是那条「网络不可用」—— 横幅已经说了
+        //   「已离线 + 攒着 N 项」，再挂一条红字是同一件事说两遍。只有「网络通着
+        //   但有错误」（如 CGI 500）才保留红条 —— 那是唯一信号。
+        var offlineShown = !!(conn && conn.known === true && conn.online === false);
+        if (offlineShown) {
           var off = (s && isObj(s.offline)) ? s.offline : null;
           var pend = off
             ? (num(off.pending_upload, 0) + num(off.pending_delete, 0) + num(off.pending_mkdir, 0)
@@ -2648,8 +2664,8 @@
           uploaded: num(sy.uploaded, 0),
           deleted: num(sy.deleted, 0),
           conflicts: num(sy.conflicts, 0)
-        }), (sy.last_error || sy.delete_block_reason) ? 'val-warn' : null);
-        if (sy.last_error) {
+        }), (!offlineShown && (sy.last_error || sy.delete_block_reason)) ? 'val-warn' : null);
+        if (sy.last_error && !offlineShown) {
           addAlert('home-alerts', T('home.sync_err_link', {
             label: label, msg: String(sy.last_error)
           }));
@@ -4997,6 +5013,7 @@
       } else {
         renderCurrentPage();
       }
+      updateTrayStatus();
       return { ok: true };
     }, function (e) {
       linksInflight = null;
@@ -5008,6 +5025,46 @@
       return { ok: false, error: str(e) };
     });
     return linksInflight;
+  }
+
+  /**
+   * ★ M28：托盘状态点 —— 聚合所有「daemon 在跑」的连接后下发一次。
+   *
+   * 判据（红 > 黄 > 绿）：
+   *   🔴 offline  任一连接 connectivity.known && !online（探活确认网络断）
+   *   🟡 warning  网络通着但有非网络错误（last_error）或删除熔断（delete_block_reason）
+   *   🟢 ok       全部正常
+   * 没有任何 daemon 在跑时**不下发**（保持原图标）：用户自己没配任务不是故障，
+   * 亮黄/亮红都是误报。Rust 侧只在状态变化时才真的动 SNI 图标（不刷 D-Bus）。
+   * 老daemon 不给 connectivity 时按「正常」处理（缺字段 ≠ 离线，与 M20 同一原则）。
+   */
+  function updateTrayStatus() {
+    var targets = runningTargets();
+    if (!targets.length) { return; }
+    var offline = [], warning = [];
+    for (var i = 0; i < targets.length; i++) {
+      var s = statusOf(targets[i].id);
+      var st = (s && isObj(s.status)) ? s.status : null;
+      if (!st) { continue; }
+      var conn = isObj(st.connectivity) ? st.connectivity : null;
+      if (conn && conn.known === true && conn.online === false) {
+        offline.push(linkLabelById(targets[i].id));
+        continue;
+      }
+      var sy = isObj(st.sync) ? st.sync : null;
+      // 离线时 last_error 多半就是那条「网络不可用」—— 已由红点表达，不重复计黄。
+      if (sy && (sy.last_error || sy.delete_block_reason)) {
+        warning.push(linkLabelById(targets[i].id) + '：' +
+          str(sy.last_error || sy.delete_block_reason));
+      }
+    }
+    if (offline.length) {
+      call('tray_set_status', { status: 'offline', note: offline.join('、') });
+    } else if (warning.length) {
+      call('tray_set_status', { status: 'warning', note: warning.join('；') });
+    } else {
+      call('tray_set_status', { status: 'ok', note: '' });
+    }
   }
 
   /** 「这一页只作用于当前连接」的可见说明（文件 / 诊断页顶部）。 */
@@ -5075,8 +5132,9 @@
       if (linksInflight) { return; }
       refreshStatus(true);
       // ★ M8.4：每 3 个 tick（≈6s）看一次错误列表，有新错误就发桌面通知
+      // ★ M28：同一个 tick 顺带看冲突（网络错误已降 warn，不会走错误通知这条路）
       state.errorTick = (state.errorTick || 0) + 1;
-      if (state.errorTick % 3 === 0) { checkErrorsForNotify(); }
+      if (state.errorTick % 3 === 0) { checkErrorsForNotify(); checkConflictsForNotify(); }
     }, POLL_MS);
   }
 
@@ -6300,6 +6358,9 @@
       }
       if (!best) { return { ok: true, entries: 0 }; }
       var e = best.e;
+      // ★ M28：老 daemon 会把网络错误也写成 error 级 —— 按文案兜底跳过，
+      //   不给「拔一下网线弹一次窗」留后门（新 daemon 写的是 warn 级，本就查不到）。
+      if (isNetworkErrorEntry(e)) { return { ok: true, entries: 0 }; }
       var entryId = (e.id !== undefined && e.id !== null && str(e.id) !== '')
         ? str(e.id)
         : (str(e.ts) + '|' + str(e.path) + '|' + str(e.detail));
@@ -6312,6 +6373,60 @@
       }
       notifyUser('qxync 同步出错（' + linkLabelById(best.id) + '）',
         str(e.path) + ' —— ' + str(e.detail));
+      return { ok: true, entries: 1 };
+    }, function () { return { ok: false }; });
+  }
+
+  /**
+   * ★ M28：这条 journal 条目是不是「网络类错误」（断网 / 波动 / 探活失败）。
+   *
+   * 新 daemon 把这类条目写成 `status='warn'` + `kind='network'`（错误列表与桌面通知
+   * 天然不含它）；这里是对**老 daemon** 的兜底 —— 它们仍写 error 级，只能按文案认。
+   * 文案判据与 daemon 侧 `record_net_error_or_abort` 的措辞对齐（「网络不可用」/
+   * 「网络错误」开头），措辞变了这里要跟着改（有 e2e 钉着）。
+   */
+  function isNetworkErrorEntry(e) {
+    if (!isObj(e)) { return false; }
+    if (str(e.status) === 'warn' || str(e.kind) === 'network') { return true; }
+    var d = str(e.detail);
+    return d.indexOf('网络不可用') === 0 || d.indexOf('网络错误') === 0;
+  }
+
+  /**
+   * ★ M28：冲突弹窗 —— 发现新的冲突条目（kind=conflict 且不是「队列清理」那种）时
+   * 发一条桌面通知。冲突需要人来处理（rename 策略看一眼副本名、ask 策略要裁决），
+   * 静默生成副本会让用户以为「文件被改了」。
+   * 与错误检查共用同一个 6s tick，去重键独立（`linkId + ':' + 条目 id`）。
+   */
+  function checkConflictsForNotify() {
+    return fanout({ method: 'journal', level: 'all', limit: 20 }, fanoutTargets()).then(function (rs) {
+      var best = null;
+      for (var i = 0; i < rs.length; i++) {
+        if (!rs[i].r.ok) { continue; }
+        var d = isObj(rs[i].r.data) ? rs[i].r.data : {};
+        var es = (d.entries || []).filter(isObj);
+        for (var j = 0; j < es.length; j++) {
+          var e = es[j];
+          // 只认「产生了冲突」这一种：待裁决队列的自动清理不是新冲突，不弹。
+          if (str(e.kind) !== 'conflict' || str(e.status) !== 'ok') { continue; }
+          if (str(e.detail).indexOf('双方都改') !== 0) { continue; }
+          if (!best || num(e.ts, 0) > num(best.e.ts, 0)) { best = { id: str(rs[i].id), e: e }; }
+        }
+      }
+      if (!best) { return { ok: true, entries: 0 }; }
+      var e = best.e;
+      var entryId = (e.id !== undefined && e.id !== null && str(e.id) !== '')
+        ? str(e.id)
+        : (str(e.ts) + '|' + str(e.path) + '|' + str(e.detail));
+      var key = best.id + ':' + entryId;
+      if (state.lastConflictKey === key) { return { ok: true, entries: 1 }; }
+      state.lastConflictKey = key;
+      if (state.settings && isObj(state.settings.settings) &&
+          state.settings.settings.desktop_notifications === false) {
+        return { ok: true, entries: 1 };   // 用户关掉了通知
+      }
+      notifyUser('qxync 发现同步冲突（' + linkLabelById(best.id) + '）',
+        str(e.detail) + ' —— 打开主窗口的「冲突中心」处理（谁的改动都不会被覆盖）');
       return { ok: true, entries: 1 };
     }, function () { return { ok: false }; });
   }

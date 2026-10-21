@@ -5207,8 +5207,19 @@ fn journal_record_sync(state: &Arc<State>, r: &sync::SyncReport) {
         );
         n += 1;
     }
-    for e in &r.errors {
-        journal_log(state, JournalEntry::error("sync", "", e.clone()));
+    // ★ 网络类错误降级为 `warn`（kind=network）：断网/波动不是「同步出错」，是
+    //   「暂时连不上」—— 托盘红点已经表达了这件事，再进错误列表 + 桌面通知就是
+    //   同一件事说两遍，而且一次拔网线弹一次窗正是用户抱怨的「到处报错」。
+    //   普通错误（业务 status / 会话 / 本地 IO）照旧 `error`。
+    //   ⚠️ `r.errors` 与 `r.error_is_network` 由 `push_error` 保证逐条对齐。
+    for (i, e) in r.errors.iter().enumerate() {
+        let is_network = r.error_is_network.get(i).copied().unwrap_or(false);
+        let entry = if is_network {
+            JournalEntry::warn("network", "", e.clone())
+        } else {
+            JournalEntry::error("sync", "", e.clone())
+        };
+        journal_log(state, entry);
         n += 1;
     }
     // 「引擎活着」的轻量条目：扫过但**没有任何值得记的事**时才写，且限频

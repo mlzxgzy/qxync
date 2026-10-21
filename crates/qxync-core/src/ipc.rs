@@ -969,7 +969,7 @@ pub struct JournalData {
     pub entries: Vec<crate::store::JournalEntry>,
     /// 库里的总条数（不是本次返回的条数）。
     pub total: i64,
-    /// 按状态分组的计数（`ok` / `error` / `blocked`）。
+    /// 按状态分组的计数（`ok` / `warn` / `error` / `blocked`）。
     pub counts: BTreeMap<String, i64>,
     /// 本次是否执行了清空。
     pub cleared: bool,

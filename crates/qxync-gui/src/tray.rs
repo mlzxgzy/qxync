@@ -37,6 +37,91 @@ const MENU_SYNC: &str = "tray-sync";
 const MENU_PAUSE: &str = "tray-pause";
 const MENU_QUIT: &str = "tray-quit";
 
+/// ★ M28：托盘默认 tooltip（状态图标会在此基础上追加一行状态说明）。
+const TRAY_TOOLTIP: &str = "qxync — QNAP 按需同步";
+
+/// ★ M28：托盘状态（由前端聚合所有连接后下发，见 `tray_set_status`）。
+///
+/// 图标 = 原图标 + 右下角状态点（编译期 `include_bytes!`，三个变体只差那个点，
+/// 品牌形状不动）。**没有 daemon 在跑时不设状态**（保持原图标）—— 用户自己没配
+/// 任务不是故障，亮黄/亮红都是误报。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayStatus {
+    /// 🟢 全部连接正常。
+    Ok,
+    /// 🔴 有连接确认网络不可达（探活失败）。
+    Offline,
+    /// 🟡 网络通着但有需要注意的事（非网络错误 / 删除熔断）。
+    Warning,
+}
+
+impl TrayStatus {
+    /// 前端协议字符串（`tray_set_status` 的入参；拼错按 `Ok` 处理并记日志）。
+    pub fn from_protocol(s: &str) -> Option<Self> {
+        match s {
+            "ok" => Some(Self::Ok),
+            "offline" => Some(Self::Offline),
+            "warning" => Some(Self::Warning),
+            _ => None,
+        }
+    }
+    fn icon(&self) -> &'static [u8] {
+        match self {
+            Self::Ok => include_bytes!("../icons/32x32-green.png"),
+            Self::Offline => include_bytes!("../icons/32x32-red.png"),
+            Self::Warning => include_bytes!("../icons/32x32-yellow.png"),
+        }
+    }
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Ok => "在线",
+            Self::Offline => "离线",
+            Self::Warning => "注意",
+        }
+    }
+}
+
+/// ★ M28：把托盘切到指定状态（图标 + tooltip）。
+///
+/// * **只在状态变化时才真的动图标**：SNI 每次换图标都是一次 D-Bus 往返，
+///   前端 2s 轮询一次状态，无脑重设既刷 D-Bus 也可能让动画型托盘闪烁。
+/// * **失败只记日志**（沿用「托盘失败不拖垮 GUI」）：托盘可能压根没建成，
+///   或者宿主不支持运行时换图标 —— 状态点丢了，但主功能不受影响。
+/// * `note` 追加进 tooltip（如「注意：3 项删除被熔断挡住」），空则只显示状态行。
+pub fn set_status(app: &AppHandle, status: TrayStatus, note: &str) {
+    static LAST: LazyLock<StdMutex<Option<(TrayStatus, String)>>> =
+        LazyLock::new(|| StdMutex::new(None));
+    let note = note.trim();
+    {
+        let mut last = LAST.lock().unwrap();
+        if last.as_ref() == Some(&(status, note.to_string())) {
+            return; // 状态没变：不刷 D-Bus
+        }
+        *last = Some((status, note.to_string()));
+    }
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        tracing::debug!("★ M28：托盘未创建，状态点不生效（{status:?}）");
+        return;
+    };
+    let tooltip = if note.is_empty() {
+        format!("{TRAY_TOOLTIP} — {}", status.label())
+    } else {
+        format!("{TRAY_TOOLTIP} — {}：{note}", status.label())
+    };
+    match tauri::image::Image::from_bytes(status.icon()) {
+        Ok(img) => {
+            if let Err(e) = tray.set_icon(Some(img)) {
+                tracing::warn!("★ M28：托盘状态图标切换失败（{status:?}）: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("★ M28：托盘状态图标解码失败（{status:?}）: {e}"),
+    }
+    if let Err(e) = tray.set_tooltip(Some(tooltip.clone())) {
+        tracing::warn!("★ M28：托盘 tooltip 更新失败（{status:?}）: {e}");
+    }
+    tracing::debug!("★ M28：托盘状态 → {status:?}（{tooltip}）");
+}
+
 /// 托盘是否**真的**建起来了。`OnceLock` 是刻意的：一个进程只有一个托盘，
 /// 且 `m84_info` 可能在任何时刻被前端调用（那时 setup 早已跑完）。
 static TRAY_CREATED: OnceLock<bool> = OnceLock::new();
@@ -252,7 +337,7 @@ fn build(app: &AppHandle) -> tauri::Result<()> {
 
     TrayIconBuilder::with_id(TRAY_ID)
         .icon(icon)
-        .tooltip("qxync — QNAP 按需同步")
+        .tooltip(TRAY_TOOLTIP)
         .menu(&menu)
         .on_menu_event(|app, event| match event.id().as_ref() {
             MENU_OPEN => emit_action(app, "open"),
@@ -277,5 +362,63 @@ pub fn emit_action(app: &AppHandle, action: &str) {
         Ok(()) => tracing::info!("★ M8.4：托盘动作 {action:?} 已 emit 到主窗口（{ACTION_EVENT}）"),
         // 主窗口还没建/已销毁不算致命：托盘仍可用，前端下次起来也能自己拉状态。
         Err(e) => tracing::warn!("★ M8.4：托盘动作 {action:?} emit 失败: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ★ M28：前端协议字符串 → 状态枚举。拼错必须返回 `None`（命令层按 ok 兜底并记日志），
+    /// 不能静默映射成某个状态 —— 否则前端拼错字会让托盘永远停在错误颜色上。
+    #[test]
+    fn tray_status_protocol_roundtrip() {
+        assert_eq!(TrayStatus::from_protocol("ok"), Some(TrayStatus::Ok));
+        assert_eq!(
+            TrayStatus::from_protocol("offline"),
+            Some(TrayStatus::Offline)
+        );
+        assert_eq!(
+            TrayStatus::from_protocol("warning"),
+            Some(TrayStatus::Warning)
+        );
+        for bad in ["", "OK", "error", "red", "green", "warn"] {
+            assert!(
+                TrayStatus::from_protocol(bad).is_none(),
+                "拼错的状态 {bad:?} 必须返回 None（按 ok 兜底是命令层的事）"
+            );
+        }
+    }
+
+    /// ★ M28：三个状态图标的资源必须**编译期就在**且是合法 PNG —— 托盘状态点是
+    /// 「网络断没断」的唯一可见信号，图标缺了/坏了不能等到运行时才发现。
+    #[test]
+    fn tray_status_icons_are_valid_pngs() {
+        for (st, name) in [
+            (TrayStatus::Ok, "green"),
+            (TrayStatus::Offline, "red"),
+            (TrayStatus::Warning, "yellow"),
+        ] {
+            let bytes = st.icon();
+            assert!(
+                bytes.len() > 100,
+                "{name} 图标过小（{}B）：include_bytes! 大概率没拿到真文件",
+                bytes.len()
+            );
+            // PNG 魔数（8 字节）：坏了 `Image::from_bytes` 会在运行时才报错。
+            assert_eq!(
+                &bytes[..8],
+                &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A],
+                "{name} 图标不是合法 PNG"
+            );
+        }
+    }
+
+    /// ★ M28：状态标签要进 tooltip —— 空标签会让 tooltip 变成「qxync — 」这种半截话。
+    #[test]
+    fn tray_status_labels_are_nonempty() {
+        for st in [TrayStatus::Ok, TrayStatus::Offline, TrayStatus::Warning] {
+            assert!(!st.label().is_empty());
+        }
     }
 }
