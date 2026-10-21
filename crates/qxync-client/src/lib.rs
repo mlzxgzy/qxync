@@ -49,6 +49,86 @@ pub mod write_action {
 /// ★ M7：LAN 对等协议（设备配对 / 事件快路径 / 直传）。
 pub mod peer;
 
+// ---------------------------------------------------------------- M30 错误文案与重试
+
+/// 幂等 GET 的**最多尝试次数**（首次 + 2 次重试）。
+///
+/// 为什么要有重试：真机（2026-10-21）轮询每 30s 一轮，仍会偶发一条
+/// `get_list` 失败 —— 探活同时是通的，说明只是这一条请求被对端丢了。
+/// 最常见的成因是 **keep-alive 竞态**：NAS 的 nginx 回收空闲连接，
+/// 而 reqwest 连接池里恰好复用了那条刚被关掉的连接。GET 是幂等的，
+/// 重试一次就往往成功，用户不该为这种抖动看到一条「同步失败」。
+///
+/// 为什么只重试「对端提前关连接 / 协议中断」这一小类：连接超时、连接拒绝、
+/// 请求超时是**离线**的第一现场 —— 把它们也重试，会把一次 20s 的 connect
+/// timeout 拖成 60s，让断网检测反而变慢。
+const GET_MAX_ATTEMPTS: u32 = 3;
+
+/// 首次重试前的等待（之后每次 ×3：200ms、600ms）。
+const GET_RETRY_BACKOFF: Duration = Duration::from_millis(200);
+
+/// 把 `reqwest::Error` 压成一句**不含 URL / 远端路径**的人话。
+///
+/// 为什么必须压：`reqwest::Error` 的 `Display` 会带上完整请求 URL，例如
+/// `error sending request for url (https://nas:9834/cgi-bin/qsync/qsyncsrv.cgi?func=get_list&sid=…&path=%2Fhome%2F…&…)`。
+/// 那条 URL 同时泄露 **sid、远端路径和全部查询参数**；用户看到的却不只是
+/// 「网络错误」，还有一长串本地/远程路径 —— 这正是 M30 要消掉的东西。
+/// 这里只保留「哪一类失败 + 最底层原因」，路径由调用方自己的 context 决定要不要带。
+fn http_error_text(e: reqwest::Error) -> String {
+    http_error_text_ref(&e)
+}
+
+/// [`http_error_text`] 的借用版本（重试日志要在返回错误前先描述一次）。
+fn http_error_text_ref(e: &reqwest::Error) -> String {
+    let kind = if e.is_timeout() {
+        "请求超时"
+    } else if e.is_connect() {
+        "连接失败"
+    } else if e.is_body() || e.is_decode() {
+        "响应读取失败"
+    } else if e.is_request() {
+        "请求发送失败"
+    } else {
+        "网络失败"
+    };
+    match io_cause(e) {
+        // 底层 io 原因（如 `Connection reset by peer (os error 104)`）能一眼看出
+        // 是「对端把连接关了」还是「本机发不出去」，且自身不含路径。
+        Some(cause) => format!("{kind}：{cause}"),
+        None => kind.to_string(),
+    }
+}
+
+/// 从错误链里找最底层的 `io::Error` 文本（不含路径）。
+fn io_cause(e: &(dyn std::error::Error + 'static)) -> Option<String> {
+    let mut src = e.source();
+    for _ in 0..8 {
+        let s = src?;
+        if let Some(io) = s.downcast_ref::<std::io::Error>() {
+            let text = io.to_string();
+            if !text.trim().is_empty() {
+                return Some(text);
+            }
+        }
+        src = s.source();
+    }
+    None
+}
+
+/// 这次 GET 失败值不值得**立刻重试**（幂等，且不是「离线」的判据）。
+fn is_transient_send_error(e: &reqwest::Error) -> bool {
+    // 超时 / 连接失败（含 DNS、拒绝）是离线的第一现场：只试一次，别拖慢离线检测。
+    if e.is_timeout() || e.is_connect() {
+        return false;
+    }
+    e.is_request() || e.is_body() || e.is_decode()
+}
+
+/// 反代 / 服务端忙时值得再试一次的状态码（网关抖动常见，且 GET 幂等）。
+fn is_transient_http_status(code: u16) -> bool {
+    matches!(code, 502 | 503 | 504)
+}
+
 /// 登录后拿到的会话信息。
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -132,7 +212,7 @@ impl Client {
         }
         let http = builder
             .build()
-            .map_err(|e| Error::Transport(e.to_string()))?;
+            .map_err(|e| Error::Transport(http_error_text(e)))?;
         Ok(Self {
             http,
             link: link.clone(),
@@ -318,12 +398,12 @@ impl Client {
             .form(&body)
             .send()
             .await
-            .map_err(|e| Error::Transport(format!("authLogin.cgi: {e}")))?;
+            .map_err(|e| Error::Transport(format!("authLogin.cgi: {}", http_error_text(e))))?;
         let status = resp.status();
         let text = resp
             .text()
             .await
-            .map_err(|e| Error::Transport(e.to_string()))?;
+            .map_err(|e| Error::Transport(http_error_text(e)))?;
         if !status.is_success() {
             return Err(Error::Auth(format!("authLogin.cgi HTTP {status}")));
         }
@@ -433,7 +513,7 @@ impl Client {
             .timeout(timeout)
             .send()
             .await
-            .map_err(|e| Error::Transport(format!("探活: {e}")))?;
+            .map_err(|e| Error::Transport(format!("探活: {}", http_error_text(e))))?;
         if !resp.status().is_success() {
             // HTTP 层能回包 = 网络是通的（哪怕 500 也是服务端在回话）
             return Ok(true);
@@ -441,7 +521,7 @@ impl Client {
         let body = resp
             .bytes()
             .await
-            .map_err(|e| Error::Transport(format!("探活读响应: {e}")))?;
+            .map_err(|e| Error::Transport(format!("探活读响应: {}", http_error_text(e))))?;
         let m = parse_max_log(&body)?;
         Ok(m.status
             .is_none_or(|s| ServerStatus(s).is_success() || s == 8))
@@ -526,12 +606,12 @@ impl Client {
             .get(url)
             .send()
             .await
-            .map_err(|e| Error::Transport(format!("GET 失败: {e}")))?;
+            .map_err(|e| Error::Transport(format!("GET 失败: {}", http_error_text(e))))?;
         let code = resp.status().as_u16();
         let body = resp
             .bytes()
             .await
-            .map_err(|e| Error::Transport(e.to_string()))?;
+            .map_err(|e| Error::Transport(http_error_text(e)))?;
         Ok((code, body.to_vec()))
     }
 
@@ -540,23 +620,51 @@ impl Client {
         self.url(cgi, query)
     }
 
+    /// 发一次**幂等** GET：对端提前关连接 / 反代 502 这类抖动自动重试
+    /// （见 [`GET_MAX_ATTEMPTS`] 与 [`is_transient_send_error`]）。
+    ///
+    /// 传 `what` 而不是完整 URL：错误文案里只留「哪一跳失败」，
+    /// URL 里的 sid 与远端路径不外泄（见 [`http_error_text`]）。
+    async fn send_get(&self, what: &str, url: &str) -> Result<reqwest::Response> {
+        let mut backoff = GET_RETRY_BACKOFF;
+        for attempt in 1..=GET_MAX_ATTEMPTS {
+            let last = attempt == GET_MAX_ATTEMPTS;
+            match self.http.get(url).send().await {
+                Ok(resp) if !last && is_transient_http_status(resp.status().as_u16()) => {
+                    tracing::debug!(
+                        "{what}: HTTP {}（反代/服务端忙），{backoff:?} 后重试（第 {attempt}/{GET_MAX_ATTEMPTS} 次尝试）",
+                        resp.status()
+                    );
+                }
+                Ok(resp) => return Ok(resp),
+                Err(e) if !last && is_transient_send_error(&e) => {
+                    tracing::debug!(
+                        "{what}: {}，{backoff:?} 后重试（第 {attempt}/{GET_MAX_ATTEMPTS} 次尝试）",
+                        http_error_text_ref(&e)
+                    );
+                }
+                Err(e) => {
+                    return Err(Error::Transport(format!("{what}: {}", http_error_text(e))));
+                }
+            }
+            tokio::time::sleep(backoff).await;
+            backoff *= 3;
+        }
+        unreachable!("send_get 的每个分支都会 return")
+    }
+
     /// 调 `qsyncsrv.cgi?func=…`，按给定键值原样发出去。
     async fn qsync_func(&self, func: &str, extra: &[(&str, &str)]) -> Result<Vec<u8>> {
         let sid = self.require_sid()?.to_string();
         let mut q: Vec<(&str, &str)> = vec![("func", func), ("sid", sid.as_str())];
         q.extend_from_slice(extra);
         let url = self.url("cgi-bin/qsync/qsyncsrv.cgi", &q);
-        let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| Error::Transport(format!("{func}: {e}")))?;
+        let resp = self.send_get(func, &url).await?;
         let code = resp.status();
         let body = resp
             .bytes()
             .await
-            .map_err(|e| Error::Transport(e.to_string()))?;
+            .map_err(|e| Error::Transport(http_error_text(e)))?;
         if !code.is_success() {
             return Err(Error::Transport(format!("{func}: HTTP {code}")));
         }
@@ -578,12 +686,12 @@ impl Client {
             .get(&url)
             .send()
             .await
-            .map_err(|e| Error::Transport(format!("probe: {e}")))?;
+            .map_err(|e| Error::Transport(format!("probe: {}", http_error_text(e))))?;
         let code = resp.status();
         let body = resp
             .bytes()
             .await
-            .map_err(|e| Error::Transport(e.to_string()))?;
+            .map_err(|e| Error::Transport(http_error_text(e)))?;
         if !code.is_success() {
             return Err(Error::Transport(format!("probe: HTTP {code}")));
         }
@@ -626,7 +734,7 @@ impl Client {
             }
             start += got;
             if start > 1_000_000 {
-                return Err(Error::Parse(format!("get_list {path} 翻页异常")));
+                return Err(Error::Parse("get_list 翻页异常".to_string()));
             }
         }
         Ok(out)
@@ -653,28 +761,23 @@ impl Client {
                 ("hidden_file", "1"),
             ],
         );
-        let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| Error::Transport(format!("get_list {path}: {e}")))?;
+        let resp = self.send_get("get_list", &url).await?;
         // ★ HTTP 层失败**不能**当「目录是空的」：反代 502/504 的 JSON 错误体
         //   （如 `{"error":...}`）能通过 `Listing` 的全默认反序列化 + `ensure_ok`，
         //   于是被读成「0 项」→ 对账把该目录所有条目当成「远端已删」。
         if !resp.status().is_success() {
             return Err(Error::Transport(format!(
-                "get_list {path}: HTTP {}",
+                "get_list: HTTP {}",
                 resp.status()
             )));
         }
         let body = resp
             .bytes()
             .await
-            .map_err(|e| Error::Transport(e.to_string()))?;
-        Self::ensure_listing_shape(&body, &format!("get_list {path}"))?;
+            .map_err(|e| Error::Transport(http_error_text(e)))?;
+        Self::ensure_listing_shape(&body, "get_list")?;
         let listing: Listing = parse_listing(&body)?;
-        listing.ensure_ok(format!("get_list {path}"))?;
+        listing.ensure_ok("get_list")?;
         Ok(listing)
     }
 
@@ -715,27 +818,19 @@ impl Client {
                 ("file_total", "1"),
             ],
         );
-        let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| Error::Transport(format!("stat {dir}/{file_name}: {e}")))?;
+        let resp = self.send_get("stat", &url).await?;
         // ★ stat 的 `Ok(None)` 会被对账当成「确认不存在」并据此删本地 ——
         //   HTTP 层失败绝不能长成「不存在」。
         if !resp.status().is_success() {
-            return Err(Error::Transport(format!(
-                "stat {dir}/{file_name}: HTTP {}",
-                resp.status()
-            )));
+            return Err(Error::Transport(format!("stat: HTTP {}", resp.status())));
         }
         let body = resp
             .bytes()
             .await
-            .map_err(|e| Error::Transport(e.to_string()))?;
-        Self::ensure_listing_shape(&body, &format!("stat {dir}/{file_name}"))?;
+            .map_err(|e| Error::Transport(http_error_text(e)))?;
+        Self::ensure_listing_shape(&body, "stat")?;
         let listing: Listing = parse_listing(&body)?;
-        listing.ensure_ok(format!("stat {dir}/{file_name}"))?;
+        listing.ensure_ok("stat")?;
         // ★ 只能靠 `exist` 判定：不存在的路径也会返回「占位条目」
         //   （filename 是请求的名字、filesize=0、owner/privilege 为空），但 `exist=0`。
         //   早期用 `!filename.is_empty()` 兜底 → 把不存在的文件当存在，FUSE lookup 误报正项
@@ -757,11 +852,11 @@ impl Client {
             .form(&[("dest_path", parent), ("dest_folder", name)])
             .send()
             .await
-            .map_err(|e| Error::Transport(format!("createdir: {e}")))?;
+            .map_err(|e| Error::Transport(format!("createdir: {}", http_error_text(e))))?;
         let body = resp
             .bytes()
             .await
-            .map_err(|e| Error::Transport(e.to_string()))?;
+            .map_err(|e| Error::Transport(http_error_text(e)))?;
         let listing: Listing = parse_listing(&body)?;
         listing.ensure_ok(format!("createdir {parent}/{name}"))?;
         Ok(())
@@ -811,12 +906,12 @@ impl Client {
             .header("Range", format!("bytes={start}-{end}"))
             .send()
             .await
-            .map_err(|e| Error::Transport(format!("download {name}: {e}")))?;
+            .map_err(|e| Error::Transport(format!("download {name}: {}", http_error_text(e))))?;
         let code = resp.status().as_u16();
         let body = resp
             .bytes()
             .await
-            .map_err(|e| Error::Transport(e.to_string()))?;
+            .map_err(|e| Error::Transport(http_error_text(e)))?;
         if code != 200 && code != 206 {
             return Err(Error::Transport(format!(
                 "download {dir}/{name}: HTTP {code}, body={}",
@@ -867,12 +962,10 @@ impl Client {
             "cgi-bin/filemanager/utilRequest.cgi",
             &self.filetool_query("download", dir, name, &sid),
         );
-        let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| Error::Transport(format!("download {name}: {e}")))?;
+        let resp =
+            self.http.get(&url).send().await.map_err(|e| {
+                Error::Transport(format!("download {name}: {}", http_error_text(e)))
+            })?;
         let code = resp.status().as_u16();
         if code != 200 && code != 206 {
             return Err(Error::Transport(format!(
@@ -888,7 +981,7 @@ impl Client {
         let total = resp.content_length();
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| Error::Transport(e.to_string()))?;
+            let chunk = chunk.map_err(|e| Error::Transport(http_error_text(e)))?;
             tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
             written += chunk.len() as u64;
             if let Some(cb) = progress {
@@ -934,11 +1027,11 @@ impl Client {
             .multipart(form)
             .send()
             .await
-            .map_err(|e| Error::Transport(format!("upload {filename}: {e}")))?;
+            .map_err(|e| Error::Transport(format!("upload {filename}: {}", http_error_text(e))))?;
         let body = resp
             .bytes()
             .await
-            .map_err(|e| Error::Transport(e.to_string()))?;
+            .map_err(|e| Error::Transport(http_error_text(e)))?;
         parse_upload_result(&body, filename)
     }
 
@@ -1045,11 +1138,11 @@ impl Client {
             .multipart(form)
             .send()
             .await
-            .map_err(|e| Error::Transport(format!("upload {filename}: {e}")))?;
+            .map_err(|e| Error::Transport(format!("upload {filename}: {}", http_error_text(e))))?;
         let body = resp
             .bytes()
             .await
-            .map_err(|e| Error::Transport(e.to_string()))?;
+            .map_err(|e| Error::Transport(http_error_text(e)))?;
         parse_upload_result(&body, filename)?;
         Ok(sent.load(Ordering::Relaxed))
     }
@@ -1070,16 +1163,11 @@ impl Client {
                 ("file_name", name),
             ],
         );
-        let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| Error::Transport(format!("settime: {e}")))?;
+        let resp = self.send_get("settime", &url).await?;
         let body = resp
             .bytes()
             .await
-            .map_err(|e| Error::Transport(e.to_string()))?;
+            .map_err(|e| Error::Transport(http_error_text(e)))?;
         parse_listing(&body)?.ensure_ok(format!("stat&settime {dir}/{name}"))?;
         Ok(())
     }
@@ -1242,11 +1330,11 @@ impl Client {
             .form(&[("path", dir), ("source_name", from), ("dest_name", to)])
             .send()
             .await
-            .map_err(|e| Error::Transport(format!("rename: {e}")))?;
+            .map_err(|e| Error::Transport(format!("rename: {}", http_error_text(e))))?;
         let body = resp
             .bytes()
             .await
-            .map_err(|e| Error::Transport(e.to_string()))?;
+            .map_err(|e| Error::Transport(http_error_text(e)))?;
         parse_listing(&body)?.ensure_ok(format!("rename {dir}/{from} -> {to}"))?;
         Ok(())
     }
@@ -1277,11 +1365,11 @@ impl Client {
             ])
             .send()
             .await
-            .map_err(|e| Error::Transport(format!("move: {e}")))?;
+            .map_err(|e| Error::Transport(format!("move: {}", http_error_text(e))))?;
         let body = resp
             .bytes()
             .await
-            .map_err(|e| Error::Transport(e.to_string()))?;
+            .map_err(|e| Error::Transport(http_error_text(e)))?;
         parse_listing(&body)?.ensure_ok(format!("move {from_dir}/{from_name} -> {to_dir}"))?;
 
         for _ in 0..40 {
@@ -1330,11 +1418,11 @@ impl Client {
             .form(&form)
             .send()
             .await
-            .map_err(|e| Error::Transport(format!("delete: {e}")))?;
+            .map_err(|e| Error::Transport(format!("delete: {}", http_error_text(e))))?;
         let body = resp
             .bytes()
             .await
-            .map_err(|e| Error::Transport(e.to_string()))?;
+            .map_err(|e| Error::Transport(http_error_text(e)))?;
         // 部分成功也要能看出是哪几个：ensure_ok 只报首个失败项。
         let listing = parse_listing(&body)?;
         listing.ensure_ok(format!("delete {dir}/{}", names.join(",")))?;

@@ -5278,20 +5278,42 @@ fn journal_record_sync(state: &Arc<State>, r: &sync::SyncReport) {
     //   同一件事说两遍，而且一次拔网线弹一次窗正是用户抱怨的「到处报错」。
     //   普通错误（业务 status / 会话 / 本地 IO）照旧 `error`。
     //   ⚠️ `r.errors` 与 `r.error_is_network` 由 `push_error` 保证逐条对齐。
+    //
+    // ★ M30：网络类条目**按断网事件去重**（`r.network_failure_changed`）。断网常常
+    //   持续很多轮，每轮都写一条「网络失败」正是「怎么还在报网络错误」的来源；
+    //   只有第一次失败 / 失败内容变了才写，恢复时补一条「已恢复」让历史有闭环。
+    let mut network_logged = false;
     for (i, e) in r.errors.iter().enumerate() {
         let is_network = r.error_is_network.get(i).copied().unwrap_or(false);
-        let entry = if is_network {
-            JournalEntry::warn("network", "", e.clone())
-        } else {
-            JournalEntry::error("sync", "", e.clone())
-        };
-        journal_log(state, entry);
+        if is_network {
+            if r.network_failure_changed && !network_logged {
+                journal_log(state, JournalEntry::warn("network", "", e.clone()));
+                n += 1;
+                network_logged = true;
+            }
+            continue;
+        }
+        journal_log(state, JournalEntry::error("sync", "", e.clone()));
+        n += 1;
+    }
+    if r.network_failure_changed && !network_logged {
+        // 本轮没有任何网络错误、但签名变了 = 上一轮的断网**已恢复**。
+        journal_log(
+            state,
+            JournalEntry::ok("network", "", "网络已恢复：同步继续".to_string()),
+        );
         n += 1;
     }
     // 「引擎活着」的轻量条目：扫过但**没有任何值得记的事**时才写，且限频
     // （默认 30s 一轮 = 一天 2880 条，照样会把 1 万条上限几天冲掉）。
     // 熔断持续中的轮次不算「无变化」—— 那种轮次本来就不是安静轮次。
-    if n == 0 && r.dirs_scanned > 0 && r.deletes_blocked == 0 && scan_journal_due() {
+    // ★ M30：有错误（含被去重掉的网络失败）时也不写 —— 断网轮次不是「无变化」。
+    if n == 0
+        && r.errors.is_empty()
+        && r.dirs_scanned > 0
+        && r.deletes_blocked == 0
+        && scan_journal_due()
+    {
         journal_log(
             state,
             JournalEntry::ok(

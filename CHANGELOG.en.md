@@ -36,10 +36,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (92 ms each), so one full pass takes ~8–9 minutes — instead of a 24-minute rotation
     during which deletions cannot be judged.
 
+### Fixed
+
+- **Network failures no longer spam or leak paths/URLs/sid; a single blip is absorbed by
+  a retry, a real outage is reported as "buffered, waiting for the network"
+  ([M30](docs/M30-网络失败缓冲与错误降噪.md))**. The real-device user's three sentences:
+  "why is it still reporting network errors", "stop showing local and remote paths, just
+  say which sync hit the network failure", "put it in the buffer and wait until online".
+  - **Bounded retry for idempotent GETs** (`get_list` / `stat` / GETs on `qsyncsrv.cgi` /
+    `settime`): up to 3 attempts (200ms → 600ms backoff), retrying only "peer closed the
+    connection early / protocol interruption / reverse-proxy 502/503/504". Connect
+    timeouts, connection refused and DNS failures are **not** retried (they are the
+    offline signal — retrying would stretch a 20s connect timeout into 60s). A blip that
+    the retry absorbs produces **zero errors**; the user sees nothing.
+  - **Copy drops URLs / sid / local and remote paths**: the client flattens
+    `reqwest::Error` into "failure class + innermost io cause" (e.g.
+    `request failed: Connection reset by peer (os error 104)`), so the full URL that
+    `reqwest` embeds (`sid=`, URL-encoded remote path) never leaks; `get_list`/`stat`
+    contexts no longer append paths; reconciliation failures now read
+    "sync \"task\" list failed (directory N/M): …; this round is buffered, will continue
+    when the network recovers" — "which sync" is the mount directory name (the task name),
+    and paths only appear in `tracing::debug` logs.
+  - **Network failures go to the note, not "last error"**: `absorb_round` writes only
+    **non-network** errors into `last_error`; network failures go into `last_note`
+    (`qxync status` / `qxync sync` / GUI sync and diagnostics pages show
+    "note: … buffered …"). Being disconnected is not "sync is broken" and must not leave
+    a permanent red line in the UI.
+  - **Journal deduplicates by outage signature**: one outage writes one `warn` entry
+    (repeat rounds drop to debug) and an `ok` "network recovered" entry when it clears, so
+    the update center no longer grows a line every 30s.
+  - Data safety is unchanged: directories that failed to list are still **not judged**,
+    never deleted as missing, and their cache is kept.
+
 ### Verification
 
 - `cargo test --workspace` green (5 new full-sync tests + 1 `#[ignore]` read-only
-  real-NAS smoke test);
+  real-NAS smoke test; M30 adds 3 tests: retry absorbs a blip / copy has no paths, URL or
+  sid / network failures only go to the note);
 - `cargo fmt --check` clean; `cargo check --workspace --all-targets` has no errors.
 
 ## [0.7.7] - 2026-10-21
