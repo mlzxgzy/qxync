@@ -155,6 +155,31 @@ fn remove_cache_files(cache: &Path) {
     let _ = std::fs::remove_file(sum_path(cache));
 }
 
+/// ★ M32：把缓存文件的「内容 + 位图 + 校验和」**三件套**一起搬到新名字。
+///
+/// 改名（`rename`）与 O_TMPFILE 物化（`link`）都必须走这里。旧实现只搬内容 +
+/// 位图，**漏掉 `.qxsum`** —— 后果分两种，都很难查：
+/// * 目标位置没有旧三件套（KIO 的 `.part` → 正式名）→ 新名字**没有校验和表**，
+///   重启认领时 T3 把「没有基准」当损坏 → 明明内容好好的却整份重下；
+/// * 目标位置有旧文件留下的 `.qxsum`（覆盖保存）→ **新内容 + 旧校验和**，
+///   每次认领都判损坏。
+///
+/// 目标位置可能残留同路径旧文件的位图/校验和（`create` 不清理它们），所以先删再搬：
+/// **宁可没有基准（重新水合），也不能拿错版本的基准去对**。
+fn move_cache_triplet(old: &Path, new: &Path) -> io::Result<()> {
+    if old == new {
+        return Ok(());
+    }
+    let _ = std::fs::remove_file(state_path(new));
+    let _ = std::fs::remove_file(sum_path(new));
+    std::fs::rename(old, new)?;
+    // 位图/校验和可能压根不存在（从未落盘的本地新文件）——搬不到就算了，
+    // 但**绝不**把目标位置残留的旧文件当作它的。
+    let _ = std::fs::rename(state_path(old), state_path(new));
+    let _ = std::fs::rename(sum_path(old), sum_path(new));
+    Ok(())
+}
+
 /// 位图落盘（先写 `.tmp` 再 `rename`，原子替换）。
 ///
 /// 顺序很关键：**先 pwrite 内容与 `.qxsum`、后写位图**。崩在中间只会「位图比内容旧」
@@ -721,6 +746,18 @@ struct Node {
     cache: Option<PathBuf>,
     /// 每个 128 KiB 区间的完成标记；长度 = 区间数，在创建缓存文件时初始化。
     chunks_done: Vec<bool>,
+    /// ★ M32：哪些区间的「内容变过、但 `.qxsum` 里的校验和还是旧的」。
+    ///
+    /// 写入不保证按 128 KiB 对齐：一次 `write` 只盖住区间的一部分时内容已经变了，
+    /// 却**不能**拿当前（半截）内容算 hash 当最终值 —— 旧实现就是这么干的：
+    /// 把 `min(区间尾, EOF)` 当区间尾，新建/追加文件第一次写进来的几 KB 就被当成
+    /// 整个区间的内容算进 `.qxsum`；之后再追加/补写也不会重算（那些写没有「完整
+    /// 覆盖」该区间）→ 校验和与内容永久分叉 → 重启认领时 T3 判成损坏、白重下一遍。
+    ///
+    /// 这里只记「脏」；真正的重算发生在关文件（`release`/`flush`/`fsync`）时 ——
+    /// 那时内容才是最终的，一次读把脏区间补齐（见
+    /// [`QxyncFs::finalize_written_chunks`]）。
+    stale_sums: Vec<bool>,
     /// ★ T3/T9：跨改名/移动稳定的文件身份（`.qxstate` v2 头里的一栏）。
     ///
     /// ★ M15/T9 起是**真值**：`compute_file_id(is_dir, size, mtime, name, parent)`。
@@ -898,6 +935,11 @@ impl Node {
     /// 单独重写 —— 位图（内存态）和校验和（落盘态）在这里必须一起想。
     fn reset_chunks(&mut self, chunk_size: u64, done: bool) {
         self.chunks_done = vec![done; self.chunk_count(chunk_size)];
+        // ★ M32：区间表重来一遍 → 旧的「校验和待重算」标记一并作废。
+        //   `done=false` 表示内容要重新拿（水合/写入时各自会写对应校验和）；
+        //   `done=true` 是「整份内容刚被原子换上」—— 调用方必须自己重写整张
+        //   `.qxsum`（见 `install_refreshed`），这里不替它编造基准。
+        self.stale_sums = vec![false; self.chunks_done.len()];
         self.whole_xxhash = NO_HASH;
     }
 
@@ -3382,6 +3424,7 @@ impl QxyncFs {
             attr: root_attr,
             cache: None,
             chunks_done: Vec::new(),
+            stale_sums: Vec::new(),
             // ★ T9：挂载根本身也是一个目录节点，给它真身份（父目录为空串）。
             //   之前是全零 —— 那会让「根目录参与 rename 配对」永远配不上。
             file_id: compute_file_id(true, 0, 0, "", ""),
@@ -4120,6 +4163,7 @@ impl QxyncFs {
             attr,
             cache: None,
             chunks_done: Vec::new(),
+            stale_sums: Vec::new(),
             // ★ T9：真身份，紧接着由 `refresh_file_id` 按 (kind, size, mtime,
             // name, parent) 现算填上 —— 节点表是本地权威，签名的唯一来源是 `attr`。
             file_id: ZERO_FILE_ID,
@@ -4684,13 +4728,22 @@ impl QxyncFs {
     /// 「没有缓存内容」：既不能脱水、xattr 的 chunks 也不准
     /// （实测踩过：16 MiB 本地文件脱水被判成「本来就是占位符」）。
     /// 只有整块区间都被这次写覆盖才算完整（部分覆盖的块里还有别的字节）。
+    ///
+    /// ★ M32：**部分覆盖的区间不能就地算校验和**。旧实现的两个坑：
+    /// 1. 把 `min(区间尾, EOF)` 当区间尾 —— 新建/追加文件中，第一次写进来的几 KB
+    ///    就满足「整块被覆盖」，于是被当成整区间算了 hash（内容还远没写完）；
+    /// 2. 后续追加/补写只盖住该区间一部分时**不重算**，`.qxsum` 永久停在第一版。
+    /// 现在：只有这次写真的覆盖到「当前文件里的这个区间尾」才立刻算；被**部分**
+    /// 改写、且原先已经就绪的区间只标进 `stale_sums`，等关文件时按最终内容一次补齐
+    /// （见 [`QxyncFs::finalize_written_chunks`]）。
     fn mark_written_chunks(&self, ino: INodeNo, offset: u64, len: u64) {
         if len == 0 {
             return;
         }
         let chunk_size = self.chunk_size;
         let mut flipped: Vec<u64> = Vec::new();
-        let mut newly: Vec<u64> = Vec::new();
+        let mut hash_now: Vec<u64> = Vec::new();
+        let mut content_touched = false;
         let (cache, size, want) = {
             let mut g = self.inner.lock().unwrap();
             let Some(n) = g.nodes.get_mut(&ino) else {
@@ -4700,29 +4753,46 @@ impl QxyncFs {
             if n.chunks_done.len() < want {
                 n.chunks_done.resize(want, false);
             }
+            if n.stale_sums.len() != n.chunks_done.len() {
+                n.stale_sums.resize(n.chunks_done.len(), false);
+            }
             let end = offset + len;
             let (first, last) = chunk_indices(offset, len, chunk_size);
             for idx in first..=last {
                 let c_start = idx * chunk_size;
                 let c_end = ((idx + 1) * chunk_size).min(n.attr.size);
-                if c_start >= offset && c_end <= end {
-                    if let Some(slot) = n.chunks_done.get_mut(idx as usize) {
-                        if !*slot {
-                            *slot = true;
-                            flipped.push(idx);
-                        }
-                        newly.push(idx);
+                let covered = c_start >= offset && c_end <= end;
+                let Some(slot) = n.chunks_done.get_mut(idx as usize) else {
+                    continue;
+                };
+                if covered {
+                    // 这次写把「当前文件里的这个区间」整段盖住了 → 内容是最终的
+                    if !*slot {
+                        *slot = true;
+                        flipped.push(idx);
                     }
+                    if let Some(stale) = n.stale_sums.get_mut(idx as usize) {
+                        *stale = false;
+                    }
+                    hash_now.push(idx);
+                    content_touched = true;
+                } else if *slot {
+                    // 已经就绪的区间被**部分**改写：内容变了，但现在算的 hash 不是
+                    // 最终内容 → 记脏，等关文件（finalize）按最终内容重算。
+                    if let Some(stale) = n.stale_sums.get_mut(idx as usize) {
+                        *stale = true;
+                    }
+                    content_touched = true;
                 }
+                // 未就绪 + 部分覆盖：什么都没盖全，不置位（保留旧的「部分覆盖不能算
+                // 内容完整」语义：脱水/统计不把半截内容当缓存）。
             }
             (n.cache.clone(), n.attr.size, want)
         };
-        // ★ T3：本地写过的区间同样要有校验和 —— 否则 verify 会把「用户自己写的文件」
-        // 全判成损坏。内容刚由 write 落盘，这里读回来算很便宜；一次 write 覆盖多个
-        // 区间时合成一次 `pwrite` 批次，别一个区间开一次文件。
+        // 整块被覆盖的区间：内容在这一段就是最终的，可以立刻算
         if let Some(cache) = &cache {
-            let mut items: Vec<(u64, u64)> = Vec::with_capacity(newly.len());
-            for idx in &newly {
+            let mut items: Vec<(u64, u64)> = Vec::with_capacity(hash_now.len());
+            for idx in &hash_now {
                 match chunk_hash(cache, chunk_size, size, *idx) {
                     Ok(h) => items.push((*idx, h)),
                     Err(e) => tracing::warn!("算区间校验和失败 {} #{idx}: {e}", cache.display()),
@@ -4734,15 +4804,104 @@ impl QxyncFs {
         }
         // ★ M9：本地写入同样是「已有内容」。只在**真的有区间翻成就绪**时落盘：
         //   4 KB 一块的小写不该每写一次就重写一遍位图（`release` 时还有一次兜底落盘）。
-        if !flipped.is_empty() {
-            // 内容变了 → 旧的整文件哈希作废
+        // ★ M32：内容只要被碰过，整文件哈希就作废（哪怕位图没有新翻成的区间 ——
+        //   覆盖一个已就绪的区间同样让旧整文件哈希失效）。
+        if content_touched {
             let mut g = self.inner.lock().unwrap();
             if let Some(n) = g.nodes.get_mut(&ino) {
                 n.whole_xxhash = NO_HASH;
             }
-            drop(g);
+        }
+        if !flipped.is_empty() {
             persist_chunk_state(&self.inner, chunk_size, ino, &self.cache_index);
         }
+    }
+
+    /// ★ M32：关文件/fsync 时，把「内容变过但校验和还是旧的」区间按**最终内容**补齐。
+    ///
+    /// 为什么要等到关文件：一次 `write` 只盖住区间一部分时，内容还会继续变；
+    /// 拿半截内容算 hash 就是上面 `mark_written_chunks` 注释里那条老 bug。
+    ///
+    /// 只对 **dirty** 节点做：dirty = 本地内容是权威 —— 写路径开头的 `hydrate_all`
+    /// 已经保证每个区间要么被本地写过、要么从远端补齐过（新建文件的空洞按 0 算，
+    /// 与稀疏文件语义一致），所以此刻每个区间的内容都是完整的。
+    ///
+    /// 代价：只读**脏区间**（不是整份文件）；常见的「整块对齐的 cp」一个脏区间都没有，
+    /// 这一步是零开销。
+    fn finalize_written_chunks(&self, ino: INodeNo) {
+        let chunk_size = self.chunk_size;
+        let Some(op_lock) = self.op_lock(ino) else {
+            return;
+        };
+        let Ok(_guard) = op_lock.try_lock() else {
+            // 另一个线程正在读/写这个 inode（例如同一文件还有别的 fd 开着）——
+            // 这一轮跳过；release 之后的 fsync/下一次关文件会再补。
+            return;
+        };
+        let (cache, size, want, todo) = {
+            let mut g = self.inner.lock().unwrap();
+            let Some(n) = g.nodes.get_mut(&ino) else {
+                return;
+            };
+            if n.attr.kind != FileType::RegularFile || !n.dirty {
+                return;
+            }
+            let Some(cache) = n.cache.clone() else {
+                return;
+            };
+            let want = n.chunk_count(chunk_size);
+            if n.chunks_done.len() != want {
+                n.chunks_done.resize(want, false);
+            }
+            if n.stale_sums.len() != want {
+                n.stale_sums.resize(want, false);
+            }
+            // 只重算「已就绪、且内容变过」的区间：未就绪的区间本来就没有基准
+            // （部分覆盖不算内容完整，见 mark_written_chunks），不能在这里凭空造一个。
+            let todo: Vec<u64> = (0..want)
+                .filter(|i| n.chunks_done[*i] && n.stale_sums[*i])
+                .map(|i| i as u64)
+                .collect();
+            (cache, n.attr.size, want, todo)
+        };
+        if todo.is_empty() {
+            return;
+        }
+        let mut items: Vec<(u64, u64)> = Vec::with_capacity(todo.len());
+        for idx in &todo {
+            match chunk_hash(&cache, chunk_size, size, *idx) {
+                Ok(h) => items.push((*idx, h)),
+                Err(e) => {
+                    tracing::warn!("关文件补算校验和失败 {} #{idx}: {e}", cache.display());
+                    return;
+                }
+            }
+        }
+        if let Err(e) = sum_store_many(&cache, want, &items) {
+            tracing::warn!("关文件写校验和失败 {}: {e}", cache.display());
+            return;
+        }
+        {
+            let mut g = self.inner.lock().unwrap();
+            let Some(n) = g.nodes.get_mut(&ino) else {
+                return;
+            };
+            // 拿锁期间签名又变了（另一个 fd 又写了）→ 这一轮作废，别把旧内容算成新基准。
+            if n.attr.size != size {
+                return;
+            }
+            for (idx, _) in &items {
+                if let Some(s) = n.stale_sums.get_mut(*idx as usize) {
+                    *s = false;
+                }
+            }
+        }
+        tracing::debug!(
+            "关文件补齐校验和 {} 个区间: {}",
+            items.len(),
+            cache.display()
+        );
+        persist_chunk_state(&self.inner, chunk_size, ino, &self.cache_index);
     }
 
     /// 节点操作锁（read/write/setattr 持锁；脱水 try_lock）。
@@ -6003,6 +6162,7 @@ impl Filesystem for QxyncFs {
                 attr,
                 cache: None,
                 chunks_done: Vec::new(),
+                stale_sums: Vec::new(),
                 file_id: ZERO_FILE_ID,
                 whole_xxhash: NO_HASH,
                 dirty: false,
@@ -6124,9 +6284,13 @@ impl Filesystem for QxyncFs {
             };
             let _guard = op_lock.lock().unwrap();
             let new_cache = self.cache_path(&new_remote, newname);
+            // ★ M32：内容 + 位图 + 校验和**三件套**一起搬（旧实现漏了 `.qxsum`）
+            let mut moved = true;
             if let Some(old_cache) = src.cache.clone() {
                 if old_cache != new_cache {
-                    if let Err(e) = std::fs::rename(&old_cache, &new_cache) {
+                    index_forget(&self.cache_index, &old_cache);
+                    if let Err(e) = move_cache_triplet(&old_cache, &new_cache) {
+                        moved = false;
                         tracing::warn!(
                             "物化 O_TMPFILE 缓存迁移失败 {} -> {}: {e}",
                             old_cache.display(),
@@ -6142,7 +6306,7 @@ impl Filesystem for QxyncFs {
                     n.parent = newparent;
                     n.name = newname.to_string();
                     n.remote = new_remote.clone();
-                    if n.cache.is_some() {
+                    if n.cache.is_some() && moved {
                         n.cache = Some(new_cache);
                     }
                 }
@@ -6197,11 +6361,16 @@ impl Filesystem for QxyncFs {
                 if std::fs::copy(src_cache, &dst_cache).is_err() {
                     return reply.error(fuser::Errno::EIO);
                 }
+                // ★ M32：内容复制了，**校验和表也要复制** —— 只把位图置成全就绪、
+                // 不给 `.qxsum` 的话，重启认领时 T3 会把「有位图没基准」判成损坏，
+                // 明明本地有一份完整副本却还要重下一次。
+                let _ = std::fs::copy(sum_path(src_cache), sum_path(&dst_cache));
                 // 复制出来的内容 = 全部区间已就绪
                 let mut g = self.inner.lock().unwrap();
                 if let Some(n) = g.nodes.get_mut(&node.ino) {
                     let want = n.chunk_count(self.chunk_size);
                     n.chunks_done = vec![true; want];
+                    n.stale_sums = vec![false; want];
                     n.whole_xxhash = NO_HASH;
                 }
             }
@@ -6559,16 +6728,14 @@ impl Filesystem for QxyncFs {
             g.by_remote.remove(&old_remote);
             g.by_remote.insert(new_remote.clone(), ino);
             if let Some(n) = g.nodes.get_mut(&ino) {
-                // ★ M9：缓存文件（+ 位图）跟着改名走，否则重启后新名字认领不到旧内容
+                // ★ M9：缓存文件（+ 位图 + 校验和）跟着改名走，否则重启后新名字
+                // 认领不到旧内容，或者拿旧文件的校验和去对不上。
                 if let Some(old_cache) = n.cache.clone() {
                     let new_cache = self.cache_path(&new_remote, newname);
                     if old_cache != new_cache {
-                        match std::fs::rename(&old_cache, &new_cache) {
-                            Ok(()) => {
-                                let _ =
-                                    std::fs::rename(state_path(&old_cache), state_path(&new_cache));
-                                n.cache = Some(new_cache);
-                            }
+                        index_forget(&self.cache_index, &old_cache);
+                        match move_cache_triplet(&old_cache, &new_cache) {
+                            Ok(()) => n.cache = Some(new_cache),
                             Err(e) => {
                                 tracing::warn!(
                                     "改名后迁移缓存失败 {} -> {}: {e}",
@@ -6773,6 +6940,10 @@ impl Filesystem for QxyncFs {
             tracing::debug!("O_TMPFILE 未命名节点已丢弃: ino={}", u64::from(ino));
             return reply.ok();
         }
+        // ★ M32：先把「写到了但校验和还是旧的」区间按最终内容补算 ——
+        //   必须在 `persist_chunk_state` 之前（那份位图落盘后才是可认领状态），
+        //   否则重启后 T3 会拿旧校验和判新内容为损坏。
+        self.finalize_written_chunks(ino);
         // ★ M9：关文件时把位图按**最终**的 size/mtime 落一次盘 ——
         //   本地改写过的文件在下次挂载时也能直接认领，不必重新拉一遍。
         persist_chunk_state(&self.inner, self.chunk_size, ino, &self.cache_index);
@@ -6785,22 +6956,28 @@ impl Filesystem for QxyncFs {
     fn flush(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         _fh: fuser::FileHandle,
         _lock_owner: fuser::LockOwner,
         reply: ReplyEmpty,
     ) {
+        // ★ M32：编辑器保存完常常 `close` 之后还留着 fd / 或者只 `fsync` 不关，
+        //   而上传队列可能已经把它传走了 —— 趁这里把校验和补齐，别让「内容已上传、
+        //   校验和还是半截」的状态活到下次重启。没有脏区间时是零开销。
+        self.finalize_written_chunks(ino);
         reply.ok();
     }
 
     fn fsync(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         _fh: fuser::FileHandle,
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
+        // ★ M32：`fsync` 是应用声明「这一版写完了」的时刻 —— 正是补校验和的最好时机。
+        self.finalize_written_chunks(ino);
         reply.ok();
     }
 
@@ -7363,6 +7540,7 @@ mod tests {
             attr,
             cache: None,
             chunks_done: vec![false; 3],
+            stale_sums: Vec::new(),
             file_id: ZERO_FILE_ID,
             whole_xxhash: NO_HASH,
             dirty: false,
@@ -7927,6 +8105,7 @@ mod tests {
                     attr,
                     cache: Some(cache),
                     chunks_done: vec![true],
+                    stale_sums: Vec::new(),
                     file_id: ZERO_FILE_ID,
                     whole_xxhash: NO_HASH,
                     dirty: false,
@@ -8891,6 +9070,232 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// ★ M32 回归：应用**不按 128 KiB 对齐**地写文件时，`.qxsum` 必须跟着最终内容走。
+    ///
+    /// 真机现场：WPS/KIO 之类的程序按 1~16 KB 的小块写/追加，旧实现把「第一次写到
+    /// 这个区间的那几 KB」当成整区间内容算 hash，之后补写不再重算 → 重启后认领时
+    /// T3 判成损坏、整份重下（真机 198 个文件中招，内容其实完好）。
+    ///
+    /// 这里模拟「先写 1 字节，再一块块补齐」——正是那批锁文件的写法。
+    fn m32_write(fs: &QxyncFs, ino: INodeNo, offset: u64, data: &[u8]) {
+        use std::os::unix::fs::FileExt;
+        let path = fs.cache_file_for(ino).unwrap();
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let end = offset + data.len() as u64;
+        let cur = {
+            let g = fs.inner.lock().unwrap();
+            g.nodes.get(&ino).map(|n| n.attr.size).unwrap_or(0)
+        };
+        if end > cur {
+            f.set_len(end).unwrap();
+            let mut g = fs.inner.lock().unwrap();
+            if let Some(n) = g.nodes.get_mut(&ino) {
+                n.attr.size = end;
+                n.attr.blocks = end.div_ceil(512);
+            }
+        }
+        f.write_all_at(data, offset).unwrap();
+        fs.mark_written_chunks(ino, offset, data.len() as u64);
+        let mut g = fs.inner.lock().unwrap();
+        if let Some(n) = g.nodes.get_mut(&ino) {
+            n.set_dirty(true);
+        }
+    }
+
+    #[test]
+    fn m32_partial_writes_keep_checksums_in_sync() {
+        // ── 场景 A：新建的小文件，先写 1 字节再补齐（真机 `.~` 锁文件就是这样写的）
+        let dir = m7_tmpdir("m32-partial");
+        let cs = 128 * 1024u64;
+        let small: Vec<u8> = (0..162u32).map(|i| (i % 251) as u8).collect();
+        let entry = DirEntry::local("lock.docx", false, 0, 777);
+        let fs = test_fs(&dir, false);
+        let node = fs.insert_node(INodeNo::ROOT, "lock.docx", "/home/lock.docx", &entry);
+        let cache = fs.cache_file_for(node.ino).unwrap();
+        m32_write(&fs, node.ino, 0, &small[..1]);
+        m32_write(&fs, node.ino, 1, &small[1..]);
+
+        // 旧实现：1 字节那次写就把整个区间算了 hash 并永不再改。
+        // 现在：区间仍记「已就绪」（内容确实完整），但校验和标脏。
+        {
+            let g = fs.inner.lock().unwrap();
+            let n = g.nodes.get(&node.ino).unwrap();
+            assert!(n.is_fully_hydrated(), "写到 EOF 的区间算内容完整");
+            assert!(
+                n.stale_sums.iter().any(|s| *s),
+                "未对齐的写必须留下待重算标记"
+            );
+        }
+        assert!(
+            !verify_done_chunks(&cache, &vec![true; 1], small.len() as u64, cs).is_empty(),
+            "中间态校验和本来就不该是终值（这正是旧 bug 的现场）"
+        );
+        fs.finalize_written_chunks(node.ino);
+        assert!(
+            verify_done_chunks(&cache, &vec![true; 1], small.len() as u64, cs).is_empty(),
+            "关文件后校验和必须与最终内容一致（否则重启认领会判成损坏）"
+        );
+        // 「重新挂载」后能直接认领，不需要回源
+        let done_entry = DirEntry::local("lock.docx", false, small.len() as u64, 777);
+        let fs2 = test_fs(&dir, false);
+        let node2 = fs2.insert_node(INodeNo::ROOT, "lock.docx", "/home/lock.docx", &done_entry);
+        assert_eq!(fs2.cache_file_for(node2.ino).unwrap(), cache);
+        let st = {
+            let g = fs2.inner.lock().unwrap();
+            g.nodes.get(&node2.ino).unwrap().state_str()
+        };
+        assert_eq!(st, "hydrated", "校验和全对 → 重启后必须直接认领为已水合");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // ── 场景 B：已有远端文件被整份覆盖（真机 09:40 那批「旧内容 + 新内容」的形态）：
+        //    区间从远端水合时就全部就绪、校验和是旧版本的；新内容按小写块覆盖。
+        let dir = m7_tmpdir("m32-partial-overwrite");
+        let size = 300 * 1024u64; // 2 个满区间 + 1 个半区间
+        let old: Vec<u8> = (0..size).map(|i| ((i * 7) % 251) as u8).collect();
+        let new: Vec<u8> = (0..size).map(|i| (i % 199) as u8).collect();
+        let entry = DirEntry::local("existing.bin", false, size, 555);
+        let fs = test_fs(&dir, false);
+        let node = fs.insert_node(INodeNo::ROOT, "existing.bin", "/home/existing.bin", &entry);
+        let cache = fs.cache_file_for(node.ino).unwrap();
+        // 假装这份内容是从远端水合来的：内容 + 3 个区间校验和 + 全就绪位图
+        std::fs::write(&cache, &old).unwrap();
+        for i in 0..3u64 {
+            sum_store_one(&cache, 3, i, chunk_hash(&cache, cs, size, i).unwrap()).unwrap();
+        }
+        state_save(
+            &cache,
+            &ChunkState {
+                chunk_size: cs,
+                size,
+                mtime: 555,
+                file_id: ZERO_FILE_ID,
+                whole_xxhash: whole_hash(&cache, size).unwrap(),
+                done: vec![true; 3],
+            },
+        )
+        .unwrap();
+        {
+            let mut g = fs.inner.lock().unwrap();
+            let n = g.nodes.get_mut(&node.ino).unwrap();
+            n.cache = Some(cache.clone());
+            n.chunks_done = vec![true; 3];
+        }
+        // 按 4 KiB 块整份覆盖（块边界与 128 KiB 区间边界不对齐 → 没有区间被「整段」盖住）
+        let mut off = 0usize;
+        while off < new.len() {
+            let end = (off + 4096).min(new.len());
+            m32_write(&fs, node.ino, off as u64, &new[off..end]);
+            off = end;
+        }
+        {
+            let g = fs.inner.lock().unwrap();
+            let n = g.nodes.get(&node.ino).unwrap();
+            assert!(
+                n.chunks_done.iter().all(|d| *d),
+                "位图不能因为「部分覆盖」被清掉"
+            );
+            assert!(
+                n.stale_sums.iter().all(|s| *s),
+                "3 个区间都被改过 → 3 个都该标脏"
+            );
+        }
+        assert_eq!(std::fs::read(&cache).unwrap(), new, "内容确实已经是新版");
+        assert!(
+            !verify_done_chunks(&cache, &vec![true; 3], size, cs).is_empty(),
+            "旧校验和 + 新内容 = 重启认领必失配（真机 198 个文件的中招形态）"
+        );
+        fs.finalize_written_chunks(node.ino);
+        assert!(
+            verify_done_chunks(&cache, &vec![true; 3], size, cs).is_empty(),
+            "关文件后三个区间的校验和都要按新内容重算"
+        );
+        // 重新挂载后同样能直接认领
+        let fs3 = test_fs(&dir, false);
+        let node3 = fs3.insert_node(INodeNo::ROOT, "existing.bin", "/home/existing.bin", &entry);
+        fs3.cache_file_for(node3.ino).unwrap();
+        let st = {
+            let g = fs3.inner.lock().unwrap();
+            g.nodes.get(&node3.ino).unwrap().state_str()
+        };
+        assert_eq!(st, "hydrated");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M32 回归：**整块对齐**的写（cp 的常见形态）不该多付一次全文件读。
+    #[test]
+    fn m32_aligned_writes_hash_immediately() {
+        let dir = m7_tmpdir("m32-aligned");
+        let cs = 128 * 1024u64;
+        let size = 2 * cs;
+        let payload: Vec<u8> = (0..size).map(|i| (i % 97) as u8).collect();
+        let entry = DirEntry::local("aligned.bin", false, size, 88);
+        let fs = test_fs(&dir, false);
+        let node = fs.insert_node(INodeNo::ROOT, "aligned.bin", "/home/aligned.bin", &entry);
+        let cache = fs.cache_file_for(node.ino).unwrap();
+
+        m32_write(&fs, node.ino, 0, &payload[..cs as usize]);
+        m32_write(&fs, node.ino, cs, &payload[cs as usize..]);
+
+        // 没有脏区间：finalize 是零开销的 no-op，校验和此刻就已经是对的
+        assert!(verify_done_chunks(&cache, &vec![true; 2], size, cs).is_empty());
+        let g = fs.inner.lock().unwrap();
+        assert_eq!(
+            g.nodes
+                .get(&node.ino)
+                .unwrap()
+                .stale_sums
+                .iter()
+                .filter(|s| **s)
+                .count(),
+            0
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M32 回归：改名/物化后缓存文件搬到新名字时，**内容 + 位图 + 校验和**三件套
+    /// 必须一起走。
+    ///
+    /// 旧实现只搬内容 + 位图，`.qxsum` 留在旧名字下：新名字于是「有位图、没基准」，
+    /// T3 在重启认领时判成损坏、整份重下（KIO 的 `.part` → 正式名就是这条路径）。
+    #[test]
+    fn m32_rename_moves_content_state_and_sums() {
+        let dir = m7_tmpdir("m32-rename");
+        let cs = 128 * 1024u64;
+        let size = 200 * 1024u64;
+        let payload: Vec<u8> = (0..size).map(|i| (i % 131) as u8).collect();
+        let entry = DirEntry::local("old.bin", false, size, 1234);
+
+        let fs = test_fs(&dir, false);
+        let node = fs.insert_node(INodeNo::ROOT, "old.bin", "/home/old.bin", &entry);
+        let old_cache = fs.cache_file_for(node.ino).unwrap();
+        m32_write(&fs, node.ino, 0, &payload);
+        fs.finalize_written_chunks(node.ino);
+        assert!(sum_path(&old_cache).is_file(), "前提：校验和表已落盘");
+
+        let new_cache = fs.cache_path("/home/new.bin", "new.bin");
+        // 目标位置先放一份「旧文件留下的」垃圾校验和/位图 —— 搬运必须把它们换掉
+        std::fs::write(sum_path(&new_cache), [0u8; 8 * 2]).unwrap();
+        std::fs::write(state_path(&new_cache), b"QXSTATE1garbage").unwrap();
+
+        move_cache_triplet(&old_cache, &new_cache).expect("三件套搬运必须成功");
+        assert!(
+            !old_cache.exists()
+                && !state_path(&old_cache).exists()
+                && !sum_path(&old_cache).exists()
+        );
+        assert!(new_cache.is_file());
+        assert!(state_path(&new_cache).is_file());
+        assert!(sum_path(&new_cache).is_file());
+        assert_eq!(std::fs::read(&new_cache).unwrap(), payload);
+        // 关键：目标位置**不能**保留旧文件的校验和（否则新内容 + 旧基准 → 每次都判损坏）
+        assert!(
+            verify_done_chunks(&new_cache, &vec![true; 2], size, cs).is_empty(),
+            "搬过来的校验和必须是这份内容的，不能继承目标位置的旧 .qxsum"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// ★ T3：daemon 的实际缓存目录是 `<配置的 cache_dir>/<nas host>`，
     /// 比 CLI 默认的那一层深 —— 扫不到就会「什么都没扫到还报一切正常」，
     /// 那是最坏的失败方式。
@@ -9745,6 +10150,7 @@ mod tests {
             attr,
             cache: None,
             chunks_done: vec![true],
+            stale_sums: Vec::new(),
             file_id: ZERO_FILE_ID,
             whole_xxhash: NO_HASH,
             dirty: false,

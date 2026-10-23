@@ -42,6 +42,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     / newer-signature reject, mtime resync); `cargo test --workspace`
     **537 passed / 0 failed / 22 ignored**; `cargo fmt --check` clean.
 
+- **Local writes split the chunk checksums from the content, and renames dropped the
+  checksum table ([M32](docs/M32-写入校验和与缓存搬运.md))**. On real hardware
+  `qxync verify` reported **198 of 403 hydrated files as "corrupted"**, yet spot-checked
+  files were byte-identical (sha256) to a fresh download from the NAS — the content was
+  fine, the `.qxsum` (per-chunk xxhash64 table) was not. Two independent defects:
+  - **Unaligned writes were treated as "the whole chunk was written"**:
+    `mark_written_chunks()` used `min(chunk_end, EOF)` as the chunk end, so the first few
+    KB written into a chunk of a growing file were hashed as if they were the whole
+    chunk, and later appends/partial writes never re-hashed it → `.qxsum` stayed at its
+    first version forever. Real-hardware evidence: all 19 damaged single-chunk samples
+    satisfy "stored hash == `xxh64(content[..N])`" where N is exactly the first write
+    length of that program (1 / 4096 / 16000 bytes).
+    Fix: `Node` gains `stale_sums`; a partially covered chunk is only marked dirty and is
+    never hashed from half-written content; new `finalize_written_chunks()` recomputes
+    the dirty chunks from the final content on **`release` / `flush` / `fsync`** (only
+    dirty chunks are read — aligned `cp` writes pay nothing).
+  - **Rename / O_TMPFILE materialisation moved "content + bitmap" but not `.qxsum`**: the
+    new name ended up "bitmap, but no baseline" (T3 judges it corrupt → pointless
+    re-download) or "new content + previous file's baseline" (judged corrupt every time).
+    On real hardware the 22 orphaned `.qxsum` files all sat under pre-rename names such as
+    `.part` / `.tmp` / `wpsdiag_*`.
+    Fix: `move_cache_triplet()` moves all three together (dropping whatever stale
+    bitmap/checksums the destination had — better no baseline than the wrong one); the
+    hard-link copy branch now copies `.qxsum` too.
+  - Verification: 3 new unit tests (unaligned writes → checksums match after
+    `finalize`; aligned writes leave no dirty chunk; rename moves the triplet and
+    overrides a stale destination baseline). The already-damaged 198 tables self-heal on
+    first read (T3 re-downloads once; the content was correct), or by saving those files
+    once through the mount (the checksums are recomputed without any download).
+
 ## [0.7.8] - 2026-10-21
 
 ### Added
