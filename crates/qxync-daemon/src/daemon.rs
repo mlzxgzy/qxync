@@ -4211,6 +4211,11 @@ struct DehydrateOpts {
 fn cache_info(state: &Arc<State>) -> CacheInfo {
     let cfg = state.dehydrate_cfg.lock().unwrap().clone();
     let st = &state.dehydrate_stats;
+    // ★ M9 补丁：分母用「已知远端文件数」（baseline），不再只数已物化的节点。
+    // 节点表是按需物化的 —— 重启后只物化了几百个，按它算会印出
+    // 「水合文件 386 / 共 210」这种分子大于分母的自相矛盾数字。
+    // 锁顺序：先 sync_store 再 mounts（不嵌套反序），与其它路径一致。
+    let known_files = state.sync_store.lock().unwrap().baseline.len() as u64;
     let g = state.mounts.lock().unwrap();
     let mut used = 0u64;
     let mut files = 0u64;
@@ -4225,6 +4230,7 @@ fn cache_info(state: &Arc<State>) -> CacheInfo {
             mode = "direct".to_string();
         }
     }
+    files = files.max(known_files);
     let last = st.last_run_unix.load(Ordering::Relaxed);
     CacheInfo {
         mode,
@@ -6260,7 +6266,13 @@ async fn file_states_cmd(state: &Arc<State>, path: String) -> Result<serde_json:
             .as_ref()
             .map(|c| c.pin.clone())
             .unwrap_or_else(|| "unspecified".into());
-        let hydrated_bytes = cand.as_ref().map(|c| c.hydrated_bytes).unwrap_or(0);
+        let hydrated_bytes = cand.as_ref().map(|c| c.hydrated_bytes).unwrap_or_else(|| {
+            // ★ M9 补丁：节点还没物化（重启后没进过这个目录）→ 问挂载点的缓存索引。
+            // 以前这里直接回 0，于是整列已水合文件都显示成「仅在线」（用户说的「变回白云」）。
+            handle
+                .cached_bytes_for(&remote, e.filesize, e.epochmt)
+                .unwrap_or(0)
+        });
         let dirty = cand.as_ref().map(|c| c.dirty).unwrap_or(false);
         let state_str = if pin == "pinned" {
             always += 1;

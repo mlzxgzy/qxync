@@ -5,6 +5,33 @@
 
 [English](CHANGELOG.en.md) · [README](README.md) · [验收记录](docs/验收记录.md)
 
+## [Unreleased]
+
+### 修复
+
+- **重启 / 重新挂载后「缓存好像没了、水合过的文件又变回白云」
+  （[M31](docs/M31-重启后缓存状态与签名自愈.md)）**。真机取证：缓存目录里 392 份
+  `.qxstate`、386 份全量就绪、约 495 MiB 内容**一份没丢**，但重挂后
+  `qxync status` 显示「已缓存 7.6 KiB / 水合文件 1」、Dolphin/角标全变 placeholder，
+  读一个 5.26 MiB 已缓存文件还真的回源下载了 41 个区间。两个独立缺陷：
+  - **水合状态只在第一次 `read` 时读回**：位图落盘了，但读回它的唯一入口是
+    `cache_file_for`。daemon 重启后节点表重建、`chunks_done` 全空，而
+    `user.qxync.state` / `user.qxync.overlay` / `user.xdg.tags` / `status` 的缓存统计 /
+    GUI 文件页三态全看内存节点 → 整列已缓存文件变成占位符。
+    修：挂载时 `scan_cache_index()` 扫 `<cache>/*.qxstate`（**只读头 + 位图，不读内容**）
+    重建水合索引；节点物化时按签名预填区间表（零网络）；`cache_stats` 改从索引统计，
+    「共 N」分母用 baseline；GUI 文件页三态在节点未物化时用 `cached_bytes_for` 兜底。
+  - **`mtime` 被改后位图签名不更新，重启后认领必然失配 → 整份重下**：
+    `cp -a` / `rsync -a` 拷入挂载点时时序是「写完 → `release` 落位图（记写盘时刻）→
+    工具再 `utimensat` 把源文件时间戳设回」，`setattr` 更新了节点/清单/远端却**没有
+    回写 `.qxstate` 头** → 位图和清单签名永久分叉（真机 326/392 命中）。
+    修：① `setattr` 只改 mtime 时 `resync_cache_signature()` 同步回写位图头，
+    在线路径同步补上 `update_pending_mtime`（与离线路径一致）；② 认领新增第二种容差：
+    清单 mtime **更旧** + 全量就绪 + 逐区间 `xxhash64` 全过 → 认领并把签名对齐清单；
+    远端更新方向仍然拒绝、校验和不过仍然回源 —— 「绝不返回错误内容」的红线不动。
+  - 验证：新增 3 个单测（重启未读即 `hydrated`、签名更旧认领/更新拒绝、mtime 同步）；
+    `cargo test --workspace` **537 passed / 0 failed / 22 ignored**；`cargo fmt --check` 干净。
+
 ## [0.7.8] - 2026-10-21
 
 ### 新增
