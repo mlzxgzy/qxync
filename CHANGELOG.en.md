@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **GUI "Download to local" progress now shows as a floating card in the bottom-right
+  corner ([M33](docs/M33-右下角下载进度卡片.md))**. User feedback: "downloading a large
+  file (>3s) never pops up a download progress box in the bottom-right corner". The M26
+  progress pipeline itself was fine (daemon pushes progress lines → GUI emit → frontend
+  listener), but the display was attached to the small "in progress…" badge in the file
+  page toolbar — tiny, inconspicuous, and invisible once you switch to another page, which
+  on a real machine amounts to "no progress indication at all". Now:
+  - downloads longer than 3 seconds (the silence period, same rule as the CLI) float a
+    card in the **bottom-right corner of the window**: filename + progress bar +
+    percentage / downloaded / speed / ETA; concurrent downloads each get their own card,
+    stacked vertically;
+  - the container is `pointer-events: none` (only the card itself is clickable — click
+    dismisses it), so it never blocks interaction with the page beneath it;
+    `position: fixed`, visible on every page;
+  - unknown total (server-side chunked) runs an indeterminate sliding animation;
+  - success → green "✅ Download complete · N", auto-removed after 2.5s; failure → red
+    with the error summary (full error in the `title`) for 6s; fast downloads (<3s)
+    leave no trace at all;
+  - the `#files-busy` badge remains the generic "in progress…" indicator and no longer
+    carries progress text (the card is the single source of truth); zero changes on the
+    Rust/daemon side.
+  - Verification: 9/9 source-level unit tests (silence period / throttle / sliding
+    window / unknown total / finish semantics) + 17/17 headless-chromium integration
+    test (drives the real user path "files page → right-click → Download to local… →
+    confirm dialog", asserting the card appears, is fixed to the bottom-right,
+    pointer-events, done state, auto-removal); `cargo test --workspace` 540/0/22,
+    `ui_spec` self-check green.
+
 ### Fixed
 
 - **"The cache seems gone and previously hydrated files show the cloud icon again"

@@ -502,10 +502,12 @@
     });
   }
 
-  // ------------------------------------------------- ★ M26 下载进度（GUI）
+  // ------------------------------------------------- ★ M26/M33 下载进度（GUI）
   // 与 CLI（crates/qxync-cli/src/progress.rs）同一套规则：3 秒静默期（快下载
-  // 零打扰）→ 10 Hz 刷新 → 3 秒滑窗速度 → 剩余时间。挂点选「进行中…」徽标：
-  // 下载中用户还要浏览文件列表，新开弹窗/遮罩反而挡操作。
+  // 零打扰）→ 10 Hz 刷新 → 3 秒滑窗速度 → 剩余时间。
+  // ★ M33：挂点从「进行中…」徽标改为**右下角浮动卡片**。徽标在文件页工具栏里，
+  //   字号小、切到别的页就看不见，真机上等于「没有进度提示」；卡片 fixed 定位
+  //   于窗口右下角，任何页面都可见，且容器 pointer-events:none 不挡操作。
   function fmtEta(secs) {
     if (!isFinite(secs) || secs < 0) { return '—'; }
     if (secs < 60) { return Math.round(secs) + 's'; }
@@ -513,12 +515,43 @@
     return Math.floor(secs / 3600) + 'h' + pad2(Math.floor((secs % 3600) / 60)) + 'm';
   }
 
-  /** 一次下载的进度行。`busyEl` 是 #files-busy 徽标；`total=0` 表示未知总量。 */
-  function makeDownloadProgress(busyEl) {
+  /** ★ M33：建一张右下角下载进度卡片（纯 DOM 薄层，时序逻辑在 makeDownloadProgress）。
+   *  返回句柄 {card, fill, line}；容器缺失（旧 index.html）返回 null → 静默降级。 */
+  function buildDlCard(name) {
+    var host = $('dl-toasts');
+    if (!host) { return null; }
+    host.hidden = false;
+    var card = el('div', 'dl-card');
+    card.title = T('dl.click_close');
+    var title = el('div', 'dl-title', name);
+    title.title = str(name);
+    var bar = el('div', 'dl-bar');
+    var fill = el('div', 'dl-fill');
+    bar.appendChild(fill);
+    var line = el('div', 'dl-line', '⬇ …');
+    card.appendChild(title);
+    card.appendChild(bar);
+    card.appendChild(line);
+    host.appendChild(card);
+    return { card: card, fill: fill, line: line };
+  }
+
+  /** ★ M33：移除一张卡片；最后一张移除后把容器藏回去。 */
+  function removeDlCard(h) {
+    if (!h || !h.card || !h.card.parentNode) { return; }
+    var host = h.card.parentNode;
+    host.removeChild(h.card);
+    if (!host.firstChild) { host.hidden = true; }
+  }
+
+  /** 一次下载的进度卡片。`name` 是文件名（展示用）；`total=0` 表示未知总量。 */
+  function makeDownloadProgress(name) {
     var start = Date.now();
     var samples = [];      // [t, written]，只留最近 3 秒（滑窗速度）
     var lastDraw = 0;
-    var shown = false;
+    var ui = null;         // 懒建：3 秒静默期内不建卡片（快下载零打扰）
+    var done = false;
+    var lastWritten = 0;
 
     function speed(now) {
       if (samples.length < 2) { return 0; }
@@ -528,33 +561,52 @@
     }
 
     function draw(now, written, total) {
-      if (!busyEl) { return; }
+      if (!ui) { return; }
       var v = speed(now);
       if (total > 0) {
         var pct = Math.min(100, written / total * 100);
         var eta = (v > 0 && written < total) ? ' · 剩余 ' + fmtEta((total - written) / v) : '';
-        busyEl.textContent = '⬇ ' + pct.toFixed(1) + '% · ' + humanSize(written)
+        ui.fill.classList.remove('indet');
+        ui.fill.style.width = pct.toFixed(1) + '%';
+        ui.line.textContent = '⬇ ' + pct.toFixed(1) + '% · ' + humanSize(written)
           + '/' + humanSize(total) + ' · ' + humanSize(v) + '/s' + eta;
       } else {
-        busyEl.textContent = '⬇ 已下载 ' + humanSize(written) + ' · ' + humanSize(v) + '/s';
+        ui.fill.classList.add('indet');
+        ui.line.textContent = '⬇ 已下载 ' + humanSize(written) + ' · ' + humanSize(v) + '/s';
       }
     }
 
     return {
       /** 喂一次采样（progress://download 事件）。必须廉价：高频调用。 */
       update: function (written, total) {
+        if (done) { return; }
         var now = Date.now();
+        lastWritten = written;
         samples.push([now, written]);
         while (samples.length > 1 && now - samples[0][0] > 3000) { samples.shift(); }
         if (now - start < 3000) { return; }            // 3 秒静默期：快下载零打扰
-        if (shown && now - lastDraw < 100) { return; } // 10 Hz 节流
-        shown = true;
+        if (!ui) { ui = buildDlCard(name); }
+        if (!ui) { return; }                            // 容器缺失（旧页面）→ 静默降级
+        if (lastDraw && now - lastDraw < 100) { return; } // 10 Hz 节流
         lastDraw = now;
         draw(now, written, total);
       },
-      /** 下载结束（成功/失败都调）：把徽标还原成通用文案（随后 setBusy 会隐藏它）。 */
-      finish: function () {
-        if (busyEl) { busyEl.textContent = T('busy.text'); }
+      /** 下载结束（成功/失败都调）。快下载（卡片没建过）什么都不做——零打扰。
+       *  成功停留 2.5s、失败 6s（够看清错误）后自动移除；点击卡片立即关闭。 */
+      finish: function (ok, errText) {
+        if (done) { return; }
+        done = true;
+        if (!ui) { return; }
+        var h = ui;
+        ui = null;
+        h.card.classList.add(ok ? 'done' : 'err');
+        h.fill.classList.remove('indet');
+        h.line.textContent = ok
+          ? '✅ ' + T('dl.done') + ' · ' + humanSize(lastWritten)
+          : '✗ ' + T('dl.fail') + (errText ? '：' + errText : '');
+        h.line.title = ok ? '' : str(errText || '');
+        setTimeout(function () { removeDlCard(h); }, ok ? 2500 : 6000);
+        h.card.onclick = function () { removeDlCard(h); };
       }
     };
   }
@@ -4584,14 +4636,14 @@
     if (!requireDaemon()) { return; }
     var base = state.home || '';
     var guess = base ? pathJoin(base, e.filename) : e.filename;
-    // ★ M26：下载超过 3 秒会在「进行中…」徽标上亮进度（百分比/速度/剩余时间），
-    //   快下载与老版本 daemon（不推进度行）看到的都还是原来的「进行中…」。
-    openModal('下载到本地', 'NAS：' + pathJoin(state.files.dir, e.filename) + '（大文件可能较久；超过 3 秒显示下载进度）', guess)
+    // ★ M26/M33：下载超过 3 秒会在**右下角**浮一张进度卡片（百分比/速度/剩余
+    //   时间），快下载与老版本 daemon（不推进度行）零打扰。
+    openModal('下载到本地', 'NAS：' + pathJoin(state.files.dir, e.filename) + '（大文件可能较久；超过 3 秒在右下角显示下载进度）', guess)
       .then(function (dest) {
         if (!dest) { return null; }
         var target = str(dest).trim();
         if (!target) { return null; }
-        var prog = makeDownloadProgress($('files-busy'));
+        var prog = makeDownloadProgress(str(e.filename));
         return withBusy({
           spinners: ['files-busy'],
           buttons: btn ? [btn] : []
@@ -4601,7 +4653,7 @@
             prog.update(num(p.written, 0), p.total == null ? 0 : num(p.total, 0));
           });
         }).then(function (r) {
-          prog.finish();
+          prog.finish(r.ok, r.ok ? null : str(r.error));
           if (r.ok) {
             var d = isObj(r.data) ? r.data : {};
             logOk('下载完成：' + str(d.dest) + '（' + humanSize(d.bytes) + '）');
@@ -4610,7 +4662,7 @@
           }
           return r;
         }, function (err) {
-          prog.finish();
+          prog.finish(false, str(err));
           throw err;
         });
       });
