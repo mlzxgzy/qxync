@@ -1401,3 +1401,81 @@ button.primary.danger:hover:not(:disabled) {
 
 /* 危险区卡片：左侧一条红边，和普通设置卡片区分开（内层仍是同一套卡片样式） */
 .danger-card { border-left: 3px solid var(--err); }
+
+/* ============================================================================
+ * ★ M33：右下角下载进度卡片（#dl-toasts / .dl-card）
+ *
+ * 「下载到本地」超过 3 秒（静默期，与 CLI 同一套规则）后浮一张卡片：
+ * 文件名（mono + 省略号）+ 进度条 + 一行统计（百分比/已下载/速度/剩余时间）。
+ * * 容器 `pointer-events: none`：右下角这块区域**不挡**下面的页面交互，
+ *   只有卡片自身恢复 `auto` —— 下载中用户还要继续浏览/操作。
+ * * fixed 定位 + z-index 70：高于右键菜单（60），页面怎么切都看得见。
+ * * 多笔并发下载各自一张卡片，纵向堆叠（column）。
+ * * 未知总量（服务端 chunked 无 Content-Length）：进度条走 indeterminate 滑动。
+ * * 完成/失败：进度条变绿/红，卡片短暂停留后自动移除；点击可立即关闭。
+ * ==========================================================================*/
+.dl-toasts {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 70;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 340px;
+  max-width: calc(100vw - 32px);
+  pointer-events: none;
+}
+.dl-toasts[hidden] { display: none; }
+
+.dl-card {
+  pointer-events: auto;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-lg);
+  padding: 8px 12px 9px;
+  cursor: pointer;               /* 点击 = 立即关闭（不等自动移除） */
+}
+
+.dl-title {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dl-bar {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--bg-sunken);
+  border: 1px solid var(--border-soft);
+  margin: 7px 0 5px;
+  overflow: hidden;
+}
+.dl-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  border-radius: 3px;
+  transition: width .15s linear;
+}
+/* 未知总量：条不装死 —— 30% 宽的滑块来回走 */
+.dl-fill.indet { width: 30%; animation: dl-slide 1.2s ease-in-out infinite alternate; }
+@keyframes dl-slide { from { margin-left: 0; } to { margin-left: 70%; } }
+
+.dl-line {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dl-card.done .dl-fill { background: var(--ok); animation: none; width: 100%; }
+.dl-card.done .dl-line { color: var(--ok); }
+.dl-card.err .dl-fill { background: var(--err); animation: none; }
+.dl-card.err .dl-line { color: var(--err); }

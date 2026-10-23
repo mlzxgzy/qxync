@@ -292,6 +292,11 @@
     'nas_picker.empty': '这个目录下没有子文件夹。',
     'busy.text': '进行中…',
 
+    // ---- ★ M33：右下角下载进度卡片
+    'dl.done': '下载完成',
+    'dl.fail': '下载失败',
+    'dl.click_close': '点击关闭',
+
     // ---- 行右键菜单（节省空间模式）
     'menu.pinquery': '🔍 查询 pin 状态',
     'menu.pin': '☑ 始终保留在此设备（Always keep on this device）',
