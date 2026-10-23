@@ -5,6 +5,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [中文](CHANGELOG.md) · [README](README.en.md) · [Acceptance log](docs/验收记录.md)
 
+## [Unreleased]
+
+### Fixed
+
+- **"The cache seems gone and previously hydrated files show the cloud icon again"
+  after a restart / remount ([M31](docs/M31-重启后缓存状态与签名自愈.md))**. On real
+  hardware the cache directory held **392 `.qxstate` files, 386 fully hydrated, ~495 MiB
+  of content — nothing was lost** — yet after a remount `qxync status` reported
+  "cached 7.6 KiB / hydrated files 1", Dolphin/overlay badges all showed `placeholder`,
+  and reading an already-cached 5.26 MiB file really re-downloaded 41 chunks. Two
+  independent defects:
+  - **Hydration state was only read back on the first `read`**: the bitmap is persisted,
+    but its only reader is `cache_file_for`. After a daemon restart the node table is
+    rebuilt with empty `chunks_done`, while `user.qxync.state` / `user.qxync.overlay` /
+    `user.xdg.tags` / the cache stats in `status` / the GUI file-page tri-state all trust
+    in-memory nodes → every cached file turns into a placeholder.
+    Fix: at mount, `scan_cache_index()` rebuilds a hydration index from
+    `<cache>/*.qxstate` (**header + bitmap only, content is not read**); nodes get their
+    chunk map pre-filled on materialisation (zero network); `cache_stats` now uses the
+    index and the "of N" denominator uses the baseline; the GUI file page falls back to
+    `cached_bytes_for` for nodes that are not materialised yet.
+  - **Bitmap signatures were never refreshed after an `mtime` change, so the claim was
+    guaranteed to fail on restart → full re-download**: `cp -a` / `rsync -a` into the
+    mount point runs "write → `release` persists the bitmap (recording the write time) →
+    the tool `utimensat`s the source timestamp back", and `setattr` updated the
+    node/listing/remote but **never rewrote the `.qxstate` header** → the bitmap and the
+    listing signatures diverge permanently (326/392 entries on real hardware).
+    Fix: ① a mtime-only `setattr` now calls `resync_cache_signature()` to rewrite the
+    bitmap header, and the online path also updates pending upload jobs' mtime (matching
+    the offline path); ② the claim path gains a second tolerance: listing mtime **older**
+    + fully hydrated + every chunk's `xxhash64` matches → claim and align the signature to
+    the listing. A newer remote mtime is still rejected and any checksum failure still
+    falls back to downloading — "never return wrong content" is untouched.
+  - Verification: 3 new unit tests (state restored before any read, older-signature adopt
+    / newer-signature reject, mtime resync); `cargo test --workspace`
+    **537 passed / 0 failed / 22 ignored**; `cargo fmt --check` clean.
+
 ## [0.7.8] - 2026-10-21
 
 ### Added

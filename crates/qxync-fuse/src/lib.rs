@@ -295,6 +295,151 @@ fn state_load_ro(cache: &Path) -> Option<ChunkState> {
     }
 }
 
+// ------------------------------------------------ ★ 重启后的缓存状态索引（M9 补丁）
+//
+// 为什么需要：位图落盘在 `<cache>.qxstate`，但**读回它**以前只发生在
+// `cache_file_for`（第一次 `read`/`open`）。daemon 一重启、挂载点一重挂，节点表从
+// 远端清单重建、每个节点的 `chunks_done` 都是空的 —— 于是：
+//
+// * `user.qxync.overlay` / `user.xdg.tags` 全部报 placeholder（Dolphin 角标全是云）；
+// * `qxync status` 的「已缓存 N / 水合文件 M」接近 0；
+// * 用户以为「重启把缓存清了」，其实几百 MB 内容一份不少地躺在 `<data>/cache/<ns>/`。
+//
+// M9 已经把**内容**持久化了，这里补的是**读路径**：挂载时把缓存目录里所有
+// `.qxstate` 的头 + 位图扫一遍（每个文件几十字节 + 位图，**不读内容**，代价与
+// 文件大小无关），节点物化时按远端签名认领它。逐区间 `xxhash` 校验仍然推迟到
+// 第一次 `read`（`cache_file_for`）—— 显示可以乐观，**内容安全不降级**。
+
+/// 一条「磁盘上有这份缓存」的摘要（`.qxstate` 头 + 位图，不含内容）。
+#[derive(Debug, Clone)]
+struct CachedSig {
+    /// 内容文件路径（`<cache>`，不是 `.qxstate`）。
+    path: PathBuf,
+    chunk_size: u64,
+    size: u64,
+    /// `.qxstate` 里记的内容签名 mtime（= 内容写下去那一刻的节点 mtime）。
+    mtime: i64,
+    whole_xxhash: u64,
+    done: Vec<bool>,
+}
+
+impl CachedSig {
+    fn full(&self) -> bool {
+        !self.done.is_empty() && self.done.iter().all(|d| *d)
+    }
+
+    /// 已就绪字节数（末块按文件大小截断）。
+    fn hydrated_bytes(&self) -> u64 {
+        let mut sum = 0u64;
+        for (i, done) in self.done.iter().enumerate() {
+            if !*done {
+                continue;
+            }
+            let start = i as u64 * self.chunk_size;
+            if start >= self.size {
+                continue;
+            }
+            sum += (start + self.chunk_size).min(self.size) - start;
+        }
+        sum
+    }
+}
+
+/// 键 = 缓存文件名前缀（`fnv1a64(远端路径)`，见 [`cache_name_for`]）。
+/// 扫描时只有文件名可用、查的时候（节点物化）有远端路径 —— 两头都只靠这个哈希。
+type CacheIndex = std::sync::Arc<Mutex<HashMap<u64, CachedSig>>>;
+
+/// 从 `<cache>/*.qxstate` 重建索引（**只读头 + 位图**）。
+/// 返回 `(索引, 文件数, 已缓存字节数)`，给挂载时的一行 INFO 日志用。
+fn scan_cache_index(cache_dir: &Path) -> (HashMap<u64, CachedSig>, u64, u64) {
+    let mut idx = HashMap::new();
+    let mut bytes = 0u64;
+    let Ok(rd) = std::fs::read_dir(cache_dir) else {
+        return (idx, 0, 0);
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        // 只认 `.qxstate` 本体：`.qxstate.tmp`（写到一半）与 `.qxsum` 都不算。
+        let Some(stem) = name.strip_suffix(".qxstate") else {
+            continue;
+        };
+        let Some(hash) = stem
+            .split('_')
+            .next()
+            .and_then(|h| u64::from_str_radix(h, 16).ok())
+        else {
+            continue;
+        };
+        let Ok(buf) = std::fs::read(&path) else {
+            continue;
+        };
+        if state_verdict(&buf) != StateVerdict::Ok {
+            continue;
+        }
+        let Some(st) = state_decode(&buf) else {
+            continue;
+        };
+        let content = cache_dir.join(stem);
+        // 内容文件不在（只剩位图残骸）→ 不算缓存，否则 status 会虚报。
+        if !content.is_file() {
+            continue;
+        }
+        let sig = CachedSig {
+            path: content,
+            chunk_size: st.chunk_size,
+            size: st.size,
+            mtime: st.mtime,
+            whole_xxhash: st.whole_xxhash,
+            done: st.done,
+        };
+        bytes += sig.hydrated_bytes();
+        idx.insert(hash, sig);
+    }
+    let files = idx.len() as u64;
+    (idx, files, bytes)
+}
+
+/// 缓存文件名 → 索引键（`<fnv1a64(remote)的16位十六进制>_<safe name>`）。
+fn cache_hash_of(cache: &Path) -> Option<u64> {
+    let name = cache.file_name()?.to_str()?;
+    name.split('_')
+        .next()
+        .and_then(|h| u64::from_str_radix(h, 16).ok())
+}
+
+fn index_get(index: &CacheIndex, remote: &str) -> Option<CachedSig> {
+    index
+        .lock()
+        .unwrap()
+        .get(&fnv1a64(remote.as_bytes()))
+        .cloned()
+}
+
+/// 位图刚落盘 / 认领对齐签名之后同步内存索引（`status` 与后续节点物化看的是它）。
+fn index_put(index: &CacheIndex, remote: &str, cache: &Path, st: &ChunkState) {
+    index.lock().unwrap().insert(
+        fnv1a64(remote.as_bytes()),
+        CachedSig {
+            path: cache.to_path_buf(),
+            chunk_size: st.chunk_size,
+            size: st.size,
+            mtime: st.mtime,
+            whole_xxhash: st.whole_xxhash,
+            done: st.done.clone(),
+        },
+    );
+}
+
+/// 内容/位图被删（脱水、失效、删除）→ 索引里也清掉。
+fn index_forget(index: &CacheIndex, cache: &Path) {
+    if let Some(h) = cache_hash_of(cache) {
+        index.lock().unwrap().remove(&h);
+    }
+}
+
 /// 读回整张 per-chunk 校验和表（长度必须正好是 `8 × nchunks`，否则全 [`NO_HASH`]）。
 fn sum_load(cache: &Path, nchunks: usize) -> Vec<u64> {
     let want = nchunks * 8;
@@ -417,8 +562,13 @@ fn nodes_remember(
 ///
 /// ★ T9：落盘前按当前签名**现算** `file_id` 写进 `.qxstate` 头 ——
 /// 认领时（`cache_file_for`）会用同一个函数重算并比对，两边算法天生一致。
-fn persist_chunk_state(inner: &Arc<Mutex<Inner>>, chunk_size: u64, ino: INodeNo) {
-    let (cache, st) = {
+fn persist_chunk_state(
+    inner: &Arc<Mutex<Inner>>,
+    chunk_size: u64,
+    ino: INodeNo,
+    index: &CacheIndex,
+) {
+    let (cache, remote, st) = {
         let mut g = inner.lock().unwrap();
         let Some(parent_remote) = g
             .nodes
@@ -437,6 +587,7 @@ fn persist_chunk_state(inner: &Arc<Mutex<Inner>>, chunk_size: u64, ino: INodeNo)
         n.refresh_file_id(&parent_remote);
         (
             cache,
+            n.remote.clone(),
             ChunkState {
                 chunk_size,
                 size: n.attr.size,
@@ -449,7 +600,12 @@ fn persist_chunk_state(inner: &Arc<Mutex<Inner>>, chunk_size: u64, ino: INodeNo)
     };
     if let Err(e) = state_save(&cache, &st) {
         tracing::warn!("水合位图落盘失败 {}: {e}", cache.display());
+        return;
     }
+    // ★ M9 补丁：索引与磁盘位图同步 —— `status` 的「已缓存 N」当场就准，
+    //   后续同一挂载会话里重建节点也不会拿到旧状态。
+    //   锁顺序固定为「先 inner 后 index」：这里 inner 已释放，只拿 index，安全。
+    index_put(index, &remote, &cache, &st);
 }
 
 // ---------------------------------------------------------------- T3：内容校验和
@@ -1345,6 +1501,7 @@ async fn refresh_into(
 #[allow(clippy::too_many_arguments)]
 fn install_refreshed(
     inner: &Arc<Mutex<Inner>>,
+    index: &CacheIndex,
     remote: &str,
     tmp: &Path,
     cache: &Path,
@@ -1417,7 +1574,7 @@ fn install_refreshed(
         }
     }
     // 内容、元数据、区间表、位图必须一起切到新签名，否则下次挂载会认领到旧的那份
-    persist_chunk_state(inner, chunk_size, ino);
+    persist_chunk_state(inner, chunk_size, ino, index);
     Some(ino)
 }
 
@@ -1550,6 +1707,8 @@ pub trait LocalView: Send + Sync {
 pub struct FsHandle {
     inner: Arc<Mutex<Inner>>,
     cache_dir: PathBuf,
+    /// ★ M9 补丁：挂载时从 `.qxstate` 重建的「哪些内容还在盘上」索引（只读摘要）。
+    cache_index: CacheIndex,
     chunk_size: u64,
     remote_root: String,
     /// 全部远端根（一对一：长度恒为 1）。
@@ -1942,6 +2101,33 @@ impl FsHandle {
         self.candidate_locked(remote, true)
     }
 
+    /// ★ M9 补丁：**节点没物化**时回答「这条路本地有多少缓存内容」。
+    ///
+    /// GUI 的文件列表是一次目录 `list` + 逐条问状态，节点往往是空的（重启后尤其）——
+    /// 按节点答会把整列已水合文件都显示成「仅在线 ← 无本地内容」。
+    /// 判据与节点物化时的预填完全一致（见 `insert_node_with`）：
+    /// size 一致，且 mtime 一致或者「清单更旧 + 全量就绪」。
+    /// 返回已缓存字节数（`Some(0)` = 认得出这份缓存但还没取过内容，例如只有空文件）；
+    /// 签名对不上（远端可能改过）→ `None`，让调用方按「仅在线」展示。
+    pub fn cached_bytes_for(&self, remote: &str, size: u64, mtime: i64) -> Option<u64> {
+        if self.hidden(remote, false).is_some() {
+            return None;
+        }
+        // 节点已物化 → 以节点为准（它带的是最新 attr / 实时区间表）。
+        if let Some(c) = self.candidate_locked(remote, true) {
+            return Some(c.hydrated_bytes);
+        }
+        let sig = index_get(&self.cache_index, remote)?;
+        if sig.chunk_size != self.chunk_size || sig.size != size {
+            return None;
+        }
+        if sig.mtime == mtime || (mtime < sig.mtime && sig.full()) {
+            Some(sig.hydrated_bytes())
+        } else {
+            None
+        }
+    }
+
     /// `check_op_lock=false` 用在「调用方已经持有该节点操作锁」的场景
     /// （脱水复查）——否则会把自己的锁当成「在途」而误判。
     fn candidate_locked(&self, remote: &str, check_op_lock: bool) -> Option<Candidate> {
@@ -1985,18 +2171,30 @@ impl FsHandle {
 
     /// 缓存占用统计。
     pub fn cache_stats(&self) -> CacheStats {
-        let g = self.inner.lock().unwrap();
+        // ★ M9 补丁：缓存占用改从**索引**算（挂载时从 `.qxstate` 重建、写入/脱水时同步），
+        // 不再只数「已经物化过的节点」。重启后节点表是空的，按节点数会把 495 MB 缓存
+        // 报成 0 B（`qxync status` 显示「已缓存 7.6 KiB」、用户以为缓存被清了）。
+        // 索引条目是「盘上确实有内容」的快照，与浏览到哪个目录无关。
         let mut out = CacheStats::default();
-        for n in g.nodes.values() {
-            if n.attr.kind != FileType::RegularFile {
-                continue;
+        {
+            let idx = self.cache_index.lock().unwrap();
+            for sig in idx.values() {
+                let used = sig.hydrated_bytes();
+                if used > 0 {
+                    out.hydrated_files += 1;
+                    out.used_bytes += used;
+                }
             }
-            out.total_files += 1;
-            let used = n.hydrated_bytes(self.chunk_size);
-            if used > 0 {
-                out.hydrated_files += 1;
-                out.used_bytes += used;
-            }
+        }
+        // 锁顺序固定「先 released inner 再 index」：上面已经释放 inner 才拿 index。
+        // `total_files` 语义不变（已物化文件数），daemon 会用 baseline 兜底成「已知文件数」。
+        {
+            let g = self.inner.lock().unwrap();
+            out.total_files = g
+                .nodes
+                .values()
+                .filter(|n| n.attr.kind == FileType::RegularFile)
+                .count() as u64;
         }
         out
     }
@@ -2185,6 +2383,7 @@ impl FsHandle {
         };
         if let Some(p) = cache_path {
             remove_cache_files(&p);
+            index_forget(&self.cache_index, &p);
         }
         // ③ 再更新占位符状态
         {
@@ -2367,6 +2566,7 @@ impl LocalView for FsHandle {
             // 脱水 / 部分水合 / 类型变了：丢掉旧内容，下次 read 按需水合新版本
             if let Some(p) = n.cache.take() {
                 remove_cache_files(&p);
+                index_forget(&self.cache_index, &p);
             }
             n.reset_chunks(chunk_size, false);
             n.pending = None;
@@ -2387,6 +2587,7 @@ impl LocalView for FsHandle {
         n.apply_pending_sig();
         if let Some(p) = n.cache.take() {
             remove_cache_files(&p);
+            index_forget(&self.cache_index, &p);
         }
         n.reset_chunks(chunk_size, false);
         // ★ T8：内容作废 → 传输一定已经结束（要么没在传，要么被这次作废打断），
@@ -2413,6 +2614,7 @@ impl LocalView for FsHandle {
                 g.by_remote.remove(&n.remote);
                 if let Some(p) = n.cache {
                     remove_cache_files(&p);
+                    index_forget(&self.cache_index, &p);
                 }
             }
         }
@@ -2749,6 +2951,7 @@ impl LocalView for FsHandle {
         );
         let inner = self.inner.clone();
         let invalidator = self.hooks.invalidator.clone();
+        let index = self.cache_index.clone();
         let remote = remote.to_string();
         tracing::info!("后台刷新内容 {remote}（{size} 字节）");
         self.rt.spawn(async move {
@@ -2766,6 +2969,7 @@ impl LocalView for FsHandle {
                             tracing::warn!("后台刷新连续失败，退回按需水合: {remote}");
                             if let Some(p) = n.cache.take() {
                                 remove_cache_files(&p);
+                                index_forget(&index, &p);
                             }
                             n.reset_chunks(chunk_size, false);
                             n.pending = None;
@@ -2781,8 +2985,9 @@ impl LocalView for FsHandle {
             //   直接在 async worker 上等一把可能被慢速水合占住几秒的锁会把 runtime 饿死。
             let (r2, t2, c2) = (remote.clone(), tmp.clone(), cache.clone());
             let inner2 = inner.clone();
+            let idx2 = index.clone();
             let installed = tokio::task::spawn_blocking(move || {
-                install_refreshed(&inner2, &r2, &t2, &c2, size, mtime, chunk_size)
+                install_refreshed(&inner2, &idx2, &r2, &t2, &c2, size, mtime, chunk_size)
             })
             .await
             .ok()
@@ -3030,6 +3235,12 @@ pub struct QxyncFs {
     /// 一对多是删除过的：一个挂载点只对应一个远端路径。
     remote_root: String,
     cache_dir: PathBuf,
+    /// ★ M9 补丁：挂载时从缓存目录里的 `.qxstate` 重建的水合索引。
+    ///
+    /// 只存「位图摘要」（签名 + 区间位图），不存内容 —— 用来让节点一物化就带上
+    /// 真实的水合状态，`getattr` 的 `user.qxync.overlay` / `status` 的缓存统计
+    /// 不必等第一次 `read` 才正确（重启后「缓存好像没了」的真凶在这里）。
+    cache_index: CacheIndex,
     uid: u32,
     gid: u32,
     /// 只读模式（默认）。M2b 起可用 `with_write_mode()` 打开写路径。
@@ -3126,6 +3337,21 @@ impl QxyncFs {
         let cache_dir = cache_dir.into();
         std::fs::create_dir_all(&cache_dir)?;
 
+        // ★ M9 补丁：挂载时先把「盘上有哪些内容、各自水合到哪」装回内存。
+        //   只读 `.qxstate` 的头 + 位图，不读内容 —— 几百份缓存也就几毫秒。
+        //   没有这一步，重启后的第一次 `getattr` 会把每一份已水合文件都报成
+        //   placeholder（角标变云、status 显示 0 字节），用户以为「缓存被清了」。
+        let (cache_map, cached_files, cached_bytes) = scan_cache_index(&cache_dir);
+        let cache_index: CacheIndex = Arc::new(Mutex::new(cache_map));
+        if cached_files > 0 {
+            tracing::info!(
+                "缓存状态索引：{} 份水合位图 / {}（已缓存 {} MiB，只读位图不读内容）",
+                cached_files,
+                cache_dir.display(),
+                cached_bytes / (1024 * 1024),
+            );
+        }
+
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -3184,6 +3410,7 @@ impl QxyncFs {
             client,
             remote_root: remote_root.clone(),
             cache_dir,
+            cache_index,
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
             read_only: true,
@@ -3546,6 +3773,7 @@ impl QxyncFs {
         FsHandle {
             inner: self.inner.clone(),
             cache_dir: self.cache_dir.clone(),
+            cache_index: self.cache_index.clone(),
             chunk_size: self.chunk_size,
             remote_root: self.remote_root.clone(),
             roots: self.remote_roots(),
@@ -3913,6 +4141,30 @@ impl QxyncFs {
             unnamed: false,
         };
         node.refresh_file_id(&parent_remote);
+        // ★ M9 补丁：节点一物化就把盘上已有的水合状态带上（**不读内容、不发网络**）。
+        //
+        // 认领条件与 `cache_file_for` 同源：尺寸对得上，且
+        // ① 位图签名与清单签名完全一致；或者
+        // ② 清单 mtime **比位图里的更旧**（只可能是我们自己的 `set_mtime`/utimensat
+        //    把服务器时间回推出来的）且这份缓存是全量就绪。
+        // ② 的内容校验（逐区间 xxhash）推迟到第一次 `read` —— 那时 `cache_file_for`
+        // 会真验一遍；验不过就退回按需水合，**绝不把坏内容当好的用**。
+        // 反过来（清单 mtime 更新）说明远端可能真的改过 → 不预填，老实重下。
+        // 只对「远端已知」的节点预填：`create()` 出来的本地新文件还没上传，
+        // 同名旧缓存不属于它（宁可空着，也不让新文件认领旧内容）。
+        if remote_known && node.attr.kind == FileType::RegularFile {
+            if let Some(sig) = index_get(&self.cache_index, remote) {
+                let node_mtime = epoch_secs(node.attr.mtime);
+                let signature_ok = sig.chunk_size == self.chunk_size
+                    && sig.size == node.attr.size
+                    && sig.path.is_file()
+                    && (sig.mtime == node_mtime || (node_mtime < sig.mtime && sig.full()));
+                if signature_ok {
+                    node.whole_xxhash = sig.whole_xxhash;
+                    node.chunks_done = sig.done;
+                }
+            }
+        }
         let (file_id, size, mtime, is_dir) = (
             node.file_id,
             node.attr.size,
@@ -4328,6 +4580,7 @@ impl QxyncFs {
                     // ★ M9：本地删除同时清掉「内容 + 位图」，别让同名新文件认领到旧内容
                     if let Some(p) = n.cache {
                         remove_cache_files(&p);
+                        index_forget(&self.cache_index, &p);
                     }
                 }
             }
@@ -4488,7 +4741,7 @@ impl QxyncFs {
                 n.whole_xxhash = NO_HASH;
             }
             drop(g);
-            persist_chunk_state(&self.inner, chunk_size, ino);
+            persist_chunk_state(&self.inner, chunk_size, ino, &self.cache_index);
         }
     }
 
@@ -4540,6 +4793,75 @@ impl QxyncFs {
         }
     }
 
+    /// ★ M9 补丁：**签名变了但内容没变**（`touch` / utimensat / 上传对齐之后）→
+    /// 把 `<cache>.qxstate` 头里的 mtime / 身份同步过去。
+    ///
+    /// 不同步的后果是真实故障：`cp -a` / `rsync -a` 往挂载点里拷文件时，内容写完
+    /// （`release` 先落位图，记的是**写盘时刻**的 mtime）之后工具才 `utimensat` 设回
+    /// 源文件时间戳 —— 位图签名就此和节点/清单/远端永久分叉。重启后 `cache_file_for`
+    /// 按签名严格比对 → 整份缓存认领失败 → 每个文件都重新下载一遍。
+    /// 在这里顺手对齐，从源头断掉这条分叉（认领侧的「清单更旧」容差是第二道兜底）。
+    fn resync_cache_signature(&self, ino: INodeNo) {
+        let (remote, name, cache, size, mtime, parent_remote) = {
+            let g = self.inner.lock().unwrap();
+            let Some(n) = g.nodes.get(&ino) else { return };
+            if n.attr.kind != FileType::RegularFile || n.unnamed {
+                return;
+            }
+            // 已排队/在飞的远端刷新：内容马上要换成远端那一版，此刻的签名是中间态，
+            // 写进位图只会制造一个新的分叉（刷新换上去时会自己 persist）。
+            if n.pending.is_some() || n.refreshing {
+                return;
+            }
+            // 节点还没认领（重启后没读过）时也要处理：位图就在缓存目录里，
+            // 路径按远端名现拼（与 `cache_path` 同一规则）。
+            let cache = n
+                .cache
+                .clone()
+                .unwrap_or_else(|| self.cache_path(&n.remote, &n.name));
+            (
+                n.remote.clone(),
+                n.name.clone(),
+                cache,
+                n.attr.size,
+                epoch_secs(n.attr.mtime),
+                g.nodes
+                    .get(&n.parent)
+                    .map(|p| p.remote.clone())
+                    .unwrap_or_default(),
+            )
+        };
+        if !cache.is_file() {
+            return;
+        }
+        let Some(st) = state_load_ro(&cache) else {
+            return;
+        };
+        // 只处理「内容没变、只是签名变了」：粒度/尺寸对不上说明是另一份内容，不归这里管。
+        if st.chunk_size != self.chunk_size || st.size != size || st.mtime == mtime {
+            return;
+        }
+        let new = ChunkState {
+            chunk_size: self.chunk_size,
+            size,
+            mtime,
+            file_id: compute_file_id(false, size, mtime, &name, &parent_remote),
+            whole_xxhash: st.whole_xxhash,
+            done: st.done,
+        };
+        match state_save(&cache, &new) {
+            Ok(()) => {
+                tracing::debug!("缓存签名随 mtime 对齐 {remote}：{} → {mtime}", st.mtime);
+                index_put(&self.cache_index, &remote, &cache, &new);
+                let mut g = self.inner.lock().unwrap();
+                if let Some(n) = g.nodes.get_mut(&ino) {
+                    n.file_id = new.file_id;
+                }
+            }
+            Err(e) => tracing::warn!("缓存签名对齐失败 {}: {e}", cache.display()),
+        }
+    }
+
     /// 缓存文件（懒创建）：**apparent size = 文件大小**，用 `set_len` 造稀疏文件。
     ///
     /// ★ M9：**先认领磁盘上已有的缓存**。节点表是内存态，重建节点后 `chunks_done`
@@ -4585,8 +4907,16 @@ impl QxyncFs {
         // 容差判据（保守）：baseline 里记录的「我们最后传上去的签名」与 `.qxstate`
         // **完全一致**（size + mtime）→ 盘上这份就是远端现在的那份（set_mtime 已
         // 成功，清单只是还没看到）→ 按 `.qxstate` 认领，并把节点签名对齐到真值。
-        // baseline 不认识这份签名（如「删了重建」留下的旧缓存）→ 仍走严格路径，
-        // 绝不认领 —— 「绝不返回错误内容」的红线不动。
+        //
+        // ★ M9 补丁（第二种偏斜）：清单 mtime **比位图更旧**。复现路径是
+        // `cp -a` / `rsync -a` 往挂载点里拷：内容写完 → `release` 落位图（记下当时
+        // 的 mtime）→ 工具再 `utimensat` 把源文件时间戳设回来 → FUSE 把新 mtime 推给
+        // NAS。重启后清单说 mtime=源文件时间（更旧）、位图说 mtime=写盘时间（更新）
+        // → 旧代码一律拒认领 → **每份缓存都重新下载一遍**（真机复现：495 MB 缓存里
+        // 326/392 份签名对不上，读 A.pdf 直接回源拉了 41 个区间）。
+        // 现在只在这种「远端签名更旧 + 全量就绪 + 逐区间 xxhash 全过」的情况下认领，
+        // 并把位图签名对齐到清单（内容没变，只是签名来源不同）；**远端更新方向仍然
+        // 严格拒绝** —— 那可能是别处真的改过内容，宁可重下也不返回错误内容。
         let adopted = if path.is_file() {
             state_load(&path).and_then(|st| {
                 let len_ok = std::fs::metadata(&path)
@@ -4595,9 +4925,10 @@ impl QxyncFs {
                 if st.chunk_size != chunk_size || st.size != size || !len_ok {
                     return None;
                 }
-                // 偏斜容差：mtime 不匹配时查 baseline（见上面的判据说明）
+                let mtime_match = st.mtime == mtime;
                 let mut skew_fix = None;
-                if st.mtime != mtime {
+                let mut resync_sig = false;
+                if !mtime_match {
                     let trusted = self
                         .nodes
                         .as_ref()
@@ -4609,15 +4940,25 @@ impl QxyncFs {
                                 && sig.mtime == st.mtime
                         })
                         .unwrap_or(false);
-                    if !trusted {
+                    if trusted {
+                        skew_fix = Some((st.mtime, st.file_id));
+                        tracing::debug!(
+                            "认领容差 {remote}：清单 mtime={mtime} 与位图 mtime={} 偏斜 \
+                             （baseline 证实这就是最后上传的那版），按位图签名认领",
+                            st.mtime
+                        );
+                    } else if mtime < st.mtime && st.done.iter().all(|d| *d) {
+                        // ★ M9 补丁：清单签名更旧 + 全量就绪 → 先按位图认领内容，
+                        // 下面 T3 的逐区间校验和会真验一遍内容。
+                        resync_sig = true;
+                    } else {
+                        tracing::debug!(
+                            "认领作废 {remote}：清单 mtime={mtime} 与位图 mtime={} 不符\
+                             （远端可能更新过），退回按需水合",
+                            st.mtime
+                        );
                         return None;
                     }
-                    skew_fix = Some((st.mtime, st.file_id));
-                    tracing::debug!(
-                        "认领容差 {remote}：清单 mtime={mtime} 与位图 mtime={} 偏斜 \
-                         （baseline 证实这就是最后上传的那版），按位图签名认领",
-                        st.mtime
-                    );
                 }
                 // ★ T9：签名过了，再比**身份**。这一栏挡的是「另一个文件认领了这份缓存」——
                 // 典型场景：同一路径删了重建、或改名后旧缓存文件被留在盘上。
@@ -4626,9 +4967,9 @@ impl QxyncFs {
                 // 这一栏是 T3 序列上的**新增一道**，不是替代：T3 的「先比签名、
                 // 签名过了再逐区间核 xxhash、坏区间清未就绪」顺序原样保留，
                 // file_id 只是把签名比对的判据补全。
-                // ★ M21 偏斜场景例外：want_id 是按（偏斜的）清单 mtime 算的，
-                // 此刻以 `.qxstate` 里的身份为准（它对应 baseline 记录的那一版）。
-                if st.file_id != want_id && skew_fix.is_none() {
+                // ★ 偏斜场景例外：identity 是按（不同的）mtime 算的，此刻以位图里的
+                // 身份为准（M21：baseline 证实的那一版；M9 补丁：清单签名对齐后重算）。
+                if mtime_match && st.file_id != want_id {
                     tracing::debug!(
                         "认领作废 {remote}：位图身份 {} 与当前身份 {} 不符",
                         qxync_core::file_id::file_id_hex(&st.file_id),
@@ -4645,26 +4986,45 @@ impl QxyncFs {
                         bad.len(),
                         summarize_bad(&bad, chunk_size)
                     );
+                    if resync_sig {
+                        // 这条捷径的前提就是「内容与位图一致」—— 核不过就不能走
+                        return None;
+                    }
                     for idx in &bad {
                         done[*idx as usize] = false;
                     }
                 }
-                Some((done, st.whole_xxhash, skew_fix))
+                Some((done, st.whole_xxhash, skew_fix, resync_sig))
             })
         } else {
             None
         };
 
         let mut g = self.inner.lock().unwrap();
-        let n = g.nodes.get_mut(&ino).ok_or(fuser::Errno::ENOENT)?;
-        // 竞态兜底：拿锁期间别人可能已经建好了
-        if let Some(p) = &n.cache {
-            return Ok(p.clone());
+        if let Some(p) = g.nodes.get(&ino).and_then(|n| n.cache.clone()) {
+            // 竞态兜底：拿锁期间别人可能已经建好了
+            return Ok(p);
         }
-        let want = n.chunk_count(chunk_size);
-        if let Some((mut done, whole, skew_fix)) = adopted {
+        let want = g
+            .nodes
+            .get(&ino)
+            .map(|n| n.chunk_count(chunk_size))
+            .ok_or(fuser::Errno::ENOENT)?;
+        if let Some((mut done, whole, skew_fix, resync_sig)) = adopted {
             // size 在拿锁期间变了 → 认领作废
-            if n.attr.size == size {
+            if g.nodes.get(&ino).map(|n| n.attr.size) == Some(size) {
+                // 清单签名（节点 attr 的 mtime）与父目录（重算身份要用）
+                let (parent_remote, node_mtime) = {
+                    let n = g.nodes.get(&ino).ok_or(fuser::Errno::ENOENT)?;
+                    (
+                        g.nodes
+                            .get(&n.parent)
+                            .map(|p| p.remote.clone())
+                            .unwrap_or_default(),
+                        epoch_secs(n.attr.mtime),
+                    )
+                };
+                let n = g.nodes.get_mut(&ino).ok_or(fuser::Errno::ENOENT)?;
                 // ★ M21：偏斜容差认领 → 节点签名对齐到 `.qxstate` 的真值
                 // （mtime + 身份）。对齐之后节点/缓存/baseline 三方一致，
                 // 后续的 persist_chunk_state 也不会把旧签名写回去。
@@ -4680,13 +5040,43 @@ impl QxyncFs {
                     done.iter().filter(|d| **d).count(),
                     want
                 );
+                // ★ M9 补丁：清单签名（更旧）就是「远端那一版」，位图签名只是写盘时刻的
+                // 中间态。认领后把两者对齐，下一次挂载/重启才不用再做一遍全量校验。
+                let resync_state = resync_sig.then(|| ChunkState {
+                    chunk_size,
+                    size,
+                    mtime: node_mtime,
+                    file_id: compute_file_id(false, size, node_mtime, &n.name, &parent_remote),
+                    whole_xxhash: whole,
+                    done: done.clone(),
+                });
+                if let Some(st) = &resync_state {
+                    n.file_id = st.file_id;
+                }
                 n.chunks_done = done;
                 n.whole_xxhash = whole;
                 n.cache = Some(path.clone());
+                drop(g);
+                if let Some(st) = resync_state {
+                    match state_save(&path, &st) {
+                        Ok(()) => {
+                            tracing::info!(
+                                "缓存签名已对齐清单（内容校验和全过，不重新下载）: {remote}"
+                            );
+                            index_put(&self.cache_index, &remote, &path, &st);
+                        }
+                        Err(e) => tracing::warn!(
+                            "缓存签名对齐失败（下次重启会重新校验一次）{}: {e}",
+                            path.display()
+                        ),
+                    }
+                }
                 return Ok(path);
             }
         }
 
+        // 认领作废（或本来就没有缓存）→ 建稀疏缓存文件，按需水合。
+        let n = g.nodes.get_mut(&ino).ok_or(fuser::Errno::ENOENT)?;
         let f = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -4893,7 +5283,7 @@ impl QxyncFs {
         if all_done {
             self.clear_node_progress(ino);
         }
-        persist_chunk_state(&self.inner, self.chunk_size, ino);
+        persist_chunk_state(&self.inner, self.chunk_size, ino, &self.cache_index);
         tracing::debug!("区间就绪: {remote} [{start}..={end}] ({want} 字节)");
         Ok(())
     }
@@ -5476,7 +5866,18 @@ impl Filesystem for QxyncFs {
                             tracing::warn!("set_mtime 远端失败 {remote}: {e}");
                         }
                     }
+                    // ★ M9 补丁：在线路径也要把**在途上传作业**的 mtime 跟上。
+                    // 旧代码只在离线时更新：`cp -a` 的「写完 → 上传中 → utimensat」
+                    // 顺序里，上传 worker 随后会用旧 mtime 调一次 `set_mtime`，把
+                    // 用户刚设的时间戳又盖回去 —— 真机就是靠这条把位图签名和远端
+                    // 签名拆开的。
+                    if let Some(uq) = &self.upload {
+                        uq.update_pending_mtime(&remote, epoch);
+                    }
                 }
+                // ★ M9 补丁：本地 mtime 变了、内容没变 → 把位图头里的签名同步过去，
+                // 否则重启后这份缓存会因为「签名对不上」被整份重新下载。
+                self.resync_cache_signature(ino);
             }
         }
 
@@ -6367,13 +6768,14 @@ impl Filesystem for QxyncFs {
             };
             if let Some(c) = cache {
                 remove_cache_files(&c);
+                index_forget(&self.cache_index, &c);
             }
             tracing::debug!("O_TMPFILE 未命名节点已丢弃: ino={}", u64::from(ino));
             return reply.ok();
         }
         // ★ M9：关文件时把位图按**最终**的 size/mtime 落一次盘 ——
         //   本地改写过的文件在下次挂载时也能直接认领，不必重新拉一遍。
-        persist_chunk_state(&self.inner, self.chunk_size, ino);
+        persist_chunk_state(&self.inner, self.chunk_size, ino, &self.cache_index);
         // ★ M21：本地写过的文件，清单条目也刷到**最终**签名（create 时的 size=0
         //   占位会让离线重启后的认领失败）。dirty 的文件才刷（只读打开不必写库）。
         self.refresh_listing_entry(ino, false);
@@ -7637,7 +8039,7 @@ mod tests {
             let n = g.nodes.get_mut(&ino).unwrap();
             n.chunks_done = vec![true; n.chunk_count(DEFAULT_CHUNK_SIZE)];
         }
-        persist_chunk_state(&fs1.inner, fs1.chunk_size, ino);
+        persist_chunk_state(&fs1.inner, fs1.chunk_size, ino, &fs1.cache_index);
 
         // 新挂载视图：节点 cache=None（= 本次挂载还没读过它），磁盘位图必须能兜住。
         let fs2 = test_fs(&dir, false);
@@ -7663,7 +8065,7 @@ mod tests {
             n.chunks_done = vec![false; n.chunk_count(DEFAULT_CHUNK_SIZE)];
             n.chunks_done[0] = true;
         }
-        persist_chunk_state(&fs1.inner, fs1.chunk_size, ino);
+        persist_chunk_state(&fs1.inner, fs1.chunk_size, ino, &fs1.cache_index);
         let err = h2.read_cached("/home/b.txt", SIZE + 1).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock, "{err}");
         assert_eq!(h2.read_cached("/home/b.txt", 100).unwrap(), payload[..100]);
@@ -7716,6 +8118,9 @@ mod tests {
             // 真的写点字节，验证「删缓存文件」确实发生
             std::fs::write(&cache, vec![7u8; 300 * 1024]).unwrap();
         }
+        // ★ M9 补丁：水合状态要同步进「重启索引」，否则 `cache_stats`（改由索引统计）
+        // 看不到这份手工造出来的缓存。
+        persist_chunk_state(&fs.inner, DEFAULT_CHUNK_SIZE, node.ino, &fs.cache_index);
         (fs, node.ino, cache)
     }
 
@@ -8784,6 +9189,130 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// ★ M9 补丁：重启（新挂载会话）后，**一次 `read` 都没有**时，
+    /// `getattr` 的 xattr 与 `status` 的缓存统计就必须已经报出真实的水合状态。
+    ///
+    /// 修的是真机反馈：「重新挂载后缓存好像没了，原来水合过的文件又变成白云」——
+    /// 内容其实全在盘上，只是 `chunks_done` 要等第一次 `read` 才被认领回来。
+    #[test]
+    fn restart_restores_hydration_state_before_first_read() {
+        let dir = m7_tmpdir("m9-restart-index");
+        let payload: Vec<u8> = (0..300 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let mtime = 1_700_000_000i64;
+        {
+            let fs = test_fs(&dir, false);
+            hydrated_node(&fs, "a.bin", "/home/a.bin", &payload, mtime);
+        }
+        // 新会话 = 重新挂载：节点表从远端清单重建（这里手动 insert 模拟）
+        let fs2 = test_fs(&dir, false);
+        let e = DirEntry::local("a.bin", false, payload.len() as u64, mtime);
+        let n2 = fs2.insert_node(INodeNo::ROOT, "a.bin", "/home/a.bin", &e);
+
+        // ① 一次 read 都没有：xattr 必须已经说 hydrated（角标不是云）
+        assert_eq!(
+            fs2.xattr_value(n2.ino, "user.qxync.state").as_deref(),
+            Some("hydrated")
+        );
+        assert_eq!(
+            fs2.xattr_value(n2.ino, "user.qxync.chunks").as_deref(),
+            Some("3/3")
+        );
+        // ② status 的「已缓存 N」也必须已经算上它（不用读）
+        let stats = fs2.handle().cache_stats();
+        assert_eq!(stats.hydrated_files, 1);
+        assert_eq!(stats.used_bytes, payload.len() as u64);
+        // ③ 真去读：走本地内容（nas.invalid 一被问到就必失败 → EIO）
+        let got =
+            std::fs::read(fs2.ensure_range(n2.ino, 0, payload.len() as u64).unwrap()).unwrap();
+        assert_eq!(got, payload);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M9 补丁：清单 mtime 比位图**更旧**（`cp -a` 的 utimensat 顺序造成的分叉）→
+    /// 逐区间校验和全过就认领本地内容、不重新下载，并把位图签名对齐到清单；
+    /// 清单 mtime **更新** → 远端可能真改过 → 仍然严格拒绝（宁可重下）。
+    #[test]
+    fn stale_bitmap_signature_is_adopted_when_manifest_mtime_is_older() {
+        let dir = m7_tmpdir("m9-skew-adopt");
+        let payload: Vec<u8> = (0..300 * 1024u32).map(|i| (i % 249) as u8).collect();
+        // 会话 1：写入缓存，位图签名 mtime=2000（写盘时刻）
+        {
+            let fs = test_fs(&dir, false);
+            hydrated_node(&fs, "a.bin", "/home/a.bin", &payload, 2000);
+        }
+        // 会话 2：清单说 mtime=1000（更旧、size 相同）→ 应认领
+        let fs2 = test_fs(&dir, false);
+        let e = DirEntry::local("a.bin", false, payload.len() as u64, 1000);
+        let n2 = fs2.insert_node(INodeNo::ROOT, "a.bin", "/home/a.bin", &e);
+        assert_eq!(
+            fs2.xattr_value(n2.ino, "user.qxync.state").as_deref(),
+            Some("hydrated"),
+            "清单更旧时必须认出这份缓存还在"
+        );
+        let got =
+            std::fs::read(fs2.ensure_range(n2.ino, 0, payload.len() as u64).unwrap()).unwrap();
+        assert_eq!(got, payload, "必须直接用盘上内容，不许回源");
+        let cache = fs2.cache_file_for(n2.ino).unwrap();
+        let st = state_load(&cache).unwrap();
+        assert_eq!(
+            (st.size, st.mtime),
+            (payload.len() as u64, 1000),
+            "认领后位图签名要对齐清单，下次重启不必再全量校验"
+        );
+
+        // 反方向：清单 mtime 更新（2500 > 位图 2000）→ 远端可能真改过 → 必须拒认领
+        let dir2 = m7_tmpdir("m9-skew-reject");
+        {
+            let fs = test_fs(&dir2, false);
+            hydrated_node(&fs, "b.bin", "/home/b.bin", &payload, 2000);
+        }
+        let fs3 = test_fs(&dir2, false);
+        let e3 = DirEntry::local("b.bin", false, payload.len() as u64, 2500);
+        let n3 = fs3.insert_node(INodeNo::ROOT, "b.bin", "/home/b.bin", &e3);
+        assert_eq!(
+            fs3.xattr_value(n3.ino, "user.qxync.state").as_deref(),
+            Some("placeholder"),
+            "清单更新时不能预填水合状态"
+        );
+        assert!(
+            fs3.ensure_range(n3.ino, 0, payload.len() as u64).is_err(),
+            "清单更新必须回源（nas.invalid → EIO），不能拿旧内容冒充"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// ★ M9 补丁：`setattr` 只改 mtime（`touch` / utimensat / 上传对齐）时，
+    /// 位图头的签名必须跟着改 —— 否则重启后「签名对不上」会把整份缓存重下一遍。
+    #[test]
+    fn mtime_change_resyncs_bitmap_signature() {
+        let dir = m7_tmpdir("m9-resync-sig");
+        let payload = vec![7u8; 200 * 1024];
+        let fs = test_fs(&dir, false);
+        let (ino, cache) = hydrated_node(&fs, "a.bin", "/home/a.bin", &payload, 1000);
+        assert_eq!(state_load(&cache).unwrap().mtime, 1000);
+        // 模拟 FUSE setattr：节点 mtime 改成 4000（内容没动），然后同步位图签名
+        {
+            let mut g = fs.inner.lock().unwrap();
+            let n = g.nodes.get_mut(&ino).unwrap();
+            n.attr.mtime = UNIX_EPOCH + Duration::from_secs(4000);
+            n.attr.ctime = n.attr.mtime;
+        }
+        fs.resync_cache_signature(ino);
+        let st = state_load(&cache).unwrap();
+        assert_eq!(st.mtime, 4000, "位图签名必须跟上节点签名");
+        assert!(st.done.iter().all(|d| *d), "内容位图不能被动");
+        // 新会话按清单 mtime=4000 认领 → 零网络
+        drop(fs);
+        let fs2 = test_fs(&dir, false);
+        let e = DirEntry::local("a.bin", false, payload.len() as u64, 4000);
+        let n2 = fs2.insert_node(INodeNo::ROOT, "a.bin", "/home/a.bin", &e);
+        let got =
+            std::fs::read(fs2.ensure_range(n2.ino, 0, payload.len() as u64).unwrap()).unwrap();
+        assert_eq!(got, payload);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// ★ M9：后台刷新「原子换上」—— 内容、大小、mtime、区间表、位图一次切换；
     /// 换完再挂载一次（新节点表）仍然认领得到这份新内容。
     #[test]
@@ -8802,6 +9331,7 @@ mod tests {
             std::fs::write(&tmp, &new).unwrap();
             let installed = install_refreshed(
                 &fs.inner,
+                &fs.cache_index,
                 "/home/a.bin",
                 &tmp,
                 &cache,
@@ -8858,6 +9388,7 @@ mod tests {
         assert_eq!(
             install_refreshed(
                 &fs.inner,
+                &fs.cache_index,
                 "/home/a.bin",
                 &tmp,
                 &cache,
