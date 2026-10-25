@@ -3659,6 +3659,14 @@ async fn flush_offline_backlog(state: &Arc<State>, client: &Arc<qxync_client::Cl
                 if let Err(e) = login_internal(state, None, None, None).await {
                     tracing::warn!("离线缓冲回放重登失败: {}", e.message);
                 }
+            } else if report.parent_pending > 0 {
+                // ★ 结构操作在互相等（父 mkdir / 改名还没落地）：网络与会话都正常，
+                //   **绝不重登**。真机 2026-10-25 这里每 3 秒打一次「会话失效」，
+                //   6 分钟打了 95 次「登录成功」，把 NAS 的失败登录封锁风险拉满。
+                tracing::info!(
+                    "离线缓冲区回放等待本地结构操作先落地（{} 项，不重登，队列继续冻结）: {why}",
+                    report.parent_pending
+                );
             } else {
                 tracing::warn!("离线缓冲区回放中断（服务端未就绪，稍后继续）: {why}");
             }

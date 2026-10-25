@@ -33,15 +33,19 @@ use std::sync::{Arc, Mutex};
 pub const DB_FILE: &str = "sync.db";
 
 /// schema 版本（写进 `PRAGMA user_version`；将来加表要迁移时用它判断）。
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 // ★ M8.3：v1 → v2 只是**新增 journal 表与索引**。
 // ★ M8.4：v2 → v3 只是**新增 decisions 表（冲突待裁决队列）**。
 // ★ M15/T9：v3 → v4 只是**新增 nodes 表（稳定文件身份 file_id → path 的索引）**。
 // ★ M20：v4 → v5 只是**新增 outbox 表（离线期间做不成的结构操作）**。
 // ★ M21：v5 → v6 只是**新增 listings 表（目录清单快照的持久化）**。
+// ★ M36：v6 → v7 只是**给 nodes 表加 `local_only` 列**（本地新建、远端还没有副本的
+//   持久化证据；跨重启回答「远端到底有没有这个名字」）。
 // 因为整份 SCHEMA_SQL 都是
 // `CREATE TABLE/INDEX IF NOT EXISTS`，老库在下次 `Store::open()` 时会被自动补齐，
 // **不需要写迁移代码、也不会碰已有表里的数据**（迁移幂等由 m5-matrix 断言覆盖）。
+// 唯一的例外是**给已有表加列**（SQLite 的 `CREATE TABLE IF NOT EXISTS` 不会改表结构）：
+// 见 [`Store::ensure_node_columns`]，它按 `PRAGMA table_info` 判断后再 `ALTER TABLE`。
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (
@@ -161,6 +165,14 @@ CREATE TABLE IF NOT EXISTS nodes (
   mtime      INTEGER NOT NULL DEFAULT 0,
   isfolder   INTEGER NOT NULL DEFAULT 0,
   updated_at INTEGER NOT NULL DEFAULT 0,
+  -- ★ M36：这个路径**远端还没有副本**（只有本地有）。
+  --
+  -- 为什么必须持久化：`Node::remote_known` 只在内存里，重启后节点表是空的、
+  -- 条目按持久化清单懒物化。而清单**分不清**「NAS 上的条目」和「本地新建、
+  -- 还没上传的条目」（`create()` 也会 `listing_upsert`）—— 于是重启后一个本地
+  -- 新建的 `.part` 会被当成远端已有，紧接着的改名发一条永远不成立的远端 rename。
+  -- 这一列就是那个区分：本地新建时置 1，上传成功 / 远端确认后清 0。
+  local_only INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (file_id, path)
 );
 -- path 侧查询（上传队列落地时按 file_id 反查最新名字、对账时按 path 取身份）
@@ -174,7 +186,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS nodes_path ON nodes(path);
 -- 能读（缓存文件 + `.qxstate` 位图本来就在盘上）、写操作照旧进 outbox。
 --
 -- 语义：**快照 = 最后一次已知的目录内容**，不是权威状态。行丢了/旧了都只是
--- 「离线重启后少看见一些东西」，联网后轮询的 apply_listing 会整份换新 ——
+-- 「离线重启后少看见一些东西」，联网后轮询的 apply_listing 会用 NAS 清单重建 ——
+-- ★ M34：重建时**不是整份换新**，而是 `远端全集 ∪ 本地未同步新建 − 本地待删`
+-- （见 qxync-fuse 的 `install_merged_listing`）。整份换新会把「本地刚建、还没回放 /
+-- 上传」的条目抹掉，用户看到目录凭空消失、再建同名目录却 EEXIST（真机 2026-10-25）。
 -- 这与 nodes 表「可重建的派生索引」是同一条设计线。
 --
 -- entries 是 `Vec<DirEntry>` 的 JSON（模型本身 Serialize/Deserialize，含 file_id）。
@@ -198,6 +213,12 @@ pub struct NodeRow {
     pub mtime: i64,
     pub is_folder: bool,
     pub updated_at: i64,
+    /// ★ M36：这个路径**远端还没有副本**（本地新建、上传还没成功）。
+    ///
+    /// 与 `Node::remote_known` 是同一个事实的持久化形态：内存里那份不跨重启，
+    /// 而重启后按持久化清单物化节点时又分不清条目来源 —— 所以需要这一列。
+    /// 只在**已知答案**的地方翻转：本地新建置 1，上传成功 / 远端确认清 0。
+    pub local_only: bool,
 }
 
 /// 上传队列里的一行（M5 起队列也进状态库）。
@@ -524,12 +545,51 @@ impl Store {
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(Error::from)?;
         conn.execute_batch(SCHEMA_SQL).map_err(Error::from)?;
+        Self::ensure_node_columns(&conn)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(Error::from)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             path,
         })
+    }
+
+    /// ★ M36：给 `nodes` 表补 `local_only` 列（v6 及更老的库）。
+    ///
+    /// `SCHEMA_SQL` 里的 `CREATE TABLE IF NOT EXISTS` 只会建新表，**不会改已有表**；
+    /// 所以老库按 `PRAGMA table_info` 判断缺列，再 `ALTER TABLE ... ADD COLUMN`
+    /// （带 `NOT NULL DEFAULT 0`：老行的语义按「远端已有」处理，与旧行为一致）。
+    /// 幂等：列在就只补索引，不重复 ALTER。
+    fn ensure_node_columns(conn: &Connection) -> Result<()> {
+        let mut has = false;
+        {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(nodes)")
+                .map_err(Error::from)?;
+            let cols = stmt
+                .query_map([], |r| r.get::<_, String>(1))
+                .map_err(Error::from)?;
+            for col in cols {
+                if col.map_err(Error::from)? == "local_only" {
+                    has = true;
+                }
+            }
+        }
+        if !has {
+            conn.execute(
+                "ALTER TABLE nodes ADD COLUMN local_only INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(Error::from)?;
+        }
+        // 局部索引：`readdir` 每次都要问「这个目录下哪些名字只有本地有」，
+        // 不给索引就是扫整张 nodes 表（目录规模一大就明显）。
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS nodes_local_only ON nodes(local_only)
+               WHERE local_only <> 0;",
+        )
+        .map_err(Error::from)?;
+        Ok(())
     }
 
     pub fn path(&self) -> &Path {
@@ -1077,14 +1137,15 @@ impl Store {
         )
         .map_err(Error::from)?;
         tx.execute(
-            "INSERT INTO nodes (file_id, path, remote_path, size, mtime, isfolder, updated_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7)
+            "INSERT INTO nodes (file_id, path, remote_path, size, mtime, isfolder, updated_at, local_only)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
              ON CONFLICT(file_id, path) DO UPDATE SET
                remote_path = excluded.remote_path,
                size        = excluded.size,
                mtime       = excluded.mtime,
                isfolder    = excluded.isfolder,
-               updated_at  = excluded.updated_at",
+               updated_at  = excluded.updated_at,
+               local_only  = excluded.local_only",
             params![
                 row.file_id.as_slice(),
                 row.path,
@@ -1093,6 +1154,7 @@ impl Store {
                 row.mtime,
                 row.is_folder as i64,
                 row.updated_at,
+                row.local_only as i64,
             ],
         )
         .map_err(Error::from)?;
@@ -1114,10 +1176,12 @@ impl Store {
             mtime: r.get(4)?,
             is_folder: r.get::<_, i64>(5)? != 0,
             updated_at: r.get(6)?,
+            local_only: r.get::<_, i64>(7)? != 0,
         })
     }
 
-    const NODE_COLS: &'static str = "file_id, path, remote_path, size, mtime, isfolder, updated_at";
+    const NODE_COLS: &'static str =
+        "file_id, path, remote_path, size, mtime, isfolder, updated_at, local_only";
 
     /// 按身份取**全部**行（对账/上传队列落地时的主力查询）。
     ///
@@ -1210,6 +1274,66 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// ★ M36：**目录**改名 —— 整棵子树的 `path` 一起搬到新前缀下（含目录自身）。
+    ///
+    /// 单行版 [`Self::node_rename`] 只搬目录自己那一行，而 FUSE/远端改名把清单
+    /// （`listings`）整棵子树一起搬了 —— 两边一旦分叉，重启后子项的 `local_only`
+    /// 证据留在旧路径：新路径下的子项被当成「远端已有」（M36 要修的缺陷对子项复发），
+    /// 旧路径下的行还会被清单叠加当成幽灵。
+    ///
+    /// SQL 用 `length()` 而不是 Rust 的字节长度：路径里可能有中文（真机 `取证1`），
+    /// SQLite 的 `substr` 按**字符**计。
+    ///
+    /// 目标子树上已有别的身份 → 先删（与单行版同一条规则：`nodes_path` 唯一索引不能撞；
+    /// 被删的行下次对账会重新记进来）。返回搬动的行数。
+    pub fn node_rename_subtree(&self, old_path: &str, new_path: &str) -> Result<usize> {
+        let old_path = old_path.trim_end_matches('/');
+        let new_path = new_path.trim_end_matches('/');
+        if old_path == new_path || old_path.is_empty() || new_path.is_empty() {
+            return Ok(0);
+        }
+        // 防御：目标嵌套在源里、或目标是源的祖先 —— 合法 `rename(2)` / NAS 改名不会
+        // 产生这种 pair（目录不能挪进自己；目标是祖先时它已存在、改名本来就会失败），
+        // 但「先删目标子树、再整体改前缀」在这两种形状下会误删祖先/兄弟行，或撞
+        // `nodes_path` 唯一索引导致整个事务回滚（一行都不搬）。直接不动。
+        if new_path.len() > old_path.len()
+            && new_path.starts_with(old_path)
+            && new_path.as_bytes()[old_path.len()] == b'/'
+        {
+            return Ok(0);
+        }
+        if old_path.len() > new_path.len()
+            && old_path.starts_with(new_path)
+            && old_path.as_bytes()[new_path.len()] == b'/'
+        {
+            return Ok(0);
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(Error::from)?;
+        // 目标位置上已有别的身份 → 先删掉（否则 UPDATE 会撞 `nodes_path` 唯一索引）。
+        // 前缀比较用 `substr(...) = ?` 而**不是** `LIKE`：SQLite 的 LIKE 默认大小写
+        // 不敏感，`/home/a` 会误命中 `/home/A/...`（把兄弟目录的行当成目标删掉、
+        // 证据一起丢）。
+        tx.execute(
+            "DELETE FROM nodes
+              WHERE (path = ?1 OR substr(path, 1, length(?1) + 1) = ?1 || '/')
+                AND NOT (path = ?2 OR substr(path, 1, length(?2) + 1) = ?2 || '/')",
+            params![new_path, old_path],
+        )
+        .map_err(Error::from)?;
+        let n = tx
+            .execute(
+                "UPDATE nodes
+                    SET path = ?1 || substr(path, length(?2) + 1),
+                        updated_at = ?3
+                  WHERE path = ?2 OR substr(path, 1, length(?2) + 1) = ?2 || '/'",
+                params![new_path, old_path, now_unix()],
+            )
+            .map_err(Error::from)?;
+        tx.commit().map_err(Error::from)?;
+        Ok(n)
+    }
+
     /// ★ 清理：本地/远端真的删掉了 → 把这个身份的行删掉。
     ///
     /// **为什么必须删**（正确性红线）：留着行，下次对账时那个 `file_id` 还在，
@@ -1229,16 +1353,77 @@ impl Store {
     ///
     /// `prefix` 传目录自身的远端路径（不带尾斜杠），内部补斜杠，
     /// 免得 `/home/a` 误删 `/home/ab`。
+    ///
+    /// ★ M36：段级匹配用 `substr` 而**不是** `LIKE` —— SQLite 的 LIKE 默认大小写
+    /// 不敏感，`/home/a` 会误删 `/home/A/...`（Linux/NAS 上两者是不同目录）。
     pub fn node_forget_subtree(&self, dir: &str) -> Result<usize> {
-        let prefix = format!("{}/", dir.trim_end_matches('/'));
         let n = self
             .conn()
             .execute(
-                "DELETE FROM nodes WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'",
-                params![dir, like_prefix(&prefix)],
+                "DELETE FROM nodes
+                  WHERE path = ?1 OR substr(path, 1, length(?1) + 1) = ?1 || '/'",
+                params![dir],
             )
             .map_err(Error::from)?;
         Ok(n)
+    }
+
+    /// ★ M36：`dir` 子树里**只有本地有**（远端还没有副本）的路径。
+    ///
+    /// 消费方是 FUSE 的「按持久化清单物化节点 / 清单叠加」：清单本身分不清条目来源，
+    /// 这一列才能回答「重启后这个 `.part` 是不是远端根本还没有」。
+    /// 返回整棵子树（含更深层）—— 调用方按 `path` 建 `HashSet` 判断成员；
+    /// **不保证顺序**（`ORDER BY` 会让 SQLite 放弃局部索引、退化成全表/全索引扫，
+    /// 3 万行实测 1.1ms vs 0.006ms）。
+    pub fn node_local_only_under(&self, dir: &str) -> Result<Vec<NodeRow>> {
+        let dir = dir.trim_end_matches('/');
+        let sql = format!(
+            "SELECT {} FROM nodes
+              WHERE local_only <> 0
+                AND (path = ?1 OR substr(path, 1, length(?1) + 1) = ?1 || '/')",
+            Self::NODE_COLS
+        );
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&sql).map_err(Error::from)?;
+        let rows = stmt
+            .query_map(params![dir], |r| Self::node_from_row(r))
+            .map_err(Error::from)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(Error::from)?);
+        }
+        Ok(out)
+    }
+
+    /// ★ M36：这个路径在持久化索引里是不是「本地新建、远端还没有副本」。
+    ///
+    /// 路径不在表里 → `false`（没有证据就按「远端有」处理：这是旧行为，也是
+    /// **保守**方向 —— 多发一次远端改名/删除，而不是把远端名字留成幽灵）。
+    pub fn node_is_local_only(&self, path: &str) -> Result<bool> {
+        let row: Option<i64> = self
+            .conn()
+            .query_row(
+                "SELECT local_only FROM nodes WHERE path = ?1",
+                params![path],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(Error::from)?;
+        Ok(row.unwrap_or(0) != 0)
+    }
+
+    /// ★ M36：远端已经确认有这个路径（上传成功 / 远端清单命中）→ 清掉 `local_only`。
+    ///
+    /// 返回是否命中行（没命中不算错：节点可能还没记进索引）。
+    pub fn node_mark_remote_known(&self, path: &str) -> Result<bool> {
+        let n = self
+            .conn()
+            .execute(
+                "UPDATE nodes SET local_only = 0 WHERE path = ?1 AND local_only <> 0",
+                params![path],
+            )
+            .map_err(Error::from)?;
+        Ok(n > 0)
     }
 
     pub fn nodes_len(&self) -> Result<u64> {
@@ -1532,6 +1717,42 @@ impl Store {
     /// `kind=rename` 行要**同时**改写 `path` 与 `target`（改名链里出现前缀移动）；
     /// `mkdir` / `setmtime` 只改 `path`。按**段级前缀**匹配，`/home/a` 不会命中
     /// `/home/ab`。
+    ///
+    /// ## ★ M36：改写 = **删了重插到队尾**，不是原地 `UPDATE` 保留 seq
+    ///
+    /// `seq` 是回放的执行顺序（= 入队顺序），而这个函数会把行指向**新的父目录**——
+    /// 新父目录的 `mkdir` 行可能排在原 seq **之后**。真机形态：
+    ///
+    /// ```text
+    /// seq1 mkdir /p/a        （本地新建，先有 a）
+    /// seq2 mkdir /b          （后来才建的、要搬进去的新父目录）
+    /// seq3 mkdir /p/a/sub
+    /// 改名 /p/a → /b/a2
+    /// ```
+    ///
+    /// 原地改写得到 `seq1 mkdir /b/a2`、`seq2 mkdir /b`、`seq3 …/sub` —— **子目录排在
+    /// 父 mkdir 前面**，回放只能靠「等结构操作」的兜底逻辑一轮轮试探（真实事故里正是
+    /// 这个形状）。改成「改写行按原相对顺序重排到队尾」后：
+    ///
+    /// * 改写行之间的相对顺序不变（父先于子这条不变量继承下来）；
+    /// * 所有**未被改写**的行（含新父目录及其祖先的 `mkdir`）都排在它们前面。
+    ///
+    /// 新的父目录一定不在 `old` 子树里（`rename(2)` 不允许把目录挪进自己），
+    /// 所以它的创建行要么不是 outbox 行（远端已有），要么本来就不被改写 ——
+    /// 队尾语义因此覆盖了「祖先先落地」这条排序依赖，回放不再依赖隐式时序。
+    ///
+    /// 删/插在**同一个事务**里：崩在中间不会留下「旧行删了、新行没插」的丢操作。
+    ///
+    /// ## 与 daemon 回放并发时
+    ///
+    /// daemon 也在回放 outbox（在线时每轮都会尝试清空）时，行被重插到队尾后，
+    /// 回放方按**旧 seq** `outbox_done` 会 no-op —— 该行会在下一轮按新路径再回放一次
+    /// （`mkdir` / `rename` 的回放都先 `stat`，天然幂等）。这比旧行为安全：
+    /// 旧实现原地改 path、seq 不变，回放方的 `outbox_done(旧 seq)` 会把**已改写**的行
+    /// 删掉 → 新父目录永远不会被建出来（本地视图有、远端没有，上传全部失败）。
+    /// 现在最坏是多一次幂等重放 + 远端可能多出一个旧路径（下一轮对账按「远端删除 +
+    /// 本地已在」收敛）。窗口很窄（纯本地改名与回放同刻），不做全局串行化：
+    /// 那会把 FUSE 写路径卡在同步轮次上。
     pub fn outbox_rewrite_prefix(&self, old: &str, new: &str) -> Result<usize> {
         let old = old.trim_end_matches('/');
         let new = new.trim_end_matches('/');
@@ -1554,7 +1775,7 @@ impl Store {
             }
         }
         let rows = self.outbox_pending()?;
-        let mut n = 0usize;
+        let mut moved: Vec<(OutboxRow, String, String)> = Vec::new();
         for row in rows {
             let path = rewrite(&row.path, old, new);
             let target = if row.kind == OUTBOX_RENAME {
@@ -1565,15 +1786,43 @@ impl Store {
             if path == row.path && target == row.target {
                 continue;
             }
-            self.conn()
-                .execute(
-                    "UPDATE outbox SET path = ?2, target = ?3 WHERE seq = ?1",
-                    params![row.seq, path, target],
-                )
-                .map_err(Error::from)?;
-            n += 1;
+            moved.push((row, path, target));
         }
-        Ok(n)
+        if moved.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(Error::from)?;
+        let mut resequenced = 0usize;
+        for (row, path, target) in &moved {
+            // ★ M36 复核：先确认「还在」再重插 —— 并发回放可能在这条事务之前就把
+            //   这一行 `outbox_done` 删掉了（已成功落地）。不看影响行数就 INSERT
+            //   等于把已完成的操作重新排进队列（重复回放 / 幽灵行）。
+            let deleted = tx
+                .execute("DELETE FROM outbox WHERE seq = ?1", params![row.seq])
+                .map_err(Error::from)?;
+            if deleted == 0 {
+                continue;
+            }
+            // 不写 seq：`AUTOINCREMENT` 会接着用过的最大 seq 往下发 —— 即「队尾」，
+            // 而遍历顺序（原 seq 升序）保证改写行之间的相对顺序不变。
+            tx.execute(
+                "INSERT INTO outbox(kind, path, target, is_dir, attempts, created_unix)
+                 VALUES(?1,?2,?3,?4,?5,?6)",
+                params![
+                    row.kind,
+                    path,
+                    target,
+                    row.is_dir as i64,
+                    row.attempts as i64,
+                    row.created_unix,
+                ],
+            )
+            .map_err(Error::from)?;
+            resequenced += 1;
+        }
+        tx.commit().map_err(Error::from)?;
+        Ok(resequenced)
     }
 
     /// 回放成功 → 删行。
@@ -1583,6 +1832,32 @@ impl Store {
             .execute("DELETE FROM outbox WHERE seq = ?1", params![seq])
             .map_err(Error::from)?;
         Ok(n > 0)
+    }
+
+    /// ★ M36：本地把「还没回放的本地新建」删掉了 → 撤销它（及子树）的结构操作。
+    ///
+    /// 场景：离线建了 `取证1`（outbox 里一条 `mkdir`），回放前用户又把它删了。
+    /// 不撤销的话，回放/清单叠加会把「已经删掉的目录」重新建出来 / 摆回 `ls`
+    /// （用户视角：删了又长回来，再建同名目录 EEXIST）。
+    ///
+    /// 只按 `path` 匹配（`rename` 行的 `target` 指向这个子树时不动它：那是「把别处
+    /// 的东西搬进来」的意图，目录都不存在了回放本来也会失败/放弃，交给回放处理；
+    /// 这里不做猜测性改写）。段级前缀：`/a` 不命中 `/ab`；用 `substr` 而不是 `LIKE`
+    /// —— SQLite 的 LIKE 默认大小写不敏感，`/home/a` 会误删 `/home/A/sub` 的回放意图。
+    pub fn outbox_forget_under(&self, path: &str) -> Result<usize> {
+        let path = path.trim_end_matches('/');
+        if path.is_empty() {
+            return Ok(0);
+        }
+        let n = self
+            .conn()
+            .execute(
+                "DELETE FROM outbox
+                  WHERE path = ?1 OR substr(path, 1, length(?1) + 1) = ?1 || '/'",
+                params![path],
+            )
+            .map_err(Error::from)?;
+        Ok(n)
     }
 
     /// 非网络错误 → 重试计数 +1（网络错误**不要**调它：联网后原样再试）。
@@ -2469,6 +2744,250 @@ mod tests {
         assert!(s.outbox_pending().unwrap().is_empty());
     }
 
+    /// ★ M36：前缀改写**重排到队尾** —— 改写出来的子项不能排在「新父目录的 mkdir」前面。
+    ///
+    /// 真机形态：先建 `/p/a`（seq1），后来才建要搬进去的新父目录 `/b`（seq2），
+    /// 再在 `/p/a` 下建 `/p/a/sub`（seq3），最后把本地新建的 `/p/a` 改名到 `/b/a2`
+    /// （`remote_known=false` → 纯本地改名 + 回写 outbox，没有 rename 行）。
+    ///
+    /// 旧实现原地改 path、保留 seq → 回放顺序是 `/b/a2`(1)、`/b`(2)、`/b/a2/sub`(3)：
+    /// 子项排在新父目录前面，只能靠「等结构操作」兜底一轮轮试探（多烧几次 stat）。
+    /// 新实现把改写行按原相对顺序重排到队尾 → 顺序天然满足「祖先先落地」。
+    #[test]
+    fn outbox_rewrite_resequences_rewritten_rows_after_their_new_parent() {
+        let s = Store::open_in_memory().unwrap();
+        s.outbox_add(OUTBOX_MKDIR, "/p/a", "", true).unwrap();
+        let b = s.outbox_add(OUTBOX_MKDIR, "/b", "", true).unwrap();
+        let sub = s.outbox_add(OUTBOX_MKDIR, "/p/a/sub", "", true).unwrap();
+        s.outbox_add(OUTBOX_RENAME, "/x/f.txt", "/p/a/f.txt", false)
+            .unwrap();
+        // 重试计数必须跟着行走：换 seq 不等于重置状态
+        s.outbox_bump_attempts(sub, 2).unwrap();
+        let before = s.outbox_pending().unwrap();
+        let created_sub = before.iter().find(|r| r.seq == sub).unwrap().created_unix;
+
+        assert_eq!(s.outbox_rewrite_prefix("/p/a", "/b/a2").unwrap(), 3);
+
+        let rows = s.outbox_pending().unwrap();
+        let order: Vec<(String, String)> = rows
+            .iter()
+            .map(|r| (r.kind.clone(), r.path.clone()))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                (OUTBOX_MKDIR.to_string(), "/b".to_string()),
+                (OUTBOX_MKDIR.to_string(), "/b/a2".to_string()),
+                (OUTBOX_MKDIR.to_string(), "/b/a2/sub".to_string()),
+                (OUTBOX_RENAME.to_string(), "/x/f.txt".to_string()),
+            ],
+            "改写行按原相对顺序排到队尾，未被改写的 /b 必须在它们前面"
+        );
+        // 回放顺序就是 `outbox_pending` 的顺序：seq 严格递增
+        let seqs: Vec<i64> = rows.iter().map(|r| r.seq).collect();
+        assert!(seqs.windows(2).all(|w| w[0] < w[1]));
+        // 没被改写的行保持原 seq；改写行者全部排在它后面
+        let b_row = rows.iter().find(|r| r.path == "/b").unwrap();
+        assert_eq!(b_row.seq, b, "未被改写的行不换 seq");
+        assert!(rows
+            .iter()
+            .filter(|r| r.path != "/b")
+            .all(|r| r.seq > b_row.seq));
+        // 状态原样保留
+        let sub_row = rows.iter().find(|r| r.path == "/b/a2/sub").unwrap();
+        assert_eq!(sub_row.attempts, 2, "重试计数不能因为重排丢失");
+        assert!(sub_row.is_dir);
+        assert_eq!(sub_row.created_unix, created_sub, "入队时刻不能变");
+        // rename 行两个字段都改写
+        let ren = rows.iter().find(|r| r.is_rename()).unwrap();
+        assert_eq!(ren.path, "/x/f.txt", "源不在子树里 → 不动");
+        assert_eq!(ren.target, "/b/a2/f.txt", "目标前缀必须跟着搬");
+        // 幂等
+        assert_eq!(s.outbox_rewrite_prefix("/p/a", "/b/a2").unwrap(), 0);
+    }
+
+    /// ★ M36：`nodes.local_only` —— 本地新建的持久化证据（跨重启回答「远端有没有」）。
+    #[test]
+    fn nodes_local_only_tracks_create_rename_and_forget() {
+        let s = Store::open_in_memory().unwrap();
+        let id = |name: &str| crate::file_id::compute_file_id(false, 3, 100, name, "/home");
+        let put = |path: &str, local_only: bool| {
+            s.node_upsert(&NodeRow {
+                file_id: id(path.rsplit('/').next().unwrap()),
+                path: path.into(),
+                remote_path: path.into(),
+                size: 3,
+                mtime: 100,
+                is_folder: false,
+                updated_at: 0,
+                local_only,
+            })
+            .unwrap();
+        };
+        put("/home/a.txt", true);
+        put("/home/ab.txt", false);
+        put("/home/sub/b.txt", true);
+
+        assert!(s.node_is_local_only("/home/a.txt").unwrap());
+        assert!(!s.node_is_local_only("/home/ab.txt").unwrap());
+        assert!(
+            !s.node_is_local_only("/home/not-recorded.txt").unwrap(),
+            "没有证据 = 远端有（保守）"
+        );
+        // 段级前缀：/home/a.txt 子树查询不能把 /home/ab.txt 带进来
+        let paths = |dir: &str| {
+            let mut v = s
+                .node_local_only_under(dir)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.path)
+                .collect::<Vec<_>>();
+            // 查询**不保证顺序**（ORDER BY 会让 SQLite 放弃局部索引、退化成全索引扫）
+            v.sort();
+            v
+        };
+        assert_eq!(
+            paths("/home"),
+            vec!["/home/a.txt".to_string(), "/home/sub/b.txt".to_string()]
+        );
+        assert_eq!(paths("/home/sub"), vec!["/home/sub/b.txt".to_string()]);
+        // 大小写不同的兄弟目录不算同一棵子树（SQL 用 substr，大小写敏感）
+        put("/home/Case/x", true);
+        assert_eq!(
+            paths("/home/case"),
+            Vec::<String>::new(),
+            "/home/case 不能命中 /home/Case"
+        );
+        s.node_forget("/home/Case/x").unwrap();
+
+        // 改名只搬 path：证据跟着文件走
+        assert!(s.node_rename("/home/a.txt", "/home/c.txt").unwrap());
+        assert!(s.node_is_local_only("/home/c.txt").unwrap());
+
+        // 上传成功 / 远端确认 → 清证据（再清一次不命中也不算错）
+        assert!(s.node_mark_remote_known("/home/c.txt").unwrap());
+        assert!(!s.node_is_local_only("/home/c.txt").unwrap());
+        assert!(!s.node_mark_remote_known("/home/c.txt").unwrap());
+
+        // 删除清行 → 证据一起消失（否则重启后清单会把已删文件重新「长出来」）
+        s.node_forget("/home/sub/b.txt").unwrap();
+        assert!(!s.node_is_local_only("/home/sub/b.txt").unwrap());
+    }
+
+    /// ★ M36：**目录**改名要把整棵子树的 `nodes.path` 一起搬（含中文路径）。
+    #[test]
+    fn node_rename_subtree_moves_children_and_keeps_provenance() {
+        let s = Store::open_in_memory().unwrap();
+        let put = |path: &str, local_only: bool| {
+            let name = path.rsplit('/').next().unwrap();
+            let parent = path.rsplit_once('/').map(|(d, _)| d).unwrap();
+            s.node_upsert(&NodeRow {
+                file_id: crate::file_id::compute_file_id(
+                    path.ends_with("/d"),
+                    1,
+                    100,
+                    name,
+                    parent,
+                ),
+                path: path.into(),
+                remote_path: path.into(),
+                size: 1,
+                mtime: 100,
+                is_folder: path.ends_with("/d"),
+                updated_at: 0,
+                local_only,
+            })
+            .unwrap();
+        };
+        // 真机形状：中文目录名 + 子项
+        put("/home/取证1/d", true);
+        put("/home/取证1/d/a.bin", true);
+        put("/home/取证1/d/sub", true);
+        put("/home/取证1/d/sub/b.bin", true);
+        put("/home/取证1/dd", false); // 段级前缀：/…/d 不能命中 /…/dd
+        put("/home/取证1/d/a.bin", true); // 幂等写
+                                          // 目标位置已有别的身份（唯一索引不能撞）
+        put("/home/bk/d/a.bin", false);
+
+        assert_eq!(
+            s.node_rename_subtree("/home/取证1/d", "/home/bk/d")
+                .unwrap(),
+            4,
+            "目录自身 + 3 个子项"
+        );
+        assert!(s.node_is_local_only("/home/bk/d").unwrap());
+        assert!(s.node_is_local_only("/home/bk/d/a.bin").unwrap());
+        assert!(s.node_is_local_only("/home/bk/d/sub/b.bin").unwrap());
+        // 旧路径不再有行；兄弟目录 /…/dd 一个字节都没动
+        assert!(s.node_by_path("/home/取证1/d").unwrap().is_none());
+        assert!(s.node_by_path("/home/取证1/d/a.bin").unwrap().is_none());
+        assert!(
+            !s.node_is_local_only("/home/取证1/dd").unwrap(),
+            "段级前缀不能误伤 /…/dd"
+        );
+        // 目标位置原有行被顶掉（唯一索引语义），不是报错
+        assert!(s.node_by_path("/home/bk/d/a.bin").unwrap().is_some());
+        assert_eq!(s.nodes_len().unwrap(), 5, "4 搬过来 + dd 一个");
+
+        // 大小写不同的兄弟目录不能跟着搬（SQL 用 substr 而不是 LIKE：LIKE 默认
+        // 大小写不敏感，Linux/NAS 上 /home/ABC 与 /home/abc 是两个目录）
+        put("/home/ABC/d", true);
+        put("/home/ABC/d/x.bin", true);
+        assert_eq!(s.node_rename_subtree("/home/abc/d", "/home/zz").unwrap(), 0);
+        assert!(
+            s.node_is_local_only("/home/ABC/d/x.bin").unwrap(),
+            "大小写不同的兄弟目录的行不能被带走"
+        );
+
+        // 重叠（目标嵌套在源里 / 目标是源的祖先）→ 显式拒绝，一行都不动
+        assert_eq!(
+            s.node_rename_subtree("/home/bk/d", "/home/bk/d/inner")
+                .unwrap(),
+            0
+        );
+        assert_eq!(s.node_rename_subtree("/home/bk/d", "/home/bk").unwrap(), 0);
+        assert!(s.node_by_path("/home/bk/d/a.bin").unwrap().is_some());
+
+        // 单行/原地改名是 no-op
+        assert_eq!(
+            s.node_rename_subtree("/home/bk/d", "/home/bk/d").unwrap(),
+            0
+        );
+    }
+
+    /// ★ M36：删除本地新建项时撤销 outbox 结构操作（段级前缀，不碰 rename 的 target）。
+    #[test]
+    fn outbox_forget_under_is_segment_scoped() {
+        let s = Store::open_in_memory().unwrap();
+        s.outbox_add(OUTBOX_MKDIR, "/home/取证1", "", true).unwrap();
+        s.outbox_add(OUTBOX_MKDIR, "/home/取证1/sub", "", true)
+            .unwrap();
+        s.outbox_add(OUTBOX_MKDIR, "/home/取证10", "", true)
+            .unwrap();
+        s.outbox_add(OUTBOX_RENAME, "/home/elsewhere", "/home/取证1/x", false)
+            .unwrap();
+
+        assert_eq!(s.outbox_forget_under("/home/取证1").unwrap(), 2);
+        let rows = s.outbox_pending().unwrap();
+        let paths: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["/home/取证10", "/home/elsewhere"],
+            "段级前缀不误伤；rename 的 target 不动（那是「搬进来」的意图）"
+        );
+
+        // 大小写不同的兄弟目录不能被连带删掉（SQL 用 substr 而不是 LIKE：LIKE 默认
+        // 大小写不敏感；丢的是不可恢复的回放意图 —— 父 mkdir 没了，子项上传永久失败）
+        s.outbox_add(OUTBOX_MKDIR, "/home/A/i", "", true).unwrap();
+        s.outbox_add(OUTBOX_MKDIR, "/home/a/i", "", true).unwrap();
+        assert_eq!(s.outbox_forget_under("/home/a").unwrap(), 1);
+        let rows = s.outbox_pending().unwrap();
+        let paths: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
+        assert!(paths.contains(&"/home/A/i"), "大小写不同 → 不是同一棵子树");
+        assert!(!paths.contains(&"/home/a/i"));
+        assert_eq!(s.outbox_forget_under("/home/never").unwrap(), 0);
+    }
+
     /// ★ M21：目录清单持久化 —— 存取往返（含 file_id）、upsert 覆盖、删行。
     #[test]
     fn listings_roundtrip_upsert_and_delete() {
@@ -2869,6 +3388,7 @@ mod tests {
             mtime: 100,
             is_folder: false,
             updated_at: 1,
+            local_only: false,
         })
         .unwrap();
         assert_eq!(s.nodes_by_file_id(&id).unwrap()[0].path, "/home/a.txt");
@@ -2898,6 +3418,7 @@ mod tests {
             mtime: 100,
             is_folder: false,
             updated_at: 0,
+            local_only: false,
         };
 
         s.node_upsert(&mk(id_a, "/home/a.txt", 10)).unwrap();
@@ -2950,6 +3471,7 @@ mod tests {
                 mtime: 100,
                 is_folder: false,
                 updated_at: 0,
+                local_only: false,
             })
             .unwrap();
         }
@@ -2968,6 +3490,7 @@ mod tests {
             mtime: 100,
             is_folder: false,
             updated_at: 0,
+            local_only: false,
         })
         .unwrap();
         assert_eq!(s.nodes_len().unwrap(), 3, "换身份顶掉旧行，总数不变");
@@ -2989,6 +3512,7 @@ mod tests {
                 mtime: seq,
                 is_folder: false,
                 updated_at: 0,
+                local_only: false,
             })
             .unwrap();
         };
@@ -3058,6 +3582,77 @@ mod m11_file_backed_tests {
         assert_eq!(rows[1].attempts, 3, "重试计数必须跨重启保留");
         // 新库的表结构齐全
         assert_eq!(s.integrity_check().unwrap(), "ok");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ★ M36：v6 老库（`nodes` 表没有 `local_only` 列）打开后自动补列。
+    ///
+    /// `CREATE TABLE IF NOT EXISTS` 不会改已有表，所以这条路径是**唯一**需要
+    /// 迁移代码的地方。断言：旧行原样保留、新列默认 0（= 远端已有，与旧行为一致）、
+    /// 重复打开不再 ALTER（幂等，不会报 duplicate column）。
+    #[test]
+    fn v6_db_gets_local_only_column_without_losing_nodes() {
+        let dir = tmpdir("v6-nodes-local-only");
+        let db = dir.join("sync.db");
+        let id = crate::file_id::compute_file_id(false, 10, 100, "a.txt", "/home");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE nodes (
+                   file_id     BLOB    NOT NULL,
+                   path        TEXT    NOT NULL,
+                   remote_path TEXT    NOT NULL DEFAULT '',
+                   size        INTEGER NOT NULL DEFAULT 0,
+                   mtime       INTEGER NOT NULL DEFAULT 0,
+                   isfolder    INTEGER NOT NULL DEFAULT 0,
+                   updated_at  INTEGER NOT NULL DEFAULT 0,
+                   PRIMARY KEY (file_id, path)
+                 );
+                 CREATE UNIQUE INDEX nodes_path ON nodes(path);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO nodes(file_id, path, remote_path, size, mtime, isfolder, updated_at)
+                 VALUES(?1, '/home/a.txt', '/home/a.txt', 10, 100, 0, 1)",
+                params![id.as_slice()],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 6i64).unwrap();
+        }
+        let s = Store::open(&db).unwrap();
+        assert_eq!(s.schema_version().unwrap(), SCHEMA_VERSION);
+        let row = s.node_by_path("/home/a.txt").unwrap().unwrap();
+        assert_eq!(row.path, "/home/a.txt");
+        assert!(
+            !row.local_only,
+            "老行默认按「远端已有」处理（与旧行为一致）"
+        );
+
+        // 新列可写读
+        s.node_upsert(&NodeRow {
+            file_id: id,
+            path: "/home/a.txt".into(),
+            remote_path: "/home/a.txt".into(),
+            size: 10,
+            mtime: 100,
+            is_folder: false,
+            updated_at: 2,
+            local_only: true,
+        })
+        .unwrap();
+        assert!(s.node_is_local_only("/home/a.txt").unwrap());
+        assert!(s.node_mark_remote_known("/home/a.txt").unwrap());
+        assert!(!s.node_is_local_only("/home/a.txt").unwrap());
+
+        // 幂等：再打开一次不重复 ALTER
+        drop(s);
+        let s2 = Store::open(&db).unwrap();
+        assert_eq!(s2.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(
+            s2.node_by_path("/home/a.txt").unwrap().unwrap().path,
+            "/home/a.txt"
+        );
+        assert_eq!(s2.integrity_check().unwrap(), "ok");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

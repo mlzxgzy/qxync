@@ -560,6 +560,10 @@ fn compute_node_file_id(inner: &Arc<Mutex<Inner>>, ino: INodeNo) -> Option<FileI
 ///
 /// 只记「当前这一条」，不记历史：`nodes` 是**当下位置**的索引，
 /// 历史关联由「改名时改 path、删除时删行」维护。
+///
+/// ★ M36：顺带把「远端有没有副本」落库（`nodes.local_only` = `!remote_known`）。
+/// 内存里的 [`Node::remote_known`] 不跨重启，而重启后节点要按持久化清单懒物化 ——
+/// 那一步分不清条目来源，只能靠这一列。
 fn nodes_remember(
     nodes: Option<&Arc<Store>>,
     remote: &str,
@@ -567,6 +571,7 @@ fn nodes_remember(
     size: u64,
     mtime: i64,
     is_dir: bool,
+    remote_known: bool,
 ) {
     let Some(store) = nodes else { return };
     if let Err(e) = store.node_upsert(&NodeRow {
@@ -577,6 +582,7 @@ fn nodes_remember(
         mtime,
         is_folder: is_dir,
         updated_at: qxync_core::store::now_unix(),
+        local_only: !remote_known,
     }) {
         // 索引写失败只影响 rename 配对的收益，**绝不影响数据操作本身**。
         tracing::warn!("记 nodes 身份失败 {remote}: {e}");
@@ -783,8 +789,12 @@ struct Node {
     ///
     /// 维护：从远端清单/`stat` 物化的节点天生是 `true`；`create()` 出来的本地
     /// 新节点是 `false`；上传成功（[`FsHandle::clear_dirty`] /
-    /// [`FsHandle::mark_remote_known`]）置 `true`。不持久化 —— 重启后节点都从
-    /// 远端清单重建，本来就都是 `true`。
+    /// [`FsHandle::mark_remote_known`]）置 `true`。
+    ///
+    /// ★ M36：**跨重启靠持久化证据**。内存这一位不跨重启，重启后节点按持久化
+    /// 清单懒物化 —— 而清单里混着本地新建条目（`create()` 也会 `listing_upsert`）。
+    /// 所以 `nodes.local_only` 把同一事实落了库：物化时按它填这一位
+    /// （见 [`QxyncFs::load_children`] / [`QxyncFs::lookup_child`]），上传成功时清掉。
     remote_known: bool,
     /// ★ M15/T8 **同步维度**：本地与远端是否一致。
     ///
@@ -1049,6 +1059,15 @@ struct Inner {
     dirs: HashMap<String, DirListing>,
     /// 正在后台补清单的目录（去重，避免同一目录并发拉好几遍）。
     listing_inflight: HashSet<String>,
+    /// ★ M34：本地新建、远端还没有副本的节点（`Node::remote_known == false`）。
+    ///
+    /// 只当**索引**用：清单叠加要知道「这个目录里有哪些本地新条目还没同步上去」。
+    /// 遍历整张节点表是 O(全部节点)（真机 3 万），而这里只装那少数几个。
+    ///
+    /// 维护是**单向**的（只在 [`QxyncFs::insert_node_with`] 传 `remote_known=false`
+    /// 时插入）；列表条目可能过期 —— 消费方一律再确认 `nodes` 里还在、且
+    /// `remote_known` 仍为 false，过期条目只是浪费一次迭代，不会造成错误。
+    local_only: HashSet<INodeNo>,
 }
 
 /// 一个目录的 NAS 清单快照。
@@ -1221,17 +1240,258 @@ fn begin_listing_refresh(inner: &Arc<Mutex<Inner>>, dir: &str) -> bool {
         .insert(dir.to_string())
 }
 
+// ---------------------------------------------------------------- ★ M34：本地未同步条目叠加
+
+/// ★ M34：锁外预先查好的「本地还没同步到 NAS 的那部分」。
+///
+/// 分两段是为了**不把 SQL 塞进节点表锁**：`outbox_pending()` 与
+/// `DeleteQueue::has_pending()` 都在锁外调用，拿到结果后再进锁做内存合并 ——
+/// 合并与安装在同一把锁里完成。否则「先算后装」之间用户新建的条目会被这次写入
+/// 盖掉（`seed_listing` 当年踩过同一个坑，见 `m20_seed_listing_never_clobbers_newer_snapshot`）。
+struct PendingOverlay {
+    /// 离线缓冲区里还没回放的结构操作（`seq` 升序）。
+    rows: Vec<qxync_core::store::OutboxRow>,
+    /// 远端还列着、但本地已经删掉的名字（删除作业还没回放完）→ 挂载点里不给看。
+    deleting: HashSet<String>,
+    /// ★ M36：`nodes.local_only` 里落在本目录下的条目（本地新建、远端还没有）。
+    ///
+    /// 跨重启用：会话内那份证据是 `Inner::local_only`（inode 索引，重启后为空），
+    /// 而重启后一份远端清单刷新就会把本地新建的文件从 `ls` 里抹掉 —— 尽管它还在
+    /// 本地、上传作业也还在队列里。用持久化证据把它叠回去。
+    local_only: Vec<NodeRow>,
+}
+
+/// 远端路径的父目录（`/a/b` → `/a`；根下的 `/a` → `""`）。
+fn parent_dir(path: &str) -> &str {
+    path.rsplit_once('/').map(|(d, _)| d).unwrap_or("")
+}
+
+/// 远端路径的最后一段（空名字返回 `None`）。
+fn file_name(path: &str) -> Option<&str> {
+    path.rsplit_once('/')
+        .map(|(_, n)| n)
+        .filter(|n| !n.is_empty())
+}
+
+/// ★ M34：锁外收集叠加层要用的「本地未同步」事实。
+fn collect_pending_overlay(
+    store: Option<&Arc<Store>>,
+    delete: Option<&Arc<crate::delete::DeleteQueue>>,
+    dir: &str,
+    remote: &[DirEntry],
+) -> PendingOverlay {
+    let dir = dir.trim_end_matches('/');
+    let rows = match store.map(|s| s.outbox_pending()) {
+        Some(Ok(rows)) => rows,
+        Some(Err(e)) => {
+            tracing::warn!("读离线缓冲区失败，清单叠加只能用会话内本地节点（{dir}）: {e}");
+            Vec::new()
+        }
+        None => Vec::new(),
+    };
+    let mut deleting = HashSet::new();
+    if let Some(q) = delete {
+        for e in remote {
+            if q.has_pending(&join_path(dir, &e.filename)) {
+                deleting.insert(e.filename.clone());
+            }
+        }
+    }
+    // ★ M36：跨重启的「本地新建」证据（见 `PendingOverlay::local_only`）。
+    let local_only = match store.map(|s| s.node_local_only_under(dir)) {
+        Some(Ok(rows)) => rows,
+        Some(Err(e)) => {
+            tracing::warn!("读 nodes.local_only 失败，清单叠加少一路来源（{dir}）: {e}");
+            Vec::new()
+        }
+        None => Vec::new(),
+    };
+    PendingOverlay {
+        rows,
+        deleting,
+        local_only,
+    }
+}
+
+/// ★ M34：造一个「本地新建」的清单条目。
+///
+/// 有节点就用节点的**真实签名与身份**（大小 / mtime / `file_id`）；没有（qxyncd
+/// 重启后节点表是空的，只剩 outbox）才退回入队时刻的占位 —— 否则用户会在 `ls`
+/// 里看到一个 0 字节、mtime 是「刚才」的假文件，而且身份是现算出来的伪值。
+fn local_child_entry(
+    g: &Inner,
+    dir: &str,
+    name: &str,
+    is_dir: bool,
+    fallback_mtime: i64,
+) -> DirEntry {
+    if let Some(ino) = g.by_remote.get(&join_path(dir, name)).copied() {
+        if let Some(n) = g.nodes.get(&ino) {
+            return DirEntry {
+                filename: name.to_string(),
+                filesize: n.attr.size,
+                isfolder: n.attr.kind == FileType::Directory,
+                epochmt: QxyncFs::epoch_of(n.attr.mtime),
+                have_child: false,
+                exist: true,
+                privilege: None,
+                versioning_support: false,
+                mtime_text: None,
+                file_id: n.file_id,
+            };
+        }
+    }
+    DirEntry::local(name, is_dir, 0, fallback_mtime).with_file_id(dir)
+}
+
+/// ★ M34：把远端清单 + 本地未同步增量合并后装进快照（**合并与安装同一把锁**）。
+///
+/// 不变式：`快照 = 远端全集 ∪ 本地未同步新建 − 本地待删 / 待改名旧名`。
+///
+/// 为什么必须这样：`readdir` 只吃这份快照（`load_children` → `dir_entries`），而
+/// `lookup` 先查节点表。两边一旦分叉，用户就会遇到「目录凭空消失、再建同名目录却
+/// `EEXIST`」（真机 2026-10-25 的 `取证1` 事故）。原来「快照 = NAS 列举整份换新」，
+/// 恰恰会把本地新建、还没回放 / 上传的条目抹掉。
+///
+/// 三个来源，缺一不可：
+///
+/// 1. **离线缓冲区 `outbox`**（持久化）：`mkdir` / `rename`。跨重启的唯一证据 ——
+///    qxyncd 重启后节点表是空的，只有它能把还没回放的目录重新摆回 `ls`。
+/// 2. **会话内本地新建节点**（[`Node::remote_known`] `== false`，索引
+///    [`Inner::local_only`]）：覆盖「父目录当时还没有快照（`listing_upsert` 是
+///    no-op）的本地新文件」—— 光靠旧快照回填会漏掉它们：`lookup` 命中节点表、
+///    `ls` 却看不见。
+/// 3. **删除队列**：本地已删、远端还挂着 → 藏起来（否则 `rm` 之后下一轮列举又
+///    「长回来」）。
+///
+/// `if_absent` = 只在没有快照时灌入（`seed_listing` 的预热语义），此时返回 `None`。
+/// 远端真删除仍然生效：远端没有、本地也没有主的名字不会被补回来。
+fn install_merged_listing(
+    inner: &Arc<Mutex<Inner>>,
+    dir: &str,
+    remote: &[DirEntry],
+    pending: &PendingOverlay,
+    if_absent: bool,
+) -> Option<Arc<Vec<DirEntry>>> {
+    let dir = dir.trim_end_matches('/');
+    let mut g = inner.lock().unwrap();
+    if if_absent && g.dirs.contains_key(dir) {
+        return None;
+    }
+
+    // ① 离线缓冲区：待回放的 rename 旧名要藏、mkdir / rename 的新名要补
+    let mut hide: HashSet<String> = HashSet::new();
+    let mut add: Vec<DirEntry> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for r in &pending.rows {
+        if r.is_rename() {
+            if parent_dir(&r.path) == dir {
+                if let Some(n) = file_name(&r.path) {
+                    hide.insert(n.to_string());
+                }
+            }
+            if parent_dir(&r.target) == dir {
+                if let Some(n) = file_name(&r.target) {
+                    if seen.insert(n.to_string()) {
+                        add.push(local_child_entry(&g, dir, n, r.is_dir, r.created_unix));
+                    }
+                }
+            }
+        } else if r.is_mkdir() && parent_dir(&r.path) == dir {
+            // setmtime 只改元数据，不影响「目录里有什么」→ 不管
+            if let Some(n) = file_name(&r.path) {
+                if seen.insert(n.to_string()) {
+                    add.push(local_child_entry(&g, dir, n, true, r.created_unix));
+                }
+            }
+        }
+    }
+
+    // ② 会话内本地新建的节点（索引只装这类节点，且节点消失 / 转成远端已知时会自愈，
+    //    见 [`Inner::local_only`] 的说明）—— O(本地新建数)，与目录规模无关
+    if let Some(pino) = g.by_remote.get(dir).copied() {
+        for ino in g.local_only.iter() {
+            let Some(n) = g.nodes.get(ino) else { continue };
+            if n.parent != pino || n.remote_known {
+                continue;
+            }
+            if seen.insert(n.name.clone()) {
+                add.push(local_child_entry(&g, dir, &n.name.clone(), false, 0));
+            }
+        }
+    }
+
+    // ③ ★ M36：跨重启的本地新建条目（`nodes.local_only` 持久化证据）。
+    //    会话内那份 inode 索引重启后为空；没有这一路，一次远端清单刷新就会把
+    //    本地新建的文件从 `ls` 里抹掉（文件还在本地、上传作业也还在队列里）。
+    for row in &pending.local_only {
+        if parent_dir(&row.path) != dir {
+            continue;
+        }
+        let Some(name) = file_name(&row.path) else {
+            continue;
+        };
+        if !seen.insert(name.to_string()) {
+            continue;
+        }
+        add.push(DirEntry {
+            filename: name.to_string(),
+            filesize: row.size,
+            isfolder: row.is_folder,
+            epochmt: row.mtime,
+            have_child: false,
+            exist: true,
+            privilege: None,
+            versioning_support: false,
+            mtime_text: None,
+            file_id: row.file_id,
+        });
+    }
+
+    // 改名链（`a→b`、`b→c`）里同一个名字可能既在 hide 又在 add：以 hide 为准
+    add.retain(|e| !hide.contains(&e.filename));
+
+    let mut out: Vec<DirEntry> = Vec::with_capacity(remote.len() + add.len());
+    let mut present: HashSet<String> = HashSet::with_capacity(remote.len() + add.len());
+    for e in remote {
+        if hide.contains(&e.filename) || pending.deleting.contains(&e.filename) {
+            continue;
+        }
+        if present.insert(e.filename.clone()) {
+            out.push(e.clone());
+        }
+    }
+    for e in add {
+        if present.insert(e.filename.clone()) {
+            out.push(e);
+        }
+    }
+    let merged = Arc::new(out);
+    g.dirs.insert(
+        dir.to_string(),
+        DirListing {
+            entries: merged.clone(),
+            fetched: Instant::now(),
+        },
+    );
+    Some(merged)
+}
+
 async fn run_listing_refresh(
     inner: Arc<Mutex<Inner>>,
     client: Arc<Client>,
     store: Option<Arc<Store>>,
+    delete: Option<Arc<crate::delete::DeleteQueue>>,
     dir: String,
 ) {
     match client.list(&dir).await {
         Ok(entries) => {
             tracing::debug!("后台刷新目录清单 {dir}（{} 项）", entries.len());
-            let saved = listing_put(&inner, &dir, Arc::new(entries));
-            persist_listing(store.as_ref(), &dir, &saved);
+            // ★ M34：远端只是「NAS 上有什么」，本地未同步的条目要叠回来
+            let pending = collect_pending_overlay(store.as_ref(), delete.as_ref(), &dir, &entries);
+            if let Some(saved) = install_merged_listing(&inner, &dir, &entries, &pending, false) {
+                persist_listing(store.as_ref(), &dir, &saved);
+            }
         }
         Err(e) => tracing::debug!("后台刷新目录清单失败 {dir}: {e}"),
     }
@@ -1777,6 +2037,9 @@ pub struct FsHandle {
     hooks: Hooks,
     /// ★ T9：稳定身份索引（`nodes` 表）；`None` = 未注入（见 [`QxyncFs::with_nodes_store`]）。
     nodes: Option<Arc<Store>>,
+    /// ★ M34：删除队列（daemon 注入）。清单叠加用它挡掉「本地已删、远端还挂着」的
+    /// 幽灵条目 —— 否则 `rm a` 之后下一轮轮询又把 `a` 「长回来」。
+    delete_queue: Option<Arc<crate::delete::DeleteQueue>>,
 }
 
 /// 「把某个 inode 的内核缓存作废」的回调（daemon 挂载后注入 `fuser::Notifier`）。
@@ -2334,17 +2597,27 @@ impl FsHandle {
     ///
     /// ★ M17：无论清不清 dirty，都把 `remote_known` 置 true —— 上传成功意味着
     /// NAS 上**一定**有这个路径了，紧接着的改名/删除必须知道这件事。
+    ///
+    /// ★ M36：同一事实跨重启也要成立 —— 顺带清掉 `nodes.local_only`。
+    /// 不清的话，重启后按持久化清单物化这个文件时还会以为「远端没有」，
+    /// 后续改名只做本地、远端留下旧名字的幽灵。
     pub fn clear_dirty(&self, remote: &str) {
         let pending = self.has_pending(remote);
-        let mut g = self.inner.lock().unwrap();
-        if let Some(ino) = g.by_remote.get(remote).copied() {
-            if let Some(n) = g.nodes.get_mut(&ino) {
-                n.remote_known = true;
-                if !pending {
-                    n.set_dirty(false);
+        {
+            let mut g = self.inner.lock().unwrap();
+            if let Some(ino) = g.by_remote.get(remote).copied() {
+                if let Some(n) = g.nodes.get_mut(&ino) {
+                    n.remote_known = true;
+                    if !pending {
+                        n.set_dirty(false);
+                    }
                 }
+                // ★ M36 复核：远端已确认 → 从「清单叠加」的会话内索引里摘掉。
+                //   只增不减的话，长会话里每次清单安装都要空转遍历历史 inode。
+                g.local_only.remove(&ino);
             }
         }
+        self.persist_remote_known(remote);
     }
 
     /// ★ M17：记住「这个路径在 NAS 上已经有一份」。**不**清 dirty、不推进 baseline。
@@ -2352,12 +2625,29 @@ impl FsHandle {
     /// 给上传成功 hook 用：上传期间本地又被改了（hook 因此不推进 baseline）时，
     /// 远端确实已经有了这一版 —— 若不记下来，紧接着的「新建后改名」会被误判成
     /// 「远端没有老副本」，改名不同步到 NAS，留下一个旧名字的幽灵文件。
+    ///
+    /// ★ M36：同时写穿 `nodes.local_only`（理由见 [`Self::clear_dirty`]）。
     pub fn mark_remote_known(&self, remote: &str) {
-        let mut g = self.inner.lock().unwrap();
-        if let Some(ino) = g.by_remote.get(remote).copied() {
-            if let Some(n) = g.nodes.get_mut(&ino) {
-                n.remote_known = true;
+        {
+            let mut g = self.inner.lock().unwrap();
+            if let Some(ino) = g.by_remote.get(remote).copied() {
+                if let Some(n) = g.nodes.get_mut(&ino) {
+                    n.remote_known = true;
+                }
+                g.local_only.remove(&ino);
             }
+        }
+        self.persist_remote_known(remote);
+    }
+
+    /// ★ M36：把「远端已经有这个路径」写穿到 `nodes.local_only`。
+    ///
+    /// 只写库、不碰内存（内存那份由调用方置位）。失败只 WARN：
+    /// 证据没清掉的后果是「重启后多猜一次远端没有」，比让上传回调失败轻得多。
+    fn persist_remote_known(&self, remote: &str) {
+        let Some(store) = &self.nodes else { return };
+        if let Err(e) = store.node_mark_remote_known(remote) {
+            tracing::warn!("清 nodes.local_only 失败（{remote}）: {e}");
         }
     }
 
@@ -2654,6 +2944,8 @@ impl LocalView for FsHandle {
         for ino in victims {
             if let Some(n) = g.nodes.remove(&ino) {
                 g.by_remote.remove(&n.remote);
+                // ★ M36：从「清单叠加」的会话内索引摘掉（只增不减会越积越多）
+                g.local_only.remove(&ino);
                 if let Some(p) = n.cache {
                     remove_cache_files(&p);
                     index_forget(&self.cache_index, &p);
@@ -2776,8 +3068,15 @@ impl LocalView for FsHandle {
         // 与 FUSE `rename` 回调走的是 `QxyncFs::migrate_nodes_row` 同一套语义
         // （`store.node_rename`，失败只 warn）。这里在 `FsHandle` 上，故直接调
         // `Store`，不走那个包装函数。
+        // ★ M36：目录改名要搬**整棵子树**的行（清单是整棵子树搬的，nodes 不搬就会
+        //   分叉 —— 子项的 `local_only` 证据留在旧路径，重启后缺陷复发）。
         if let Some(store) = &self.nodes {
-            if let Err(e) = store.node_rename(old_remote, new_remote) {
+            let moved = if is_dir {
+                store.node_rename_subtree(old_remote, new_remote)
+            } else {
+                store.node_rename(old_remote, new_remote).map(|_| 1)
+            };
+            if let Err(e) = moved {
                 tracing::warn!("迁移 nodes 身份路径失败 {old_remote} -> {new_remote}: {e}");
             }
         }
@@ -2902,29 +3201,37 @@ impl LocalView for FsHandle {
     }
 
     fn apply_listing(&self, dir: &str, entries: &[DirEntry]) {
-        let saved = listing_put(&self.inner, dir, Arc::new(entries.to_vec()));
-        // ★ M21：daemon 轮询推来的清单 = 最新真相，写穿（离线重启后凭它恢复视图）
-        persist_listing(self.nodes.as_ref(), dir, &saved);
+        // ★ M34：NAS 的列举结果**不是**挂载视图的全部真相 —— 本地新建、还没回放 /
+        // 上传的条目在 NAS 上根本不存在，整份替换会把它们从 `ls` 里抹掉
+        // （用户视角：目录凭空消失，再建同名目录却 EEXIST）。
+        let pending = collect_pending_overlay(
+            self.nodes.as_ref(),
+            self.delete_queue.as_ref(),
+            dir,
+            entries,
+        );
+        if let Some(saved) = install_merged_listing(&self.inner, dir, entries, &pending, false) {
+            // ★ M21：写穿（离线重启后凭它恢复视图）—— 写的是**合并后**的视图
+            persist_listing(self.nodes.as_ref(), dir, &saved);
+        }
     }
 
     fn seed_listing(&self, dir: &str, entries: &[DirEntry]) {
-        // 检查和插入在同一把锁里：不能先 `contains_key` 再 `insert` ——
-        // 中间用户新建文件的 upsert 会被迟到的预热抹掉（首次真机 FUSE 验收踩过：
-        // 挂载刚完成就 `printf` 的文件在 `ls` 里凭空消失，随后 `mv` 报源不存在）。
-        let mut g = self.inner.lock().unwrap();
-        if g.dirs.contains_key(dir) {
-            return;
-        }
-        g.dirs.insert(
-            dir.to_string(),
-            DirListing {
-                entries: Arc::new(entries.to_vec()),
-                fetched: Instant::now(),
-            },
+        // 检查和插入在同一把锁里（`if_absent=true` 由 [`install_merged_listing`]
+        // 在同一把锁内复查）：不能先 `contains_key` 再 `insert` —— 中间用户新建文件
+        // 的 upsert 会被迟到的预热抹掉（首次真机 FUSE 验收踩过：挂载刚完成就
+        // `printf` 的文件在 `ls` 里凭空消失，随后 `mv` 报源不存在）。
+        // ★ M34：预热清单同样要叠加本地未同步条目（挂载/重连那一瞬间最容易被整份覆盖）
+        let pending = collect_pending_overlay(
+            self.nodes.as_ref(),
+            self.delete_queue.as_ref(),
+            dir,
+            entries,
         );
-        drop(g);
-        // ★ M21：预热清单也写穿（只在真的灌入时 —— 已有快照的分支上面 return 了）
-        persist_listing(self.nodes.as_ref(), dir, entries);
+        if let Some(merged) = install_merged_listing(&self.inner, dir, entries, &pending, true) {
+            // ★ M21：预热清单也写穿（只在真的灌入时）
+            persist_listing(self.nodes.as_ref(), dir, &merged);
+        }
     }
 
     fn drop_listing(&self, dir: &str) {
@@ -3469,6 +3776,7 @@ impl QxyncFs {
                 inflight_chunks: HashMap::new(),
                 dirs: HashMap::new(),
                 listing_inflight: HashSet::new(),
+                local_only: HashSet::new(),
             })),
             delete_guard: DeleteGuard::new(DEFAULT_DELETE_LIMIT, DEFAULT_DELETE_WINDOW),
             cache_mode: CacheMode::PageCache,
@@ -3834,6 +4142,7 @@ impl QxyncFs {
             hydro: self.hydro.clone(),
             hooks: self.hooks.clone(),
             nodes: self.nodes.clone(),
+            delete_queue: self.delete_queue.clone(),
         }
     }
 
@@ -4085,7 +4394,11 @@ impl QxyncFs {
             if self.hide_reason(&remote, entry.isfolder).is_some() {
                 return Err(fuser::Errno::ENOENT);
             }
-            return Ok(self.insert_node(parent, name, &remote, &entry));
+            // ★ M36：清单命中也可能是「本地新建、还没上传」的条目（重启后按持久化
+            //   清单物化）：用持久化证据告诉小节点表「远端到底有没有」，
+            //   否则紧接着的改名会误发一条永远不成立的远端 rename。
+            let on_remote = !self.local_only_known(&remote);
+            return Ok(self.insert_node_with(parent, name, &remote, &entry, on_remote));
         }
         // ★ M20：冷路径 + 已知离线 → 立刻 EIO。回 ENOENT 是撒谎（「没有」≠「不知道」），
         // 上层可能据此做删除/覆盖判断；EIO 才是诚实的「现在答不了」。
@@ -4116,18 +4429,74 @@ impl QxyncFs {
         g.nodes.get(&ino).cloned()
     }
 
-    /// 物化一个**远端确实存在**的节点（清单/`stat` 命中）。
+    /// ★ M36：`dir` 子树里「只有本地有」的条目（读持久化证据，锁外查库）。
+    ///
+    /// 只服务两个时刻：「按持久化清单物化节点」与「清单叠加」—— 快照本身分不清
+    /// 远端条目与本地新建条目。没有注入 store / 查询失败 → 空集（退回旧行为）。
+    fn local_only_under(&self, dir: &str) -> Vec<NodeRow> {
+        let Some(store) = &self.nodes else {
+            return Vec::new();
+        };
+        match store.node_local_only_under(dir) {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!("读 nodes.local_only 失败（{dir}），节点按远端已有物化: {e}");
+                Vec::new()
+            }
+        }
+    }
+
+    /// ★ M36：这个路径是不是「只有本地有」（读持久化证据；无证据 = 远端有）。
+    fn local_only_known(&self, remote: &str) -> bool {
+        let Some(store) = &self.nodes else {
+            return false;
+        };
+        match store.node_is_local_only(remote) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("读 nodes.local_only 失败（{remote}），按远端已有处理: {e}");
+                false
+            }
+        }
+    }
+
+    /// ★ M36：改名前后判断「NAS 上到底有没有这个老名字」。
+    ///
+    /// 判据顺序（**刻意不看 `dirty`** —— 那是另一个事实）：
+    /// 1. 节点在表里 → `remote_known`（M17 起由远端清单 / 上传成功维护；
+    ///    ★ M36 起重启物化时按 `nodes.local_only` 填对）；
+    /// 2. 节点不在表里（罕见：内核 dentry 还在、节点被摘掉）→ 持久化证据；
+    /// 3. 没有证据 → `true`（按远端有处理：这是旧行为，也是**保守**方向 ——
+    ///    多发一次远端改名，而不是把远端名字留成永远没人清的幽灵）。
+    fn on_remote_for(&self, ino: Option<INodeNo>, old_remote: &str) -> bool {
+        let known = {
+            let g = self.inner.lock().unwrap();
+            ino.and_then(|i| g.nodes.get(&i)).map(|n| n.remote_known)
+        };
+        match known {
+            Some(v) => v,
+            None => !self.local_only_known(old_remote),
+        }
+    }
+
+    /// 物化一个**远端确实存在**的节点（NAS 的 `stat` / `list` 命中、在线 `mkdir` 成功后）。
     ///
     /// 本地新建（`create`）走 [`Self::insert_node_with`] 并传 `remote_known=false` ——
-    /// 见 [`Node::remote_known`] 的说明。
+    /// 见 [`Node::remote_known`] 的说明。★ M36：按**清单快照**物化时不能假设「远端有」
+    /// （快照里可能混着本地新建条目），那条路走 `insert_node_with(.., 证据)`。
     fn insert_node(&self, parent: INodeNo, name: &str, remote: &str, entry: &DirEntry) -> Node {
         self.insert_node_with(parent, name, remote, entry, true)
     }
 
     /// ★ M17：物化节点，并显式声明「远端有没有这个名字」。
     ///
-    /// 只有 `create()` 传 `false`（本地新建、还没上传过）；其余入口（远端清单、
-    /// `stat`、`mkdir` 成功后）都传 `true`。
+    /// 传 `false`（远端没有副本）的入口：
+    /// * `create()` —— 本地新建、还没上传过；
+    /// * 离线 `mkdir`（[`Self::materialize_local_dir`] 的 `offline=true`）；
+    /// * ★ M36：按**清单快照**物化、且持久化证据 `nodes.local_only` 说是本地新建
+    ///   （重启后按装回的清单 `readdir`/`lookup` 就是这条路径）。
+    ///
+    /// 其余入口（NAS 的 `get_list` / `stat` 响应、在线 `mkdir` 成功后）传 `true`。
     ///
     /// **已存在的节点一律不改 `remote_known`**：`readdir` 也会把「本地清单快照」
     /// 里的条目递过来（`create()` 会 `listing_upsert`），那些条目可能只是本地新建、
@@ -4217,10 +4586,25 @@ impl QxyncFs {
         );
         g.nodes.insert(ino, node.clone());
         g.by_remote.insert(remote.to_string(), ino);
+        // ★ M34：本地新建（远端还没有副本）→ 进「清单叠加」索引。
+        //   消费方（`install_merged_listing`）会再确认 `remote_known` 仍为 false，
+        //   所以这里不需要在 `clear_dirty`/`mark_remote_known` 里反向清理。
+        if !remote_known {
+            g.local_only.insert(ino);
+        }
         drop(g);
         // ★ T9：节点一建出来就把身份记进索引（对账要靠它把「删除 + 新增」配成改名）。
         //   锁外写库：SQLite 有自己的锁，不能在持有节点表锁时做慢 IO。
-        nodes_remember(self.nodes.as_ref(), remote, file_id, size, mtime, is_dir);
+        //   ★ M36：连「远端有没有副本」一起记（`nodes.local_only`），跨重启可用。
+        nodes_remember(
+            self.nodes.as_ref(),
+            remote,
+            file_id,
+            size,
+            mtime,
+            is_dir,
+            remote_known,
+        );
         node
     }
 
@@ -4277,9 +4661,19 @@ impl QxyncFs {
     ///
     /// 失败**刻意不上报**：远端已经改成功、本地节点也搬完了，因为索引写失败
     /// 就让用户看到 ENOENT 是本末倒置（索引只影响配对收益，保守退化即可）。
-    fn migrate_nodes_row(&self, old_remote: &str, new_remote: &str) {
+    ///
+    /// ★ M36：目录要搬**整棵子树**（`node_rename_subtree`）—— 与清单的
+    /// `listing_move` 对齐；只搬目录自己那一行会让子项的 `local_only` 证据留在旧路径。
+    fn migrate_nodes_row(&self, old_remote: &str, new_remote: &str, is_dir: bool) {
         let Some(store) = &self.nodes else { return };
-        if let Err(e) = store.node_rename(old_remote, new_remote) {
+        let res = if is_dir {
+            store
+                .node_rename_subtree(old_remote, new_remote)
+                .map(|_| ())
+        } else {
+            store.node_rename(old_remote, new_remote).map(|_| ())
+        };
+        if let Err(e) = res {
             tracing::warn!("迁移 nodes 身份路径失败 {old_remote} -> {new_remote}: {e}");
         }
     }
@@ -4297,9 +4691,20 @@ impl QxyncFs {
         let entries = self.dir_entries(&remote)?;
         let visible = self.filter_visible(&remote, &entries);
         let hidden = entries.len().saturating_sub(visible.len());
+        // ★ M36：清单快照里混着「NAS 上的条目」和「本地新建、还没上传的条目」
+        //   （`create()` 也会 `listing_upsert`），快照本身分不清。重启后节点表是空的、
+        //   只能按这份清单物化 —— 用持久化的 `nodes.local_only` 把两者区分开，
+        //   否则一个本地新建的 `.part` 会被当成「远端已有」，改名时发一条
+        //   永远不成立的远端 rename（在线直接 EIO，离线重试到放弃）。
+        let local_only: HashSet<String> = self
+            .local_only_under(&remote)
+            .into_iter()
+            .map(|r| r.path)
+            .collect();
         let mut out = Vec::with_capacity(visible.len());
         for (child_remote, e) in visible {
-            out.push(self.insert_node(ino, &e.filename, &child_remote, &e));
+            let on_remote = !local_only.contains(&child_remote);
+            out.push(self.insert_node_with(ino, &e.filename, &child_remote, &e, on_remote));
         }
         if hidden > 0 {
             // ★ M7：排除 / 临时文件不进节点表 —— 挂载点里根本看不到它们。
@@ -4321,6 +4726,7 @@ impl QxyncFs {
                     self.inner.clone(),
                     self.client.clone(),
                     self.nodes.clone(),
+                    self.delete_queue.clone(),
                     remote.to_string(),
                 ));
             }
@@ -4339,10 +4745,17 @@ impl QxyncFs {
                 return Err(fuser::Errno::EIO);
             }
         };
-        let arc = Arc::new(entries);
-        let saved = listing_put(&self.inner, remote, arc.clone());
+        // ★ M34：冷路径列举同样是「快照 = 远端清单」，必须叠回本地未同步的条目
+        let pending = collect_pending_overlay(
+            self.nodes.as_ref(),
+            self.delete_queue.as_ref(),
+            remote,
+            &entries,
+        );
+        let saved = install_merged_listing(&self.inner, remote, &entries, &pending, false)
+            .expect("if_absent=false 一定返回合并结果");
         persist_listing(self.nodes.as_ref(), remote, &saved);
-        Ok(arc)
+        Ok(saved)
     }
 
     /// ★ M7：readdir 的过滤闸门（抽出来是为了**不挂 FUSE 也能单测**）。
@@ -4511,18 +4924,17 @@ impl QxyncFs {
         };
         // 先算出目标远端路径：★ M6 的只读检查必须在真正删除之前，
         // 也不能让被 EROFS 挡下的删除白白吃掉一次熔断额度。
-        let (parent_remote, _ino, dirty) = {
+        let (parent_remote, _ino, dirty, node_remote_known) = {
             let g = self.inner.lock().unwrap();
             let Some(p) = g.nodes.get(&parent) else {
                 return reply.error(fuser::Errno::ENOENT);
             };
             let remote = join_path(&p.remote, name);
             let ino = g.by_remote.get(&remote).copied();
-            let dirty = ino
-                .and_then(|i| g.nodes.get(&i))
-                .map(|n| n.dirty)
-                .unwrap_or(false);
-            (p.remote.clone(), ino, dirty)
+            let node = ino.and_then(|i| g.nodes.get(&i));
+            let dirty = node.map(|n| n.dirty).unwrap_or(false);
+            let remote_known = node.map(|n| n.remote_known);
+            (p.remote.clone(), ino, dirty, remote_known)
         };
         let remote = join_path(&parent_remote, name);
         // ★ M7：被排除的路径在挂载点里不存在 —— 删除它同样回 ENOENT
@@ -4557,6 +4969,13 @@ impl QxyncFs {
         // 而跳过远端删除 —— 那个文件下一轮对账会作为远端新增出现，用户能看见；
         // 比「先传一版本地内容把对方覆盖掉再删」破坏性更小。
         let mut skip_remote_delete = false;
+        // ★ M36：远端到底有没有这个副本？判据与改名同一套（节点表 → 持久化证据），
+        //   不再从 `dirty` 反推 —— 目录从不置 dirty，旧写法会让「离线新建的目录」
+        //   也去 NAS 发一条注定 404 的删除。
+        let mut on_remote = match node_remote_known {
+            Some(k) => k,
+            None => !self.local_only_known(&remote),
+        };
         if dirty {
             if let Some(q) = &self.upload {
                 q.pause();
@@ -4566,13 +4985,31 @@ impl QxyncFs {
                     return reply.error(fuser::Errno::EBUSY);
                 }
                 // 在途作业刚落地的話，远端可能刚有这个副本 —— 重新读一次再决定
-                let on_remote = self
+                on_remote = self
                     .node_by_remote(&remote)
                     .map(|n| n.remote_known)
-                    .unwrap_or(false);
+                    .unwrap_or(!self.local_only_known(&remote));
                 q.cancel_under(&remote);
                 q.resume();
                 skip_remote_delete = !on_remote;
+            }
+        }
+        // ★ M36：本地新建（远端还没有副本）→ 远端什么都不用删；还要撤销它在 outbox
+        //   里的结构操作（`mkdir`），否则回放 / 清单叠加会把「已经删掉的目录」重新
+        //   建出来、摆回 `ls`（用户视角：删了又长回来，再建同名目录 EEXIST）。
+        if !on_remote {
+            skip_remote_delete = true;
+            if let Some(q) = &self.upload {
+                q.cancel_under(&remote);
+            }
+            if let Some(store) = &self.nodes {
+                match store.outbox_forget_under(&remote) {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        tracing::info!("删除本地新建项时撤销 {n} 条未回放的离线结构操作: {remote}")
+                    }
+                    Err(e) => tracing::warn!("撤销离线结构操作失败（{remote}）: {e}"),
+                }
             }
         }
         // ★ M11：**异步入队，立刻返回**。
@@ -4621,6 +5058,8 @@ impl QxyncFs {
             for ino in victims {
                 if let Some(n) = g.nodes.remove(&ino) {
                     g.by_remote.remove(&n.remote);
+                    // ★ M36：从「清单叠加」的会话内索引摘掉
+                    g.local_only.remove(&ino);
                     // ★ M9：本地删除同时清掉「内容 + 位图」，别让同名新文件认领到旧内容
                     if let Some(p) = n.cache {
                         remove_cache_files(&p);
@@ -4925,28 +5364,61 @@ impl QxyncFs {
     /// 父目录还没有清单时是 no-op（与 [`listing_upsert`] 同语义：不凭空断言
     /// 「其它名字都不存在」—— 那个空缺由预热/轮询补上）。
     fn refresh_listing_entry(&self, ino: INodeNo, force: bool) {
-        let (remote, name, size, mtime, is_dir, file_id, dirty) = {
+        let (remote, dirty) = {
             let g = self.inner.lock().unwrap();
             let Some(n) = g.nodes.get(&ino) else { return };
-            (
-                n.remote.clone(),
-                n.name.clone(),
-                n.attr.size,
-                epoch_secs(n.attr.mtime),
-                n.attr.kind == FileType::Directory,
-                n.file_id,
-                n.dirty,
-            )
+            (n.remote.clone(), n.dirty)
         };
         if !dirty && !force {
             return;
         }
-        let Some((dir, _)) = remote.rsplit_once('/') else {
+        // ★ M36：`nodes` 行也刷到**最终签名**（**先于**清单写：崩在两次写之间时，
+        // 「清单新、证据旧(0)」正是要避免的形态；反过来则只是清单旧、证据新，重启后
+        // 叠加层会把正确签名写回清单）。
+        //
+        // `nodes` 行是「重启后清单叠加」与「远端有没有副本」的证据来源，而它之前只在
+        // 物化那一刻写一次：`create()` 写下的 `size=0` 行会一直陈旧到上传成功，重启后
+        // 叠加层就会拿 0 字节盖掉清单里已经刷新的正确条目 → `read` 静默 EOF、追加写
+        // 还会按陈旧 size 截断缓存（本地唯一副本）。release / setattr 走这里，正好是
+        // 「签名已经定稿」的时机。
+        //
+        // 锁外间隔里可能有并发 rename/unlink：写库前**重读**节点当前的路径与签名。
+        // 节点不在了（被 unlink）就直接不写；路径变了就按新值写（否则会把行写回旧
+        // path → 幽灵行 / 同身份两行，上传队列的身份反查会变成「歧义」）。
+        let Some((remote_now, file_id_now, size_now, mtime_now, is_dir_now, known_now)) = ({
+            let g = self.inner.lock().unwrap();
+            g.by_remote
+                .get(&remote)
+                .copied()
+                .and_then(|i| g.nodes.get(&i))
+                .map(|n| {
+                    (
+                        n.remote.clone(),
+                        n.file_id,
+                        n.attr.size,
+                        epoch_secs(n.attr.mtime),
+                        n.attr.kind == FileType::Directory,
+                        n.remote_known,
+                    )
+                })
+        }) else {
             return;
         };
-        let mut e = DirEntry::local(&name, is_dir, size, mtime);
+        nodes_remember(
+            self.nodes.as_ref(),
+            &remote_now,
+            file_id_now,
+            size_now,
+            mtime_now,
+            is_dir_now,
+            known_now,
+        );
+        let Some((dir, name_now)) = remote_now.rsplit_once('/') else {
+            return;
+        };
+        let mut e = DirEntry::local(name_now, is_dir_now, size_now, mtime_now);
         // ★ 沿用节点身份（不重算）—— 清单里的 file_id 与节点表保持同一来源
-        e.file_id = file_id;
+        e.file_id = file_id_now;
         if let Some(entries) = listing_upsert(&self.inner, dir, &e) {
             persist_listing(self.nodes.as_ref(), dir, &entries);
         }
@@ -6311,6 +6783,9 @@ impl Filesystem for QxyncFs {
                     }
                 }
                 g.by_remote.insert(new_remote.clone(), ino);
+                // ★ M36：物化出来的节点 = 本地新建（远端还没有副本）→ 进「清单叠加」索引
+                //   （`link` 手工搬节点，绕过了 `insert_node_with` 的记账尾部）。
+                g.local_only.insert(ino);
             }
             // 进目录清单（与 create 相同的路径）
             let node_now = self.node_by_remote(&new_remote);
@@ -6321,6 +6796,17 @@ impl Filesystem for QxyncFs {
                 if let Some(entries) = listing_upsert(&self.inner, &parent_remote, &e) {
                     persist_listing(self.nodes.as_ref(), &parent_remote, &entries);
                 }
+                // ★ M36：持久化「远端还没有副本」的证据（同上，补 `insert_node_with`
+                //   的记账；不补的话 linkat→close 窗口里重启，M36 的改名误判会复发）。
+                nodes_remember(
+                    self.nodes.as_ref(),
+                    &n.remote,
+                    n.file_id,
+                    n.attr.size,
+                    Self::epoch_of(n.attr.mtime),
+                    false,
+                    false,
+                );
             }
             // 标脏 → 上传到 NAS（物化出来的内容只在本地）
             if let Err(e) = self.mark_dirty(ino) {
@@ -6517,7 +7003,7 @@ impl Filesystem for QxyncFs {
                 return reply.error(fuser::Errno::EEXIST);
             }
         }
-        let (old_remote, new_remote, parent_remote, newparent_remote, ino, dirty, is_dir) = {
+        let (old_remote, new_remote, parent_remote, newparent_remote, ino, is_dir) = {
             let g = self.inner.lock().unwrap();
             let (Some(p), Some(np)) = (g.nodes.get(&parent), g.nodes.get(&newparent)) else {
                 return reply.error(fuser::Errno::ENOENT);
@@ -6526,20 +7012,11 @@ impl Filesystem for QxyncFs {
             let new = join_path(&np.remote, newname);
             let ino = g.by_remote.get(&old).copied();
             let node = ino.and_then(|i| g.nodes.get(&i));
-            let dirty = node.map(|n| n.dirty).unwrap_or(false);
             // ★ M20：离线改名要记「源是文件还是目录」（回放日志 / 冲突处理要用）。
             let is_dir = node
                 .map(|n| n.attr.kind == FileType::Directory)
                 .unwrap_or(false);
-            (
-                old,
-                new,
-                p.remote.clone(),
-                np.remote.clone(),
-                ino,
-                dirty,
-                is_dir,
-            )
+            (old, new, p.remote.clone(), np.remote.clone(), ino, is_dir)
         };
 
         // ★ M7：改名的两端都不能落在被排除的路径上（挪进去/挪出来都算写）
@@ -6601,15 +7078,17 @@ impl Filesystem for QxyncFs {
                 tracing::warn!("改名前等待删除队列在途批次超时（继续改名）: {old_remote}");
             }
         }
-        // 远端到底有没有老副本？有本地改动时以节点的 `remote_known` 为准（它来自
-        // 远端清单 / 上传成功回调，不是猜的）；没有本地改动时老节点必然来自远端。
-        // 在途作业刚落地的话，上面的等待期间 hook 已经把 `remote_known` 置 true。
-        let on_remote = {
-            let g = self.inner.lock().unwrap();
-            ino.and_then(|i| g.nodes.get(&i))
-                .map(|n| n.remote_known)
-                .unwrap_or(!dirty)
-        };
+        // 远端到底有没有老副本？
+        //
+        // ★ M36：**不再用 `dirty` 反推**（旧写法 `unwrap_or(!dirty)`）。`dirty` 答的是
+        //   「本地有没有还没上传的改动」，与「远端有没有这个名字」是两个不同的事实：
+        //   重启后按持久化清单物化的节点恰好 `dirty=false`，但它可能只是本地新建、
+        //   远端根本没有 —— 旧写法会给它发一条永远不成立的远端 rename。
+        //
+        // 现在的判据见 [`Self::on_remote_for`]：节点在表里用 `remote_known`
+        // （M17 起由远端清单 / 上传成功维护；★ M36 起重启物化时也按持久化的
+        // `nodes.local_only` 填对）；节点不在表里（罕见）→ 查同一份持久化证据。
+        let on_remote = self.on_remote_for(ino, &old_remote);
 
         // ★ M20：已知离线 → 不试网络，远端改名操作进离线缓冲区；本地视图照常推进。
         // 回放顺序由 outbox 的 seq 保证（离线期间改名的链条按用户操作顺序重放）。
@@ -6755,7 +7234,7 @@ impl Filesystem for QxyncFs {
             }
         }
         // ★ T9：把 `nodes` 行的 path 一起搬过去（`file_id` 一个字节都不动）。
-        self.migrate_nodes_row(&old_remote, &new_remote);
+        self.migrate_nodes_row(&old_remote, &new_remote, is_dir);
         // ★ M20 修复：目录改名 → 它自己的清单快照跟着搬到新路径。
         //   不搬的话，离线改名后的目录在新路径下「没有快照 + 离线」→ `ls`/写入 EIO
         //   （与 `mkdir` 离线分支创建空快照是同一个坑的两条入口）。
@@ -9930,7 +10409,7 @@ mod tests {
                 n.remote = "/home/new.txt".to_string();
             }
         }
-        fs.migrate_nodes_row("/home/old.txt", "/home/new.txt");
+        fs.migrate_nodes_row("/home/old.txt", "/home/new.txt", false);
 
         // 1. 节点身份没变
         let after = fs.node_by_remote("/home/new.txt").unwrap();
@@ -10755,6 +11234,414 @@ mod tests {
         h.drop_listing("/home/seed");
         let (rows, _) = store.listing_load_all().unwrap();
         assert!(!rows.iter().any(|(d, _)| d == "/home/seed"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M34 回归：daemon 轮询把 NAS 的目录清单**整份**推给挂载视图时，本地新建、
+    /// 还没回放 / 上传的条目必须留在 `ls` 里。
+    ///
+    /// 真机事故（2026-10-25）：Dolphin 里 `取证1` 目录凭空消失，再建同名目录得到
+    /// 「名为"取证1"的目录已经存在」—— NAS 那一轮列举里当然没有它（离线 mkdir
+    /// 还没回放成功），整份覆盖把快照抹空；节点表里还有它，于是既看不见、又建不了。
+    #[test]
+    fn m34_remote_listing_keeps_local_pending_entries() {
+        use qxync_core::store::{OUTBOX_MKDIR, OUTBOX_RENAME};
+        let dir = m7_tmpdir("m34-overlay");
+        let db = dir.join("sync.db");
+        let store = Arc::new(Store::open(&db).unwrap());
+        let c = Connectivity::shared();
+        let fs = test_fs(&dir, true)
+            .with_nodes_store(store.clone())
+            .with_connectivity(c.clone());
+        let h = fs.handle();
+
+        // 远端有 remote.txt；本地离线建 取证1（outbox mkdir + 本地节点 + 空清单）
+        h.apply_listing("/home", &[DirEntry::local("remote.txt", false, 8, 1000)]);
+        c.mark_offline("连接超时");
+        fs.enqueue_outbox(OUTBOX_MKDIR, "/home/取证1", "", true)
+            .unwrap();
+        fs.materialize_local_dir(INodeNo::ROOT, "/home", "取证1", "/home/取证1", true);
+
+        fn names(fs: &QxyncFs) -> Vec<String> {
+            fs.dir_entries("/home")
+                .unwrap()
+                .iter()
+                .map(|e| e.filename.clone())
+                .collect()
+        }
+
+        // ① 会话内：daemon 推来「NAS 上还没有它」的清单 → 不能抹掉
+        h.apply_listing("/home", &[DirEntry::local("remote.txt", false, 8, 1000)]);
+        let n = names(&fs);
+        assert!(
+            n.iter().any(|x| x == "取证1"),
+            "轮询推来远端清单后 取证1 必须仍在 ls 里，实际 {n:?}"
+        );
+        assert!(
+            n.iter().any(|x| x == "remote.txt"),
+            "远端条目不能被叠加逻辑丢掉，实际 {n:?}"
+        );
+        assert_eq!(
+            n.iter().filter(|x| *x == "取证1").count(),
+            1,
+            "叠加不能产生重复条目"
+        );
+
+        // ② 写穿：重启后要能凭 listings 表看到它
+        let (rows, _) = store.listing_load_all().unwrap();
+        let home = rows.iter().find(|(d, _)| d == "/home").unwrap();
+        assert!(
+            home.1.iter().any(|e| e.filename == "取证1"),
+            "叠加后的清单必须写穿 sync.db，否则重启又看不见"
+        );
+
+        // ③ 重启（节点表空，只剩 listings + outbox）：仍然看得见
+        drop(fs);
+        let fs2 = test_fs(&dir, true)
+            .with_nodes_store(store.clone())
+            .with_connectivity(c.clone());
+        let n2 = names(&fs2);
+        assert!(
+            n2.iter().any(|x| x == "取证1"),
+            "离线重启后 取证1 必须从持久化清单恢复，实际 {n2:?}"
+        );
+
+        // ④ 回放成功后远端也有它了：以远端为准，不许重复也不许消失
+        let h2 = fs2.handle();
+        h2.apply_listing(
+            "/home",
+            &[
+                DirEntry::local("remote.txt", false, 8, 1000),
+                DirEntry::local("取证1", true, 0, 1200),
+            ],
+        );
+        let n4 = names(&fs2);
+        assert_eq!(
+            n4.iter().filter(|x| *x == "取证1").count(),
+            1,
+            "远端追平后不能出现两份 取证1，实际 {n4:?}"
+        );
+
+        // ⑤ 本地改名还没回放：远端还挂着旧名字 → 旧名不复活、新名可见
+        h2.apply_listing("/home", &[DirEntry::local("old.txt", false, 3, 1000)]);
+        fs2.enqueue_outbox(OUTBOX_RENAME, "/home/old.txt", "/home/new.txt", false)
+            .unwrap();
+        h2.apply_listing(
+            "/home",
+            &[
+                DirEntry::local("old.txt", false, 3, 1000),
+                DirEntry::local("remote.txt", false, 8, 1000),
+            ],
+        );
+        let n5 = names(&fs2);
+        assert!(
+            n5.iter().any(|x| x == "new.txt"),
+            "改名后的新名字必须可见，实际 {n5:?}"
+        );
+        assert!(
+            !n5.iter().any(|x| x == "old.txt"),
+            "改名旧名在回放前不能复活，实际 {n5:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M34：远端真删除仍然生效 —— 叠加重建不能把已经删掉的条目变回幽灵。
+    #[test]
+    fn m34_remote_delete_still_disappears() {
+        let dir = m7_tmpdir("m34-remote-delete");
+        let store = Arc::new(Store::open(dir.join("sync.db")).unwrap());
+        let fs = test_fs(&dir, true).with_nodes_store(store);
+        let h = fs.handle();
+        let keep = DirEntry::local("keep.txt", false, 1, 1000);
+        let gone = DirEntry::local("gone.txt", false, 2, 1000);
+        fs.insert_node(INodeNo::ROOT, "keep.txt", "/home/keep.txt", &keep);
+        fs.insert_node(INodeNo::ROOT, "gone.txt", "/home/gone.txt", &gone);
+
+        h.apply_listing("/home", &[keep.clone(), gone.clone()]);
+        let names = |fs: &QxyncFs| -> Vec<String> {
+            fs.dir_entries("/home")
+                .map(|v| v.iter().map(|e| e.filename.clone()).collect())
+                .unwrap_or_default()
+        };
+        assert!(names(&fs).iter().any(|x| x == "gone.txt"));
+
+        // 远端把它删了，本地没有任何待回放 / 本地新建的依据 → 必须消失（不留幽灵）
+        h.apply_listing("/home", &[keep.clone()]);
+        let n = names(&fs);
+        assert!(
+            !n.iter().any(|x| x == "gone.txt"),
+            "远端真删除必须仍然生效，实际 {n:?}"
+        );
+        assert!(n.iter().any(|x| x == "keep.txt"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M34：本地新建的**文件**在「父目录当时还没有快照」时也要能看见。
+    ///
+    /// `create` 的 `listing_upsert` 在无快照时是 no-op，outbox 里也没有文件行
+    /// （只有结构操作）—— 只靠「旧快照回填」会漏掉这类条目：节点表里有它
+    /// （`lookup` / `open(O_CREAT)` 因此 EEXIST），`ls` 却看不见。
+    /// 这里直接验合并函数（冷路径本身要走真 NAS，本 crate 单测没有 mock）。
+    #[test]
+    fn m34_merge_keeps_local_new_file_without_snapshot() {
+        let dir = m7_tmpdir("m34-local-file");
+        let store = Arc::new(Store::open(dir.join("sync.db")).unwrap());
+        let fs = test_fs(&dir, true).with_nodes_store(store);
+        // 模拟 create()：本地新建、远端还没有副本（parent 当时没有 /home 快照）
+        let entry = DirEntry::local("new.txt", false, 12, 1000);
+        fs.insert_node_with(INodeNo::ROOT, "new.txt", "/home/new.txt", &entry, false);
+
+        let pending = PendingOverlay {
+            rows: Vec::new(),
+            deleting: HashSet::new(),
+            local_only: Vec::new(),
+        };
+        let merged = install_merged_listing(
+            &fs.inner,
+            "/home",
+            &[DirEntry::local("remote.txt", false, 8, 1000)],
+            &pending,
+            false,
+        )
+        .expect("if_absent=false 一定会返回合并结果");
+        let names: Vec<&str> = merged.iter().map(|e| e.filename.as_str()).collect();
+        assert!(
+            names.contains(&"new.txt"),
+            "本地新建的文件必须叠回清单，实际 {names:?}"
+        );
+        assert!(names.contains(&"remote.txt"), "远端条目不能被丢");
+        let e = merged.iter().find(|e| e.filename == "new.txt").unwrap();
+        assert_eq!(
+            e.filesize, 12,
+            "叠回来的条目要用节点的真实大小，不是 0 字节假文件"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M36：**重启后**不能把「本地新建、还没上传」的文件当成远端已有。
+    ///
+    /// 这正是旧 `unwrap_or(!dirty)` 的坑：重启后节点按持久化清单物化 → 节点在表里、
+    /// `dirty=false`，旧逻辑默认「远端有」→ 一次改名就发出一条永远不成立的远端
+    /// rename（在线 EIO、离线重试到放弃）。修复 = 物化时按 `nodes.local_only` 填
+    /// `remote_known`。
+    #[test]
+    fn m36_restart_rematerializes_local_only_entry_as_remote_unknown() {
+        let dir = m7_tmpdir("m36-local-only-restart");
+        let db = dir.join("sync.db");
+        let entry = DirEntry::local("save.txt.part", false, 12, 1000);
+        // 会话 1：`create()` 的形状（本地新建、远端还没有）→ 落持久化证据 + 清单快照
+        {
+            let fs = test_fs(&dir, true);
+            let store = Arc::new(Store::open(&db).unwrap());
+            let fs = fs.with_nodes_store(store.clone());
+            fs.insert_node_with(
+                INodeNo::ROOT,
+                "save.txt.part",
+                "/home/save.txt.part",
+                &entry,
+                false,
+            );
+            // 重启后的视图来源：持久化清单（`create()` 会 listing_upsert）
+            store.listing_save("/home", &[entry.clone()]).unwrap();
+        }
+        let store = Arc::new(Store::open(&db).unwrap());
+        assert!(
+            store.node_is_local_only("/home/save.txt.part").unwrap(),
+            "本地新建证据必须落库"
+        );
+
+        // 会话 2：全新 fs + 同一个库（节点表空，只能按持久化清单物化）
+        let fs2 = test_fs(&dir, true).with_nodes_store(store.clone());
+        // ① lookup 路径
+        let n = fs2
+            .lookup_child(INodeNo::ROOT, "save.txt.part")
+            .expect("清单里有这个名字");
+        assert!(
+            !n.remote_known,
+            "重启后按清单物化也必须知道「远端没有副本」，不能猜成远端已有"
+        );
+        // ② readdir 路径（同一条清单）
+        let children = fs2.load_children(INodeNo::ROOT).unwrap();
+        let n = children.iter().find(|n| n.name == "save.txt.part").unwrap();
+        assert!(!n.remote_known);
+        // ③ 改名决策不再看 dirty，而是看这一位
+        assert!(!fs2.on_remote_for(Some(n.ino), "/home/save.txt.part"));
+
+        // 上传成功 → 证据清掉
+        fs2.handle().mark_remote_known("/home/save.txt.part");
+        assert!(
+            !store.node_is_local_only("/home/save.txt.part").unwrap(),
+            "上传成功后必须清证据"
+        );
+
+        // 会话 3：重启后这次必须是「远端已知」
+        let fs3 = test_fs(&dir, true).with_nodes_store(store.clone());
+        let n = fs3
+            .lookup_child(INodeNo::ROOT, "save.txt.part")
+            .expect("清单里有这个名字");
+        assert!(
+            n.remote_known,
+            "上传成功后重启，远端确实有它 —— 改名必须走远端 rename"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M36：改名决策的三种来源（节点表 / 持久化证据 / 无证据保守）。
+    #[test]
+    fn m36_on_remote_decision_uses_persisted_evidence_not_dirty() {
+        let dir = m7_tmpdir("m36-on-remote");
+        let store = Arc::new(Store::open(dir.join("sync.db")).unwrap());
+        let fs = test_fs(&dir, true).with_nodes_store(store.clone());
+        let local = fs.insert_node_with(
+            INodeNo::ROOT,
+            "local.bin",
+            "/home/local.bin",
+            &DirEntry::local("local.bin", false, 1, 10),
+            false,
+        );
+        let remote = fs.insert_node(
+            INodeNo::ROOT,
+            "remote.bin",
+            "/home/remote.bin",
+            &DirEntry::local("remote.bin", false, 1, 10),
+        );
+        // ① 节点在表里 → 直接看 remote_known
+        assert!(!fs.on_remote_for(Some(local.ino), "/home/local.bin"));
+        assert!(fs.on_remote_for(Some(remote.ino), "/home/remote.bin"));
+        // ② 节点不在表里 → 查持久化证据（本地新建那条证据还在）
+        assert!(!fs.on_remote_for(None, "/home/local.bin"));
+        assert!(fs.on_remote_for(None, "/home/remote.bin"));
+        // ③ 完全没有证据 → 保守按「远端有」（旧行为；多发一次远端改名，
+        //    而不是把远端名字留成幽灵）
+        assert!(fs.on_remote_for(None, "/home/never-seen.bin"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M36：跨重启的本地新建条目要能挡住「远端清单刷新把它抹掉」。
+    ///
+    /// 会话内靠 `Inner::local_only`（inode 索引），重启后索引是空的 —— 没有
+    /// `nodes.local_only` 这一路，一次刷新就会让本地新建的文件从 `ls` 里消失
+    /// （文件其实还在本地、上传作业也还在队列里）。
+    #[test]
+    fn m36_merged_listing_keeps_local_only_entry_after_restart() {
+        let dir = m7_tmpdir("m36-merged-restart");
+        let db = dir.join("sync.db");
+        {
+            let fs = test_fs(&dir, true);
+            let store = Arc::new(Store::open(&db).unwrap());
+            let fs = fs.with_nodes_store(store.clone());
+            fs.insert_node_with(
+                INodeNo::ROOT,
+                "draft.txt",
+                "/home/draft.txt",
+                &DirEntry::local("draft.txt", false, 5, 1234),
+                false,
+            );
+        }
+        let store = Arc::new(Store::open(&db).unwrap());
+        let fs = test_fs(&dir, true).with_nodes_store(store.clone());
+        // 重启后一份远端清单刷新：NAS 上当然没有 draft.txt
+        let pending = collect_pending_overlay(Some(&store), None, "/home", &[]);
+        assert_eq!(pending.local_only.len(), 1, "持久化证据必须被叠加层收集到");
+        let merged = install_merged_listing(&fs.inner, "/home", &[], &pending, false)
+            .expect("if_absent=false 一定返回合并结果");
+        let e = merged
+            .iter()
+            .find(|e| e.filename == "draft.txt")
+            .expect("本地新建的文件不能被远端清单刷新抹掉");
+        assert_eq!(e.filesize, 5, "条目要用持久化的真实大小");
+        assert!(!e.isfolder);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M36 复核回归（阻塞级）：清单叠加必须用**最终签名**，不能用 `create()` 时的
+    /// `size=0` 行 —— 否则重启后「重启 + 远端清单刷新」会用 0 字节盖掉正确条目：
+    /// `read` 静默 EOF、追加写还会按陈旧 size 截断本地缓存（唯一副本）。
+    #[test]
+    fn m36_merge_uses_final_signature_not_stale_zero() {
+        let dir = m7_tmpdir("m36-fresh-sig");
+        let db = dir.join("sync.db");
+        let store = Arc::new(Store::open(&db).unwrap());
+        {
+            let fs = test_fs(&dir, true).with_nodes_store(store.clone());
+            // create() 的形状：size=0 的节点 + 清单条目
+            let node = fs.insert_node_with(
+                INodeNo::ROOT,
+                "a.bin",
+                "/home/a.bin",
+                &DirEntry::local("a.bin", false, 0, 1000),
+                false,
+            );
+            // 写入 / 关文件之后：节点签名定稿（release 会走 refresh_listing_entry）
+            {
+                let mut g = fs.inner.lock().unwrap();
+                let n = g.nodes.get_mut(&node.ino).unwrap();
+                n.attr.size = 12;
+                n.attr.mtime = UNIX_EPOCH + Duration::from_secs(2000);
+                n.set_dirty(true);
+            }
+            fs.refresh_listing_entry(node.ino, false);
+        }
+        let store2 = Arc::new(Store::open(&db).unwrap());
+        let row = store2.node_by_path("/home/a.bin").unwrap().unwrap();
+        assert_eq!(
+            row.size, 12,
+            "release 之后 nodes 行必须刷到最终签名（叠加层的证据来源）"
+        );
+
+        // 重启 + 远端清单刷新（NAS 上没有这个还没上传的文件）
+        let fs2 = test_fs(&dir, true).with_nodes_store(store2.clone());
+        let pending = collect_pending_overlay(Some(&store2), None, "/home", &[]);
+        let merged = install_merged_listing(&fs2.inner, "/home", &[], &pending, false)
+            .expect("if_absent=false 一定返回合并结果");
+        let e = merged.iter().find(|e| e.filename == "a.bin").unwrap();
+        assert_eq!(
+            e.filesize, 12,
+            "叠加层不能拿 create 时的 0 字节盖掉清单里的正确条目"
+        );
+        let n = fs2.lookup_child(INodeNo::ROOT, "a.bin").unwrap();
+        assert_eq!(
+            n.attr.size, 12,
+            "lookup 物化后大小必须是最终值（否则 read 静默 EOF）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M36 复核回归：目录改名要把它下面的 `nodes` 行与 `local_only` 证据一起搬走。
+    ///
+    /// 只搬目录自己那一行的话，重启后子项在**新路径**下没有证据 → M36 修的「改名
+    /// 误发远端 rename」对子项复发；旧路径下的行还会被清单叠加当成幽灵。
+    #[test]
+    fn m36_dir_rename_moves_subtree_nodes_evidence() {
+        let dir = m7_tmpdir("m36-dir-rename-evidence");
+        let store = Arc::new(Store::open(dir.join("sync.db")).unwrap());
+        let fs = test_fs(&dir, true).with_nodes_store(store.clone());
+        let d = fs.insert_node(
+            INodeNo::ROOT,
+            "d",
+            "/home/d",
+            &DirEntry::local("d", true, 0, 1),
+        );
+        fs.insert_node_with(
+            d.ino,
+            "new.bin",
+            "/home/d/new.bin",
+            &DirEntry::local("new.bin", false, 3, 2),
+            false,
+        );
+        assert!(store.node_is_local_only("/home/d/new.bin").unwrap());
+
+        // 对账认定的目录改名（与 FUSE rename 走同一个子树搬迁逻辑）
+        assert!(fs.handle().rename_remote("/home/d", "/home/e"));
+        assert!(
+            store.node_is_local_only("/home/e/new.bin").unwrap(),
+            "子项的 local_only 证据必须跟着目录搬到新路径"
+        );
+        assert!(
+            store.node_by_path("/home/d/new.bin").unwrap().is_none(),
+            "旧路径不能留行（否则清单叠加会当幽灵加回来）"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
