@@ -15,7 +15,7 @@
 use anyhow::Result;
 use qxync_client::{write_action, Client};
 use qxync_core::rules::{HideReason, Rules};
-use qxync_core::store::{Store, DB_FILE};
+use qxync_core::store::{OutboxRow, Store, DB_FILE};
 use qxync_core::sync::{
     apply_renames_to_baseline, conflict_name, conflict_name_with_seq, decide, is_log_missing,
     map_event_path, pair_renames, Baseline, Cursors, Decision, DeleteProtection, LocalSig,
@@ -27,7 +27,7 @@ use qxync_core::tasks::{
 use qxync_core::{Error as CoreError, MaxLog};
 use qxync_fuse::upload::UploadQueue;
 use qxync_fuse::LocalView;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1551,6 +1551,11 @@ pub struct OutboxFlushReport {
     pub gave_up: u64,
     /// 非网络错误、这轮没成、留待下轮的次数。
     pub retried: u64,
+    /// ★ 结构操作在互相等（父 `mkdir` / 改名还没在 NAS 落地）：本轮没做完，但
+    /// **不是**会话失效 —— 绝不能触发重登。见 [`ReplayError::Pending`]。
+    pub parent_pending: u64,
+    /// 直接跳过、不再重试的冗余操作（离线时间戳已由上传落地对齐）。
+    pub dropped: u64,
     /// 网络断了：本轮**没做完**，剩余行原样保留。
     pub offline: Option<String>,
     /// ★ 会话失效 / 服务端未就绪：本轮**没做完**，但网络是通的，不计重试次数。
@@ -1575,7 +1580,7 @@ impl OutboxFlushReport {
     }
 }
 
-/// 回放失败的三类：等联网 / 等重登或 NAS 就绪 / 这条操作本身不行。
+/// 回放失败的四类：等联网 / 等重登或 NAS 就绪 / 等自己的结构操作落地 / 这条操作本身不行。
 #[derive(Debug)]
 enum ReplayError {
     Offline(CoreError),
@@ -1583,6 +1588,14 @@ enum ReplayError {
     Auth(String),
     /// 服务端未就绪（status=8，迁移/启动中）—— 等下一轮，不计次数。
     Transient(String),
+    /// ★ 我们自己的结构操作（`mkdir` / `rename`）还没在 NAS 上落地，所以这条
+    /// 「路径不存在」是**预期之内**的等待，不是会话失效：
+    ///
+    /// 真机事故（2026-10-25）：离线建了 `取证1`，回放时子项的 `stat` 因为父目录
+    /// 还没建而回 status=5；旧分类器把 5 当成会话失效 → 每 3 秒真登录一次，
+    /// 6 分钟打了 **95 次**「登录成功」，最后把 5 条离线意图整行删掉。
+    /// 同一轮里父目录的 `mkdir` 明明排在后面几条 —— 只要不 `break`，它当场就能建出来。
+    Pending(String),
     Fatal(String),
 }
 
@@ -1605,6 +1618,54 @@ fn classify_replay_error(e: CoreError, context: impl Into<String>) -> ReplayErro
     }
 }
 
+/// ★ 回放期间共享的「本地还没落地的结构操作」视图。
+///
+/// 用来回答分类器答不了的那个问题：`stat` 回 status=5（「路径不存在 / 无权限」）
+/// 到底是**会话失效**，还是**我们自己的 mkdir / rename 还没回放、父目录在 NAS 上
+/// 还不存在**？后者在离线新建目录的场景里是常态。
+struct ReplayCtx<'a> {
+    /// 本轮待回放的全部行（`seq` 升序）。
+    rows: &'a [OutboxRow],
+}
+
+impl ReplayCtx<'_> {
+    /// 分类一条回放错误：先排除「等自己的结构操作落地」，再走常规分类。
+    fn classify(
+        &self,
+        row: &OutboxRow,
+        failing: &str,
+        e: CoreError,
+        context: impl Into<String>,
+    ) -> ReplayError {
+        let context = context.into();
+        if is_not_found(&e) && pending_structure_explains(self.rows, row.seq, failing) {
+            return ReplayError::Pending(format!("{context}: 等本地的父目录 / 改名先在 NAS 落地"));
+        }
+        classify_replay_error(e, context)
+    }
+}
+
+/// `a` 是 `b` 本身或它的祖先目录（段级：`/a` 不命中 `/ab`）。
+fn is_same_or_ancestor(a: &str, b: &str) -> bool {
+    let a = a.trim_end_matches('/');
+    b == a || (b.len() > a.len() && b.starts_with(a) && b.as_bytes()[a.len()] == b'/')
+}
+
+/// 失败路径的「不存在」能不能被**还没回放的结构操作**解释？
+///
+/// 判据全部在本地（不额外打 NAS）：outbox 里存在一条**别的**行，是 `mkdir` 或
+/// `rename`，其目标路径（rename 还看新名字）正好是失败路径的祖先或本身。
+/// 拓扑上无环，所以不会出现「A 等 B、B 等 A」的互等；祖先行一旦落地 / 被放弃，
+/// 下一次调用就不再有依据，子项自然往前走。
+fn pending_structure_explains(rows: &[OutboxRow], self_seq: i64, failing: &str) -> bool {
+    rows.iter()
+        .filter(|r| r.seq != self_seq && (r.is_mkdir() || r.is_rename()))
+        .any(|r| {
+            is_same_or_ancestor(&r.path, failing)
+                || (r.is_rename() && is_same_or_ancestor(&r.target, failing))
+        })
+}
+
 /// outbox 一行回放的结论。
 enum ReplayOutcome {
     Applied,
@@ -1615,14 +1676,15 @@ enum ReplayOutcome {
 /// 回放一条操作（发请求 + 幂等检查）。
 async fn replay_outbox_row(
     client: &Client,
-    row: &qxync_core::store::OutboxRow,
+    row: &OutboxRow,
+    ctx: &ReplayCtx<'_>,
 ) -> Result<ReplayOutcome, ReplayError> {
     if row.is_mkdir() {
-        replay_mkdir(client, row).await
+        replay_mkdir(client, row, ctx).await
     } else if row.is_rename() {
-        replay_rename(client, row).await
+        replay_rename(client, row, ctx).await
     } else if row.kind == qxync_core::store::OUTBOX_SET_MTIME {
-        replay_set_mtime(client, row).await
+        replay_set_mtime(client, row, ctx).await
     } else {
         Err(ReplayError::Fatal(format!(
             "未知的离线操作类型 {:?}（版本不匹配？）",
@@ -1633,11 +1695,17 @@ async fn replay_outbox_row(
 
 async fn replay_mkdir(
     client: &Client,
-    row: &qxync_core::store::OutboxRow,
+    row: &OutboxRow,
+    ctx: &ReplayCtx<'_>,
 ) -> Result<ReplayOutcome, ReplayError> {
-    let cur = stat_path(client, &row.path)
-        .await
-        .map_err(|e| classify_replay_error(e, format!("回放 mkdir {} 前 stat", row.path)))?;
+    let cur = stat_path(client, &row.path).await.map_err(|e| {
+        ctx.classify(
+            row,
+            &row.path,
+            e,
+            format!("回放 mkdir {} 前 stat", row.path),
+        )
+    })?;
     match plan_mkdir(cur.exists, cur.is_dir) {
         ReplayPlan::Apply => {
             let (dir, name) = split_path(&row.path);
@@ -1650,7 +1718,9 @@ async fn replay_mkdir(
                         Ok(s) if s.exists && s.is_dir => Ok(ReplayOutcome::AlreadyDone),
                         Ok(_) => Err(ReplayError::Fatal(format!("mkdir {} 失败: {e}", row.path))),
                         // stat 期间网络断了：按离线处理（不能算成业务失败、消耗次数）。
-                        Err(e2) => Err(classify_replay_error(
+                        Err(e2) => Err(ctx.classify(
+                            row,
+                            &row.path,
                             e2,
                             format!("mkdir {} 失败后 stat 确认", row.path),
                         )),
@@ -1666,17 +1736,28 @@ async fn replay_mkdir(
 
 async fn replay_rename(
     client: &Client,
-    row: &qxync_core::store::OutboxRow,
+    row: &OutboxRow,
+    ctx: &ReplayCtx<'_>,
 ) -> Result<ReplayOutcome, ReplayError> {
-    let src = stat_path(client, &row.path)
-        .await
-        .map_err(|e| classify_replay_error(e, format!("回放改名 {} 前 stat 源", row.path)))?;
-    let dst = stat_path(client, &row.target)
-        .await
-        .map_err(|e| classify_replay_error(e, format!("回放改名 {} 前 stat 目标", row.target)))?;
+    let src = stat_path(client, &row.path).await.map_err(|e| {
+        ctx.classify(
+            row,
+            &row.path,
+            e,
+            format!("回放改名 {} 前 stat 源", row.path),
+        )
+    })?;
+    let dst = stat_path(client, &row.target).await.map_err(|e| {
+        ctx.classify(
+            row,
+            &row.target,
+            e,
+            format!("回放改名 {} 前 stat 目标", row.target),
+        )
+    })?;
     match plan_rename(src.exists, dst.exists) {
         ReplayPlan::Apply => {
-            replay_do_rename(client, &row.path, &row.target).await?;
+            replay_do_rename(client, row, ctx).await?;
             Ok(ReplayOutcome::Applied)
         }
         ReplayPlan::AlreadyDone => Ok(ReplayOutcome::AlreadyDone),
@@ -1689,12 +1770,14 @@ async fn replay_rename(
                 .rename(&dst_dir, &dst_name, &conflict)
                 .await
                 .map_err(|e| {
-                    classify_replay_error(
+                    ctx.classify(
+                        row,
+                        &row.target,
                         e,
                         format!("改名冲突副本 {}/{} -> {conflict}", dst_dir, dst_name),
                     )
                 })?;
-            replay_do_rename(client, &row.path, &row.target).await?;
+            replay_do_rename(client, row, ctx).await?;
             Ok(ReplayOutcome::ConflictResolved)
         }
         ReplayPlan::GiveUp(why) => {
@@ -1705,15 +1788,17 @@ async fn replay_rename(
             let (dst_dir, dst_name) = split_path(&row.target);
             if src_dir != dst_dir && src_name != dst_name {
                 let mid = join(&dst_dir, &src_name);
-                let mid_sig = stat_path(client, &mid)
-                    .await
-                    .map_err(|e| classify_replay_error(e, format!("回放改名检查中间路径 {mid}")))?;
+                let mid_sig = stat_path(client, &mid).await.map_err(|e| {
+                    ctx.classify(row, &mid, e, format!("回放改名检查中间路径 {mid}"))
+                })?;
                 if mid_sig.exists {
                     client
                         .rename(&dst_dir, &src_name, &dst_name)
                         .await
                         .map_err(|e| {
-                            classify_replay_error(
+                            ctx.classify(
+                                row,
+                                &row.target,
                                 e,
                                 format!("回放改名第二段 {mid} -> {dst_dir}/{dst_name}"),
                             )
@@ -1732,16 +1817,24 @@ async fn replay_rename(
 /// 真正执行改名/移动（同目录 rename；跨目录 move + 必要时再 rename）。
 async fn replay_do_rename(
     client: &Client,
-    src_path: &str,
-    dst_path: &str,
+    row: &OutboxRow,
+    ctx: &ReplayCtx<'_>,
 ) -> Result<(), ReplayError> {
+    let (src_path, dst_path) = (row.path.as_str(), row.target.as_str());
     let (src_dir, src_name) = split_path(src_path);
     let (dst_dir, dst_name) = split_path(dst_path);
     if src_dir == dst_dir {
         client
             .rename(&src_dir, &src_name, &dst_name)
             .await
-            .map_err(|e| classify_replay_error(e, format!("回放改名 {src_path} -> {dst_path}")))?;
+            .map_err(|e| {
+                ctx.classify(
+                    row,
+                    src_path,
+                    e,
+                    format!("回放改名 {src_path} -> {dst_path}"),
+                )
+            })?;
         return Ok(());
     }
     // 与 FUSE rename 的在线路径同一套语义：move 会**忽略 dest_file**（保持原名），
@@ -1749,13 +1842,22 @@ async fn replay_do_rename(
     client
         .move_into(&src_dir, &src_name, &dst_dir)
         .await
-        .map_err(|e| classify_replay_error(e, format!("回放移动 {src_path} -> {dst_dir}/")))?;
+        .map_err(|e| {
+            ctx.classify(
+                row,
+                src_path,
+                e,
+                format!("回放移动 {src_path} -> {dst_dir}/"),
+            )
+        })?;
     if dst_name != src_name {
         client
             .rename(&dst_dir, &src_name, &dst_name)
             .await
             .map_err(|e| {
-                classify_replay_error(
+                ctx.classify(
+                    row,
+                    dst_path,
                     e,
                     format!("回放移动后改名 {dst_dir}/{src_name} -> {dst_name}"),
                 )
@@ -1766,7 +1868,8 @@ async fn replay_do_rename(
 
 async fn replay_set_mtime(
     client: &Client,
-    row: &qxync_core::store::OutboxRow,
+    row: &OutboxRow,
+    ctx: &ReplayCtx<'_>,
 ) -> Result<ReplayOutcome, ReplayError> {
     let epoch: i64 = row
         .target
@@ -1776,7 +1879,7 @@ async fn replay_set_mtime(
     client
         .set_mtime(&dir, &name, epoch)
         .await
-        .map_err(|e| classify_replay_error(e, format!("回放 set_mtime {}", row.path)))?;
+        .map_err(|e| ctx.classify(row, &row.path, e, format!("回放 set_mtime {}", row.path)))?;
     Ok(ReplayOutcome::Applied)
 }
 
@@ -1811,6 +1914,12 @@ const OUTBOX_MAX_ATTEMPTS: u32 = 5;
 /// 会话失效的容忍次数：每次都会触发重登，正常一轮就恢复；20 次还不行说明
 /// 账号/2SV 真的坏了，才把这条操作当放弃（否则「5 次」会在网络恢复的几秒内被耗光）。
 const OUTBOX_MAX_AUTH_ATTEMPTS: u32 = 20;
+/// 结构操作互相等待的轮数上限（每轮回放间隔约 3 秒 → 600 轮 ≈ 30 分钟）。
+///
+/// 正常场景几轮就解开（祖先行一落地，子项下一轮就成功）；给这么宽是为了容忍
+/// 「父目录的 mkdir 本身还在重试」。真到上限才放弃 —— 比旧行为（20 轮就把
+/// **离线意图整行删掉**）安全一个量级。
+const OUTBOX_MAX_PENDING_ATTEMPTS: u32 = 600;
 
 /// 回放离线缓冲区，最多处理 `max_rows` 条。
 ///
@@ -1836,8 +1945,33 @@ pub async fn flush_outbox(client: &Client, store: &Store, max_rows: usize) -> Ou
             return report;
         }
     };
-    for row in rows {
-        match replay_outbox_row(client, &row).await {
+    // ★ Pending 判据要「本轮全部待回放行」：子项的父目录 mkdir 可能排在它后面几条
+    //   （★ M36 之前 `outbox_rewrite_prefix` 只改 path 不改 seq，库里可能还存着那种
+    //   老形状；M36 起改写会重排到队尾，但「行序」仍只是**约定**，不是回放能依赖的
+    //   不变量 —— 别的手工/旧版本写入的行也必须能解开）。
+    let ctx = ReplayCtx { rows: &rows };
+    // ★ 上传队列里排着的文件路径：离线 set_mtime 的**唯一正确归宿**是丢弃 ——
+    //   上传队列在 outbox 清空前被冻结，所以「文件还没上传成功」期间 set_mtime
+    //   必然回 status=5；而上传落地时 worker 会自己按作业里的 mtime 对齐
+    //   （epoch 在入队时就带上了，`update_pending_mtime` 也会跟着改）。
+    //   不丢的话它就成了死锁：只能靠「20 次假重登后放弃删行」解开。
+    let uploads_queued: HashSet<String> = store
+        .uploads()
+        .map(|v| v.into_iter().map(|r| r.remote_path()).collect())
+        .unwrap_or_default();
+    for row in &rows {
+        // 冗余：文件还在上传队列 → 时间戳由上传落地对齐，直接删行
+        if row.kind == qxync_core::store::OUTBOX_SET_MTIME && uploads_queued.contains(&row.path) {
+            if let Err(e) = store.outbox_done(row.seq) {
+                tracing::warn!("跳过冗余 setmtime 行时删行失败 seq={}: {e}", row.seq);
+            }
+            report.dropped += 1;
+            let msg = format!("离线时间戳操作已由上传落地后对齐，跳过: {}", row.path);
+            tracing::info!("{msg}");
+            report.notes.push(msg);
+            continue;
+        }
+        match replay_outbox_row(client, row, &ctx).await {
             Ok(outcome) => {
                 if let Err(e) = store.outbox_done(row.seq) {
                     tracing::warn!("删除已回放的 outbox 行失败 seq={}: {e}", row.seq);
@@ -1924,6 +2058,35 @@ pub async fn flush_outbox(client: &Client, store: &Store, max_rows: usize) -> Ou
                     row.path
                 );
                 break;
+            }
+            Err(ReplayError::Pending(why)) => {
+                // ★ 不是会话失效：不置 `auth_failed`、不重登、也**不 break** ——
+                //   父目录的 mkdir 往往就在后面几条，同一轮就能落地。
+                let attempts = row.attempts.saturating_add(1);
+                if attempts >= OUTBOX_MAX_PENDING_ATTEMPTS {
+                    if let Err(e) = store.outbox_done(row.seq) {
+                        tracing::warn!("放弃 outbox 行时删行失败 seq={}: {e}", row.seq);
+                    }
+                    report.gave_up += 1;
+                    let msg = format!(
+                        "离线操作失败（放弃，已等父级结构操作 {attempts} 轮仍未落地）: {} {}: {why}",
+                        row.kind, row.path
+                    );
+                    tracing::error!("{msg}");
+                    report.notes.push(msg);
+                } else {
+                    if let Err(e) = store.outbox_bump_attempts(row.seq, attempts) {
+                        tracing::warn!("outbox 重试计数落库失败 seq={}: {e}", row.seq);
+                    }
+                    report.parent_pending += 1;
+                    report.waiting = Some(why.clone());
+                    tracing::debug!(
+                        "回放等待本地结构操作先落地（同一轮继续处理后面的行）: {} {}: {why}",
+                        row.kind,
+                        row.path
+                    );
+                    continue;
+                }
             }
             Err(ReplayError::Fatal(why)) => {
                 let attempts = row.attempts.saturating_add(1);
@@ -5271,6 +5434,10 @@ mod tests {
         stat_fail: BTreeSet<String>,
         /// `stat` 这些完整路径 → JSON `status`
         stat_status: BTreeMap<String, i64>,
+        /// `createdir`（mkdir）是否成功（默认 false → status 6）。
+        ///
+        /// 回放用例需要它：`mkdir` 走 **POST 表单**，mock 必须解 body 才能应答。
+        mkdir_ok: bool,
         /// ★ M30：`get_list` 这些路径的**前 N 次请求直接断开连接**（不回包）。
         ///
         /// 模拟真机上最常见的一次性传输失败：NAS 的 nginx 回收了 keep-alive
@@ -5332,6 +5499,7 @@ mod tests {
             existing_entries,
             stat_fail,
             stat_status,
+            mkdir_ok,
             drop_n_for_path,
             refuse_after,
             max_log,
@@ -5348,6 +5516,7 @@ mod tests {
         let existing_entries = Arc::new(existing_entries);
         let stat_fail = Arc::new(stat_fail);
         let stat_status = Arc::new(stat_status);
+        let mkdir_ok = Arc::new(mkdir_ok);
         let max_log = Arc::new(max_log);
         let events = Arc::new(events);
         let drop_budget = Arc::new(Mutex::new(drop_n_for_path));
@@ -5373,30 +5542,60 @@ mod tests {
                 let existing_entries = existing_entries.clone();
                 let stat_fail = stat_fail.clone();
                 let stat_status = stat_status.clone();
+                let mkdir_ok = mkdir_ok.clone();
                 let max_log = max_log.clone();
                 let events = events.clone();
                 let drop_budget = drop_budget.clone();
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 8192];
                     let mut req = Vec::new();
+                    // 读到「头部完整 + 按 Content-Length 的 body 也完整」为止：
+                    // `createdir` 走 POST 表单，body 里的 `dest_path`/`dest_folder`
+                    // 不一定和头在同一次 read 里到，必须等齐。
                     loop {
                         match sock.read(&mut buf).await {
                             Ok(0) | Err(_) => return,
                             Ok(n) => req.extend_from_slice(&buf[..n]),
                         }
-                        if req.windows(4).any(|w| w == b"\r\n\r\n") || req.len() > 65536 {
+                        let complete = match req.windows(4).position(|w| w == b"\r\n\r\n") {
+                            Some(i) => {
+                                let hdr_end = i + 4;
+                                let head = String::from_utf8_lossy(&req[..hdr_end]);
+                                let cl = head
+                                    .lines()
+                                    .find_map(|l| {
+                                        let (k, v) = l.split_once(':')?;
+                                        if k.eq_ignore_ascii_case("content-length") {
+                                            v.trim().parse::<usize>().ok()
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .unwrap_or(0);
+                                req.len() >= hdr_end + cl
+                            }
+                            None => false,
+                        };
+                        if complete || req.len() > 65536 {
                             break;
                         }
                     }
                     let text = String::from_utf8_lossy(&req);
-                    let first = text.lines().next().unwrap_or("");
+                    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+                    let first = head.lines().next().unwrap_or("");
                     let target = first.split_whitespace().nth(1).unwrap_or("/");
                     let query = target.split_once('?').map(|(_, q)| q).unwrap_or("");
-                    let params: BTreeMap<String, String> = query
+                    let mut params: BTreeMap<String, String> = query
                         .split('&')
                         .filter_map(|kv| kv.split_once('='))
-                        .map(|(k, v)| (k.to_string(), percent_decode(v)))
+                        .map(|(k, v)| (percent_decode(k), percent_decode(v)))
                         .collect();
+                    // form POST 的 body 参数并进来（同名以 body 为准）
+                    for kv in body.trim().split('&') {
+                        if let Some((k, v)) = kv.split_once('=') {
+                            params.insert(percent_decode(k), percent_decode(v));
+                        }
+                    }
                     let func = params.get("func").map(String::as_str).unwrap_or("");
                     // ★ M30：模拟「对端提前关连接」——直接 return（socket drop，不回包）。
                     if func == "get_list" {
@@ -5458,6 +5657,20 @@ mod tests {
                             "200 OK",
                             serde_json::json!({"status": -17, "msg": "no log"}).to_string(),
                         )
+                    } else if func == "createdir" {
+                        let parent = params.get("dest_path").cloned().unwrap_or_default();
+                        let name = params.get("dest_folder").cloned().unwrap_or_default();
+                        seen.lock()
+                            .unwrap()
+                            .push(format!("createdir:{parent}/{name}"));
+                        if *mkdir_ok {
+                            ("200 OK", serde_json::json!({"status": 0}).to_string())
+                        } else {
+                            (
+                                "200 OK",
+                                serde_json::json!({"status": 6, "msg": "not found"}).to_string(),
+                            )
+                        }
                     } else if func == "stat" {
                         let parent = params.get("path").cloned().unwrap_or_default();
                         let name = params.get("file_name").cloned().unwrap_or_default();
@@ -7437,6 +7650,128 @@ mod tests {
         assert_eq!(rows.len(), 1, "网络错误绝不能丢 outbox 行");
         assert_eq!(rows[0].attempts, 0, "网络错误不能消耗重试次数");
         assert_eq!(rows[0].path, "/home/offline-dir");
+    }
+
+    /// ★ 回归（真机 2026-10-25）：父目录还没回放时，子项的 `stat` 回 status=5
+    /// 必须判成「等自己的结构操作」，不能当会话失效去重登。
+    #[test]
+    fn replay_not_found_with_pending_structure_is_not_auth() {
+        use qxync_core::store::{OUTBOX_MKDIR, OUTBOX_RENAME};
+        let mk = |seq: i64, kind: &str, path: &str, target: &str| OutboxRow {
+            seq,
+            kind: kind.to_string(),
+            path: path.to_string(),
+            target: target.to_string(),
+            is_dir: kind == OUTBOX_MKDIR,
+            attempts: 0,
+            created_unix: 0,
+        };
+        let rows = vec![
+            mk(1, OUTBOX_MKDIR, "/home/a/b", ""),
+            mk(2, OUTBOX_MKDIR, "/home/a", ""),
+            mk(3, OUTBOX_RENAME, "/home/old.txt", "/home/new.txt"),
+        ];
+        let ctx = ReplayCtx { rows: &rows };
+
+        // 子项：父 mkdir 还没落地 → Pending（不是 Auth）
+        let child = &rows[0];
+        match ctx.classify(child, "/home/a/b/c", CoreError::status(5, "stat"), "x") {
+            ReplayError::Pending(_) => {}
+            other => panic!("父 mkdir 未落地时的 status=5 必须等，不能当会话失效: {other:?}"),
+        }
+        // 自己的路径不算自己的祖先（否则自己等自己 = 永久冻结）
+        let solo = vec![mk(1, OUTBOX_MKDIR, "/home/solo", "")];
+        assert!(!pending_structure_explains(&solo, 1, "/home/solo"));
+        assert!(pending_structure_explains(&solo, 7, "/home/solo/deep"));
+        // rename 的**新名字**也算依据
+        assert!(pending_structure_explains(&rows, 1, "/home/new.txt/sub"));
+        // 段级匹配：/home/a 不能命中 /home/ab
+        assert!(!pending_structure_explains(&rows, 1, "/home/ab/x"));
+        // 无关路径：仍然是会话失效（真 sid 过期的既有语义不能丢）
+        match ctx.classify(child, "/home/other/x", CoreError::status(5, "stat"), "x") {
+            ReplayError::Auth(_) => {}
+            other => panic!("无关路径的 status=5 仍按会话失效处理: {other:?}"),
+        }
+    }
+
+    /// ★ 回归（真机 2026-10-25）：结构操作彼此有依赖时，回放必须
+    /// ① 不把 status=5 当会话失效（零次重登）；
+    /// ② 跳过等待的行**继续**处理后面的行 —— 父 mkdir 就在子项之后几条。
+    #[tokio::test]
+    async fn flush_outbox_waits_for_pending_parent_without_relogin() {
+        use qxync_core::store::{Store, OUTBOX_MKDIR};
+        let store = Store::open_in_memory().unwrap();
+        // 老形状（M36 之前 `outbox_rewrite_prefix` 只改 path 不改 seq）：子项排在父
+        // mkdir 之前。M36 起改写会把行重排到队尾，但库里可能还有旧版本写下的行 ——
+        // 回放不能假设「行序一定满足祖先先落地」。
+        store
+            .outbox_add(OUTBOX_MKDIR, "/home/a/b", "", true)
+            .unwrap();
+        store.outbox_add(OUTBOX_MKDIR, "/home/a", "", true).unwrap();
+
+        let mut stat_status = BTreeMap::new();
+        stat_status.insert("/home/a/b".to_string(), 5i64); // 父还没建：stat 回 5
+        let (host, port, _seen, _srv) = spawn_nas_server(MockNasSpec {
+            mkdir_ok: true,
+            stat_status,
+            ..Default::default()
+        })
+        .await;
+        let client = client_for(&host, port);
+        let rep = flush_outbox(&client, &store, 100).await;
+
+        assert!(
+            !rep.auth_failed,
+            "父目录还没落地不是会话失效，绝不能触发重登"
+        );
+        assert_eq!(rep.parent_pending, 1, "子项应当被计为「等父级结构操作」");
+        assert!(rep.applied >= 1, "同一轮必须继续把后面的父 mkdir 建出来");
+        let rows = store.outbox_pending().unwrap();
+        assert_eq!(rows.len(), 1, "只剩子项，留待下一轮");
+        assert_eq!(rows[0].path, "/home/a/b");
+        assert_eq!(rows[0].attempts, 1, "等待计一轮防永久冻结，但不触发重登");
+        assert!(!rep.drained(), "没清空 → 队列继续保持冻结");
+    }
+
+    /// ★ 回归：`setmtime` 的目标还在上传队列里 → 直接跳过（时间戳由上传落地对齐）。
+    ///
+    /// 旧实现的死锁：上传在 outbox 清空前被冻结，而 `set_mtime` 只在文件已上传后
+    /// 才可能成功 —— 于是只能靠「20 次假重登后放弃删行」解开，连带丢掉离线意图。
+    #[tokio::test]
+    async fn flush_outbox_drops_setmtime_when_upload_pending() {
+        use qxync_core::store::{Store, UploadRow, OUTBOX_SET_MTIME};
+        let store = Store::open_in_memory().unwrap();
+        store
+            .outbox_add(OUTBOX_SET_MTIME, "/home/x.bin", "1700000000", false)
+            .unwrap();
+        store
+            .put_upload(&UploadRow {
+                remote_dir: "/home".into(),
+                remote_name: "x.bin".into(),
+                local: std::path::PathBuf::from("/tmp/x.bin"),
+                mtime: 1_700_000_000,
+                attempts: 0,
+                ephemeral: false,
+            })
+            .unwrap();
+
+        let mut stat_status = BTreeMap::new();
+        stat_status.insert("/home/x.bin".to_string(), 5i64);
+        let (host, port, _seen, _srv) = spawn_nas_server(MockNasSpec {
+            stat_status,
+            ..Default::default()
+        })
+        .await;
+        let client = client_for(&host, port);
+        let rep = flush_outbox(&client, &store, 100).await;
+
+        assert_eq!(rep.dropped, 1, "冗余 setmtime 行应当被跳过");
+        assert!(
+            store.outbox_pending().unwrap().is_empty(),
+            "冗余行必须删掉，不能卡住后面的队列"
+        );
+        assert!(!rep.auth_failed, "不该触发重登");
+        assert_eq!(rep.gave_up, 0, "上传会自己对齐 mtime，不算放弃");
     }
 
     // ------------------------------------------------- ★ 首次 / 全量同步

@@ -5,6 +5,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [中文](CHANGELOG.md) · [README](README.en.md) · [Acceptance log](docs/验收记录.md)
 
+## [0.7.10] - 2026-10-25
+
+### Fixed
+
+- **Replay order no longer relies on an implicit invariant: outbox prefix rewrites are
+  re-sequenced to the tail (M36).** `outbox_rewrite_prefix` used to rewrite `path` in
+  place and keep `seq`, but a rewrite points rows at a *new parent directory* whose
+  `mkdir` row may sit later in the queue (real shape: create `/p/a`, later create `/b`,
+  then `/p/a/sub`, then rename the locally-created `/p/a` to `/b/a2`). Replay order then
+  becomes "children before the new parent's mkdir", only survivable by the
+  "wait for our own structure op" fallback burning `stat` round-trips. Now rewritten rows
+  are deleted and re-inserted at the tail in their original relative order inside **one
+  transaction** (`attempts` / `created_unix` / `target` preserved); untouched rows keep
+  their seq, so "ancestor lands first" is guaranteed by seq itself. The replay-side
+  `Pending` fallback stays (rows written by older versions must still replay).
+  See [docs/M36](docs/M36-回放顺序与远端副本证据.md).
+- **"Does the remote have a copy" is no longer guessed from `dirty`: it uses persisted
+  evidence (M36).** The rename decision's `unwrap_or(!dirty)` conflated "has local
+  unsynced changes" with "does a remote file with this name exist" — two different facts.
+  After a restart nodes are materialized lazily from persisted listings, which cannot tell
+  NAS entries apart from locally created ones (`create()` also does `listing_upsert`): a
+  locally created, not-yet-uploaded KIO `.part` was treated as remotely known, so the
+  subsequent rename (`.part` → final name) issued a remote rename that can never succeed
+  (online `EIO`; offline retried until giving up). `nodes` now has a `local_only` column
+  (schema v7, auto-`ALTER`ed on v6 DBs): set on local creation, cleared on upload success,
+  carried along renames/deletes; snapshot materialization and the rename decision both read
+  it, and `dirty` no longer participates. This also completes M34's merge overlay across
+  restarts — a remote listing refresh no longer wipes locally created files from `ls`.
+  See [docs/M36](docs/M36-回放顺序与远端副本证据.md).
+- **Four holes found by the independent M36 review.** ① After a restart the merge overlay
+  used the stale `size=0` `nodes` row written by `create()`, overriding the correct entry
+  (silent `read` EOF, append writes truncating the cache to the stale size) → `nodes` rows
+  are now refreshed to the final signature on release/setattr. ② Directory renames moved
+  only the directory's own `nodes` row (listings moved the whole subtree) → new
+  `node_rename_subtree` carries children's `local_only` evidence along. ③ Deleting a
+  locally created directory did not revoke its outbox `mkdir` row, so replay/merge brought
+  it back → deletes now use the same evidence to skip the remote delete and revoke the
+  structure rows. ④ Concurrently with replay, `outbox_rewrite_prefix` could re-insert rows
+  that `outbox_done` had already removed (resurrection/duplicate replay) → it now skips
+  rows whose DELETE affected zero rows. See
+  [docs/M36](docs/M36-回放顺序与远端副本证据.md) §2.1.
+- **M36 second review round.** `nodes`/`outbox` subtree prefix matching switched from
+  `LIKE` (case-insensitive by default) to `substr` comparison — `/home/a` no longer
+  deletes/moves rows and replay intents under `/home/A/...`; `node_rename_subtree` now
+  explicitly rejects "target nested in / ancestor of source"; `refresh_listing_entry`
+  writes the `nodes` row **first** and re-reads the current path before writing (a
+  concurrent rename/unlink can no longer write the row back to the old path); the
+  O_TMPFILE `link()` materialization now records `local_only`; and
+  `node_local_only_under` drops `ORDER BY` so the partial index is actually used
+  (1.125ms → 0.006ms on 30k rows). See
+  [docs/M36](docs/M36-回放顺序与远端副本证据.md) §2.2.
+- **Directory listing snapshots are no longer wholesale replaced by remote listings,
+  so locally created items that have not synced yet no longer vanish from `ls` (M34).**
+  Real-machine incident (2026-10-25): an offline-created directory (`取证1`) was still
+  sitting in the replay queue, so the NAS listing obviously did not contain it — but the
+  snapshot was replaced wholesale with that empty listing, making the directory disappear
+  in Dolphin. Re-creating it then failed with "already exists" (the node table still had
+  it, the kernel `lookup` matched, and `mkdir` returned `EEXIST`). Every
+  "snapshot = remote listing" write path (daemon poll push / TTL background refill / cold
+  listing / mount prewarm) now merges `remote ∪ local-unsynced-new − local-pending-delete`
+  and persists the merged view (also visible after an offline restart). Locally created
+  **files** are covered too (parent directory had no snapshot yet when `create` ran);
+  genuine remote deletions still take effect.
+- **Outbox replay no longer treats `status=5` (path not found) as session loss and
+  re-logs in.** Real-machine 2026-10-25: a child directory's `stat` returned 5 because
+  its parent had not been replayed yet; the old classifier called it session loss, so the
+  daemon logged in for real every 3 seconds (95 successful logins in 6 minutes — risking
+  the NAS failed-login lockout) and deleted all five offline intents after 20 attempts.
+  Now a pending parent structure op means "wait": no re-login counting, and the round
+  continues (the parent `mkdir` is usually a few rows later and applies in the same
+  round). `setmtime` rows whose target is still queued for upload are dropped (the upload
+  aligns mtime on landing) — the old deadlock, since uploads are frozen until the outbox
+  drains while `set_mtime` can only succeed after the file is uploaded.
+
 ## [0.7.9] - 2026-10-23
 
 ### Changed
