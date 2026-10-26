@@ -80,9 +80,51 @@ struct Args {
     mount_hold_secs: u64,
 }
 
-fn main() -> Result<()> {
-    // 同 CLI：别让 EPIPE 变成 panic
-    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+/// 进程入口：把 [`run`] 的错误映射成退出码。
+///
+/// ★ M37：只有一个错误需要区分 —— 「另一个 daemon 已经占着 socket」用专用退出码
+/// （[`daemon::EXIT_ALREADY_RUNNING`]），unit 里 `RestartPreventExitStatus=` 认它，
+/// 这样 `Restart=always` 不会为「已经有人在同步」无限重启。
+/// 其余错误保持 anyhow 的默认形态（`Error: ...` + 退出码 1）。
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            // 与 anyhow 的 `Termination` 输出一致：daemon 化后 fd 2 是 `/dev/null`，
+            // 前台/CLI 模式下这行才是用户看到的报错（日志里另有一份 tracing 记录）。
+            eprintln!("Error: {e:?}");
+            if e.downcast_ref::<daemon::AlreadyRunning>().is_some() {
+                std::process::ExitCode::from(daemon::EXIT_ALREADY_RUNNING)
+            } else {
+                std::process::ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+/// 真正的入口（原来的 `main`）。
+fn run() -> Result<()> {
+    // ★ M37：守护进程**必须忽略** SIGPIPE（Rust 运行时的默认处置），绝不能再照搬 CLI 的
+    //   「恢复 SIG_DFL」—— 这一行是 0.7.10 及以前「休眠唤醒后 qxyncd 自己消失」的根因。
+    //
+    //   CLI 恢复 SIG_DFL 是对的：`qxync ls | head` 里 stdout 被提前关掉，进程该按 shell
+    //   惯例安静地死掉。但 daemon 是**长驻多连接**进程（NAS HTTPS 长连接 + 保活 + 本地
+    //   IPC + FUSE），把 SIGPIPE 设回 SIG_DFL 等于「只要有一次写到一个对端已关闭的
+    //   socket/pipe，内核立刻杀掉整个进程」：
+    //     * 没有任何清理机会 —— FUSE 挂载点、上传队列、journal 全停在半路；
+    //     * tracing 的 non_blocking appender 缓冲来不及落盘，日志断在死前几分钟；
+    //     * systemd 只看到 `code=killed, signal=PIPE`，而且 **SIGPIPE 在 systemd 的
+    //       clean-exit 白名单里**（`systemd.service(5)`：SIGHUP/SIGINT/SIGTERM/SIGPIPE
+    //       都算「干净退出」）→ `Result=success`，`Restart=on-failure` 永远不重启。
+    //   真机形状（2026-10-26）：盒盖 s2idle 2 分钟后唤醒，唤醒第 20 秒死亡 —— 正是
+    //   唤醒后第一轮变更轮询/会话保活去写休眠前建立的旧连接的时刻。见
+    //   docs/M37-休眠唤醒后守护被SIGPIPE杀死.md。
+    //
+    //   忽略 SIGPIPE 之后，这些写入只会返回 EPIPE/ECONNRESET 错误，由各自的错误处理
+    //   路径按「这条连接坏了 → 重连」消化，进程继续活着（Rust std 里唯一会在 EPIPE
+    //   上 panic 的是 println!/print! 系列，daemon 里只有 `--print-config` 这一条一次性
+    //   路径用它们，不会跑在长驻循环里）。
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
     let args = Args::parse();
     if !qxync_core::LinkConfig::is_valid_id(&args.link) {
         bail!(

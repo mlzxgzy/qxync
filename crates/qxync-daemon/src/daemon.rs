@@ -334,6 +334,27 @@ enum IdleExit {
     Shutdown,
 }
 
+/// ★ M37：「另一个 daemon 已经占着这个 socket」。
+///
+/// 单独成型（而不是裸 `bail!`）是为了让 `main` 能把它映射成**专用退出码**
+/// [`EXIT_ALREADY_RUNNING`]：systemd unit 里 `RestartPreventExitStatus=` 认这个码，
+/// 于是「已经有人在同步了」不会被 `Restart=always` 当成「启动失败」无限重启
+/// （否则每 5s 一次、每次都以同一个理由失败，日志刷屏且永远起不来）。
+#[derive(Debug)]
+pub struct AlreadyRunning(pub PathBuf);
+
+impl std::fmt::Display for AlreadyRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "daemon 已在运行（socket {}）", self.0.display())
+    }
+}
+
+impl std::error::Error for AlreadyRunning {}
+
+/// 见 [`AlreadyRunning`]：与 `qxyncd.service` / `qxyncd@.service` 的
+/// `RestartPreventExitStatus=3` 是一对，改这里要同步改单元文件。
+pub const EXIT_ALREADY_RUNNING: u8 = 3;
+
 /// 绑 socket + 写 pid 文件。「谁占着这个 socket」的语义只在这里定义一次，
 /// 空转待命与同步模式共用。
 async fn bind_socket(opts: &Options) -> Result<(UnixListener, PathBuf)> {
@@ -345,7 +366,8 @@ async fn bind_socket(opts: &Options) -> Result<(UnixListener, PathBuf)> {
     }
     if opts.socket.exists() {
         if ping_socket(&opts.socket).await.is_ok() {
-            bail!("daemon 已在运行（socket {}）", opts.socket.display());
+            // ★ M37：走专用错误类型 → main 映射成退出码 3（见 [`AlreadyRunning`]）。
+            return Err(anyhow::Error::new(AlreadyRunning(opts.socket.clone())));
         }
         std::fs::remove_file(&opts.socket).ok(); // 陈旧 socket
     }

@@ -5,6 +5,33 @@
 
 [English](CHANGELOG.en.md) · [README](README.md) · [验收记录](docs/验收记录.md)
 
+## [0.7.11] - 未发布
+
+### 修复
+
+- **休眠唤醒后守护进程被 SIGPIPE 杀死（M37）**。`qxyncd` 的 `main` 从 M1.5 起照搬了 CLI 的
+  「恢复 SIGPIPE 默认处置」（`libc::signal(SIGPIPE, SIG_DFL)`），于是「写到一个对端已关闭的
+  socket/pipe」不再返回 `EPIPE` 错误，而是**内核立刻杀掉整个进程**。真机形状：笔记本盒盖
+  s2idle 2 分钟后唤醒，NAS 的长连接 / 会话保活连接全部失效，唤醒后第 20 秒第一轮
+  轮询·保活去写旧连接即死亡（`code=killed, signal=PIPE`）；tracing 的 non_blocking 缓冲
+  来不及落盘（日志断在死前几分钟），FUSE 挂载点与上传队列停在半路。现在改为**忽略
+  SIGPIPE**（`SIG_IGN`，即 Rust 运行时默认处置），写坏连接退化成普通的 `EPIPE`，
+  由各调用点按「这条连接坏了 → 重连」消化，进程继续活着。CLI 侧保持 `SIG_DFL` 不变
+  （`qxync ls | head` 的惯例）。见 [docs/M37](docs/M37-休眠唤醒后守护被SIGPIPE杀死.md)。
+- **systemd 单元不再「死了不拉起来」（M37）**。按 `systemd.service(5)`，`SIGHUP/SIGINT/
+  SIGTERM/SIGPIPE` 被杀都算「干净退出」⇒ 那次死亡被记成 `Result=success`（`NRestarts=0`），
+  `Restart=on-failure` 永远轮不到重启 —— 用户看到的就是「服务自己停了、得手动启动」。
+  单元改为 `Restart=always`（唯一能覆盖 clean-exit 信号死亡的策略）+ `RestartSec=5` +
+  `StartLimitIntervalSec=0`（重启永不放弃，默认 5 次/10s 后就躺平）+ `RestartMode=direct`
+  （自动重启不白等 SIGTERM「挂载守护模式」那 30s）。⚠ 语义变化：`qxync daemon stop` /
+  GUI「停止」（干净退出）也会被拉起来 —— 装了单元就只用 `systemctl --user` 管它。
+- **「已有 daemon 占着 socket」不再被当成启动失败无限重启（M37）**。`bind_socket` 改为返回
+  专用错误 `daemon::AlreadyRunning`，`main` 把它映射成退出码 **3**，单元用
+  `RestartPreventExitStatus=3` 拦住 —— 否则 `Restart=always` 会把「你手动起过一个 daemon」
+  变成每 5 秒一次的永久重启风暴（现场抓到过每 3 秒一轮的循环）。
+- 新增回归测试 `crates/qxync-daemon/tests/sigpipe_survival.rs`：隔离 XDG 目录起一个
+  「空转待命」的 qxyncd → `kill(SIGPIPE)` → 断言进程仍活着**且 IPC 仍应答**。
+
 ## [0.7.10] - 2026-10-25
 
 ### 修复

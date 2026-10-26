@@ -21,6 +21,8 @@
 # ⚠ **不要和 GUI 同时管同一条连接**：GUI 的「启动 / 停止」走 IPC/socket，
 #   systemd 走它自己拉起的进程；两边同时管会互相打架。
 #   要么全交给 systemd，要么全交给 GUI，别混着来。
+#   ★ M37 起 `Restart=always` 会让 GUI 的「停止」（IPC 干净退出）刚停就被拉起来 ——
+#   要停只用 `systemctl --user stop qxyncd@<id>`。
 #
 # ⚠ 没有连接配置时 qxyncd 会「空转待命」（不做事但一直活着），所以这里**不需要**
 #   等网络、也不需要等登录 —— 配好连接之后它会自己转入同步，不用重启本服务。
@@ -30,14 +32,24 @@ Description=qxync 常驻同步守护（qxyncd，连接 %i）
 Documentation=https://github.com/mlzxgzy/qxync
 # 没配连接也能起来（空转待命），所以只依赖最基础的目标
 After=default.target
+# ★ M37：重启永不放弃。默认 5 次/10s 的启动频率限制会让 systemd 在连续失败后躺平
+#   （日志只剩 "start request repeated too quickly"），用户看到的还是「服务自己停了」。
+StartLimitIntervalSec=0
 
 [Service]
 # 前台运行 + 指定连接：进程由 systemd 管，**不要**让 daemon 自己 fork。
 # socket / pid / 日志全部由 `--link %i` 派生（qxyncd-<id>.sock / .pid / .log）。
 ExecStart=/usr/bin/qxyncd --foreground --link %i
-# 崩溃/被 OOM 杀掉才拉起；`systemctl stop` 是干净退出（exit 0）→ 不重启
-Restart=on-failure
-RestartSec=3
+# ★ M37：`on-failure` 改成 `always`。SIGPIPE/SIGTERM 这类死亡在 systemd 眼里是
+#   「干净退出」（`systemd.service(5)` 的 clean-exit 信号表），`on-failure` 永远不重启；
+#   而休眠唤醒后被 SIGPIPE 杀 / OOM / 断网都不是「用户主动停」，必须无条件拉起来。
+#   ⚠ 装了本单元就别再用 `qxync daemon stop` / GUI「停止」管。
+Restart=always
+RestartSec=5
+# 直接重启：不等 SIGTERM「挂载守护模式」那 30s（详见 `qxyncd.service` 同名注释）
+RestartMode=direct
+# 「已经有 daemon 占着该连接的 socket」= 退出码 3，不是启动失败，别重试
+RestartPreventExitStatus=3
 
 # ★ M15/T6：reload = SIGHUP = **重载同步引擎（poller / 脱水 / 队列 / journal /
 #   会话保活），完全不碰 FUSE 会话**。reload 不终止进程，所以挂载点一秒都不中断。
