@@ -16,7 +16,10 @@
 #
 # ⚠ 装了本单元之后，就**别再用** `qxync daemon start` / `qxync daemon stop` 管它：
 #   那条路是给「没有 systemd 单元」的用法准备的。`qxync daemon stop` 走 IPC 让进程自己退出，
-#   systemd 会看到主进程消失 —— 两边同时用只会互相打架（日志里会出现反复重启）。
+#   systemd 会看到主进程消失 —— 两边同时用只会互相打架。
+#   ★ M37 起这条更硬：`Restart=always` 会把「干净退出」也当自动恢复，于是
+#   `qxync daemon stop` / GUI 的「停止」= 刚停下就被拉起来（看起来像没停掉）。
+#   **要停只用 `systemctl --user stop qxyncd`**（systemd 明确 stop 的不会重启）。
 #
 # ★ M16：本单元只负责 **default** 连接。多 NAS 的其它连接用模板单元
 #   `qxyncd@<link_id>`（`systemctl --user enable --now qxyncd@nas2`，见同目录
@@ -30,13 +33,41 @@ Description=qxync 常驻同步守护（qxyncd）
 Documentation=https://github.com/mlzxgzy/qxync
 # 没配连接也能起来（空转待命），所以只依赖最基础的目标
 After=default.target
+# ★ M37：重启**永不放弃**。默认 `StartLimitBurst=5` + `10s` 的语义是「短时间连续失败
+#   够 5 次就躺平」—— 日志里只剩一句 "start request repeated too quickly"，用户看到的
+#   还是「服务自己停了、得手动启动」。这里设 0 = 关掉启动频率限制，配合下面的
+#   `Restart=always` + `RestartSec=5`：最坏情况也只是每 5 秒一轮**可见**的重试。
+#
+#   ⚠ 唯一会被拦下的是「已经有别的 daemon 占着 socket」（退出码 3，见
+#   `RestartPreventExitStatus=`）：那种情况重启一万次也不会成功，只会刷屏。
+StartLimitIntervalSec=0
 
 [Service]
 # 前台运行：进程由 systemd 管，**不要**让 daemon 自己 fork（那样 systemd 就看不到它了）
 ExecStart=/usr/bin/qxyncd --foreground
-# 崩溃/被 OOM 杀掉才拉起；`systemctl stop` 是干净退出（exit 0）→ 不重启
-Restart=on-failure
-RestartSec=3
+# ★ M37：`on-failure` 改成 `always`。
+#   真机事故（2026-10-26）：盒盖休眠 2 分钟后唤醒，守护进程被 SIGPIPE 杀死
+#   （`code=killed, signal=PIPE`）。而 `systemd.service(5)` 规定 **SIGHUP / SIGINT /
+#   SIGTERM / SIGPIPE 被杀都算「干净退出」** ⇒ `Result=success`、`NRestarts=0`，
+#   `Restart=on-failure` 永远轮不到重启 —— 进程一直躺到用户手动 start。
+#   「信号死亡」不等于「用户主动停」，所以只有 `always` 能兜住这类死亡。
+#   休眠/唤醒、断网、OOM 都必须无条件拉起来。
+#
+#   ★ 语义变化：`qxync daemon stop`（IPC，干净退出 0）和 GUI 的「停止」也会被拉回来。
+#   装了本单元之后只用 `systemctl --user stop|start|restart|reload qxyncd` 管它。
+Restart=always
+RestartSec=5
+# ★ M37：直接重启，不走「stop 旧单元 → 等它退出」。
+#   本守护收到 SIGTERM 会转「挂载守护模式」不肯退（见下面 TimeoutStopSec 的说明），
+#   普通重启要白等 30s 再 SIGKILL；`direct` 让**自动重启**不等这一段。
+#   ⚠ 它**不管**显式 `systemctl restart|stop`：那两条仍走 stop 阶段（M15/T6 的已知
+#   代价，要秒级重启请用 `systemctl --user reload` = SIGHUP）。
+#   （systemd < 254 不认识这个键，只会打一条 warning，不影响 Restart=always。）
+RestartMode=direct
+# ★ M37：「已经有 daemon 占着 socket」= 退出码 3（`crates/qxync-daemon/src/daemon.rs`
+#   的 `EXIT_ALREADY_RUNNING`）。这不是启动失败，重启也不会变好（典型场景：你用
+#   `qxync daemon start` 或 GUI 拉了一个不受 systemd 管的 daemon）—— 别重试。
+RestartPreventExitStatus=3
 
 # ★ M15/T6：reload = SIGHUP = **重载同步引擎（poller / 脱水 / 队列 / journal /
 #   会话保活），完全不碰 FUSE 会话**。reload 不终止进程，所以挂载点一秒都不中断。

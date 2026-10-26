@@ -5,6 +5,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [中文](CHANGELOG.md) · [README](README.en.md) · [Acceptance log](docs/验收记录.md)
 
+## [0.7.11] - Unreleased
+
+### Fixed
+
+- **The daemon no longer dies of SIGPIPE after a laptop suspend/resume (M37)**. Since M1.5,
+  `qxyncd`'s `main` copied the CLI's "restore the default SIGPIPE disposition"
+  (`libc::signal(SIGPIPE, SIG_DFL)`), so writing to a socket/pipe whose peer had already gone
+  away no longer returned `EPIPE` — **the kernel killed the whole process on the first such
+  write**. Real-world shape: lid closed, s2idle for 2 minutes, lid opened — every long-lived
+  NAS connection and session-keepalive connection is dead, and 20 seconds after resume the
+  first poll/keepalive wrote to that stale connection and killed the daemon
+  (`code=killed, signal=PIPE`). The tracing non_blocking buffer never got flushed (the log
+  stops minutes before the death) and the FUSE mount plus upload queue were left half-way.
+  The daemon now **ignores SIGPIPE** (`SIG_IGN`, the Rust runtime default); a broken
+  connection degrades into an ordinary `EPIPE` that the call sites handle as "this connection
+  is gone → reconnect" and the process keeps running. The CLI keeps `SIG_DFL`
+  (the `qxync ls | head` convention). See [docs/M37](docs/M37-休眠唤醒后守护被SIGPIPE杀死.md).
+- **The systemd units no longer stay down after a death (M37)**. Per `systemd.service(5)`,
+  being killed by `SIGHUP/SIGINT/SIGTERM/SIGPIPE` counts as a *clean exit*, so that death was
+  recorded as `Result=success` (`NRestarts=0`) and `Restart=on-failure` could never restart
+  it — exactly the "the service stopped by itself, I have to start it manually" symptom.
+  The units now use `Restart=always` (the only policy that covers clean-exit signal deaths) +
+  `RestartSec=5` +
+  `StartLimitIntervalSec=0` (never give up; the default 5-restarts/10s limit makes systemd
+  surrender) + `RestartMode=direct` (automatic restarts no longer wait out the 30s
+  SIGTERM "mount guard mode"). ⚠ Behaviour change: `qxync daemon stop` / the GUI "stop"
+  button (clean exit) also get restarted — once the unit is installed, manage it only with
+  `systemctl --user`.
+- **"Another daemon already owns the socket" is no longer treated as a failing start that is
+  retried forever (M37)**. `bind_socket` now returns a dedicated `daemon::AlreadyRunning`
+  error, `main` maps it to exit code **3**, and the units contain
+  `RestartPreventExitStatus=3` — otherwise `Restart=always` turns "you once started a daemon
+  by hand" into a permanent restart storm every 5 seconds (a 3-second loop was observed live).
+- New regression test `crates/qxync-daemon/tests/sigpipe_survival.rs`: starts an idle qxyncd
+  in an isolated XDG environment, sends `kill(SIGPIPE)`, and asserts the process is still
+  alive **and** that IPC still answers.
+
 ## [0.7.10] - 2026-10-25
 
 ### Fixed
