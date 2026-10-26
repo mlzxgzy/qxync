@@ -5,7 +5,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [中文](CHANGELOG.md) · [README](README.en.md) · [Acceptance log](docs/验收记录.md)
 
-## [0.7.11] - Unreleased
+## [0.7.11] - 2026-10-26
 
 ### Fixed
 
