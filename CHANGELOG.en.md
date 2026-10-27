@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Multi-path connections (LAN / WAN / DDNS) with failure diagnostics
+  ([M40](docs/M40-多路径与DDNS.md))**. One NAS connection can now carry several access paths
+  (home LAN, public DDNS, a backup domain) and automatically uses the first reachable one:
+  - Extra paths are tried **before** the primary address (which is appended as the final
+    fallback); an empty list keeps the old single-address behaviour byte-for-byte. Omitted
+    ports/schemes inherit the primary (no guessing 8080/443); up to 8 paths.
+  - A failing path is cooled down (30 s, doubling up to 5 min) and the client switches to the
+    next one immediately. One failure switches only one path (concurrent failures cannot skip
+    a path). A higher-priority path is switched back to only after two consecutive successful
+    probes, to avoid LAN/WAN flapping.
+  - Login, listing, stat, downloads and uploads retry across paths; mkdir / rename / move /
+    delete retry only when the connection was never established (no double-apply). A DDNS IP
+    change triggers a fresh connection pool and re-resolution.
+  - **Diagnose when nothing connects**: `qxync routes [--probe]` (works without the daemon)
+    shows every path's DNS answers (A/AAAA), LAN/WAN/CGNAT classification, latency, cooldown
+    and last error; `qxync status` gains a path summary; a failed `qxync login` prints each
+    path's state. The GUI can edit alternative paths under Settings → Connection and has a new
+    Diagnostics → Multi-path tab.
+  - **Data safety**: after a switch the NAS UID fingerprint is re-checked; a path pointing at a
+    different NAS is marked `blocked` and skipped, so data never lands on the wrong device.
+  - Compatibility: old link files need no migration (empty new fields are not serialised); the
+    IPC version is unchanged (additive fields/methods); editing paths still requires a daemon
+    restart to take effect (the GUI's "save & login" does it automatically) while runtime
+    switching does not.
+  - Verified by `xtask/tests/m40-multipath.sh` (isolated e2e, 27/27, no real NAS) plus a
+    read-only real-NAS probe (LAN path resolves as private but times out; DDNS resolves as
+    public and is reachable; the client selects DDNS) — see the acceptance log.
+
 ## [0.7.12] - 2026-10-27
 
 ### Added

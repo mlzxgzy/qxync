@@ -4,16 +4,16 @@
 
 use anyhow::{bail, Context, Result};
 use qxync_client::peer::PeerEvent;
-use qxync_client::{Client, Session};
+use qxync_client::{Client, Router, Session};
 use qxync_core::dehydrate::{Block, CacheLimit, Policy};
 use qxync_core::ipc::{
     decode_line, encode_line, mask_sid, mask_token, BalooMountInfo, BalooStatusData, CacheInfo,
-    CursorInfo, DaemonInfo, DecisionInfo, DecisionsData, DehydrateData, DiffData, ErrorKind,
-    FileStateInfo, FileStatesData, GetData, HydroStats, IpcError, JournalData, LinkInfo,
+    CursorInfo, DaemonInfo, DecisionInfo, DecisionsData, DehydrateData, DiffData, EndpointInfo,
+    ErrorKind, FileStateInfo, FileStatesData, GetData, HydroStats, IpcError, JournalData, LinkInfo,
     LogFileInfo, LoginData, LogsData, LsData, MountInfo, OfflineInfo, OverlayPluginInfo, PeerData,
     PingData, ProgressData, ProgressLine, PutData, Request, RequestEnvelope, Response, RootsData,
-    RulesData, ServerInfo, SessionInfo, SettingsData, ShutdownData, SpaceData, StatusData,
-    StoreData, SyncCursors, SyncInfo, TaskInfo, TasksData, IPC_VERSION,
+    RoutesData, RulesData, ServerInfo, SessionInfo, SettingsData, ShutdownData, SpaceData,
+    StatusData, StoreData, SyncCursors, SyncInfo, TaskInfo, TasksData, IPC_VERSION,
 };
 use qxync_core::mounts::{MountRecord, MountsFile};
 use qxync_core::rules::Rules;
@@ -318,6 +318,9 @@ pub(crate) struct State {
     /// 所有组件都只认它：离线时队列停在「等联网」、FUSE 写路径进 outbox、
     /// 轮询器切到短探活、`status` 显示离线与缓冲区计数。
     connectivity: Arc<qxync_core::connectivity::Connectivity>,
+    /// ★ M40：多路径路由表。daemon 主客户端 / 引擎客户端 / 每个挂载点共享同一份
+    /// —— 一次切路对全进程立即生效，而不是各挂各的。
+    router: Arc<Router>,
 }
 
 // ---------------------------------------------------------------- 入口
@@ -790,6 +793,8 @@ async fn handle_idle_conn(
                         uptime_secs: started.elapsed().as_secs(),
                     }),
                     Request::Status => to_value(idle_status(&socket, started)),
+                    // ★ M40：空转待命没有连接配置，也就没有路径可报
+                    Request::Routes { .. } => to_value(RoutesData::default()),
                     Request::Settings => to_value(idle_settings_data(
                         &paths,
                         false,
@@ -861,6 +866,8 @@ fn idle_status(socket: &Path, started: Instant) -> StatusData {
         // ★ M20：待命没有连接 → 连通性「还没试过」，也不会有离线缓冲。
         connectivity: None,
         offline: None,
+        // ★ M40：待命没有连接配置，也就没有路径。
+        routes: None,
         mounts: Vec::new(),
     }
 }
@@ -932,7 +939,20 @@ pub async fn run(opts: Options) -> Result<()> {
         }
     };
     // ★ M8.4：所有 HTTP 客户端都按设置里的代理构造
-    let client = Client::new_with_proxy(&link, Some(&settings.proxy))?;
+    // ★ M40：路由表在第一个 Client 之前建好，之后所有 Client 共享它。
+    let router = Router::shared(&link);
+    if router.endpoint_count() > 1 {
+        tracing::info!(
+            "多路径：{} 条（按顺序尝试）: {}",
+            router.endpoint_count(),
+            link.endpoint_list()
+                .iter()
+                .map(|e| format!("{}→{}", e.label, e.base_url()))
+                .collect::<Vec<_>>()
+                .join("  ")
+        );
+    }
+    let client = Client::new_with_route(&link, Some(&settings.proxy), router.clone())?;
     // ★ M2c/M16：游标 + baseline 落在 <data>/sync/<ns>/（不同 NAS、不同连接互不污染）
     let sync_dir = qxync_core::sync::sync_state_dir_for_link(&paths.data_dir, &link);
     let sync_store = SyncState::load(&sync_dir)
@@ -1020,6 +1040,7 @@ pub async fn run(opts: Options) -> Result<()> {
         auto_free_last: Arc::new(AtomicU64::new(0)),
         sync_epoch: SyncEpoch::new(),
         connectivity,
+        router,
     });
 
     // ★ M7：LAN 对等主机（`link.peer_listen` 配了才真正监听；失败只告警不致命 ——
@@ -1184,7 +1205,9 @@ fn start_sync_engine(state: &Arc<State>) -> Vec<tokio::task::JoinHandle<()>> {
         // ★ M8.3：journal 后台落库（批量 + 轮转）
         spawn_journal_flusher(state.clone(), gen.clone()),
         // ★ M10：会话保活（sid 失效就重登并把新 sid 推给挂载点）
-        spawn_session_keeper(state.clone(), gen),
+        spawn_session_keeper(state.clone(), gen.clone()),
+        // ★ M40：在线路径巡检（LAN 恢复后切回优先路径 / 刷新 DDNS 诊断）
+        spawn_route_watch(state.clone(), gen),
     ]
 }
 
@@ -1453,20 +1476,26 @@ async fn dispatch(
             uptime_secs: state.started.elapsed().as_secs(),
         }),
         Request::Status => status(state).await,
+        // ★ M40：多路径状态 / 诊断（`probe=true` 会真的打一轮网络）
+        Request::Routes { probe } => routes_cmd(state, probe.unwrap_or(false)).await,
         Request::Login {
             user,
             password,
             otp,
-        } => login_internal(state, user, password, otp)
-            .await
-            .and_then(|s| {
-                to_value(LoginData {
-                    sid_masked: mask_sid(&s.sid),
-                    user: s.username.clone(),
-                    uid: s.uid.clone(),
-                    two_step: s.two_step,
-                })
+        } => match login_internal(state, user, password, otp).await {
+            Ok(s) => to_value(LoginData {
+                sid_masked: mask_sid(&s.sid),
+                user: s.username.clone(),
+                uid: s.uid.clone(),
+                two_step: s.two_step,
             }),
+            Err(e) => {
+                // ★ M40 / M20：手动 `qxync login` 失败也要进连通性状态 ——
+                // 否则 `status` 会显示「未检测」，用户看不出是网络断了还是口令错。
+                note_login_failure_connectivity(state, &e);
+                Err(e)
+            }
+        },
         Request::Logout => logout(state).await,
         Request::Ls { path } => ls(state, path).await,
         Request::Stat { dir, name } => stat(state, dir, name).await,
@@ -1775,13 +1804,51 @@ async fn login_internal(
     };
     let otp_secret = new_secret.or_else(|| creds.as_ref().and_then(|c| c.otp_secret.clone()));
 
-    let session = {
-        let mut client = state.client.lock().await;
-        client
-            .login_with_otp(&user, &password, otp.as_deref())
-            .await
-            .map_err(map_err)?
-    };
+    // ★ M40：登录成功后核对 NAS 身份。若这条路径指向另一台 NAS（用户误配 / DNS
+    //   被劫持），**绝不把会话交给同步引擎**：block 该路径并换下一条重登。
+    //   路由表里有多少条就最多试多少条；全部不匹配才报错。
+    let routes = state.router.endpoint_count().max(1);
+    let mut session: Option<Session> = None;
+    let mut last_identity: Option<(String, String, String)> = None;
+    for _ in 0..routes {
+        let s = {
+            let mut client = state.client.lock().await;
+            client
+                .login_with_otp(&user, &password, otp.as_deref())
+                .await
+                .map_err(map_err)?
+        };
+        let used_idx = state.router.active_index();
+        let used = state.router.base_url();
+        match crate::identity::check_or_record(&paths, &state.link, &s.nas) {
+            Ok(crate::identity::Verdict::Mismatch { expected, actual }) => {
+                let reason = format!(
+                    "NAS 身份不符：期望 UID {expected}，实际 {actual}（这条路径可能指向另一台 NAS）"
+                );
+                tracing::error!("★ M40：路径 {used} {reason}；已禁用该路径");
+                state.router.block(used_idx, reason);
+                last_identity = Some((used, expected, actual));
+                continue;
+            }
+            Ok(crate::identity::Verdict::Unknown) => {
+                tracing::warn!("★ M40：路径 {used} 未返回 NAS UID/MAC0，跳过身份校验");
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("★ M40：NAS 身份指纹读写失败（跳过校验）: {e}"),
+        }
+        tracing::info!("登录成功（经路径 {used}）");
+        session = Some(s);
+        break;
+    }
+    let session = session.ok_or_else(|| {
+        let msg = match last_identity {
+            Some((path, expected, actual)) => format!(
+                "所有路径都未通过 NAS 身份校验（最后一条 {path}：期望 UID {expected}，实际 {actual}）。                 如果确实换了 NAS，请新建一条连接，不要把旧连接的路径指过去"
+            ),
+            None => "登录失败：没有可用路径".into(),
+        };
+        IpcError::new(ErrorKind::Auth, msg)
+    })?;
     if let Some(reason) = session.busy_reason() {
         tracing::warn!("NAS 状态：{reason}（同步应暂停）");
     }
@@ -2069,6 +2136,19 @@ async fn status(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
             insecure: state.link.insecure,
             user: state.link.user.clone(),
             ipv4_only: state.link.ipv4_only,
+            // ★ M40：GUI 的 `same_link` 拿它判断「路径改了要不要重启 daemon」
+            endpoints: state
+                .link
+                .endpoint_list()
+                .into_iter()
+                .map(|e| EndpointInfo {
+                    label: e.label,
+                    host: e.host,
+                    port: e.port,
+                    https: e.https,
+                    primary: e.primary,
+                })
+                .collect(),
         }),
         logged_in,
         session: session.map(|s| SessionInfo {
@@ -2089,6 +2169,8 @@ async fn status(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
         // ★ M20：连通性 + 离线缓冲区（在线且无积压时 `offline` 为 None）
         connectivity: Some(state.connectivity.snapshot()),
         offline: offline_info(state),
+        // ★ M40：多路径摘要；只有一条路径时也照报（GUI 可据此隐藏路径行）。
+        routes: Some(state.router.summary()),
         mounts,
     })
 }
@@ -2548,9 +2630,12 @@ async fn mount(
     // 给 FUSE 一个独立 Client（只带 sid），避免和 daemon 主体抢同一把锁
     // ★ M8.4：FUSE 的客户端也要走设置里的代理（否则挂载后水合直连、绕开代理）
     // ★ M21：sid 可能是 None（离线挂载）—— 登录成功后由 push_sid_to_mounts 热推。
-    let fuse_client =
-        Client::new_with_proxy(&state.link, Some(&state.settings.lock().unwrap().proxy))
-            .map_err(map_err)?;
+    let fuse_client = Client::new_with_route(
+        &state.link,
+        Some(&state.settings.lock().unwrap().proxy),
+        state.router.clone(),
+    )
+    .map_err(map_err)?;
     if let Some(sid) = sid {
         fuse_client.set_sid(sid);
     }
@@ -3505,8 +3590,12 @@ async fn engine_client(state: &Arc<State>) -> Result<Arc<Client>, IpcError> {
         .map(|c| c.sid().as_deref() != Some(sid.as_str()))
         .unwrap_or(true);
     if stale {
-        let c = Client::new_with_proxy(&state.link, Some(&state.settings.lock().unwrap().proxy))
-            .map_err(map_err)?;
+        let c = Client::new_with_route(
+            &state.link,
+            Some(&state.settings.lock().unwrap().proxy),
+            state.router.clone(),
+        )
+        .map_err(map_err)?;
         c.set_sid(sid);
         *g = Some(Arc::new(c));
     }
@@ -3750,9 +3839,17 @@ async fn flush_offline_backlog(state: &Arc<State>, client: &Arc<qxync_client::Cl
 async fn probe_online(state: &Arc<State>) -> bool {
     // ★ 不依赖会话：断网时登录要等 20s connect timeout，先登录再探活会把
     //   3 秒的恢复检测拖成 20 多秒。任何一个 HTTP 回应都说明网络通了。
+    //
+    // ★ M40：改成**并行探全部路径**（每条 5s 上限、实际由探测 client 的短超时
+    //   兜住）。这样 LAN 拔了但 DDNS 通着也算在线，而且 `routes` 里每条路径的
+    //   最近结果都是新鲜的 —— 「连不上时自动查多路径」不额外发包。
     let client = state.client.lock().await;
-    let up = client.probe_network(Duration::from_secs(5)).await;
-    if !up {
+    let probes = client.probe_all_routes(qxync_client::PROBE_TIMEOUT).await;
+    let up = probes.iter().any(|p| p.http_ok);
+    if up {
+        let active = state.router.base_url();
+        tracing::info!("多路径探活成功：当前走 {active}");
+    } else {
         tracing::debug!("离线探活失败（仍然连不上）");
     }
     up
@@ -3764,9 +3861,15 @@ async fn probe_online(state: &Arc<State>) -> bool {
 /// 轮询器才会切到短探活（否则要等一个完整的轮询间隔才知道网络回来了）。
 fn note_login_failure_connectivity(state: &State, e: &IpcError) {
     if e.kind == ErrorKind::Transport {
+        let n = state.router.endpoint_count();
+        let hint = if n > 1 {
+            format!("（已尝试 {n} 条路径，详见 `qxync routes`）")
+        } else {
+            String::new()
+        };
         state
             .connectivity
-            .mark_offline(format!("登录时网络不可用: {}", e.message));
+            .mark_offline(format!("登录时网络不可用: {}{hint}", e.message));
     }
 }
 
@@ -4009,6 +4112,56 @@ async fn sync_cmd(
 /// 后台轮询：按 `sync_interval` 周期跑 `run_sync_once`；未登录时静默跳过。
 ///
 /// ★ M15/T6：带一代 [`EngineGen`] —— SIGHUP 重载时它做完当前一轮就退出。
+/// ★ M40：在线路径巡检间隔（秒）；`0` = 关闭。测试可调到 2s。
+fn route_probe_secs() -> u64 {
+    std::env::var("QXNYC_ROUTE_PROBE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60)
+}
+
+/// ★ M40：在线时定期探全部路径。
+///
+/// 只做两件事：
+/// 1. **切回更靠前的路径**（LAN 恢复 → 2 次连续成功后切回，见 `Router::note_probes`）；
+/// 2. 把每条路径的 DNS / HTTP 结果刷新进路由表，`qxync routes` 随时有新鲜数据。
+///
+/// 离线阶段不在这里探 —— poller 的短探活已经在做，重复只会加压。
+fn spawn_route_watch(state: Arc<State>, mut gen: EngineGen) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let secs = route_probe_secs();
+        if secs == 0 || state.router.endpoint_count() <= 1 {
+            return;
+        }
+        tracing::info!("多路径巡检已启动：每 {secs}s 探测全部路径（离线时由短探活负责）");
+        loop {
+            if !gen.sleep(Duration::from_secs(secs.max(1))).await {
+                tracing::debug!("多路径巡检退出（同步引擎已换代）");
+                return;
+            }
+            if !state.connectivity.is_online() {
+                continue;
+            }
+            let before = state.router.snapshot().last_switch;
+            {
+                let client = state.client.lock().await;
+                client.probe_all_routes(qxync_client::PROBE_TIMEOUT).await;
+            }
+            let after = state.router.snapshot();
+            if after.last_switch != before {
+                if let Some(sw) = &after.last_switch {
+                    tracing::info!(
+                        "多路径：切换到 {}（原因 {}；累计切换 {} 次）",
+                        sw.to,
+                        sw.reason,
+                        after.switches
+                    );
+                }
+            }
+        }
+    })
+}
+
 fn spawn_poller(state: Arc<State>, mut gen: EngineGen) -> tokio::task::JoinHandle<()> {
     let interval = *state.sync_interval.lock().unwrap();
     if interval == 0 {
@@ -5685,6 +5838,23 @@ fn spawn_log_maintenance() {
     });
 }
 
+/// ★ M40：`Request::Routes` —— 多路径状态 / 诊断。
+///
+/// * `probe=false`：**零网络**，只读路由表（离线时也能答）；
+/// * `probe=true`：对每条路径并行做一次 DNS + HTTP 探测（≤3s），结果写回路由表。
+async fn routes_cmd(state: &Arc<State>, probe: bool) -> Result<serde_json::Value, IpcError> {
+    if probe {
+        let client = state.client.lock().await;
+        let probes = client.probe_all_routes(qxync_client::PROBE_TIMEOUT).await;
+        let ok = probes.iter().filter(|p| p.http_ok).count();
+        tracing::info!("多路径检测：{ok}/{} 条可达", probes.len());
+    }
+    let mut data: RoutesData = state.router.snapshot();
+    // `snapshot.probed` 表示「历史上是否探过」；这里要表达的是「本次是否探了」。
+    data.probed = probe;
+    to_value(data)
+}
+
 /// ★ M39：`Request::Logs` —— 日志目录占用 / 当前策略；`prune=true` 立即清一次。
 ///
 /// 只读调用也**绝不触发任何网络/同步动作**：GUI 每次打开设置页都要问一句
@@ -6818,6 +6988,8 @@ mod tests {
             filter_temp: true,
             peer_listen: None,
             peer_name: None,
+            endpoints: Vec::new(),
+            local_namespace: None,
         };
         let c = Client::new(&link).unwrap();
         if let Some(s) = sid {
@@ -7349,6 +7521,8 @@ mod tests {
             filter_temp: true,
             peer_listen: None,
             peer_name: None,
+            endpoints: Vec::new(),
+            local_namespace: None,
         }
     }
 }

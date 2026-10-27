@@ -711,13 +711,17 @@ impl NetGuard {
         if !probe_should_refresh(elapsed, self.failures_since_probe) {
             return self.probe.is_some_and(|(v, _)| v);
         }
-        let v = client.probe_network(OFFLINE_PROBE_TIMEOUT).await;
+        // ★ M40：探**全部路径**，不只当前 active —— 否则「这条路径死了、另一条
+        //   还活着」会被误判成整台不可达，本轮白白中止。
+        let probes = client.probe_all_routes(OFFLINE_PROBE_TIMEOUT).await;
+        let v = probes.iter().any(|p| p.http_ok);
         self.probe = Some((v, Instant::now()));
         self.failures_since_probe = 0;
         report.probe_reachable = Some(v);
         tracing::debug!(
-            "网络错误后探活 {}：{}（这决定本轮继续还是中止）",
-            client.link().base_url(),
+            "网络错误后探活（{} 条路径，当前 {}）：{}（这决定本轮继续还是中止）",
+            probes.len(),
+            client.base_url(),
             if v { "可达" } else { "不可达" }
         );
         v
@@ -4188,6 +4192,8 @@ mod tests {
                 filter_temp: true,
                 peer_listen: None,
                 peer_name: None,
+                endpoints: Vec::new(),
+                local_namespace: None,
             },
             password,
         ))
@@ -5326,6 +5332,8 @@ mod tests {
             filter_temp: true,
             peer_listen: None,
             peer_name: None,
+            endpoints: Vec::new(),
+            local_namespace: None,
         };
         let client = Client::new(&link).expect("构造 client 不该需要联网");
         // ★ 必须塞一个 sid：否则 `list` 在 require_sid 就回 Auth，根本走不到网络层
@@ -5398,6 +5406,8 @@ mod tests {
             filter_temp: true,
             peer_listen: None,
             peer_name: None,
+            endpoints: Vec::new(),
+            local_namespace: None,
         };
         let client = Client::new(&link).expect("构造 client 不该需要联网");
         client.set_sid("test-sid");
@@ -5917,6 +5927,8 @@ mod tests {
             filter_temp: true,
             peer_listen: None,
             peer_name: None,
+            endpoints: Vec::new(),
+            local_namespace: None,
         };
         let client = Client::new(&link).unwrap();
         client.set_sid("test-sid");
@@ -7240,6 +7252,8 @@ mod tests {
             filter_temp: true,
             peer_listen: None,
             peer_name: None,
+            endpoints: Vec::new(),
+            local_namespace: None,
         };
         let client = Client::new(&link).expect("构造 client 不该需要联网");
         let mv = MountView {
@@ -7632,6 +7646,8 @@ mod tests {
             filter_temp: true,
             peer_listen: None,
             peer_name: None,
+            endpoints: Vec::new(),
+            local_namespace: None,
         };
         let client = Client::new(&link).unwrap();
         client.set_sid("deadbeef");

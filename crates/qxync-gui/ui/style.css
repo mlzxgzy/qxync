@@ -902,6 +902,41 @@ table.tbl tbody tr:focus-within td { box-shadow: inset 0 -1px 0 var(--focus); }
   overscroll-behavior-x: contain;
 }
 
+/* ------------------------------------------- ★ M40 多路径表格（诊断 → 多路径）
+ *
+ * 用**百分比列宽**（不是 px）：这台机器的 WebKit 按 Xft.dpi 把整页放大 ~1.63 倍，
+ * 1200px 窗口的实际 CSS 视口只有 ~730px（内容区 ~590px）。px 列宽 + min-width 会让
+ * 表格横向溢出去，「延迟 / 说明」两列被甩到横向滚动里。百分比 + fixed 保证 7 列
+ * 永远都在这块宽度里，代价是窄屏上地址/说明会换行。
+ *
+ * ★ 选择器必须比 `table.tbl`（0,1,1）更具体，否则 `table.tbl { table-layout: auto }`
+ * 会盖掉这里的 fixed。 */
+table.tbl.tbl-routes {
+  table-layout: fixed;
+  width: 100%;
+}
+.tbl-routes .col-role    { width: 8%; }
+.tbl-routes .col-label   { width: 10%; }
+.tbl-routes .col-addr    { width: 30%; }   /* 够放下 http://127.0.0.1:65535 一整行 */
+.tbl-routes .col-state   { width: 10%; }
+.tbl-routes .col-dns     { width: 16%; }
+.tbl-routes .col-latency { width: 8%; }
+.tbl-routes .col-note    { width: 18%; }
+table.tbl.tbl-routes td { vertical-align: top; }
+table.tbl.tbl-routes td:first-child,
+table.tbl.tbl-routes td:nth-child(4),
+table.tbl.tbl-routes td:nth-child(6) { white-space: nowrap; }
+.tbl-routes td.cell-addr { overflow-wrap: anywhere; }
+.tbl-routes td.cell-dns,
+.tbl-routes td.cell-note {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  color: var(--fg-dim);
+}
+.tbl-routes tr.route-active { background: var(--accent-soft); }
+.tbl-routes tr.route-active td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+.tbl-routes .route-flag { margin-left: 5px; }
+
 /* ------------------------------------------------------------- 文件表格
  * 固定布局 + 显式列宽：文件名列拿走全部剩余宽度，长文件名单行省略（title 给全名），
  * 其余列按内容给固定 px。这样在 1200px 默认窗口（内容区约 1090px）内总宽 < 容器宽，

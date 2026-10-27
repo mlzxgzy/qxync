@@ -160,6 +160,25 @@ fn same_link(a: &qxync_core::ipc::LinkInfo, b: &LinkConfig) -> bool {
         && a.insecure == b.insecure
         && a.user == b.user
         && a.ipv4_only == b.ipv4_only
+        // ★ M40：路径列表（含顺序）变了也必须重启 daemon —— daemon 只在启动时
+        // 读 link，运行期不会自己发现新增/删除的路径。
+        //
+        // 老 daemon 的 payload 没有 `endpoints`（空数组）：按「只有主地址」处理 ——
+        // 这样单路径用户升级 GUI 不会无谓地重启一次；多路径则如实判定为不一致。
+        && if a.endpoints.is_empty() {
+            b.endpoint_list().len() == 1
+        } else {
+            a.endpoints.len() == b.endpoint_list().len()
+                && a.endpoints
+                    .iter()
+                    .zip(b.endpoint_list().into_iter())
+                    .all(|(a, b)| {
+                        a.host == b.host
+                            && a.port == b.port
+                            && a.https == b.https
+                            && a.primary == b.primary
+                    })
+        }
 }
 
 /// 前端的连接表单（字段都可省，省了就用默认值/已有 link）。
@@ -187,6 +206,12 @@ struct LinkInput {
     peer_listen: Option<String>,
     #[serde(default)]
     peer_name: Option<String>,
+    /// ★ M40：备选路径（每行一条，语法见 `EndpointConfig::parse_line`）。
+    ///
+    /// **缺省 = 保留旧值**（老 GUI / 第三方脚本不知道这个字段，不能因此把用户
+    /// 配好的路径清空）；显式空数组 = 清空（GUI 表单总是显式提交）。
+    #[serde(default)]
+    endpoints: Option<Vec<String>>,
     #[serde(default)]
     password: Option<String>,
     /// ★ M17：两步验证（2SV）的 TOTP 密钥（Base32 / `otpauth://` URI）或一次性
@@ -223,35 +248,59 @@ impl LinkInput {
             filter_temp: self.filter_temp.unwrap_or(true),
             peer_listen: self.peer_listen.clone(),
             peer_name: self.peer_name.clone(),
+            // M40：备选路径要解析后才算数，由 `link_with_existing_and_id` 填
+            endpoints: Vec::new(),
+            local_namespace: None,
         }
     }
 
-    /// 保存前把 GUI 不编辑的 M7 字段（exclude / filter_temp / peer_*）从已有配置里带过来，
-    /// 避免「GUI 保存一次就把规则清空」。
+    /// 保存前把 GUI 不编辑的字段（exclude / filter_temp / peer_* / 路径）从已有配置里
+    /// 带过来，避免「GUI 保存一次就把规则清空」。
     #[allow(dead_code)]
-    fn link_with_existing(&self, paths: &ConfigPaths) -> LinkConfig {
+    fn link_with_existing(&self, paths: &ConfigPaths) -> Result<LinkConfig, String> {
         self.link_with_existing_and_id(paths, self.link().id)
     }
 
     /// ★ M16：用指定 id 保存（新建时由后端生成 id）。
-    fn link_with_existing_and_id(&self, paths: &ConfigPaths, id: String) -> LinkConfig {
+    ///
+    /// ★ M40：`endpoints` 是 `Option<Vec<String>>`：
+    /// * `None` → 保留旧 link 的路径（老 GUI 兼容）；
+    /// * `Some(lines)` → 用行语法解析，坏行明确报错（带行号），**不静默丢弃**；
+    /// * 解析后如果这条 link 第一次启用多路径，冻结 `local_namespace`，
+    ///   保证缓存/状态目录不因主地址变化而分家。
+    fn link_with_existing_and_id(
+        &self,
+        paths: &ConfigPaths,
+        id: String,
+    ) -> Result<LinkConfig, String> {
         let mut link = self.link();
         link.id = id;
-        if let Ok(old) = LinkConfig::load(paths, &link.id) {
+        let old = LinkConfig::load(paths, &link.id).ok();
+        if let Some(old) = &old {
             if self.exclude.is_empty() {
-                link.exclude = old.exclude;
+                link.exclude = old.exclude.clone();
             }
             if self.filter_temp.is_none() {
                 link.filter_temp = old.filter_temp;
             }
             if self.peer_listen.is_none() {
-                link.peer_listen = old.peer_listen;
+                link.peer_listen = old.peer_listen.clone();
             }
             if self.peer_name.is_none() {
-                link.peer_name = old.peer_name;
+                link.peer_name = old.peer_name.clone();
             }
+            link.local_namespace = old.local_namespace.clone();
         }
-        link
+        link.endpoints = match &self.endpoints {
+            Some(lines) => LinkConfig::parse_endpoint_lines(&lines.join("\n"))
+                .map_err(|e| format!("路径不合法：{e}"))?,
+            None => old
+                .as_ref()
+                .map(|o| o.endpoints.clone())
+                .unwrap_or_default(),
+        };
+        link.ensure_local_namespace(old.as_ref());
+        Ok(link)
     }
 }
 
@@ -531,7 +580,7 @@ pub async fn link_save(input: Value) -> Result<Value, String> {
     let p = paths()?;
     p.ensure_dirs().map_err(|e| e.to_string())?;
     let id = resolve_link_id(&p, li.id.as_deref(), true)?;
-    let link = li.link_with_existing_and_id(&p, id);
+    let link = li.link_with_existing_and_id(&p, id)?;
     if let Some(other) = duplicate_link(&p, &link) {
         return Err(format!(
             "{}@{}:{} 已经有连接「{other}」；同一 NAS + 账号只保留一个连接",
@@ -609,7 +658,7 @@ pub async fn credential_save(input: Value) -> Result<Value, String> {
     let id = resolve_link_id(&p, li.id.as_deref(), false)?;
     let link = match LinkConfig::load(&p, &id) {
         Ok(existing) => existing,
-        Err(_) => li.link_with_existing_and_id(&p, id),
+        Err(_) => li.link_with_existing_and_id(&p, id)?,
     };
     // ★ M17：空输入 = 保留旧密钥；验证码不落盘；密钥归一化后保存。
     let otp = resolve_otp_for_save(&p, &link, li.otp_secret.as_deref())?;
@@ -785,7 +834,7 @@ pub async fn login_flow(input: Value) -> Result<Value, String> {
     let p = paths()?;
     p.ensure_dirs().map_err(|e| e.to_string())?;
     let id = resolve_link_id(&p, li.id.as_deref(), true)?;
-    let link = li.link_with_existing_and_id(&p, id);
+    let link = li.link_with_existing_and_id(&p, id)?;
     if let Some(other) = duplicate_link(&p, &link) {
         return Ok(json!({
             "ok": false,
@@ -927,6 +976,8 @@ async fn link_status_one(p: &ConfigPaths, link: &LinkConfig) -> Value {
         "credential_present": cred.is_some(),
         // ★ M17：是否存了两步验证密钥（只回布尔，绝不回密钥）。
         "otp": Credentials::present_otp_for(p, link),
+        // ★ M40：路径数（GUI 连接列表可显示「N 条路径」）
+        "path_count": link.endpoint_list().len(),
         "socket": daemon.socket,
         "daemon": daemon,
     })
@@ -2029,6 +2080,8 @@ mod tests {
             filter_temp: true,
             peer_listen: None,
             peer_name: None,
+            endpoints: Vec::new(),
+            local_namespace: None,
         };
         // 先存一份带 2SV 密钥的凭据（等价于用户上次填过密钥）
         Credentials::new(link.host.clone(), link.user.clone(), "pw")
@@ -2107,6 +2160,7 @@ mod tests {
             insecure: true,
             user: "test1".into(),
             ipv4_only: false,
+            endpoints: Vec::new(),
         };
         let mut link = LinkConfig {
             id: "default".into(),
@@ -2120,6 +2174,8 @@ mod tests {
             filter_temp: true,
             peer_listen: None,
             peer_name: None,
+            endpoints: Vec::new(),
+            local_namespace: None,
         };
         assert!(same_link(&info, &link));
         link.user = "other".into();
@@ -2186,6 +2242,8 @@ mod tests {
             filter_temp: false,
             peer_listen: Some("0.0.0.0:9840".into()),
             peer_name: Some("box".into()),
+            endpoints: Vec::new(),
+            local_namespace: None,
         }
         .save(&paths)
         .unwrap();
@@ -2195,7 +2253,7 @@ mod tests {
             "host": "new.nas", "user": "test2", "https": false
         }))
         .unwrap();
-        let link = li.link_with_existing(&paths);
+        let link = li.link_with_existing(&paths).unwrap();
         assert_eq!(link.host, "new.nas", "表单里的字段必须生效");
         assert_eq!(link.user, "test2");
         assert!(!link.https);
@@ -2221,9 +2279,127 @@ mod tests {
             "exclude": ["# 已清空（GUI）"], "filter_temp": true
         }))
         .unwrap();
-        let link2 = li2.link_with_existing(&paths);
+        let link2 = li2.link_with_existing(&paths).unwrap();
         assert_eq!(link2.exclude, vec!["# 已清空（GUI）".to_string()]);
         assert!(link2.filter_temp, "显式给的值必须覆盖旧值");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// ★ M40：连接表单的备选路径 —— 解析 / 保留 / 清空 / 冻结命名空间四条语义。
+    #[test]
+    fn m40_link_input_endpoints_parse_preserve_clear_and_freeze_namespace() {
+        let d = std::env::temp_dir().join(format!(
+            "qxync-gui-m40-endpoints-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|t| t.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        let paths = ConfigPaths {
+            config_dir: d.join("config"),
+            data_dir: d.join("data"),
+            state_dir: d.join("state"),
+        };
+        std::fs::create_dir_all(paths.config_dir.join("links")).unwrap();
+        LinkConfig {
+            id: "default".into(),
+            host: "old.nas".into(),
+            port: 9834,
+            https: true,
+            insecure: true,
+            user: "u".into(),
+            ipv4_only: false,
+            exclude: Vec::new(),
+            filter_temp: true,
+            peer_listen: None,
+            peer_name: None,
+            endpoints: Vec::new(),
+            local_namespace: None,
+        }
+        .save(&paths)
+        .unwrap();
+
+        // 1) 显式提交行：解析成功，并冻结旧主地址的命名空间（改 host 不换本地状态目录）
+        let li: LinkInput = serde_json::from_value(json!({
+            "host": "new.nas", "user": "u",
+            "endpoints": ["家里 LAN = 192.168.1.10:8080", "公网 = https://ddns.example.com"]
+        }))
+        .unwrap();
+        let link = li
+            .link_with_existing_and_id(&paths, "default".into())
+            .unwrap();
+        assert_eq!(link.host, "new.nas");
+        assert_eq!(link.endpoints.len(), 2);
+        assert_eq!(link.endpoints[0].label.as_deref(), Some("家里 LAN"));
+        assert_eq!(link.endpoints[0].host, "192.168.1.10");
+        assert_eq!(link.endpoints[0].port, Some(8080));
+        assert_eq!(link.endpoints[0].https, None, "没写协议 → 继承主地址");
+        assert_eq!(link.endpoints[1].https, Some(true));
+        assert_eq!(
+            link.local_namespace.as_deref(),
+            Some("old.nas"),
+            "第一次启用多路径必须冻结**旧**主地址的命名空间"
+        );
+        assert!(link.validate_endpoints().is_ok());
+
+        // 2) 缺省字段 = 保留旧路径（老 GUI / 第三方脚本兼容）
+        link.save(&paths).unwrap();
+        let li_keep: LinkInput =
+            serde_json::from_value(json!({"host": "new.nas", "user": "u"})).unwrap();
+        let kept = li_keep
+            .link_with_existing_and_id(&paths, "default".into())
+            .unwrap();
+        assert_eq!(kept.endpoints.len(), 2, "不传 endpoints 不能把路径清掉");
+        assert_eq!(kept.local_namespace.as_deref(), Some("old.nas"));
+
+        // 3) 显式空数组 = 清空（仅主地址）
+        let li_clear: LinkInput =
+            serde_json::from_value(json!({"host": "new.nas", "user": "u", "endpoints": []}))
+                .unwrap();
+        let cleared = li_clear
+            .link_with_existing_and_id(&paths, "default".into())
+            .unwrap();
+        assert!(cleared.endpoints.is_empty(), "显式空数组必须清空");
+        assert_eq!(cleared.endpoint_list().len(), 1);
+
+        // 4) 坏行带行号报错，不静默丢弃
+        let li_bad: LinkInput = serde_json::from_value(json!({
+            "host": "new.nas", "user": "u",
+            "endpoints": ["192.168.1.2:9834", "ftp://nas.local"]
+        }))
+        .unwrap();
+        let err = li_bad
+            .link_with_existing_and_id(&paths, "default".into())
+            .unwrap_err();
+        assert!(err.contains("第 2 行"), "{err}");
+
+        // 5) 路径变了 → same_link 必须报不一致（daemon 才会重启读到新路径）
+        let info = qxync_core::ipc::LinkInfo {
+            id: "default".into(),
+            host: link.host.clone(),
+            port: link.port,
+            https: link.https,
+            insecure: link.insecure,
+            user: link.user.clone(),
+            ipv4_only: false,
+            endpoints: link
+                .endpoint_list()
+                .into_iter()
+                .map(|e| qxync_core::ipc::EndpointInfo {
+                    label: e.label,
+                    host: e.host,
+                    port: e.port,
+                    https: e.https,
+                    primary: e.primary,
+                })
+                .collect(),
+        };
+        assert!(same_link(&info, &link));
+        let mut changed = link.clone();
+        changed.endpoints.pop();
+        assert!(!same_link(&info, &changed), "少一条路径也必须重启 daemon");
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -2262,6 +2438,8 @@ mod tests {
                 filter_temp: true,
                 peer_listen: None,
                 peer_name: None,
+                endpoints: Vec::new(),
+                local_namespace: None,
             }
             .save(&paths)
             .unwrap();
@@ -2299,6 +2477,8 @@ mod tests {
             filter_temp: true,
             peer_listen: None,
             peer_name: None,
+            endpoints: Vec::new(),
+            local_namespace: None,
         };
         mk("default", "NAS.local", "u").save(&paths).unwrap();
         assert_eq!(

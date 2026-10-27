@@ -855,6 +855,8 @@ mod tests {
             filter_temp: true,
             peer_listen: None,
             peer_name: None,
+            endpoints: Vec::new(),
+            local_namespace: None,
         };
         let dir = std::env::temp_dir().join(format!(
             "qxync-delete-offline-{}-{}",
@@ -909,6 +911,8 @@ mod tests {
             filter_temp: true,
             peer_listen: None,
             peer_name: None,
+            endpoints: Vec::new(),
+            local_namespace: None,
         };
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -964,6 +968,8 @@ mod tests {
             filter_temp: true,
             peer_listen: None,
             peer_name: None,
+            endpoints: Vec::new(),
+            local_namespace: None,
         };
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()

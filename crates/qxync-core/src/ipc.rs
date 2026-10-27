@@ -112,6 +112,14 @@ pub enum Request {
     Ping,
     /// 状态快照（**不触发登录**）。
     Status,
+    /// ★ M40：多路径状态 / 诊断。
+    ///
+    /// * `probe=true`：对每一条路径做一次真实探测（DNS + HTTP，最多约 3s）；
+    /// * `probe=false` / 省略：只读路由表的最近结果，**不发任何网络请求**。
+    Routes {
+        #[serde(default)]
+        probe: Option<bool>,
+    },
     /// 登录；`user`/`password` 省略时读 `credentials.json`。
     ///
     /// ★ M17：`otp` 是两步验证（2SV）的一次性输入 —— 6 位验证码，或 Base32 密钥 /
@@ -383,6 +391,7 @@ impl Request {
         match self {
             Request::Ping => "ping",
             Request::Status => "status",
+            Request::Routes { .. } => "routes",
             Request::Login { .. } => "login",
             Request::Logout => "logout",
             Request::Ls { .. } => "ls",
@@ -628,6 +637,96 @@ pub struct LinkInfo {
     pub insecure: bool,
     pub user: String,
     pub ipv4_only: bool,
+    /// ★ M40：这条连接配置的访问路径（含主地址）。老 daemon 没有该字段 →
+    /// 空数组（GUI 的 `same_link` 会因此重启一次 daemon，属于安全方向）。
+    #[serde(default)]
+    pub endpoints: Vec<EndpointInfo>,
+}
+
+/// ★ M40：一条访问路径的静态信息（不含运行期状态）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EndpointInfo {
+    pub label: String,
+    pub host: String,
+    pub port: u16,
+    pub https: bool,
+    /// 是否是主地址（`host/port/https` 字段本身）。
+    pub primary: bool,
+}
+
+/// ★ M40：一条路径的最近运行状态（`routes` 命令 / GUI 诊断页）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RouteInfo {
+    pub label: String,
+    pub host: String,
+    pub port: u16,
+    pub https: bool,
+    pub primary: bool,
+    /// 当前是否正在使用。
+    pub active: bool,
+    /// `unknown` / `ok` / `failed` / `cooling` / `blocked`。
+    pub state: String,
+    pub last_ok_unix: Option<i64>,
+    pub last_fail_unix: Option<i64>,
+    /// 最近一次网络失败原文（**不含 URL / sid / 远端路径**）。
+    pub last_error: Option<String>,
+    /// 最近一次成功请求的耗时。
+    pub latency_ms: Option<u64>,
+    /// 最近一次 DNS 解析结果（IP 字符串，A + AAAA）。
+    pub resolved: Vec<String>,
+    /// 与 `resolved` 对齐的分类标签（回环/内网/公网/运营商 NAT/…）。
+    pub resolved_scopes: Vec<String>,
+    pub resolved_at_unix: Option<i64>,
+    /// 这次解析结果是否与上一次不同（DDNS 更新的关键证据）。
+    pub resolved_changed: bool,
+    /// 还在冷却期时，距离可再试还有多少秒。
+    pub cooldown_secs: u64,
+    /// 额外说明：身份不符（指向另一台 NAS）、CGNAT 提示等。
+    pub note: Option<String>,
+}
+
+/// ★ M40：最近一次路径切换。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SwitchInfo {
+    pub at_unix: i64,
+    /// `host:port`（路径标签不够唯一，带上地址）。
+    pub from: String,
+    pub to: String,
+    /// `failure` / `probe_recovered` / `preferred_available` / `manual`。
+    pub reason: String,
+}
+
+/// ★ M40：`Request::Routes` 的响应。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RoutesData {
+    /// 当前在用的路径（`host:port`）；没有任何路径时为 `None`。
+    pub active: Option<String>,
+    pub endpoints: Vec<RouteInfo>,
+    /// 自 daemon 启动以来的切换次数。
+    pub switches: u64,
+    pub last_switch: Option<SwitchInfo>,
+    /// 本次响应是否真的触发了探测（`probe=false` 时为 false）。
+    pub probed: bool,
+}
+
+impl RoutesData {
+    pub fn healthy(&self) -> usize {
+        self.endpoints.iter().filter(|e| e.state == "ok").count()
+    }
+}
+
+/// ★ M40：`status` 里的多路径摘要（小、不触发网络）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RouteSummary {
+    pub active: Option<String>,
+    pub healthy: usize,
+    pub total: usize,
+    pub last_switch: Option<SwitchInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -880,6 +979,9 @@ pub struct StatusData {
     /// ★ M20：离线缓冲区汇总（**只有真的有待同步内容时才出现**，避免首页常驻一行 0）。
     #[serde(default)]
     pub offline: Option<OfflineInfo>,
+    /// ★ M40：多路径摘要（老 daemon 没有该字段 → `None`，界面不显示路径行）。
+    #[serde(default)]
+    pub routes: Option<RouteSummary>,
     pub mounts: Vec<MountInfo>,
 }
 
@@ -2134,6 +2236,7 @@ mod tests {
             transfers: Some(t),
             connectivity: None,
             offline: None,
+            routes: None,
             mounts: vec![],
         })
         .unwrap();

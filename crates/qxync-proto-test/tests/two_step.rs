@@ -39,6 +39,8 @@ fn env_link() -> Option<(LinkConfig, String, String)> {
             filter_temp: true,
             peer_listen: None,
             peer_name: None,
+            endpoints: Vec::new(),
+            local_namespace: None,
         },
         password,
         secret,
@@ -117,6 +119,8 @@ async fn m17_bad_totp_secret_fails_before_network() {
         filter_temp: true,
         peer_listen: None,
         peer_name: None,
+        endpoints: Vec::new(),
+        local_namespace: None,
     };
     let mut c = Client::new(&link).expect("构造 client");
     let err = c

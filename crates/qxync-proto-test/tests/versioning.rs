@@ -43,6 +43,8 @@ fn env_creds() -> Option<(LinkConfig, String)> {
             filter_temp: true,
             peer_listen: None,
             peer_name: None,
+            endpoints: Vec::new(),
+            local_namespace: None,
         },
         password,
     ))

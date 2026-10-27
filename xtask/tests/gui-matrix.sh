@@ -41,7 +41,7 @@ SOCK="$RUNDIR/gui-matrix.sock"
 SHOTS="$RUNDIR/gui-shots"
 LINK="${QXNYC_TEST_LINK:-default}"
 LOG="$RUNDIR/gui-matrix.log"
-TABS="home tasks files journal errors settings diag:status diag:mounts diag:sync"
+TABS="home tasks files journal errors settings diag:status diag:mounts diag:sync diag:routes"
 # ★ M8.4：设置页各分区（每个分区一张图，判据同其它目的地：非空白 + 与主页不同）
 SECS="settings:proxy settings:sync settings:personal settings:advanced settings:free settings:lan settings:about"
 
