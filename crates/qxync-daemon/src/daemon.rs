@@ -9,11 +9,11 @@ use qxync_core::dehydrate::{Block, CacheLimit, Policy};
 use qxync_core::ipc::{
     decode_line, encode_line, mask_sid, mask_token, BalooMountInfo, BalooStatusData, CacheInfo,
     CursorInfo, DaemonInfo, DecisionInfo, DecisionsData, DehydrateData, DiffData, ErrorKind,
-    FileStateInfo, FileStatesData, GetData, HydroStats, IpcError, JournalData, LinkInfo, LoginData,
-    LsData, MountInfo, OfflineInfo, OverlayPluginInfo, PeerData, PingData, ProgressData,
-    ProgressLine, PutData, Request, RequestEnvelope, Response, RootsData, RulesData, ServerInfo,
-    SessionInfo, SettingsData, ShutdownData, SpaceData, StatusData, StoreData, SyncCursors,
-    SyncInfo, TaskInfo, TasksData, IPC_VERSION,
+    FileStateInfo, FileStatesData, GetData, HydroStats, IpcError, JournalData, LinkInfo,
+    LogFileInfo, LoginData, LogsData, LsData, MountInfo, OfflineInfo, OverlayPluginInfo, PeerData,
+    PingData, ProgressData, ProgressLine, PutData, Request, RequestEnvelope, Response, RootsData,
+    RulesData, ServerInfo, SessionInfo, SettingsData, ShutdownData, SpaceData, StatusData,
+    StoreData, SyncCursors, SyncInfo, TaskInfo, TasksData, IPC_VERSION,
 };
 use qxync_core::mounts::{MountRecord, MountsFile};
 use qxync_core::rules::Rules;
@@ -694,7 +694,8 @@ async fn idle_until_configured(paths: &ConfigPaths, opts: &Options) -> Result<Id
                             }
                         });
                     }
-                    Err(e) => tracing::warn!("accept 失败: {e}"),
+                    // ★ M39：accept 失败要退避（理由见 `accept_backoff`）
+                    Err(e) => accept_backoff(&e).await,
                 }
             }
         }
@@ -802,6 +803,9 @@ async fn handle_idle_conn(
                     // 空转待命也要能答 —— GUI 的设置页（开关就住在那里）
                     // 在还没配连接时就打开了。
                     Request::BalooStatus => to_value(idle_baloo_status()),
+                    // ★ M39：日志目录是纯本地的，空转待命也要能看/能清
+                    //   （「daemon 空转待命」恰恰是日志最可能攒着没人管的时候）。
+                    Request::Logs { prune } => logs_cmd(prune.unwrap_or(false)),
                     Request::Shutdown => {
                         // 与同步模式一致：先回响应，再触发退出
                         let tx = shutdown.clone();
@@ -862,6 +866,9 @@ fn idle_status(socket: &Path, started: Instant) -> StatusData {
 }
 
 pub async fn run(opts: Options) -> Result<()> {
+    // ★ M39：日志清理任务（每小时 / QXNYC_LOG_PRUNE_SECS 可调）。
+    //   放在空转待命之前：没有连接配置时 daemon 也在写日志，同样要有人按时清。
+    spawn_log_maintenance();
     if !LinkConfig::is_valid_id(&opts.link_id) {
         bail!(
             "连接 id 不合法：{:?}（只允许 A-Za-z0-9 . _ -，且不能是 . / ..）",
@@ -1123,7 +1130,8 @@ pub async fn run(opts: Options) -> Result<()> {
                             }
                         });
                     }
-                    Err(e) => tracing::warn!("accept 失败: {e}"),
+                    // ★ M39：accept 失败要退避（理由见 `accept_backoff`）
+                    Err(e) => accept_backoff(&e).await,
                 }
             }
         }
@@ -1337,7 +1345,7 @@ async fn hold_mounts(
                             }
                         });
                     }
-                    Err(e) => tracing::warn!("accept 失败（挂载守护）: {e}"),
+                    Err(e) => accept_backoff(&e).await,
                 }
             }
         }
@@ -1351,6 +1359,19 @@ async fn hold_deadline(hold_secs: u64) {
     } else {
         tokio::time::sleep(Duration::from_secs(hold_secs)).await
     }
+}
+
+/// ★ M39 防御：`accept` 失败后**必须退避**，不能空转。
+///
+/// 真机 2026-10-23 与 10-27 两次 `accept 失败: Too many open files (os error 24)`
+/// 把日志刷成 5.17 GB / 674 MB（后者只用了 2 分半）：错误分支原来直接落回
+/// `select!`，下一次 `accept` 立刻又失败 —— 纯烧 CPU + 刷日志，一条有用的信息
+/// 都没有。**fd 泄漏的根因是另一件事**（待查，不在本版范围）；这里只保证
+/// 「accept 持续失败」不会变成一场日志洪水 —— 100ms 退避后一天最多 ~86 万条，
+/// 且都被 `log_max_file_mb` 切段 + `log_max_total_mb` 兜住。
+async fn accept_backoff(e: &std::io::Error) {
+    tracing::warn!("accept 失败（100ms 后重试）: {e}");
+    tokio::time::sleep(Duration::from_millis(100)).await;
 }
 
 /// CLI 用来判断「socket 在但进程已死」。
@@ -1589,6 +1610,8 @@ async fn dispatch(
         Request::FileStates { path } => file_states_cmd(state, path).await,
         Request::Space { now } => space_cmd(state, now.unwrap_or(false)).await,
         Request::BalooStatus => baloo_status_cmd(state),
+        // ★ M39：日志目录占用 / 轮转策略；`prune=true` 立即按策略清一次。
+        Request::Logs { prune } => logs_cmd(prune.unwrap_or(false)),
         Request::Peer {
             action,
             addr,
@@ -5574,11 +5597,20 @@ fn idle_settings_save(
     autostart_exe: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
     save_settings_to_disk(paths, &mut s, autostart_exe)?;
-    to_value(idle_settings_data(
-        paths,
-        true,
-        Some("设置已落盘（daemon 空转待命中：还没有配置 NAS 连接）".into()),
-    ))
+    // ★ M39：空转待命时也要让日志策略热生效 + 立即清一次（这时 daemon 也在写日志：
+    //   「还没有 NAS 连接」这类 WARN 会持续刷）。
+    let pol = qxync_core::logcfg::apply_settings(&s);
+    let rep = qxync_core::logcfg::prune(&paths.log_dir(), &pol, &[]).unwrap_or_default();
+    let note = if rep.deleted_count() > 0 {
+        format!(
+            "设置已落盘（daemon 空转待命中）；日志策略已热生效，立即清理 {} 个文件，释放 {:.2} MiB",
+            rep.deleted_count(),
+            rep.freed_bytes as f64 / 1048576.0
+        )
+    } else {
+        "设置已落盘（daemon 空转待命中：还没有配置 NAS 连接）".into()
+    };
+    to_value(idle_settings_data(paths, true, Some(note)))
 }
 
 /// ★ M23：空转待命时的 `baloo_status` —— 没有挂载点，检测的只有 Baloo 本身。
@@ -5603,6 +5635,119 @@ fn idle_baloo_status() -> BalooStatusData {
         mounts: Vec::new(),
         can_enable: true,
     }
+}
+
+/// ★ M39：后台进程外的日志清理间隔（秒，默认 3600）。
+///
+/// 「定时删除」必须**独立于写日志**：真出刷屏 bug 时日志在写、切段顺带清理，
+/// 但如果用户只是把 daemon 停着、目录里攒了一堆旧文件，也要有人按时删。
+/// 验收里调小（`QXNYC_LOG_PRUNE_SECS=5`）来快速观察。
+fn log_prune_secs() -> u64 {
+    std::env::var("QXNYC_LOG_PRUNE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3600)
+        .max(5)
+}
+
+/// ★ M39：常驻的日志清理任务（每小时一次；启动时立刻跑第一次）。
+///
+/// 只删「每族最新一个」之外的旧文件，所以**不会动正在写的日志**
+/// （daemon / GUI 各自的当前段都是本族最新）。
+///
+/// 换代（SIGHUP 重载同步引擎）不影响它：日志是进程级资源，不归同步引擎。
+fn spawn_log_maintenance() {
+    let secs = log_prune_secs();
+    tokio::spawn(async move {
+        let dir = qxync_core::ipc::default_log_dir();
+        tracing::info!(
+            "日志清理已启动：每 {secs}s 按策略清理一次（{})",
+            dir.display()
+        );
+        let mut tick = tokio::time::interval(Duration::from_secs(secs));
+        loop {
+            tick.tick().await;
+            let pol = qxync_core::logcfg::policy();
+            match qxync_core::logcfg::prune(&dir, &pol, &[]) {
+                Ok(rep) if !rep.deleted.is_empty() => {
+                    tracing::info!(
+                        "日志清理：删除 {} 个文件，释放 {:.2} MiB（保留 {} 天 / 总量上限 {} MB）",
+                        rep.deleted_count(),
+                        rep.freed_bytes as f64 / 1048576.0,
+                        pol.keep_days,
+                        pol.max_total_bytes / 1048576
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("日志清理失败（下轮再试）: {e}"),
+            }
+        }
+    });
+}
+
+/// ★ M39：`Request::Logs` —— 日志目录占用 / 当前策略；`prune=true` 立即清一次。
+///
+/// 只读调用也**绝不触发任何网络/同步动作**：GUI 每次打开设置页都要问一句
+/// 「现在占多少」，这是纯本地目录扫描。
+fn logs_cmd(prune_now: bool) -> Result<serde_json::Value, IpcError> {
+    let dir = qxync_core::ipc::default_log_dir();
+    let pol = qxync_core::logcfg::policy();
+    let (mut deleted, mut freed_bytes) = (0usize, 0u64);
+    let mut failed: Vec<String> = Vec::new();
+    let mut in_use: Vec<String> = Vec::new();
+    if prune_now {
+        match qxync_core::logcfg::prune(&dir, &pol, &[]) {
+            Ok(rep) => {
+                deleted = rep.deleted_count();
+                freed_bytes = rep.freed_bytes;
+                failed = rep
+                    .failed
+                    .iter()
+                    .map(|(p, e)| format!("{}: {e}", p.display()))
+                    .collect();
+                in_use = rep.in_use.iter().map(|p| p.display().to_string()).collect();
+                if deleted > 0 {
+                    tracing::info!(
+                        "按请求清理日志：删除 {deleted} 个文件，释放 {:.2} MiB",
+                        freed_bytes as f64 / 1048576.0
+                    );
+                }
+            }
+            Err(e) => failed.push(format!("清理失败: {e}")),
+        }
+    }
+    // 清理后重新扫一遍：返回的数字必须是「现在」的，不是清理前的。
+    let all = qxync_core::logcfg::scan(&dir);
+    let total_bytes: u64 = all.iter().map(|f| f.size).sum();
+    let mut files: Vec<LogFileInfo> = all
+        .iter()
+        .map(|f| LogFileInfo {
+            name: f.name.clone(),
+            path: dir.join(&f.name).display().to_string(),
+            size: f.size,
+            mtime: f
+                .mtime
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+        })
+        .collect();
+    files.sort_by(|a, b| b.size.cmp(&a.size).then(a.name.cmp(&b.name)));
+    files.truncate(50);
+    to_value(LogsData {
+        dir: dir.display().to_string(),
+        total_bytes,
+        file_count: all.len(),
+        max_file_mb: (pol.max_file_bytes / 1048576) as u32,
+        keep_days: pol.keep_days,
+        max_total_mb: (pol.max_total_bytes / 1048576) as u32,
+        pruned: prune_now,
+        deleted,
+        freed_bytes,
+        failed,
+        in_use,
+        files,
+    })
 }
 
 fn settings_data(state: &Arc<State>, saved: bool, note: Option<String>) -> SettingsData {
@@ -5690,6 +5835,22 @@ fn settings_save_cmd(
         save_settings_to_disk(&paths, &mut s, autostart_exe)?;
     *state.settings.lock().unwrap() = s.clone();
     *state.proxy.lock().unwrap() = proxy;
+    // ★ M39：日志策略**热生效**（`RotatingWriter` 每次写都现读策略），并立即按
+    //   新策略清一次 —— 用户把「保留 14 天」改成 3 天时，期望马上看到空间回来，
+    //   而不是等后台那一小时。
+    let log_policy = qxync_core::logcfg::apply_settings(&s);
+    let log_prune =
+        qxync_core::logcfg::prune(&paths.log_dir(), &log_policy, &[]).unwrap_or_default();
+    if log_prune.deleted_count() > 0 {
+        tracing::info!(
+            "日志策略更新为 {} 天 / 总量 {} MB / 单文件 {} MB：立即清理 {} 个文件，释放 {:.2} MiB",
+            log_policy.keep_days,
+            log_policy.max_total_bytes / 1048576,
+            log_policy.max_file_bytes / 1048576,
+            log_prune.deleted_count(),
+            log_prune.freed_bytes as f64 / 1048576.0
+        );
+    }
     // ★ M23：设置落库后按新值刷新每个挂载点的 tags 暴露标志（热切换，不重挂载）。
     refresh_dolphin_flags(state);
     journal_log(
@@ -5698,7 +5859,7 @@ fn settings_save_cmd(
             "settings",
             "",
             format!(
-                "设置已保存：代理={}，自动释放={}，开机自启={}，通知={}，Dolphin Tags={}，Dolphin 角标={}",
+                "设置已保存：代理={}，自动释放={}，开机自启={}，通知={}，Dolphin Tags={}，Dolphin 角标={}，日志保留={}天/总量{}MB/单文件{}MB",
                 s.proxy.mode,
                 if s.free_space.auto { "开" } else { "关" },
                 if s.launch_at_startup { "开" } else { "关" },
@@ -5709,20 +5870,28 @@ fn settings_save_cmd(
                 },
                 if s.dolphin_tags { "开" } else { "关" },
                 if s.dolphin_overlay { "开" } else { "关" },
+                s.log_keep_days,
+                s.log_max_total_mb,
+                s.log_max_file_mb,
             ),
         ),
     );
     tracing::info!("M8.4 设置已保存: {}", saved_path.display());
-    to_value(settings_data(
-        state,
-        true,
-        Some(if autostart_written {
-            "开机自启已写入 autostart 桌面项；代理改动手动模式后，已在跑的水合客户端要等下次挂载才生效".into()
-        } else {
-            "设置已落盘（代理改动对手动建立的连接要等下次挂载；LAN 监听地址改动要重启 daemon）"
-                .into()
-        }),
-    ))
+    let mut note = if autostart_written {
+        "开机自启已写入 autostart 桌面项；代理改动手动模式后，已在跑的水合客户端要等下次挂载才生效"
+            .to_string()
+    } else {
+        "设置已落盘（代理改动对手动建立的连接要等下次挂载；LAN 监听地址改动要重启 daemon）"
+            .to_string()
+    };
+    if log_prune.deleted_count() > 0 {
+        note.push_str(&format!(
+            "；日志策略已热生效，立即清理 {} 个文件，释放 {:.2} MiB",
+            log_prune.deleted_count(),
+            log_prune.freed_bytes as f64 / 1048576.0
+        ));
+    }
+    to_value(settings_data(state, true, Some(note)))
 }
 
 /// 找 GUI 可执行文件：优先与当前进程同目录的 `qxync-gui`。

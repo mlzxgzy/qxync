@@ -44,6 +44,8 @@ pub fn run() {
             commands::ipc_call,
             // ★ M26：带进度行的 IPC（GUI「下载到本地」）
             commands::ipc_call_with_progress,
+            // ★ M39：日志目录占用 / 轮转策略（设置 →「日志」分区；prune=true 立即清一次）
+            commands::logs,
             commands::link_read,
             commands::link_save,
             commands::credential_save,
@@ -946,8 +948,53 @@ pub fn ui_spec() -> Value {
     });
     let purge_ok = purge["ok"].as_bool().unwrap_or(false);
 
+    // 7) ★ M39：设置 →「日志」分区 —— 占用必须能看、策略必须能改、清理必须能点。
+    //    只查「有没有按钮」不够，这里逐项点名：分区本体（tab+panel）、三个策略输入、
+    //    三个动作按钮、清理结果行、文件表（`#log-files`）与失败清单容器。
+    //    同时要求 app.js 真的接了 `logs` 命令与三个处理函数 —— 缺任何一个，
+    //    按钮点下去都只会「没反应」。
+    let log_policy_inputs = ["f-log-max-file-mb", "f-log-keep-days", "f-log-max-total-mb"]
+        .iter()
+        .all(|id| index.contains(&format!("id=\"{id}\"")));
+    let log_buttons = ["btn-log-save", "btn-log-prune", "btn-log-refresh"]
+        .iter()
+        .all(|id| index.contains(&format!("id=\"{id}\"")));
+    let logs_ok = index.contains("id=\"sec-log\"")
+        && index.contains("id=\"sec-tab-log\"")
+        && index.contains("data-sec=\"log\"")
+        && log_policy_inputs
+        && log_buttons
+        && index.contains("id=\"log-prune-result\"")
+        && index.contains("id=\"log-files\"")
+        && index.contains("id=\"log-failed\"")
+        && app.contains("'logs'")
+        && app.contains("function refreshLogs")
+        && app.contains("function renderLogs")
+        && app.contains("function collectLog")
+        && app.contains("'log',"); // SETTINGS_SECS 里必须有 log，否则深链/切页不认它
+    let logs = json!({
+        "ok": logs_ok,
+        "tab": index.contains("id=\"sec-tab-log\""),
+        "panel": index.contains("id=\"sec-log\""),
+        "policy_inputs": log_policy_inputs,
+        "buttons": log_buttons,
+        "files_table": index.contains("id=\"log-files\""),
+        "prune_result_slot": index.contains("id=\"log-prune-result\""),
+        "cmd_call": app.contains("'logs'"),
+        "helpers": app.contains("function refreshLogs")
+            && app.contains("function renderLogs")
+            && app.contains("function collectLog"),
+        "in_secs": app.contains("'log',"),
+    });
+
     json!({
-        "ok": sinks.is_empty() && i18n_ok && a11y_ok && states_ok && task_defaults_ok && purge_ok,
+        "ok": sinks.is_empty()
+            && i18n_ok
+            && a11y_ok
+            && states_ok
+            && task_defaults_ok
+            && purge_ok
+            && logs_ok,
         "html_sinks": sinks,
         "i18n": {
             "ok": i18n_ok,
@@ -963,6 +1010,7 @@ pub fn ui_spec() -> Value {
         "states": states,
         "task_defaults": task_defaults,
         "purge": purge,
+        "logs": logs,
     })
 }
 
@@ -1203,7 +1251,18 @@ async fn self_test_inner() -> Value {
     })
 }
 
-/// 日志：stderr + 按天滚动文件 `<state>/log/qxync-gui.log.YYYY-MM-DD`（与 daemon 同目录）。
+/// 日志：stderr + 按天/按大小滚动文件 `<state>/log/qxync-gui.log.YYYY-MM-DD`（与 daemon 同目录）。
+///
+/// ★ M39：`tracing_appender::rolling::daily` 换成自己的
+/// [`qxync_core::logcfg::RotatingWriter`]。
+///
+/// 为什么非换不可：`daily` **只在跨天切段、同一天内没有上限、而且从不删旧文件** ——
+/// 真机 2026-10-23 的 `qxyncd.log.2026-10-23` 单文件 5.2 GB（日志目录合计 4.9 GB）
+/// 就是这么来的。GUI 也写同一个目录（`qxync-gui.log.*`），所以同样得受策略约束。
+///
+/// 顺序很重要：**先把 `settings.json` 的策略 `apply_settings` 进去，再建 writer**。
+/// `RotatingWriter::new` 在打开时会拿当前策略判断「上次进程留下的段是不是已经超限」，
+/// 先建后应用的话，那个 5 GB 的段要等到下一次写才切。
 fn init_logging() {
     static GUARD: OnceLock<tracing_appender::non_blocking::WorkerGuard> = OnceLock::new();
     static INIT: OnceLock<()> = OnceLock::new();
@@ -1213,25 +1272,58 @@ fn init_logging() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
+
+    // 策略应用的结果（给初始化之后的一行 info 用：日志里能看出「这次按什么策略在写」）。
+    let mut policy_note: Option<String> = None;
     let file_layer = qxync_core::ConfigPaths::discover().ok().and_then(|p| {
         let dir = p.log_dir();
         if std::fs::create_dir_all(&dir).is_err() {
             return None;
         }
-        let appender = tracing_appender::rolling::daily(&dir, "qxync-gui.log");
-        let (nb, guard) = tracing_appender::non_blocking(appender);
-        let _ = GUARD.set(guard);
-        Some(
-            tracing_subscriber::fmt::layer()
-                .with_ansi(false)
-                .with_writer(nb),
-        )
+        // settings.json 坏了/不存在不影响日志：退回默认策略（32 MiB / 14 天 / 256 MiB）。
+        let pol = match qxync_core::Settings::load(&p) {
+            Ok(s) => qxync_core::logcfg::apply_settings(&s),
+            Err(e) => {
+                eprintln!("⚠️ 读取 settings.json 失败，日志策略用默认值: {e}");
+                qxync_core::logcfg::policy()
+            }
+        };
+        policy_note = Some(format!(
+            "单文件 {} MiB / 保留 {} 天 / 总量 {} MiB",
+            pol.max_file_bytes / (1024 * 1024),
+            pol.keep_days,
+            pol.max_total_bytes / (1024 * 1024)
+        ));
+        // 建不出文件**绝不能 panic**（GUI 无窗口模式里 panic = 用户只看到一句
+        // 「启动失败」且日志零线索）：失败就退到只写 stderr，与旧行为一致。
+        match qxync_core::logcfg::RotatingWriter::new(&dir, "qxync-gui") {
+            Ok(w) => {
+                let (nb, guard) = tracing_appender::non_blocking(w);
+                let _ = GUARD.set(guard);
+                Some(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(false)
+                        .with_writer(nb),
+                )
+            }
+            Err(e) => {
+                eprintln!(
+                    "⚠️ 日志文件不可写（{}），只输出到 stderr: {e}",
+                    dir.display()
+                );
+                None
+            }
+        }
     });
     tracing_subscriber::registry()
         .with(filter)
         .with(stderr_layer)
         .with(file_layer)
         .init();
+    // subscriber 装好之后再写这行（在它之前 `tracing::*` 全被丢弃）。
+    if let Some(note) = policy_note {
+        tracing::info!("★ M39：日志轮转策略已应用（{note}）");
+    }
 }
 
 #[cfg(test)]
@@ -1259,5 +1351,39 @@ mod tests {
         );
         assert_eq!(s["html_sinks"].as_array().map(Vec::len), Some(0));
         assert_eq!(s["ok"], serde_json::Value::Bool(true), "ui_spec: {s:#}");
+    }
+
+    /// ★ M39：设置页必须有完整的「日志」分区 —— tab + panel + 策略输入 + 三个动作按钮
+    /// + 清理结果行 + 文件表。
+    ///
+    /// 为什么单点这几处：`ui_spec` 里那一条是**聚合**判据，失败时只看到 `logs.ok=false`。
+    /// 「有分区但没文件表」恰恰是最容易漏的半套 —— 用户看不到是哪个文件在占盘，
+    /// 与「日志又涨到 5 GB 了但不知道谁占的」的原始问题一样无解。
+    #[test]
+    fn settings_page_has_log_section() {
+        let index = include_str!("../ui/index.html");
+        assert!(
+            index.contains("id=\"sec-log\""),
+            "设置页缺少日志分区 #sec-log"
+        );
+        assert!(
+            index.contains("id=\"sec-tab-log\""),
+            "设置页缺少日志分区的 tab #sec-tab-log"
+        );
+        assert!(
+            index.contains("id=\"btn-log-prune\""),
+            "日志分区缺少「立即清理」按钮 #btn-log-prune"
+        );
+        assert!(
+            index.contains("id=\"log-files\""),
+            "日志分区缺文件表 #log-files（看不到是哪个文件占地方）"
+        );
+        let s = ui_spec();
+        assert_eq!(
+            s["logs"]["ok"],
+            serde_json::Value::Bool(true),
+            "ui_spec.logs: {:#}",
+            s["logs"]
+        );
     }
 }

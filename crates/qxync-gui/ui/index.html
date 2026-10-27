@@ -395,6 +395,8 @@
           <button type="button" class="tab" id="sec-tab-sync" data-sec="sync" role="tab" aria-selected="false" aria-controls="sec-sync" data-i18n="sec.sync">同步与筛选</button>
           <button type="button" class="tab" id="sec-tab-personal" data-sec="personal" role="tab" aria-selected="false" aria-controls="sec-personal" data-i18n="sec.personal">个人</button>
           <button type="button" class="tab" id="sec-tab-advanced" data-sec="advanced" role="tab" aria-selected="false" aria-controls="sec-advanced" data-i18n="sec.advanced">高级</button>
+          <!-- ★ M39：日志目录占用 / 轮转策略（真机 2026-10-23 单文件 5.2 GB 之后补的） -->
+          <button type="button" class="tab" id="sec-tab-log" data-sec="log" role="tab" aria-selected="false" aria-controls="sec-log" data-i18n="sec.log">日志</button>
           <button type="button" class="tab" id="sec-tab-free" data-sec="free" role="tab" aria-selected="false" aria-controls="sec-free" data-i18n="sec.free">释放空间</button>
           <button type="button" class="tab" id="sec-tab-lan" data-sec="lan" role="tab" aria-selected="false" aria-controls="sec-lan" data-i18n="sec.lan">LAN 加速</button>
           <button type="button" class="tab" id="sec-tab-about" data-sec="about" role="tab" aria-selected="false" aria-controls="sec-about" data-i18n="sec.about">关于</button>
@@ -598,7 +600,8 @@
             <div class="form">
               <label class="check"><input type="checkbox" id="s-debug-log"> 启用调试日志（Enable debug log，⚠ 影响同步性能）</label>
               <p class="hint">
-                真正的日志级别仍由 <code>RUST_LOG</code> 控制（qxync 的日志落在状态目录 <code>log/</code>，按天滚动）；
+                真正的日志级别仍由 <code>RUST_LOG</code> 控制（qxync 的日志落在状态目录 <code>log/</code>，
+                ★ M39 起按天**且按大小**切段，占用与保留策略在「日志」分区里调）；
                 这个开关是给界面/后续里程碑用的记录位。
               </p>
               <label class="check"><input type="checkbox" id="s-notifications"> 显示桌面通知（Show desktop notifications）</label>
@@ -645,7 +648,64 @@
           </div>
         </div>
 
-        <!-- ---------------- 设置 6：释放空间（Qsync「释放空间」tab） ---------------- -->
+        <!-- ---------------- 设置 6：日志（★ M39 轮转与保留策略） ---------------- -->
+        <!-- 这一页是「诊断日志占了多少盘」的唯一入口：占用、策略、立即清理、文件表。
+             数据全部来自 daemon 的 `Request::Logs`（读它自己的 `<state>/log`），
+             GUI 不自己扫目录 —— 否则两台 daemon + GUI 会各说各话。 -->
+        <div class="settings-sec" id="sec-log" role="tabpanel" aria-labelledby="sec-tab-log">
+          <div class="card">
+            <h2>日志 <span class="count" id="log-usage-label">—</span></h2>
+            <p class="hint">
+              日志目录 <code class="mono" id="log-dir">—</code>：这里既有 daemon 的
+              <code>qxyncd.log.*</code>，也有本界面的 <code>qxync-gui.log.*</code>（同一套策略）。
+              单个文件写满就切段（<code>xxx.log.日期.序号</code>），旧的再按天数与总占用删掉。
+            </p>
+            <div class="form">
+              <div class="row-3">
+                <label>单个文件上限
+                  <span class="inline-num"><input type="number" id="f-log-max-file-mb" min="0" max="4096" step="1" value="32"> MiB</span>
+                </label>
+                <label>保留天数
+                  <span class="inline-num"><input type="number" id="f-log-keep-days" min="0" max="3650" step="1" value="14"> 天</span>
+                </label>
+                <label>日志总占用上限
+                  <span class="inline-num"><input type="number" id="f-log-max-total-mb" min="0" max="102400" step="1" value="256"> MiB</span>
+                </label>
+              </div>
+              <p class="hint">
+                三个数字的 <b>0</b> 含义各不相同：单文件上限 0 = 不按大小切段；保留天数 0 = 不按天数删；
+                总占用 0 = 不限总量。保存后 daemon **立即**应用新策略并顺手清一次。
+                每个「前缀族」（daemon / GUI 各一族）里最新的那个文件永远保留 —— 它就是正在写的那个。
+              </p>
+              <div class="btn-row">
+                <button type="button" id="btn-log-save" class="primary">保存日志策略</button>
+                <button type="button" id="btn-log-prune">立即清理</button>
+                <button type="button" id="btn-log-refresh">刷新</button>
+                <span class="busy" id="log-busy" hidden data-i18n="busy.text">进行中…</span>
+              </div>
+              <p class="hint" id="log-prune-result" hidden></p>
+              <div id="log-failed" class="alert-stack"></div>
+              <!-- ★ 只显示最占地方的前 10 个：日志目录可能有一堆同一天的编号段，
+                   全列出来反而看不到重点（完整 50 条在 IPC 里）。 -->
+              <div class="tbl-scroll">
+                <table class="tbl" id="log-files">
+                  <thead>
+                    <tr>
+                      <th>文件</th>
+                      <th class="col-size">大小</th>
+                      <th class="col-time">修改时间</th>
+                    </tr>
+                  </thead>
+                  <tbody id="log-files-tbody"></tbody>
+                </table>
+              </div>
+              <p class="empty-hint" id="log-files-empty" hidden data-state="ready">尚未读取日志目录。</p>
+              <div id="log-result" class="result" hidden></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ---------------- 设置 7：释放空间（Qsync「释放空间」tab） ---------------- -->
         <div class="settings-sec" id="sec-free" role="tabpanel" aria-labelledby="sec-tab-free">
           <div class="card">
             <h2>释放空间 <span class="count" id="space-used-label"></span></h2>
@@ -678,7 +738,7 @@
           </div>
         </div>
 
-        <!-- ---------------- 设置 7：LAN 加速（Qsync「Enable LAN sync」，qxync 是自研协议） ---------------- -->
+        <!-- ---------------- 设置 8：LAN 加速（Qsync「Enable LAN sync」，qxync 是自研协议） ---------------- -->
         <div class="settings-sec" id="sec-lan" role="tabpanel" aria-labelledby="sec-tab-lan">
           <div class="card">
             <h2>LAN 加速（LAN sync）</h2>
@@ -719,7 +779,7 @@
           </div>
         </div>
 
-        <!-- ---------------- 设置 8：关于 ---------------- -->
+        <!-- ---------------- 设置 9：关于 ---------------- -->
         <div class="settings-sec" id="sec-about" role="tabpanel" aria-labelledby="sec-tab-about">
           <div class="card">
             <h2>关于 / 快捷出口</h2>

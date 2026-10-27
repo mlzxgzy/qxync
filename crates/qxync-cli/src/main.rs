@@ -323,6 +323,20 @@ enum Cmd {
         json: bool,
     },
 
+    /// ★ M39：日志目录占用 / 轮转策略；`--prune` 立即按策略清理
+    ///
+    /// 不带 `--prune` 只读（目录、总占用、单文件上限、保留天数、文件表）。
+    /// 策略本身用 `qxync settings --set log_max_file_mb=... log_keep_days=...` 改，
+    /// 保存后 daemon 会热生效并立刻清一次。
+    Log {
+        /// 立即按当前策略清理（删旧文件，不动正在写的那个）
+        #[arg(long)]
+        prune: bool,
+        /// 直接输出 JSON（脚本/验收用）
+        #[arg(long)]
+        json: bool,
+    },
+
     /// ★ M8.4：冲突待裁决队列（策略 = 每个文件都问我）
     ///
     /// 一次只能做一件事：`--resolve` / `--forget` / `--diff` / `--clear` 互斥。
@@ -995,7 +1009,10 @@ async fn main() -> Result<()> {
                 )?;
                 st.save(&paths)?;
                 saved = true;
-                eprintln!("⚠️ 直连模式：设置已写入文件；正在运行的 daemon 要重启才会读到代理/释放空间的新值");
+                eprintln!(
+                    "⚠️ 直连模式：设置已写入文件；正在运行的 daemon 要重启才会读到代理/释放空间/日志策略的新值\
+                     （走 daemon 的 `qxync settings` 会热生效并立即清理一次旧日志）"
+                );
                 // ★ M23：直连写文件绕过了 daemon 的 Baloo 门禁 —— 这里必须把
                 //   前置条件说清楚，否则用户开了 dolphin_tags 却没排除索引，
                 //   daemon 重启后 tags 不会生效（挂载时按安全条件算过）。
@@ -1015,6 +1032,7 @@ async fn main() -> Result<()> {
         | Cmd::Sync { .. }
         | Cmd::Dehydrate { .. }
         | Cmd::Space { .. }
+        | Cmd::Log { .. }
         | Cmd::BalooStatus { .. }
         | Cmd::Conflicts { .. }
         | Cmd::FileStates { .. }
@@ -1024,7 +1042,7 @@ async fn main() -> Result<()> {
         | Cmd::Task { .. }
         | Cmd::Journal { .. }
         | Cmd::Peer { .. } => {
-            bail!("`pin`/`state`/`sync`/`dehydrate`/`space`/`baloo-status`/`conflicts`/`file-states`/`store`/`roots`/`rules`/`task`/`peer` 需要 daemon：先 `qxync daemon start`（或用 --socket 指向运行中的 daemon）");
+            bail!("`pin`/`state`/`sync`/`dehydrate`/`space`/`baloo-status`/`log`/`conflicts`/`file-states`/`store`/`roots`/`rules`/`task`/`peer` 需要 daemon：先 `qxync daemon start`（或用 --socket 指向运行中的 daemon）");
         }
         Cmd::Rm { dir, name } => {
             let (client, _) = connect(&cli, true).await?;
@@ -1479,6 +1497,10 @@ fn to_request(cli: &Cli) -> Option<Request> {
         Cmd::Store { integrity, .. } => Request::Store {
             integrity: Some(*integrity),
         },
+        // ★ M39：日志目录/策略（`prune` 决定是否真的删）
+        Cmd::Log { prune, .. } => Request::Logs {
+            prune: Some(*prune),
+        },
         Cmd::Dehydrate {
             path,
             all,
@@ -1795,6 +1817,19 @@ async fn route_via_daemon(
                 print_baloo_status(&d);
             }
         }
+        Cmd::Log { prune, json } => {
+            let d: qxync_core::ipc::LogsData = ipc_client::call(&socket, req).await?;
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&d).map_err(|e| {
+                        qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string())
+                    })?
+                );
+            } else {
+                print_logs(&d, *prune);
+            }
+        }
         Cmd::Conflicts { json, diff, .. } => {
             // diff 返回的是另一种结构，别按 DecisionsData 解
             if diff.is_some() {
@@ -2059,6 +2094,10 @@ fn print_settings(st: &Settings, paths: &ConfigPaths, json: bool, saved: bool) -
         if st.dolphin_overlay { "开" } else { "关" }
     );
     println!(
+        "日志策略  : 单文件 {} MB  保留 {} 天  总量上限 {} MB（0 = 该字段不限制；占用见 `qxync log`）",
+        st.log_max_file_mb, st.log_keep_days, st.log_max_total_mb
+    );
+    println!(
         "释放空间  : {}（{}{}）",
         if st.free_space.auto {
             "自动"
@@ -2118,6 +2157,10 @@ fn print_settings_data(d: &SettingsData) {
         "Dolphin   : Tags 列={} 角标={}（user.xdg.tags / user.qxync.overlay；开启前挂载点须排除出 Baloo 索引，见 `qxync baloo-status`）",
         if st.dolphin_tags { "开" } else { "关" },
         if st.dolphin_overlay { "开" } else { "关" }
+    );
+    println!(
+        "日志策略  : 单文件 {} MB  保留 {} 天  总量上限 {} MB（0 = 该字段不限制；占用见 `qxync log`）",
+        st.log_max_file_mb, st.log_keep_days, st.log_max_total_mb
     );
     println!(
         "释放空间  : {}（{}）",
@@ -2265,6 +2308,78 @@ fn print_baloo_status(d: &qxync_core::ipc::BalooStatusData) {
             "❌ 不行 —— 先按上面的命令排除，再重试"
         }
     );
+}
+
+/// unix 秒 → 本地 `YYYY-MM-DD HH:MM:SS`（`libc::localtime_r`，与日志文件名同源）。
+fn format_unix_secs(secs: i64) -> String {
+    let t = secs as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        return format!("{secs}");
+    }
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec
+    )
+}
+
+/// ★ M39：`qxync log` 的人读报告。
+fn print_logs(d: &qxync_core::ipc::LogsData, pruned: bool) {
+    println!("日志目录  : {}", d.dir);
+    println!(
+        "当前占用  : {}（{} 个文件）",
+        human_size(d.total_bytes),
+        d.file_count
+    );
+    println!(
+        "轮转策略  : 单文件 {} MB  保留 {} 天  总量上限 {} MB{}",
+        d.max_file_mb,
+        d.keep_days,
+        d.max_total_mb,
+        "（0 = 该项不限制；改策略：qxync settings --set log_keep_days=7）"
+    );
+    if pruned {
+        if d.deleted == 0 && d.failed.is_empty() {
+            println!("清理结果  : 没有可清理的文件");
+        } else {
+            println!(
+                "清理结果  : 删除 {} 个文件，释放 {}",
+                d.deleted,
+                human_size(d.freed_bytes)
+            );
+        }
+    }
+    if d.files.is_empty() {
+        println!("文件      : （空）");
+    } else {
+        println!("文件      : （按大小降序，最多 {} 条）", d.files.len());
+        for f in &d.files {
+            let when = if f.mtime > 0 {
+                format_unix_secs(f.mtime)
+            } else {
+                "-".into()
+            };
+            println!("  {:>10}  {}  {}", human_size(f.size), when, f.name);
+        }
+    }
+    if !d.in_use.is_empty() {
+        // 「跳过」不是失败：这些文件还有进程开着（daemon/GUI 正在写），不能删。
+        println!("跳过（正被写入）:");
+        for p in &d.in_use {
+            println!("  {p}");
+        }
+    }
+    if !d.failed.is_empty() {
+        println!("⚠️ 没删掉的:");
+        for e in &d.failed {
+            println!("  {e}");
+        }
+    }
 }
 
 /// 冲突待裁决队列。

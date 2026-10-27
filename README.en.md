@@ -52,6 +52,10 @@ and `qxync-gui` (desktop GUI).
 - **LAN direct**: qxync↔qxync transfers directly on the same LAN, with silent fallback to the NAS
 - **Desktop GUI**: an overview, task list, file browser, update center, error list, settings and
   diagnostics, plus tray, notifications and autostart
+- **Logs cannot run away**: logs rotate by day **and by size** (32 MiB per file by default);
+  files older than 14 days or beyond 256 MiB are pruned automatically. `qxync log` shows usage,
+  `qxync log --prune` cleans now, and Settings → Logs in the GUI edits the same policy
+  ([M39](docs/M39-日志轮转与保留.md))
 
 ## Screenshots
 
