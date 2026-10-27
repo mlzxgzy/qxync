@@ -1386,4 +1386,39 @@ mod tests {
             s["logs"]
         );
     }
+
+    /// ★ M40：多路径 UI 必须真的接上 —— 连接表单的备选路径输入 + 诊断页的多路径表。
+    ///
+    /// 只查「有没有按钮」不够：少一个 `f-endpoints` 等于用户根本配不了多路径；
+    /// 少一个 `refreshRoutes` / `tbl-routes` 等于「多路径」页是空的。
+    #[test]
+    fn m40_multipath_page_is_wired() {
+        let index = include_str!("../ui/index.html");
+        let app = include_str!("../ui/app.js");
+        for needle in [
+            "id=\"f-endpoints\"",
+            "id=\"diag-tab-routes\"",
+            "id=\"panel-routes\"",
+            "id=\"tbl-routes\"",
+            "id=\"btn-routes-refresh\"",
+            "id=\"btn-routes-probe\"",
+            "data-i18n=\"routes.col_dns\"",
+        ] {
+            assert!(index.contains(needle), "index.html 缺少 {needle}");
+        }
+        for needle in [
+            "function refreshRoutes(",
+            "function endpointsFromText(",
+            "function renderRoutes(",
+            "'f-endpoints'",
+            "'routes-probe-busy'",
+        ] {
+            assert!(app.contains(needle), "app.js 缺少 {needle}");
+        }
+        // IPC 方法名必须是 routes，且 probe 只在「检测全部路径」时传 true。
+        assert!(
+            app.contains("method: 'routes'"),
+            "app.js 没有调用 routes IPC"
+        );
+    }
 }

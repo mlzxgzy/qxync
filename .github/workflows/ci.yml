@@ -93,6 +93,13 @@ jobs:
       - name: M20 离线状态 / 缓冲区 e2e（隔离 XDG）
         run: bash xtask/tests/m20-offline.sh
 
+      # ★ M40：多路径连接（内网 / 公网 / DDNS）的隔离 e2e —— Python 假 NAS + 隔离 XDG。
+      # 覆盖额外路径优先、失败自动切路、优先路径恢复自动切回、DDNS 主机名解析分类、
+      # NAS 身份守卫（错误 NAS 被 blocked）、旧配置行为不变、全路径不可达离线、
+      # daemon 不在时 `routes --probe` 直连回落。不需要真实 NAS / /dev/fuse。
+      - name: M40 多路径 e2e（隔离 XDG）
+        run: bash xtask/tests/m40-multipath.sh
+
       # ★ M21：离线可重启 daemon 的隔离 e2e —— 假 NAS（127.0.0.1:9）+ 真 FUSE 挂载。
       # 断言：离线启动后挂载点从 mounts.json + listings 表恢复、离线 ls / 写缓冲、
       # 第二次离线重启幂等。需要 /dev/fuse 与 python3，缺任一自动 SKIP。

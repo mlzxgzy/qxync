@@ -48,6 +48,9 @@ and `qxync-gui` (desktop GUI).
   mounted; whether they are writable is decided by the NAS
 - **Multiple NAS boxes**: one independent daemon per connection; mount and sync several NAS
   devices at once
+- **Multi-path / DDNS**: one connection can carry LAN, WAN and DDNS access paths; the first
+  reachable one wins, a dead path fails over automatically, and `qxync routes --probe`
+  diagnoses DNS reachability path by path ([M40](docs/M40-多路径与DDNS.md))
 - **Two-step verification**: supports TOTP (authenticator apps) in QNAP's 2SV
 - **LAN direct**: qxync↔qxync transfers directly on the same LAN, with silent fallback to the NAS
 - **Desktop GUI**: an overview, task list, file browser, update center, error list, settings and

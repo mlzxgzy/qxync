@@ -15,13 +15,14 @@
 use futures_util::StreamExt;
 use qxync_core::{
     build_query, encode_query_value, model::parse_listing, parse_max_log, parse_nas_uid,
-    parse_sync_log, DirEntry, Error, LinkConfig, Listing, MaxLog, NasUid, ProxySettings, ProxySpec,
-    Result, ServerStatus, Settings, SyncLogBatch,
+    parse_sync_log, DirEntry, Endpoint, Error, LinkConfig, Listing, MaxLog, NasUid, ProxySettings,
+    ProxySpec, Result, ServerStatus, Settings, SyncLogBatch,
 };
+use std::net::IpAddr;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// `get_list` 的默认单页容量（对应服务端 `Max_File_List`）。
 ///
@@ -49,6 +50,17 @@ pub mod write_action {
 /// ★ M7：LAN 对等协议（设备配对 / 事件快路径 / 直传）。
 pub mod peer;
 
+/// ★ M40：多路径路由表（内网 / 公网 / DDNS 自动切换）。
+pub mod route;
+
+pub use route::{RouteProbe, Router};
+
+/// ★ M40：单条路径一次探测的硬上限（DNS + HTTP 总计）。
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// ★ M40：探测专用客户端的**总超时**上限（更短的按调用方传入的 timeout 走）。
+const PROBE_TIMEOUT_MAX: Duration = Duration::from_secs(3);
+
 // ---------------------------------------------------------------- M30 错误文案与重试
 
 /// 幂等 GET 的**最多尝试次数**（首次 + 2 次重试）。
@@ -66,6 +78,47 @@ const GET_MAX_ATTEMPTS: u32 = 3;
 
 /// 首次重试前的等待（之后每次 ×3：200ms、600ms）。
 const GET_RETRY_BACKOFF: Duration = Duration::from_millis(200);
+
+/// 构造一个 HTTP 客户端（正常请求 / 探测共用同一套 TLS/代理/IPv4 配置）。
+fn build_http(
+    link: &LinkConfig,
+    proxy: Option<&ProxySettings>,
+    connect_timeout: Duration,
+    request_timeout: Duration,
+) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .danger_accept_invalid_certs(link.insecure)
+        .timeout(request_timeout)
+        .connect_timeout(connect_timeout)
+        .user_agent(concat!(
+            "qxync/",
+            env!("CARGO_PKG_VERSION"),
+            " (qxync-client)"
+        ));
+    if let Some(p) = proxy {
+        match p.resolve()? {
+            // 显式关掉：reqwest 默认会读环境变量，不显式关就关不掉
+            ProxySpec::None => builder = builder.no_proxy(),
+            // 自动检测 = reqwest 默认（环境变量）
+            ProxySpec::Auto => {}
+            ProxySpec::Manual { url, auth } => {
+                let mut pr = reqwest::Proxy::all(&url)
+                    .map_err(|e| Error::Transport(format!("代理地址无效 {url:?}: {e}")))?;
+                if let Some((user, pass)) = auth {
+                    pr = pr.basic_auth(&user, &pass);
+                }
+                builder = builder.proxy(pr);
+            }
+        }
+    }
+    if link.ipv4_only {
+        // 绑定 IPv4 源地址 → 只走 IPv4（Happy Eyeballs 在对端 IPv6 不通时会先失败）
+        builder = builder.local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    }
+    builder
+        .build()
+        .map_err(|e| Error::Transport(http_error_text(e)))
+}
 
 /// 把 `reqwest::Error` 压成一句**不含 URL / 远端路径**的人话。
 ///
@@ -151,8 +204,17 @@ impl Session {
 }
 
 pub struct Client {
-    http: reqwest::Client,
+    /// ★ M40：HTTP 客户端放进 `RwLock`，为了在 DDNS 换了 IP / 连接池里全是
+    /// 旧地址的死连接时能整体换一个新的（reqwest 的池按 host:port 复用，
+    /// 不换 client 就永远复用那条通往旧 IP 的连接）。
+    http: RwLock<reqwest::Client>,
+    /// ★ M40：探测专用客户端 —— 连接 2s / 总 3s。离线恢复检测不能等 20s。
+    probe_http: reqwest::Client,
     link: LinkConfig,
+    /// ★ M40：重建 `http` 时要用的代理设置（与构造时一致）。
+    proxy: Option<ProxySettings>,
+    /// ★ M40：多路径路由表；同一进程内的 daemon / 各挂载点共享同一个 `Arc`。
+    router: Arc<Router>,
     /// ★ M10：sid 放在 `Arc<RwLock<..>>` 里，**可热更新**。
     ///
     /// 挂载点持有的是同一个 [`Client`]（`Arc`）；daemon 重登之后把新 sid 直接塞回来，
@@ -167,7 +229,7 @@ impl Client {
     /// 「无代理」与「手动代理」必须用 [`Client::new_with_proxy`]，因为 reqwest
     /// 默认会自己读环境变量 —— 不显式 `no_proxy()` 就关不掉。
     pub fn new(link: &LinkConfig) -> Result<Self> {
-        Self::build(link, None)
+        Self::build(link, None, None)
     }
 
     /// ★ M8.4：按全局设置里的代理策略构造。
@@ -177,51 +239,102 @@ impl Client {
 
     /// ★ M8.4：按 `ProxySettings` 构造（`None` = 不覆盖环境变量）。
     pub fn new_with_proxy(link: &LinkConfig, proxy: Option<&ProxySettings>) -> Result<Self> {
-        Self::build(link, proxy)
+        Self::build(link, proxy, None)
     }
 
-    fn build(link: &LinkConfig, proxy: Option<&ProxySettings>) -> Result<Self> {
-        let mut builder = reqwest::Client::builder()
-            .danger_accept_invalid_certs(link.insecure)
-            .timeout(Duration::from_secs(300))
-            .connect_timeout(Duration::from_secs(20))
-            .user_agent(concat!(
-                "qxync/",
-                env!("CARGO_PKG_VERSION"),
-                " (qxync-client)"
-            ));
-        if let Some(p) = proxy {
-            match p.resolve()? {
-                // 显式关掉：reqwest 默认会读环境变量，不显式关就关不掉
-                ProxySpec::None => builder = builder.no_proxy(),
-                // 自动检测 = reqwest 默认（环境变量）
-                ProxySpec::Auto => {}
-                ProxySpec::Manual { url, auth } => {
-                    let mut pr = reqwest::Proxy::all(&url)
-                        .map_err(|e| Error::Transport(format!("代理地址无效 {url:?}: {e}")))?;
-                    if let Some((user, pass)) = auth {
-                        pr = pr.basic_auth(&user, &pass);
-                    }
-                    builder = builder.proxy(pr);
-                }
-            }
-        }
-        if link.ipv4_only {
-            // 绑定 IPv4 源地址 → 只走 IPv4（Happy Eyeballs 在对端 IPv6 不通时会先失败）
-            builder = builder.local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-        }
-        let http = builder
-            .build()
-            .map_err(|e| Error::Transport(http_error_text(e)))?;
+    /// ★ M40：用共享路由表构造 —— daemon 的所有 Client（主 / 引擎 / 每个挂载点）
+    /// 必须传同一个 `Arc<Router>`，这样一次切路对全进程立即生效。
+    pub fn new_with_route(
+        link: &LinkConfig,
+        proxy: Option<&ProxySettings>,
+        router: Arc<Router>,
+    ) -> Result<Self> {
+        Self::build(link, proxy, Some(router))
+    }
+
+    fn build(
+        link: &LinkConfig,
+        proxy: Option<&ProxySettings>,
+        router: Option<Arc<Router>>,
+    ) -> Result<Self> {
+        // ★ M40：多路径时把连接超时从 20s 降到 8s —— 一条被黑洞的 LAN 路径
+        // 不该让「切到 DDNS」等 20 秒。单路径（旧配置）保持 20s 不变。
+        let multi = link.endpoint_list().len() > 1;
+        let connect_timeout = if multi {
+            Duration::from_secs(8)
+        } else {
+            Duration::from_secs(20)
+        };
+        let http = build_http(link, proxy, connect_timeout, Duration::from_secs(300))?;
+        let probe_http = build_http(link, proxy, Duration::from_secs(2), PROBE_TIMEOUT_MAX)?;
+        let router = router.unwrap_or_else(|| Router::shared(link));
         Ok(Self {
-            http,
+            http: RwLock::new(http),
+            probe_http,
             link: link.clone(),
+            proxy: proxy.cloned(),
+            router,
             sid: Arc::new(RwLock::new(None)),
         })
     }
 
     pub fn link(&self) -> &LinkConfig {
         &self.link
+    }
+
+    /// ★ M40：共享路由表（诊断 / daemon 注入 / 单测用）。
+    pub fn router(&self) -> &Arc<Router> {
+        &self.router
+    }
+
+    /// ★ M40：当前实际在用的路径根 URL。
+    pub fn base_url(&self) -> String {
+        self.router.base_url()
+    }
+
+    /// 取一个 HTTP client 句柄（`reqwest::Client` 内部是 `Arc`，克隆很便宜）。
+    fn http(&self) -> reqwest::Client {
+        self.http.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// ★ M40：换一个全新的连接池（DDNS 解析结果变了 / 旧池全是死连接时）。
+    ///
+    /// 失败只记 debug：换池是自愈手段，不该把一次本来能成功的请求变成错误 ——
+    /// 调用方随后照常用旧 client 重试即可。
+    fn refresh_http(&self) {
+        match build_http(
+            &self.link,
+            self.proxy.as_ref(),
+            if self.link.endpoint_list().len() > 1 {
+                Duration::from_secs(8)
+            } else {
+                Duration::from_secs(20)
+            },
+            Duration::from_secs(300),
+        ) {
+            Ok(fresh) => {
+                *self.http.write().unwrap_or_else(|e| e.into_inner()) = fresh;
+                tracing::debug!("多路径：已重建 HTTP 连接池（丢弃旧 DNS/连接缓存）");
+            }
+            Err(e) => tracing::debug!("多路径：重建 HTTP 连接池失败（继续用旧池）: {e}"),
+        }
+    }
+
+    /// ★ M40：所有路径都失败后，如果目标是域名（DDNS），换一个新连接池再试一次。
+    ///
+    /// 为什么需要：reqwest 的连接池按 `host:port` 复用。DDNS 把一个域名改到新 IP 后，
+    /// 池里通往旧 IP 的死连接会一直被取出来用 —— 重建 client 才会重新解析。
+    /// 只对域名做（IP 字面量的「解析」没有意义）；每次操作最多做一次。
+    fn refresh_dns_once(&self, refreshed: &mut bool) -> bool {
+        if *refreshed {
+            return false;
+        }
+        if qxync_core::is_ip_literal(&self.router.active().host) {
+            return false;
+        }
+        *refreshed = true;
+        self.refresh_http();
+        true
     }
 
     /// 当前 sid（**克隆**出去，因为它是热更新的）。
@@ -248,8 +361,14 @@ impl Client {
     }
 
     /// 拼 URL：查询串自己编码（空格必须是 `%20`）。
+    ///
+    /// ★ M40：base URL 来自路由表的当前 active 路径，而不是 `link.base_url()`。
     fn url(&self, path: &str, query: &[(&str, &str)]) -> String {
-        let mut u = format!("{}/{}", self.link.base_url(), path.trim_start_matches('/'));
+        let mut u = format!(
+            "{}/{}",
+            self.router.base_url(),
+            path.trim_start_matches('/')
+        );
         if !query.is_empty() {
             u.push('?');
             u.push_str(&build_query(query));
@@ -295,6 +414,55 @@ impl Client {
             Some(raw) => Some(qxync_core::totp::normalize_otp(raw)?),
             None => None,
         };
+
+        // ★ M40：第一次登录前先探一次全部路径，避免「LAN 被黑洞 → 白等 8 秒」
+        //   才切到公网。只有一条路径时 `needs_initial_probe()` 为 false，旧行为不变。
+        if self.router.needs_initial_probe() {
+            self.probe_all_routes(PROBE_TIMEOUT).await;
+        }
+
+        // ★ M40：登录是「没登录之前唯一的网络入口」，必须逐路径试。
+        //   只有 `Transport` 才换路；`Auth`（口令/2SV 错）换一百条路也没用。
+        let routes = self.router.endpoint_count().max(1);
+        let max_attempts = routes + 1; // 多出来的一次留给「DDNS 换池重试」
+        let mut last: Option<Error> = None;
+        let mut refreshed = false;
+        let mut attempts = 0;
+        while attempts < max_attempts {
+            attempts += 1;
+            let idx_before = self.router.active_index();
+            self.clear_sid();
+            match self.login_once(user, password, otp.as_ref()).await {
+                Ok(session) => return Ok(session),
+                Err(e) => {
+                    let transport = matches!(e, Error::Transport(_));
+                    last = Some(e);
+                    if !transport {
+                        break;
+                    }
+                    let moved = self.router.active_index() != idx_before;
+                    if moved {
+                        tracing::debug!("登录失败，已切到另一条路径重试");
+                        continue;
+                    }
+                    if self.refresh_dns_once(&mut refreshed) {
+                        tracing::debug!("登录失败，域名可能换了 IP：重建连接池后重试");
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| Error::Transport("登录失败：没有可用路径".into())))
+    }
+
+    /// 在一次 login 流程里按当前 active 路径完成（2SV 两步 + NAS UID）。
+    async fn login_once(
+        &mut self,
+        user: &str,
+        password: &str,
+        otp: Option<&qxync_core::totp::Otp>,
+    ) -> Result<Session> {
         let first = self.auth_login(user, password, None).await?;
         let passed = xml_text(&first, "authPassed").unwrap_or("0");
         let need_2sv = xml_text(&first, "need_2_step_verification")
@@ -304,9 +472,9 @@ impl Client {
         let (text, two_step) = if passed == "1" {
             (first, false)
         } else if need_2sv == "1" {
-            let code = match &otp {
-                Some(qxync_core::totp::Otp::Code(code)) => code.clone(),
-                Some(qxync_core::totp::Otp::Secret(secret)) => qxync_core::totp::code_now(secret)?,
+            let code = match otp {
+                Some(qxync_core::Otp::Code(code)) => code.to_string(),
+                Some(qxync_core::Otp::Secret(secret)) => qxync_core::totp::code_now(secret)?,
                 None => {
                     return Err(Error::Auth(format!(
                         "该账号已开启两步验证（2SV），但这次没有提供验证码或 TOTP 密钥\
@@ -392,13 +560,14 @@ impl Client {
         }
         let url = self.url("cgi-bin/authLogin.cgi", &[]);
         let resp = self
-            .http
-            .post(&url)
-            .header("X-Forwarded-For", "127.0.0.1")
-            .form(&body)
-            .send()
-            .await
-            .map_err(|e| Error::Transport(format!("authLogin.cgi: {}", http_error_text(e))))?;
+            .send_once(
+                "authLogin.cgi",
+                self.http()
+                    .post(&url)
+                    .header("X-Forwarded-For", "127.0.0.1")
+                    .form(&body),
+            )
+            .await?;
         let status = resp.status();
         let text = resp
             .text()
@@ -430,7 +599,7 @@ impl Client {
                 "cgi-bin/qsync/qsyncsrv_logout.cgi",
                 &[("sid", sid.as_str()), ("logout", "1")],
             );
-            let _ = self.http.get(&url).send().await;
+            let _ = self.http().get(&url).send().await;
         }
         Ok(())
     }
@@ -481,14 +650,26 @@ impl Client {
     /// connect timeout（20s），每 3 秒一轮的探活会被它拖成 20+ 秒一轮，恢复延迟
     /// 反而比旧版还差。先探网络，通了再登录/flush。
     pub async fn probe_network(&self, timeout: std::time::Duration) -> bool {
-        matches!(
-            self.http
-                .get(self.link.base_url())
-                .timeout(timeout)
-                .send()
-                .await,
-            Ok(_)
-        )
+        // ★ M40：探活走**当前 active 路径**与短超时 client；结果记进路由表，
+        //   `qxync routes` 不用再额外发包就能看到最近一次结果。
+        let idx = self.router.active_index();
+        let started = Instant::now();
+        match self
+            .probe_http
+            .get(self.router.base_url())
+            .timeout(timeout)
+            .send()
+            .await
+        {
+            Ok(_) => {
+                self.router.record_success(idx, Some(started.elapsed()));
+                true
+            }
+            Err(e) => {
+                self.router.record_failure(idx, &http_error_text_ref(&e));
+                false
+            }
+        }
     }
 
     /// ★ M20：**离线时的短探活** —— 用给定的短超时打一次 `qbox_get_max_log`。
@@ -508,7 +689,7 @@ impl Client {
             &[("func", "qbox_get_max_log"), ("sid", sid.as_str())],
         );
         let resp = self
-            .http
+            .probe_http
             .get(&url)
             .timeout(timeout)
             .send()
@@ -602,7 +783,7 @@ impl Client {
     /// 正常业务代码请用上面那些有语义的封装。
     pub async fn raw_get(&self, url: &str) -> Result<(u16, Vec<u8>)> {
         let resp = self
-            .http
+            .http()
             .get(url)
             .send()
             .await
@@ -620,23 +801,166 @@ impl Client {
         self.url(cgi, query)
     }
 
+    // ---------------------------------------------------------------- ★ M40 多路径
+
+    /// 并行探测**全部**路径：DNS 解析 + 一次 HTTP GET（3s 级别）。
+    ///
+    /// 结果会写回路由表（成功/失败/解析记录/选路），并原样返回给诊断命令。
+    /// 单条路径失败**不影响**其他路径；`join_all` 保证总耗时 ≈ 最慢的一条。
+    ///
+    /// 注意：这里用**探测专用**短超时 client（连接 2s / 总 3s），不是业务请求的
+    /// 20s/8s —— 用户点「检测多路径」时不该等一分钟。
+    pub async fn probe_all_routes(&self, timeout: Duration) -> Vec<RouteProbe> {
+        let endpoints = self.router.endpoints();
+        let mut futures = Vec::with_capacity(endpoints.len());
+        for (index, endpoint) in endpoints.into_iter().enumerate() {
+            futures.push(self.probe_one(index, endpoint, timeout));
+        }
+        let mut probes = futures_util::future::join_all(futures).await;
+        self.router.note_probes(&mut probes);
+        probes
+    }
+
+    /// 探一条路径。**永远返回 `RouteProbe`，不抛错**：一条路径的失败是诊断信息，
+    /// 不是整个探测命令的失败。
+    async fn probe_one(&self, index: usize, endpoint: Endpoint, timeout: Duration) -> RouteProbe {
+        let started = Instant::now();
+        let mut probe = RouteProbe {
+            index,
+            endpoint: endpoint.clone(),
+            resolved: Vec::new(),
+            resolve_error: None,
+            resolved_changed: false,
+            http_ok: false,
+            http_status: None,
+            latency_ms: None,
+            error: None,
+        };
+        // 1) DNS（IP 字面量也会走一遍 lookup_host，结果就是它自己）
+        match tokio::time::timeout(
+            timeout,
+            tokio::net::lookup_host((endpoint.host.as_str(), endpoint.port)),
+        )
+        .await
+        {
+            Ok(Ok(addrs)) => {
+                let mut ips: Vec<IpAddr> = Vec::new();
+                for a in addrs {
+                    if !ips.contains(&a.ip()) {
+                        ips.push(a.ip());
+                    }
+                }
+                probe.resolved = ips;
+            }
+            Ok(Err(e)) => probe.resolve_error = Some(format!("解析失败：{e}")),
+            Err(_) => probe.resolve_error = Some("解析超时".into()),
+        }
+        // 2) HTTP 可达性：任何「服务端在回话」的状态都算通，但网关/代理的
+        //    502/503/504 例外 —— 那说明上游根本没连上，这条路径不算可用。
+        let url = endpoint.base_url();
+        match self.probe_http.get(&url).timeout(timeout).send().await {
+            Ok(resp) => {
+                let code = resp.status().as_u16();
+                probe.http_status = Some(code);
+                if matches!(code, 502 | 503 | 504) {
+                    probe.error = Some(format!("HTTP {code}（网关/代理上游失败）"));
+                } else {
+                    probe.http_ok = true;
+                }
+            }
+            Err(e) => {
+                probe.error = Some(http_error_text_ref(&e));
+            }
+        }
+        probe.latency_ms = Some(started.elapsed().as_millis() as u64);
+        // 解析失败 + HTTP 也不通时，错误里保留解析原因（更接近根因）
+        if !probe.http_ok {
+            if let (Some(err), Some(resolve)) = (&probe.error, &probe.resolve_error) {
+                probe.error = Some(format!("{resolve}；{err}"));
+            } else if probe.error.is_none() {
+                probe.error = probe.resolve_error.clone();
+            }
+        }
+        probe
+    }
+
+    /// ★ M40：发一次请求并把结果记进路由表（成功/失败）。不重试。
+    async fn send_once(
+        &self,
+        what: &str,
+        builder: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response> {
+        let idx = self.router.active_index();
+        let started = Instant::now();
+        match builder.send().await {
+            Ok(resp) => {
+                self.router.record_success(idx, Some(started.elapsed()));
+                Ok(resp)
+            }
+            Err(e) => {
+                let msg = format!("{what}: {}", http_error_text(e));
+                self.router.record_failure(idx, &msg);
+                Err(Error::Transport(msg))
+            }
+        }
+    }
+
     /// 发一次**幂等** GET：对端提前关连接 / 反代 502 这类抖动自动重试
-    /// （见 [`GET_MAX_ATTEMPTS`] 与 [`is_transient_send_error`]）。
+    /// （见 [`GET_MAX_ATTEMPTS`] 与 [`is_transient_send_error`]），失败后自动换路径。
     ///
     /// 传 `what` 而不是完整 URL：错误文案里只留「哪一跳失败」，
     /// URL 里的 sid 与远端路径不外泄（见 [`http_error_text`]）。
-    async fn send_get(&self, what: &str, url: &str) -> Result<reqwest::Response> {
+    async fn send_get(
+        &self,
+        what: &str,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> Result<reqwest::Response> {
+        let routes = self.router.endpoint_count().max(1);
+        let max_attempts = routes + 1; // 多出来的一次留给「DDNS 换池重试」
+        let mut last: Option<Error> = None;
+        let mut refreshed = false;
+        let mut attempts = 0;
+        while attempts < max_attempts {
+            attempts += 1;
+            let idx = self.router.active_index();
+            let url = self.url(path, query);
+            match self.send_get_on(what, idx, &url).await {
+                Ok(resp) => return Ok(resp),
+                Err(e) => {
+                    last = Some(e);
+                    // 只有「确实换到另一条路径」才继续；全部冷却时不再空转
+                    let moved = self.router.active_index() != idx;
+                    if moved {
+                        continue;
+                    }
+                    if self.refresh_dns_once(&mut refreshed) {
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| Error::Transport(format!("{what}: 没有可用路径"))))
+    }
+
+    /// 在**一条**路径上做抖动重试（不改路径）；最终失败时记进路由表。
+    async fn send_get_on(&self, what: &str, idx: usize, url: &str) -> Result<reqwest::Response> {
         let mut backoff = GET_RETRY_BACKOFF;
         for attempt in 1..=GET_MAX_ATTEMPTS {
             let last = attempt == GET_MAX_ATTEMPTS;
-            match self.http.get(url).send().await {
+            let started = Instant::now();
+            match self.http().get(url).send().await {
                 Ok(resp) if !last && is_transient_http_status(resp.status().as_u16()) => {
                     tracing::debug!(
                         "{what}: HTTP {}（反代/服务端忙），{backoff:?} 后重试（第 {attempt}/{GET_MAX_ATTEMPTS} 次尝试）",
                         resp.status()
                     );
                 }
-                Ok(resp) => return Ok(resp),
+                Ok(resp) => {
+                    self.router.record_success(idx, Some(started.elapsed()));
+                    return Ok(resp);
+                }
                 Err(e) if !last && is_transient_send_error(&e) => {
                     tracing::debug!(
                         "{what}: {}，{backoff:?} 后重试（第 {attempt}/{GET_MAX_ATTEMPTS} 次尝试）",
@@ -644,7 +968,9 @@ impl Client {
                     );
                 }
                 Err(e) => {
-                    return Err(Error::Transport(format!("{what}: {}", http_error_text(e))));
+                    let msg = format!("{what}: {}", http_error_text(e));
+                    self.router.record_failure(idx, &msg);
+                    return Err(Error::Transport(msg));
                 }
             }
             tokio::time::sleep(backoff).await;
@@ -653,13 +979,45 @@ impl Client {
         unreachable!("send_get 的每个分支都会 return")
     }
 
+    /// ★ M40：非幂等 POST 的跨路径重试 —— **只重试 `is_connect()`**（TCP/TLS 都没
+    /// 建立起来，请求确定没发出去）。响应读到一半断开这类失败不重放，避免重复建
+    /// 目录 / 重复删除。
+    async fn send_post_retry_connect<F>(&self, what: &str, mut make: F) -> Result<reqwest::Response>
+    where
+        F: FnMut() -> reqwest::RequestBuilder,
+    {
+        let routes = self.router.endpoint_count().max(1);
+        for attempt in 0..routes {
+            let idx = self.router.active_index();
+            let started = Instant::now();
+            match make().send().await {
+                Ok(resp) => {
+                    self.router.record_success(idx, Some(started.elapsed()));
+                    return Ok(resp);
+                }
+                Err(e) => {
+                    let msg = format!("{what}: {}", http_error_text_ref(&e));
+                    let can_retry = e.is_connect() && attempt + 1 < routes;
+                    self.router.record_failure(idx, &msg);
+                    if can_retry && self.router.active_index() != idx {
+                        tracing::debug!("{what}: {}；换路径重试", msg);
+                        continue;
+                    }
+                    return Err(Error::Transport(msg));
+                }
+            }
+        }
+        Err(Error::Transport(format!("{what}: 没有可用路径")))
+    }
+
     /// 调 `qsyncsrv.cgi?func=…`，按给定键值原样发出去。
     async fn qsync_func(&self, func: &str, extra: &[(&str, &str)]) -> Result<Vec<u8>> {
         let sid = self.require_sid()?.to_string();
         let mut q: Vec<(&str, &str)> = vec![("func", func), ("sid", sid.as_str())];
         q.extend_from_slice(extra);
-        let url = self.url("cgi-bin/qsync/qsyncsrv.cgi", &q);
-        let resp = self.send_get(func, &url).await?;
+        let resp = self
+            .send_get(func, "cgi-bin/qsync/qsyncsrv.cgi", &q)
+            .await?;
         let code = resp.status();
         let body = resp
             .bytes()
@@ -682,7 +1040,7 @@ impl Client {
         q.extend_from_slice(query);
         let url = self.url("cgi-bin/qsync/qsyncsrv.cgi", &q);
         let resp = self
-            .http
+            .http()
             .get(&url)
             .send()
             .await
@@ -745,23 +1103,22 @@ impl Client {
         let sid = self.require_sid()?.to_string();
         let start_s = start.to_string();
         let limit_s = limit.to_string();
-        let url = self.url(
-            "cgi-bin/qsync/qsyncsrv.cgi",
-            &[
-                ("func", "get_list"),
-                ("sid", sid.as_str()),
-                ("is_iso", "0"),
-                ("list_mode", "all"),
-                ("path", path),
-                ("dir", "ASC"),
-                ("limit", limit_s.as_str()),
-                ("sort", "filename"),
-                ("start", start_s.as_str()),
-                ("no_sort", "0"),
-                ("hidden_file", "1"),
-            ],
-        );
-        let resp = self.send_get("get_list", &url).await?;
+        let q: Vec<(&str, &str)> = vec![
+            ("func", "get_list"),
+            ("sid", sid.as_str()),
+            ("is_iso", "0"),
+            ("list_mode", "all"),
+            ("path", path),
+            ("dir", "ASC"),
+            ("limit", limit_s.as_str()),
+            ("sort", "filename"),
+            ("start", start_s.as_str()),
+            ("no_sort", "0"),
+            ("hidden_file", "1"),
+        ];
+        let resp = self
+            .send_get("get_list", "cgi-bin/qsync/qsyncsrv.cgi", &q)
+            .await?;
         // ★ HTTP 层失败**不能**当「目录是空的」：反代 502/504 的 JSON 错误体
         //   （如 `{"error":...}`）能通过 `Listing` 的全默认反序列化 + `ensure_ok`，
         //   于是被读成「0 项」→ 对账把该目录所有条目当成「远端已删」。
@@ -808,17 +1165,16 @@ impl Client {
     /// `func=stat`：**必须**是 `path=<所在目录>&file_name=<名字>&file_total=1`。
     pub async fn stat(&self, dir: &str, file_name: &str) -> Result<Option<DirEntry>> {
         let sid = self.require_sid()?.to_string();
-        let url = self.url(
-            "cgi-bin/qsync/qsyncsrv.cgi",
-            &[
-                ("func", "stat"),
-                ("sid", sid.as_str()),
-                ("path", dir),
-                ("file_name", file_name),
-                ("file_total", "1"),
-            ],
-        );
-        let resp = self.send_get("stat", &url).await?;
+        let q: Vec<(&str, &str)> = vec![
+            ("func", "stat"),
+            ("sid", sid.as_str()),
+            ("path", dir),
+            ("file_name", file_name),
+            ("file_total", "1"),
+        ];
+        let resp = self
+            .send_get("stat", "cgi-bin/qsync/qsyncsrv.cgi", &q)
+            .await?;
         // ★ stat 的 `Ok(None)` 会被对账当成「确认不存在」并据此删本地 ——
         //   HTTP 层失败绝不能长成「不存在」。
         if !resp.status().is_success() {
@@ -840,19 +1196,19 @@ impl Client {
 
     pub async fn mkdir(&self, parent: &str, name: &str) -> Result<()> {
         let sid = self.require_sid()?.to_string();
-        let url = self.url(
-            "cgi-bin/qsync/qsyncsrv.cgi",
-            &[("func", "createdir"), ("sid", sid.as_str())],
-        );
         // 注意：body 用 form 编码没问题（目录名里的空格在 body 里由 form 编码器处理，
         // 真机实测 `dest_folder` 可直接接受 UTF-8/空格）。
+        // ★ M40：只在「连接都没建立」时换路径重试，避免重复创建。
         let resp = self
-            .http
-            .post(&url)
-            .form(&[("dest_path", parent), ("dest_folder", name)])
-            .send()
-            .await
-            .map_err(|e| Error::Transport(format!("createdir: {}", http_error_text(e))))?;
+            .send_post_retry_connect("createdir", || {
+                self.http()
+                    .post(self.url(
+                        "cgi-bin/qsync/qsyncsrv.cgi",
+                        &[("func", "createdir"), ("sid", sid.as_str())],
+                    ))
+                    .form(&[("dest_path", parent), ("dest_folder", name)])
+            })
+            .await?;
         let body = resp
             .bytes()
             .await
@@ -896,42 +1252,79 @@ impl Client {
     ) -> Result<Vec<u8>> {
         checked_range(start, end)?;
         let sid = self.require_sid()?.to_string();
-        let url = self.url(
-            "cgi-bin/filemanager/utilRequest.cgi",
-            &self.filetool_query("download", dir, name, &sid),
-        );
-        let resp = self
-            .http
-            .get(&url)
-            .header("Range", format!("bytes={start}-{end}"))
-            .send()
-            .await
-            .map_err(|e| Error::Transport(format!("download {name}: {}", http_error_text(e))))?;
-        let code = resp.status().as_u16();
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| Error::Transport(http_error_text(e)))?;
-        if code != 200 && code != 206 {
-            return Err(Error::Transport(format!(
-                "download {dir}/{name}: HTTP {code}, body={}",
-                String::from_utf8_lossy(&body[..body.len().min(160)])
-            )));
+        let routes = self.router.endpoint_count().max(1);
+        let max_attempts = routes + 1; // 多出来的一次留给「DDNS 换池重试」
+        let mut last: Option<Error> = None;
+        let mut refreshed = false;
+        let mut attempts = 0;
+        while attempts < max_attempts {
+            attempts += 1;
+            let idx = self.router.active_index();
+            let url = self.url(
+                "cgi-bin/filemanager/utilRequest.cgi",
+                &self.filetool_query("download", dir, name, &sid),
+            );
+            let resp = match self
+                .http()
+                .get(&url)
+                .header("Range", format!("bytes={start}-{end}"))
+                .send()
+                .await
+            {
+                Ok(resp) => resp,
+                Err(e) => {
+                    let msg = format!("download {name}: {}", http_error_text_ref(&e));
+                    self.router.record_failure(idx, &msg);
+                    last = Some(Error::Transport(msg));
+                    if self.router.active_index() != idx {
+                        continue;
+                    }
+                    if self.refresh_dns_once(&mut refreshed) {
+                        continue;
+                    }
+                    break;
+                }
+            };
+            let code = resp.status().as_u16();
+            let body = match resp.bytes().await {
+                Ok(body) => body,
+                Err(e) => {
+                    let msg = http_error_text_ref(&e);
+                    self.router.record_failure(idx, &msg);
+                    last = Some(Error::Transport(msg));
+                    if self.router.active_index() != idx {
+                        continue;
+                    }
+                    if self.refresh_dns_once(&mut refreshed) {
+                        continue;
+                    }
+                    break;
+                }
+            };
+            self.router.record_success(idx, None);
+            if code != 200 && code != 206 {
+                return Err(Error::Transport(format!(
+                    "download {dir}/{name}: HTTP {code}, body={}",
+                    String::from_utf8_lossy(&body[..body.len().min(160)])
+                )));
+            }
+            // 服务端忽略 Range 时会回 200 + **整个文件**。长度不等于请求长度就说明拿到的
+            // 不是那一段 —— 绝不能当区间字节返回（FUSE 会把整文件写进区间缓存）。
+            if range_was_ignored(code, start, end, body.len()) {
+                return Err(Error::Transport(format!(
+                    "download {dir}/{name}: 服务端忽略了 Range（请求 bytes={start}-{end}，\
+                     实际回 {} 字节，看起来是整文件）",
+                    body.len()
+                )));
+            }
+            // 服务端出错时会用 200 + JSON 错误体，这里按内容再兜一层。
+            if let Some(e) = download_json_error(&body, &format!("download {dir}/{name}")) {
+                return Err(e);
+            }
+            return Ok(body.to_vec());
         }
-        // 服务端忽略 Range 时会回 200 + **整个文件**。长度不等于请求长度就说明拿到的
-        // 不是那一段 —— 绝不能当区间字节返回（FUSE 会把整文件写进区间缓存）。
-        if range_was_ignored(code, start, end, body.len()) {
-            return Err(Error::Transport(format!(
-                "download {dir}/{name}: 服务端忽略了 Range（请求 bytes={start}-{end}，\
-                 实际回 {} 字节，看起来是整文件）",
-                body.len()
-            )));
-        }
-        // 服务端出错时会用 200 + JSON 错误体，这里按内容再兜一层。
-        if let Some(e) = download_json_error(&body, &format!("download {dir}/{name}")) {
-            return Err(e);
-        }
-        Ok(body.to_vec())
+        Err(last
+            .unwrap_or_else(|| Error::Transport(format!("download {dir}/{name}: 没有可用路径"))))
     }
 
     /// 整文件下载到本地（流式；返回写入字节数）。
@@ -957,43 +1350,88 @@ impl Client {
         dest: &std::path::Path,
         progress: Option<&(dyn Fn(u64, Option<u64>) + Send + Sync)>,
     ) -> Result<u64> {
-        let sid = self.require_sid()?.to_string();
-        let url = self.url(
-            "cgi-bin/filemanager/utilRequest.cgi",
-            &self.filetool_query("download", dir, name, &sid),
-        );
-        let resp =
-            self.http.get(&url).send().await.map_err(|e| {
-                Error::Transport(format!("download {name}: {}", http_error_text(e)))
-            })?;
-        let code = resp.status().as_u16();
-        if code != 200 && code != 206 {
-            return Err(Error::Transport(format!(
-                "download {dir}/{name}: HTTP {code}"
-            )));
-        }
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
         let tmp = std::path::PathBuf::from(format!("{}.qxync-part", dest.display()));
-        let mut file = tokio::fs::File::create(&tmp).await?;
-        let mut written: u64 = 0;
-        let total = resp.content_length();
-        let mut stream = resp.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| Error::Transport(http_error_text(e)))?;
-            tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
-            written += chunk.len() as u64;
-            if let Some(cb) = progress {
-                cb(written, total);
+        let sid = self.require_sid()?.to_string();
+        let routes = self.router.endpoint_count().max(1);
+        let max_attempts = routes + 1; // 多出来的一次留给「DDNS 换池重试」
+        let mut last: Option<Error> = None;
+        let mut refreshed = false;
+        let mut attempts = 0;
+        while attempts < max_attempts {
+            attempts += 1;
+            let idx = self.router.active_index();
+            let url = self.url(
+                "cgi-bin/filemanager/utilRequest.cgi",
+                &self.filetool_query("download", dir, name, &sid),
+            );
+            let resp = match self.http().get(&url).send().await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    let msg = format!("download {name}: {}", http_error_text_ref(&e));
+                    self.router.record_failure(idx, &msg);
+                    last = Some(Error::Transport(msg));
+                    if self.router.active_index() != idx {
+                        continue;
+                    }
+                    if self.refresh_dns_once(&mut refreshed) {
+                        continue;
+                    }
+                    break;
+                }
+            };
+            let code = resp.status().as_u16();
+            if code != 200 && code != 206 {
+                return Err(Error::Transport(format!(
+                    "download {dir}/{name}: HTTP {code}"
+                )));
             }
+            // 每次尝试都从 0 写（失败重试不拼接残留分片）
+            let mut file = tokio::fs::File::create(&tmp).await?;
+            let mut written: u64 = 0;
+            let total = resp.content_length();
+            let mut stream = resp.bytes_stream();
+            let mut body_err: Option<Error> = None;
+            while let Some(chunk) = stream.next().await {
+                let chunk = match chunk {
+                    Ok(c) => c,
+                    Err(e) => {
+                        body_err = Some(Error::Transport(http_error_text_ref(&e)));
+                        break;
+                    }
+                };
+                tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
+                written += chunk.len() as u64;
+                if let Some(cb) = progress {
+                    cb(written, total);
+                }
+            }
+            if let Some(e) = body_err {
+                self.router.record_failure(idx, &e.to_string());
+                last = Some(e);
+                drop(file);
+                let _ = tokio::fs::remove_file(&tmp).await;
+                if self.router.active_index() != idx {
+                    continue;
+                }
+                if self.refresh_dns_once(&mut refreshed) {
+                    continue;
+                }
+                break;
+            }
+            self.router.record_success(idx, None);
+            tokio::io::AsyncWriteExt::flush(&mut file).await?;
+            file.sync_all().await?;
+            drop(file);
+            // 出错残留的 JSON 错误体会先落到临时文件里；调用方比对长度后再 rename。
+            tokio::fs::rename(&tmp, dest).await?;
+            return Ok(written);
         }
-        tokio::io::AsyncWriteExt::flush(&mut file).await?;
-        file.sync_all().await?;
-        drop(file);
-        // 出错残留的 JSON 错误体会先落到临时文件里；调用方比对长度后再 rename。
-        tokio::fs::rename(&tmp, dest).await?;
-        Ok(written)
+        let _ = tokio::fs::remove_file(&tmp).await;
+        Err(last
+            .unwrap_or_else(|| Error::Transport(format!("download {dir}/{name}: 没有可用路径"))))
     }
 
     /// 上传一个文件：`POST /cgi-bin/qsync/upload.php`，multipart 字段名必须是 `files[]`。
@@ -1007,32 +1445,64 @@ impl Client {
         bytes: Vec<u8>,
     ) -> Result<()> {
         let sid = self.require_sid()?.to_string();
-        let url = self.url(
-            "cgi-bin/qsync/upload.php",
-            &[
-                ("sid", sid.as_str()),
-                ("dest_path", dest_path),
-                ("overwrite", "1"),
-                ("type", "standard"),
-            ],
-        );
-        let part = reqwest::multipart::Part::bytes(bytes)
-            .file_name(filename.to_string())
-            .mime_str("application/octet-stream")
-            .map_err(|e| Error::Parse(e.to_string()))?;
-        let form = reqwest::multipart::Form::new().part("files[]", part);
-        let resp = self
-            .http
-            .post(&url)
-            .multipart(form)
-            .send()
-            .await
-            .map_err(|e| Error::Transport(format!("upload {filename}: {}", http_error_text(e))))?;
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| Error::Transport(http_error_text(e)))?;
-        parse_upload_result(&body, filename)
+        let routes = self.router.endpoint_count().max(1);
+        let max_attempts = routes + 1; // 多出来的一次留给「DDNS 换池重试」
+        let mut last: Option<Error> = None;
+        let mut refreshed = false;
+        let mut attempts = 0;
+        while attempts < max_attempts {
+            attempts += 1;
+            let idx = self.router.active_index();
+            let url = self.url(
+                "cgi-bin/qsync/upload.php",
+                &[
+                    ("sid", sid.as_str()),
+                    ("dest_path", dest_path),
+                    ("overwrite", "1"),
+                    ("type", "standard"),
+                ],
+            );
+            let part = reqwest::multipart::Part::bytes(bytes.clone())
+                .file_name(filename.to_string())
+                .mime_str("application/octet-stream")
+                .map_err(|e| Error::Parse(e.to_string()))?;
+            let form = reqwest::multipart::Form::new().part("files[]", part);
+            let resp = match self
+                .send_once("upload", self.http().post(&url).multipart(form))
+                .await
+            {
+                Ok(resp) => resp,
+                Err(e) if matches!(e, Error::Transport(_)) => {
+                    last = Some(e);
+                    if self.router.active_index() != idx {
+                        continue;
+                    }
+                    if self.refresh_dns_once(&mut refreshed) {
+                        continue;
+                    }
+                    break;
+                }
+                Err(e) => return Err(e),
+            };
+            let body = match resp.bytes().await {
+                Ok(body) => body,
+                Err(e) => {
+                    let msg = format!("upload {filename}: {}", http_error_text_ref(&e));
+                    self.router.record_failure(idx, &msg);
+                    last = Some(Error::Transport(msg));
+                    if self.router.active_index() != idx {
+                        continue;
+                    }
+                    if self.refresh_dns_once(&mut refreshed) {
+                        continue;
+                    }
+                    break;
+                }
+            };
+            parse_upload_result(&body, filename)?;
+            return Ok(());
+        }
+        Err(last.unwrap_or_else(|| Error::Transport(format!("upload {filename}: 没有可用路径"))))
     }
 
     /// ★ M15/T2：**流式**上传一个本地文件 —— 内存占用 O(块大小)，与文件大小无关。
@@ -1080,16 +1550,44 @@ impl Client {
         // 队列里剩了个指不到内容的作业，界面一直显示「网络断开」，而 NAS 明明通着
         // （登录、对账都正常），用户点「立即同步」也永远看不到恢复。
         //
-        // 长度必须**发之前**拿到：reqwest 据此决定发 Content-Length 还是 chunked。
-        let len = tokio::fs::metadata(local)
-            .await
-            .map_err(|e| Error::Io(format!("upload {filename}: stat {}: {e}", local.display())))?
-            .len();
-        let file = tokio::fs::File::open(local)
-            .await
-            .map_err(|e| Error::Io(format!("upload {filename}: 打开 {}: {e}", local.display())))?;
-        self.upload_stream_sized(dest_path, filename, file, len)
-            .await
+        // ★ M40：每次尝试都重新打开文件 —— 换路径重试时流式 body 必须重放。
+        let routes = self.router.endpoint_count().max(1);
+        let max_attempts = routes + 1; // 多出来的一次留给「DDNS 换池重试」
+        let mut last: Option<Error> = None;
+        let mut refreshed = false;
+        let mut attempts = 0;
+        while attempts < max_attempts {
+            attempts += 1;
+            let idx = self.router.active_index();
+            // 长度必须**发之前**拿到：reqwest 据此决定发 Content-Length 还是 chunked。
+            let len = tokio::fs::metadata(local)
+                .await
+                .map_err(|e| {
+                    Error::Io(format!("upload {filename}: stat {}: {e}", local.display()))
+                })?
+                .len();
+            let file = tokio::fs::File::open(local).await.map_err(|e| {
+                Error::Io(format!("upload {filename}: 打开 {}: {e}", local.display()))
+            })?;
+            match self
+                .upload_stream_sized(dest_path, filename, file, len)
+                .await
+            {
+                Ok(n) => return Ok(n),
+                Err(e) if matches!(e, Error::Transport(_)) => {
+                    last = Some(e);
+                    if self.router.active_index() != idx {
+                        continue;
+                    }
+                    if self.refresh_dns_once(&mut refreshed) {
+                        continue;
+                    }
+                    break;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| Error::Transport(format!("upload {filename}: 没有可用路径"))))
     }
 
     /// 同 [`Client::upload_file`]，但数据源是任意 [`AsyncRead`]，长度由调用方给。
@@ -1138,18 +1636,22 @@ impl Client {
         .mime_str("application/octet-stream")
         .map_err(|e| Error::Parse(e.to_string()))?;
         let form = reqwest::multipart::Form::new().part("files[]", part);
+        // ★ M40：流式 reader 不能重放，所以这里**不做跨路径重试**；只把结果
+        // 记进路由表，让上传队列的下一次尝试走已切换好的路径。
+        let idx = self.router.active_index();
         let resp = self
-            .http
-            .post(&url)
-            .multipart(form)
-            .send()
-            .await
-            .map_err(|e| Error::Transport(format!("upload {filename}: {}", http_error_text(e))))?;
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| Error::Transport(http_error_text(e)))?;
+            .send_once("upload", self.http().post(&url).multipart(form))
+            .await?;
+        let body = match resp.bytes().await {
+            Ok(body) => body,
+            Err(e) => {
+                let msg = format!("upload {filename}: {}", http_error_text_ref(&e));
+                self.router.record_failure(idx, &msg);
+                return Err(Error::Transport(msg));
+            }
+        };
         parse_upload_result(&body, filename)?;
+        self.router.record_success(idx, None);
         Ok(sent.load(Ordering::Relaxed))
     }
 
@@ -1157,19 +1659,18 @@ impl Client {
     pub async fn set_mtime(&self, dir: &str, name: &str, mtime: i64) -> Result<()> {
         let sid = self.require_sid()?.to_string();
         let mtime_s = mtime.to_string();
-        let url = self.url(
-            "cgi-bin/qsync/qsyncsrv.cgi",
-            &[
-                ("func", "stat"),
-                ("sid", sid.as_str()),
-                ("settime", "1"),
-                ("mtime", mtime_s.as_str()),
-                ("path", dir),
-                ("file_total", "1"),
-                ("file_name", name),
-            ],
-        );
-        let resp = self.send_get("settime", &url).await?;
+        let q: Vec<(&str, &str)> = vec![
+            ("func", "stat"),
+            ("sid", sid.as_str()),
+            ("settime", "1"),
+            ("mtime", mtime_s.as_str()),
+            ("path", dir),
+            ("file_total", "1"),
+            ("file_name", name),
+        ];
+        let resp = self
+            .send_get("settime", "cgi-bin/qsync/qsyncsrv.cgi", &q)
+            .await?;
         let body = resp
             .bytes()
             .await
@@ -1326,17 +1827,16 @@ impl Client {
     /// 大小写改名实测可直接成功（本机 NAS 不需要两阶段）。
     pub async fn rename(&self, dir: &str, from: &str, to: &str) -> Result<()> {
         let sid = self.require_sid()?.to_string();
-        let url = self.url(
-            "cgi-bin/filemanager/utilRequest.cgi",
-            &[("func", "rename"), ("sid", sid.as_str())],
-        );
         let resp = self
-            .http
-            .post(&url)
-            .form(&[("path", dir), ("source_name", from), ("dest_name", to)])
-            .send()
-            .await
-            .map_err(|e| Error::Transport(format!("rename: {}", http_error_text(e))))?;
+            .send_post_retry_connect("rename", || {
+                self.http()
+                    .post(self.url(
+                        "cgi-bin/filemanager/utilRequest.cgi",
+                        &[("func", "rename"), ("sid", sid.as_str())],
+                    ))
+                    .form(&[("path", dir), ("source_name", from), ("dest_name", to)])
+            })
+            .await?;
         let body = resp
             .bytes()
             .await
@@ -1355,23 +1855,22 @@ impl Client {
     /// 服务端异步执行并回 `{"status":1,"pid":N}`，这里轮询 `to_dir/from_name` 出现为止。
     pub async fn move_into(&self, from_dir: &str, from_name: &str, to_dir: &str) -> Result<()> {
         let sid = self.require_sid()?.to_string();
-        let url = self.url(
-            "cgi-bin/filemanager/utilRequest.cgi",
-            &[("func", "move"), ("sid", sid.as_str()), ("no_fork", "1")],
-        );
         let resp = self
-            .http
-            .post(&url)
-            .form(&[
-                ("source_path", from_dir),
-                ("source_file", from_name),
-                ("dest_path", to_dir),
-                ("dest_file", from_name),
-                ("source_total", "1"),
-            ])
-            .send()
-            .await
-            .map_err(|e| Error::Transport(format!("move: {}", http_error_text(e))))?;
+            .send_post_retry_connect("move", || {
+                self.http()
+                    .post(self.url(
+                        "cgi-bin/filemanager/utilRequest.cgi",
+                        &[("func", "move"), ("sid", sid.as_str()), ("no_fork", "1")],
+                    ))
+                    .form(&[
+                        ("source_path", from_dir),
+                        ("source_file", from_name),
+                        ("dest_path", to_dir),
+                        ("dest_file", from_name),
+                        ("source_total", "1"),
+                    ])
+            })
+            .await?;
         let body = resp
             .bytes()
             .await
@@ -1406,10 +1905,6 @@ impl Client {
             return Ok(());
         }
         let sid = self.require_sid()?.to_string();
-        let url = self.url(
-            "cgi-bin/qsync/qsyncsrv.cgi",
-            &[("func", "delete"), ("sid", sid.as_str())],
-        );
         // `file_total` 必须等于本批实际条目数，否则服务端只处理前 N 个。
         let mut form: Vec<(&str, String)> = vec![
             ("path", dir.to_string()),
@@ -1419,12 +1914,15 @@ impl Client {
             form.push(("file_name", n.to_string()));
         }
         let resp = self
-            .http
-            .post(&url)
-            .form(&form)
-            .send()
-            .await
-            .map_err(|e| Error::Transport(format!("delete: {}", http_error_text(e))))?;
+            .send_post_retry_connect("delete", || {
+                self.http()
+                    .post(self.url(
+                        "cgi-bin/qsync/qsyncsrv.cgi",
+                        &[("func", "delete"), ("sid", sid.as_str())],
+                    ))
+                    .form(&form)
+            })
+            .await?;
         let body = resp
             .bytes()
             .await
@@ -2318,6 +2816,8 @@ mod tests {
             filter_temp: true,
             peer_listen: None,
             peer_name: None,
+            endpoints: Vec::new(),
+            local_namespace: None,
         };
         let c = Client::new(&link).unwrap();
         let missing = std::env::temp_dir().join(format!(
@@ -2358,6 +2858,8 @@ mod tests {
             filter_temp: true,
             peer_listen: None,
             peer_name: None,
+            endpoints: Vec::new(),
+            local_namespace: None,
         };
         let c = Client::new(&link).unwrap();
         assert_eq!(c.sid(), None);
@@ -2673,5 +3175,197 @@ mod tests {
         assert_eq!(f[1].permission, 0, "解析不了的 permission → 0");
         assert!(f[1].read_deletable);
         assert_eq!(f[1].volume_id, None, "空串 volume_id → None");
+    }
+    // ---------------------------------------------------------------- ★ M40 多路径
+
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    /// 起一个最小 HTTP 假 NAS：对任何请求都回固定状态 + 固定 body。
+    async fn spawn_fake_nas(
+        status: u16,
+        body: &'static str,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 64 * 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let reason = if status == 200 { "OK" } else { "Partial" };
+                    let resp = format!(
+                        "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (addr, handle)
+    }
+
+    fn dead_addr() -> std::net::SocketAddr {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap()
+    }
+
+    fn ep(host: &str, port: u16) -> qxync_core::EndpointConfig {
+        qxync_core::EndpointConfig {
+            label: None,
+            host: host.into(),
+            port: Some(port),
+            https: Some(false),
+        }
+    }
+
+    fn m40_link(
+        primary: std::net::SocketAddr,
+        extras: Vec<qxync_core::EndpointConfig>,
+    ) -> LinkConfig {
+        LinkConfig {
+            id: "default".into(),
+            host: primary.ip().to_string(),
+            port: primary.port(),
+            https: false,
+            insecure: false,
+            user: "u".into(),
+            ipv4_only: true,
+            endpoints: extras,
+            local_namespace: None,
+            exclude: Vec::new(),
+            filter_temp: true,
+            peer_listen: None,
+            peer_name: None,
+        }
+    }
+
+    #[test]
+    fn m40_single_path_client_keeps_legacy_base_url() {
+        let link = LinkConfig {
+            id: "default".into(),
+            host: "nas.invalid".into(),
+            port: 9834,
+            https: true,
+            insecure: true,
+            user: "u".into(),
+            ipv4_only: false,
+            endpoints: Vec::new(),
+            local_namespace: None,
+            exclude: Vec::new(),
+            filter_temp: true,
+            peer_listen: None,
+            peer_name: None,
+        };
+        let c = Client::new(&link).unwrap();
+        assert_eq!(c.base_url(), "https://nas.invalid:9834");
+        assert_eq!(c.router().endpoint_count(), 1);
+        assert!(!c.router().needs_initial_probe());
+    }
+
+    #[tokio::test]
+    async fn m40_login_probes_and_falls_back_to_primary() {
+        let (alive, _h) = spawn_fake_nas(
+            200,
+            "<QDocRoot><authPassed>1</authPassed><authSid>sid-m40</authSid>\
+             <username>u</username></QDocRoot>",
+        )
+        .await;
+        let dead = dead_addr();
+        // 额外路径（死）在前、主地址（活）兜底
+        let link = m40_link(alive, vec![ep(&dead.ip().to_string(), dead.port())]);
+        let mut c = Client::new(&link).unwrap();
+        assert_eq!(
+            c.base_url(),
+            format!("http://{}:{}", dead.ip(), dead.port())
+        );
+        let session = c.login("u", "p").await.expect("必须能回落到主地址登录");
+        assert_eq!(session.sid, "sid-m40");
+        assert_eq!(
+            c.base_url(),
+            format!("http://{}:{}", alive.ip(), alive.port())
+        );
+        let snap = c.router().snapshot();
+        assert_eq!(snap.endpoints[0].state, "cooling", "{snap:?}");
+        assert_eq!(snap.endpoints[1].state, "ok");
+        assert!(snap.switches >= 1);
+    }
+
+    #[tokio::test]
+    async fn m40_probe_all_reports_dns_scopes_and_errors() {
+        let (alive, _h) = spawn_fake_nas(200, "ok").await;
+        let dead = dead_addr();
+        let link = m40_link(alive, vec![ep(&dead.ip().to_string(), dead.port())]);
+        let c = Client::new(&link).unwrap();
+        let probes = c.probe_all_routes(PROBE_TIMEOUT).await;
+        assert_eq!(probes.len(), 2);
+        // 额外路径（死）在前
+        assert!(!probes[0].http_ok);
+        assert!(
+            probes[0].error.as_deref().unwrap().contains("连接失败"),
+            "{:?}",
+            probes[0]
+        );
+        assert!(probes[1].http_ok);
+        let snap = c.router().snapshot();
+        let active = snap.endpoints.iter().find(|e| e.active).unwrap();
+        assert_eq!(active.state, "ok");
+        assert!(!active.resolved.is_empty(), "IP 字面量也要有解析记录");
+        assert!(
+            active.resolved_scopes.iter().any(|s| s == "回环"),
+            "{active:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn m40_get_fails_over_after_active_path_dies() {
+        let (a, a_task) = spawn_fake_nas(200, r#"{"status":1,"datas":[],"total":0}"#).await;
+        let (b, _b_task) = spawn_fake_nas(200, r#"{"status":1,"datas":[],"total":0}"#).await;
+        // 额外路径 A 在前、主地址 B 兜底
+        let link = m40_link(b, vec![ep(&a.ip().to_string(), a.port())]);
+        let c = Client::new(&link).unwrap();
+        c.set_sid("sid");
+        assert_eq!(c.base_url(), format!("http://{}:{}", a.ip(), a.port()));
+        // A 死掉 → 下一次 GET 必须自动切到 B 并成功
+        a_task.abort();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let entries = c.list("/home").await.expect("必须换路径后成功");
+        assert!(entries.is_empty());
+        assert_eq!(c.base_url(), format!("http://{}:{}", b.ip(), b.port()));
+    }
+
+    #[tokio::test]
+    async fn m40_upload_bytes_fails_over_and_keeps_bytes() {
+        let dead = dead_addr();
+        let (b, _b_task) = spawn_fake_nas(
+            200,
+            r#"{"status":1,"files":[{"status":1,"name":"x.bin","size":3}]}"#,
+        )
+        .await;
+        let link = m40_link(b, vec![ep(&dead.ip().to_string(), dead.port())]);
+        let c = Client::new(&link).unwrap();
+        c.set_sid("sid");
+        c.upload_bytes("/home/u", "x.bin", b"abc".to_vec())
+            .await
+            .expect("必须换路径后上传成功");
+        assert_eq!(c.base_url(), format!("http://{}:{}", b.ip(), b.port()));
+    }
+
+    #[tokio::test]
+    async fn m40_ranged_download_fails_over() {
+        let dead = dead_addr();
+        let (b, _b_task) = spawn_fake_nas(206, "abcdef").await;
+        let link = m40_link(b, vec![ep(&dead.ip().to_string(), dead.port())]);
+        let c = Client::new(&link).unwrap();
+        c.set_sid("sid");
+        let data = c
+            .download_range("/home/u", "x.bin", 0, 5)
+            .await
+            .expect("必须换路径后下载成功");
+        assert_eq!(data, b"abcdef");
+        assert_eq!(c.base_url(), format!("http://{}:{}", b.ip(), b.port()));
     }
 }

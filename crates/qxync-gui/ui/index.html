@@ -440,6 +440,16 @@
                     <input type="text" id="f-user" spellcheck="false" autocomplete="username">
                   </label>
                 </div>
+                <!-- ★ M40：多路径 —— 额外访问路径（每行一条，先于主地址尝试，主地址自动兜底）。
+                     语法与 Rust `EndpointConfig::parse_line` 一致：`[标签 = ][http(s)://]主机[:端口]`，
+                     `#` 开头是注释。保存时**总是**提交（空 = 清空备选路径）。 -->
+                <label>
+                  <span data-i18n="conn.endpoints_label">额外访问路径（可选，每行一条）</span>
+                  <textarea id="f-endpoints" rows="3" class="mono" spellcheck="false"
+                            data-i18n-placeholder="conn.endpoints_placeholder"
+                            placeholder="家里 LAN = http://192.168.1.10:9834&#10;公网 DDNS = https://nas.example.com"></textarea>
+                </label>
+                <p class="hint" data-i18n="conn.endpoints_hint">额外路径按书写顺序先尝试，全部不通才落到主地址；主地址是缓存 / 凭据的锚点，日常不要改它。留空 = 只走主地址。</p>
                 <label>口令
                   <input type="password" id="f-password" autocomplete="current-password" placeholder="留空则不解写凭据">
                 </label>
@@ -812,6 +822,7 @@
           <button type="button" class="tab active" id="diag-tab-status" data-panel="status" role="tab" aria-selected="true"  aria-controls="panel-status" data-i18n="diag.status">状态 / 进度</button>
           <button type="button" class="tab" id="diag-tab-mounts" data-panel="mounts" role="tab" aria-selected="false" aria-controls="panel-mounts" data-i18n="diag.mounts">挂载</button>
           <button type="button" class="tab" id="diag-tab-sync" data-panel="sync" role="tab" aria-selected="false" aria-controls="panel-sync" data-i18n="diag.sync">同步 / 缓存</button>
+          <button type="button" class="tab" id="diag-tab-routes" data-panel="routes" role="tab" aria-selected="false" aria-controls="panel-routes" data-i18n="diag.routes">多路径</button>
         </nav>
 
         <!-- ---------------- 诊断子页 1：状态 / 进度（id 与字段全部保留） ---------------- -->
@@ -985,6 +996,43 @@
               <span class="busy" id="verify-busy" hidden data-i18n="busy.text">进行中…</span>
             </div>
             <div id="verify-result" class="result" hidden></div>
+          </div>
+        </section>
+
+        <!-- ---------------- 诊断子页 4：多路径（★ M40） ----------------
+             数据源只有一条：`ipc({method:'routes'})`（零网络，只读路由表）。
+             「检测全部路径」带 probe:true，会对每条路径做一次 DNS + HTTP 探测（≤3s），
+             所以它有独立的 busy 状态；普通「刷新」绝不发网络请求。
+             高亮 = 当前正在使用的那条路径；主地址永远排在最后兜底。 -->
+        <section class="panel" id="panel-routes" role="tabpanel" aria-labelledby="diag-tab-routes">
+          <div class="card">
+            <h2>
+              <span data-i18n="routes.title">多路径连接</span>
+              <button type="button" class="mini" id="btn-routes-refresh" data-i18n="routes.refresh">刷新</button>
+              <button type="button" class="mini primary" id="btn-routes-probe" data-i18n="routes.probe_all">检测全部路径</button>
+              <span class="busy" id="routes-probe-busy" hidden data-i18n="routes.probing">检测中…</span>
+            </h2>
+            <!-- 摘要用普通 kv（不用 kv-inline）：上次切换那行很长（from → to + 原因 + 时间），
+                 kv-inline 的 auto-fit 多列会把 dt/dd 拆到不同列里，读起来像乱码。 -->
+            <dl class="kv" id="routes-summary-kv"></dl>
+            <div class="tbl-scroll">
+              <table class="tbl tbl-routes" id="tbl-routes">
+                <thead>
+                  <tr>
+                    <th class="col-role" data-i18n="routes.col_role">角色</th>
+                    <th class="col-label" data-i18n="routes.col_label">标签</th>
+                    <th class="col-addr" data-i18n="routes.col_addr">地址</th>
+                    <th class="col-state" data-i18n="routes.col_state">状态</th>
+                    <th class="col-dns" data-i18n="routes.col_dns">DNS 解析</th>
+                    <th class="col-latency" data-i18n="routes.col_latency">延迟</th>
+                    <th class="col-note" data-i18n="routes.col_note">说明</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+            <p class="empty-hint" id="routes-empty" hidden data-state="loading" data-i18n="routes.loading">正在读取多路径状态…</p>
+            <p class="hint" data-i18n="routes.hint">额外路径按书写顺序先尝试，全部不通才落到主地址。内网 / 公网 / DDNS 都可以写进来；一条路径失效时 daemon 会自动切到下一条，不需要重启。「检测全部路径」会真的发 DNS + HTTP 请求（最多约 3 秒），「刷新」只读路由表的最近结果。</p>
           </div>
         </section>
       </section>

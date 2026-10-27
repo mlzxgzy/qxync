@@ -13,7 +13,8 @@ use qxync_client::Client;
 use qxync_core::ipc::{
     socket_path_for, CacheInfo, CursorInfo, DecisionsData, DehydrateData, ErrorKind,
     FileStatesData, GetData, LsData, MountInfo, PeerData, PingData, PutData, Request, RootsData,
-    RulesData, SettingsData, ShutdownData, SpaceData, StatusData, StoreData, SyncInfo, TasksData,
+    RouteInfo, RoutesData, RulesData, SettingsData, ShutdownData, SpaceData, StatusData, StoreData,
+    SyncInfo, TasksData,
 };
 use qxync_core::settings::{Settings, PROXY_AUTO, PROXY_MANUAL, PROXY_NONE};
 use qxync_core::{ConfigPaths, Credentials, DirEntry, LinkConfig, HOME_ROOT};
@@ -414,6 +415,20 @@ enum Cmd {
         json: bool,
     },
 
+    /// ★ M40：多路径状态 / 诊断（内网 / 公网 / DDNS 各条路径）
+    ///
+    /// 不带 `--probe` 只读 daemon 路由表的最近结果（零网络）；`--probe` 立即对
+    /// 每条路径做一次 DNS + HTTP 探测。daemon 没在跑 / 版本不支持时自动回落到
+    /// 直连探测（不需要登录）。
+    Routes {
+        /// 立即探测全部路径（会发网络请求，最多约 3 秒）
+        #[arg(long)]
+        probe: bool,
+        /// 直接输出 JSON（脚本/验收用）
+        #[arg(long)]
+        json: bool,
+    },
+
     /// 守护进程生命周期
     Daemon {
         #[command(subcommand)]
@@ -663,6 +678,8 @@ fn resolve_link(cli: &Cli) -> Result<LinkConfig> {
             filter_temp: true,
             peer_listen: None,
             peer_name: None,
+            endpoints: Vec::new(),
+            local_namespace: None,
         }),
         _ => bail!(
             "没有找到连接配置 {}，且缺少 --host/--user。\n首次使用：qxync --host <NAS> --port <端口> --insecure --user <用户> --password <口令> login",
@@ -829,10 +846,21 @@ async fn main() -> Result<()> {
             // 6 位验证码而报错（那样凭据没写、用户还白登了一次）。
             let cli_secret = cli_otp_secret(&cli)?;
             let otp = resolve_otp(&cli, &link);
-            let session = client
-                .login_with_otp(&link.user, &pw, otp.as_deref())
-                .await
-                .with_context(|| format!("登录 {}@{} 失败", link.user, link.host))?;
+            let session = match client.login_with_otp(&link.user, &pw, otp.as_deref()).await {
+                Ok(s) => s,
+                Err(e) => {
+                    // ★ M40：登录失败时把每条路径的现场直接摆出来 —— 用户最想知道
+                    //   的正是「到底是内网那条不通、还是 DDNS 没更新」。
+                    eprintln!("❌ 登录 {}@{} 失败: {e}", link.user, link.host);
+                    if client.router().endpoint_count() > 1 {
+                        eprintln!("正在检测全部访问路径（DNS + HTTP）…");
+                        let _ = client.probe_all_routes(qxync_client::PROBE_TIMEOUT).await;
+                        print_routes(&client.router().snapshot(), false);
+                    }
+                    return Err(anyhow::Error::new(e))
+                        .with_context(|| format!("登录 {}@{} 失败", link.user, link.host));
+                }
+            };
             paths()?.ensure_dirs()?;
             let link_path = link.save(&paths()?)?;
             // 空输入 = 不改：保留已保存的 2SV 密钥（只换口令时别把它抹掉）
@@ -846,6 +874,7 @@ async fn main() -> Result<()> {
             let cred_path = cred.save_for(&paths()?, &link)?;
             println!("✅ 登录成功");
             println!("   sid        : {}", session.sid);
+            println!("   路径       : {}", client.base_url());
             println!("   user       : {}", session.username);
             println!("   NAS UID    : {}", session.uid.as_deref().unwrap_or("-"));
             println!(
@@ -1027,6 +1056,7 @@ async fn main() -> Result<()> {
             print_settings(&st, &paths, *json, saved)?;
         }
         Cmd::Verify { .. } => unreachable!("verify 在路由前已短路"),
+        Cmd::Routes { probe, json } => run_routes_direct(&cli, *probe, *json).await?,
         Cmd::Pin { .. }
         | Cmd::State { .. }
         | Cmd::Sync { .. }
@@ -1230,6 +1260,9 @@ fn to_request(cli: &Cli) -> Option<Request> {
             otp: cli.otp_code.clone().or_else(|| cli.otp_secret.clone()),
         },
         Cmd::Status => Request::Status,
+        Cmd::Routes { probe, .. } => Request::Routes {
+            probe: Some(*probe),
+        },
         Cmd::Ls { path } => Request::Ls { path: path.clone() },
         Cmd::Stat { dir, name } => Request::Stat {
             dir: dir.clone(),
@@ -1676,7 +1709,18 @@ async fn route_via_daemon(
         // verify 走不到这里（路由前已短路）
         Cmd::Verify { .. } => unreachable!(),
         Cmd::Login => {
-            let d: qxync_core::ipc::LoginData = ipc_client::call(&socket, req).await?;
+            let d: qxync_core::ipc::LoginData = match ipc_client::call(&socket, req).await {
+                Ok(d) => d,
+                Err(e) => {
+                    // ★ M40：daemon 侧的登录已经逐路径试过；这里给一条「怎么查」的提示，
+                    //   不让用户只看到一句网络错误。
+                    eprintln!(
+                        "❌ 经 daemon 登录失败：{}\n   提示：`qxync routes --probe` 可逐条检查 DNS / 内网-公网 / 可达性",
+                        e.message
+                    );
+                    return Err(e);
+                }
+            };
             println!(
                 "✅ 已通过 daemon 登录：user={} sid={} uid={}",
                 d.user,
@@ -1687,6 +1731,19 @@ async fn route_via_daemon(
         Cmd::Status => {
             let st: StatusData = ipc_client::call(&socket, req).await?;
             print_status(&st);
+        }
+        Cmd::Routes { probe, json } => {
+            match ipc_client::call::<RoutesData>(&socket, req).await {
+                Ok(d) => print_routes(&d, *json),
+                Err(e) => {
+                    // 老 daemon 不认识 routes：改成直连探测，而不是让用户对着
+                    // 一句「未知 method」发呆。
+                    eprintln!("⚠️ daemon 不支持多路径查询（{}），改为直连探测", e.message);
+                    run_routes_direct(cli, *probe, *json).await.map_err(|e| {
+                        qxync_core::ipc::IpcError::new(ErrorKind::Io, e.to_string())
+                    })?;
+                }
+            }
         }
         Cmd::Ls { .. } => {
             let d: LsData = ipc_client::call(&socket, req).await?;
@@ -2910,6 +2967,153 @@ fn print_sync(s: &SyncInfo) {
     }
 }
 
+/// ★ M40：daemon 不在 / 不认识 `routes` 时的直连探测。
+///
+/// **不需要登录、不写任何配置**：构造 Client 后直接探测（探测请求不带 sid）。
+/// 这也是「连不上时先查多路径」在没有 daemon 的机器上仍然可用的原因。
+async fn run_routes_direct(cli: &Cli, _probe: bool, json: bool) -> Result<()> {
+    let link = resolve_link(cli)?;
+    let client = match Settings::load(&paths()?) {
+        Ok(st) => Client::new_with_settings(&link, &st)?,
+        Err(_) => Client::new(&link)?,
+    };
+    if client.router().endpoint_count() > 1 {
+        eprintln!(
+            "（直连模式：不需要登录，正在探测 {} 条路径）",
+            client.router().endpoint_count()
+        );
+    }
+    // 直连没有 daemon 的后台巡检，不探一次就全是「未知」—— 直接探。
+    let _ = client.probe_all_routes(qxync_client::PROBE_TIMEOUT).await;
+    let mut data: RoutesData = client.router().snapshot();
+    data.probed = true;
+    print_routes(&data, json);
+    Ok(())
+}
+
+/// ★ M40：人读的多路径表。
+fn print_routes(d: &RoutesData, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(d).unwrap_or_else(|_| "{}".into())
+        );
+        return;
+    }
+    println!(
+        "多路径    : {} 条（按顺序尝试；✓ = 当前{}）",
+        d.endpoints.len(),
+        if d.probed {
+            "，本次已探测"
+        } else {
+            "；只读最近结果，加 --probe 立即检测"
+        }
+    );
+    for (i, e) in d.endpoints.iter().enumerate() {
+        let mark = if e.active { "✓" } else { " " };
+        let scheme = if e.https { "https" } else { "http" };
+        let addr = if e.host.parse::<std::net::Ipv6Addr>().is_ok() {
+            format!("[{}]:{}", e.host, e.port)
+        } else {
+            format!("{}:{}", e.host, e.port)
+        };
+        let dns = route_dns_label(e);
+        let latency = e
+            .latency_ms
+            .map(|ms| format!("{ms} ms"))
+            .unwrap_or_else(|| "-".into());
+        println!(
+            "  {:>2} {}  {:<14} {}://{}  {}  {}  {}",
+            i + 1,
+            mark,
+            truncate_label(&e.label, 14),
+            scheme,
+            addr,
+            dns,
+            latency,
+            route_state_label(&e.state)
+        );
+        if e.resolved_changed {
+            println!("        └ 域名解析结果与上次不同（DDNS 可能刚更新）");
+        }
+        if e.cooldown_secs > 0 {
+            println!("        └ 冷却中：{} 秒后可再试", e.cooldown_secs);
+        }
+        if let Some(note) = &e.note {
+            println!("        └ {note}");
+        }
+        if !matches!(e.state.as_str(), "ok" | "unknown") {
+            if let Some(err) = &e.last_error {
+                println!("        └ 最近错误：{err}");
+            }
+        }
+    }
+    if let Some(sw) = &d.last_switch {
+        println!(
+            "最近切换  : {} 从 {} 到 {}（原因 {}）",
+            fmt_ago(sw.at_unix),
+            sw.from,
+            sw.to,
+            sw.reason
+        );
+    }
+    if d.endpoints.len() > 1 {
+        println!(
+            "提示      : 顺序 = 优先级（额外路径在前、主地址兜底）；改路径用 GUI「设置 → 连接」\n\
+             \x20           或直接编辑 ~/.config/qxync/links/<连接 id>.json 的 endpoints"
+        );
+    }
+}
+
+fn route_state_label(state: &str) -> &'static str {
+    match state {
+        "ok" => "正常",
+        "failed" => "失败",
+        "cooling" => "冷却中",
+        "blocked" => "已禁用（身份不符）",
+        _ => "未探测",
+    }
+}
+
+fn route_dns_label(e: &RouteInfo) -> String {
+    if e.resolved.is_empty() {
+        return "DNS 无结果".into();
+    }
+    e.resolved
+        .iter()
+        .zip(e.resolved_scopes.iter())
+        .map(|(ip, scope)| format!("{ip}〔{scope}〕"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn truncate_label(s: &str, max_chars: usize) -> String {
+    let n = s.chars().count();
+    if n <= max_chars {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
+}
+
+/// unix 秒 → 「刚刚 / N 秒前 / N 分钟前 / N 小时前 / N 天前」。
+fn fmt_ago(unix: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(unix);
+    let d = now.saturating_sub(unix).max(0);
+    match d {
+        0..=5 => "刚刚".into(),
+        6..=59 => format!("{d} 秒前"),
+        60..=3599 => format!("{} 分钟前", d / 60),
+        3600..=86399 => format!("{} 小时前", d / 3600),
+        _ => format!("{} 天前", d / 86400),
+    }
+}
+
 fn print_status(st: &StatusData) {
     println!(
         "daemon    : v{} pid={} uptime={}s",
@@ -2944,6 +3148,30 @@ fn print_status(st: &StatusData) {
             "未登录（先 `qxync login`）"
         }
     );
+    if let Some(r) = &st.routes {
+        // ★ M40：多路径摘要（只有一条路径时也显示当前地址，便于确认走的是哪条）
+        let active = r.active.as_deref().unwrap_or("-");
+        if r.total > 1 {
+            let sw = r
+                .last_switch
+                .as_ref()
+                .map(|s| {
+                    format!(
+                        "，上次切换 {}（{}，原因 {}）",
+                        fmt_ago(s.at_unix),
+                        s.to,
+                        s.reason
+                    )
+                })
+                .unwrap_or_default();
+            println!(
+                "路径      : {} 条（当前 {}；{}/{} 可用{sw}）",
+                r.total, active, r.healthy, r.total
+            );
+        } else {
+            println!("路径      : {active}");
+        }
+    }
     if let Some(s) = &st.session {
         // ★ M22：离线时 daemon 不发 check_alive（M20 的卡顿修复），alive=false
         //   只是「不知道」—— 按 alive_known 区分，别把断网误导成会话失效。
@@ -3677,6 +3905,19 @@ async fn links_cmd(json: bool) -> Result<()> {
             "https": link.https,
             "insecure": link.insecure,
             "user": link.user,
+            // ★ M40：路径数 / 顺序（主机只展示主地址，路径细节用 `qxync routes`）
+            "path_count": link.endpoint_list().len(),
+            "paths": link
+                .endpoint_list()
+                .iter()
+                .map(|e| serde_json::json!({
+                    "label": e.label,
+                    "host": e.host,
+                    "port": e.port,
+                    "https": e.https,
+                    "primary": e.primary,
+                }))
+                .collect::<Vec<_>>(),
             "socket": socket.display().to_string(),
             "credential_present": cred.is_some(),
             // ★ M17：只报「有没有存 2SV 密钥」，绝不回传密钥本身
@@ -3716,8 +3957,9 @@ async fn links_cmd(json: bool) -> Result<()> {
         let logged = r["daemon"]["logged_in"].as_bool().unwrap_or(false);
         let cred = r["credential_present"].as_bool().unwrap_or(false);
         let otp = r["otp_present"].as_bool().unwrap_or(false);
+        let paths = r["path_count"].as_u64().unwrap_or(1);
         println!(
-            "- {id:<10} {user}@{host}:{port}  daemon={}  login={}  credential={}  2sv={}{}",
+            "- {id:<10} {user}@{host}:{port}  路径={paths}  daemon={}  login={}  credential={}  2sv={}{}",
             if running { "运行" } else { "停止" },
             if logged { "已登录" } else { "未登录" },
             if cred { "有" } else { "无" },

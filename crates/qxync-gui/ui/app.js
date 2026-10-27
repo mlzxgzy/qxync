@@ -44,7 +44,8 @@
     diag: T('page.diag')
   };
   // 诊断页内的子 tab
-  var DIAG_PANELS = ['status', 'mounts', 'sync'];
+  // ★ M40：「多路径」—— 数据源是 `ipc({method:'routes', probe})`。
+  var DIAG_PANELS = ['status', 'mounts', 'sync', 'routes'];
   // ★ M8.4：设置页内的分区（对齐 Qsync 的四个 tab + 连接/筛选/LAN/关于）
   // ★ M39：多了「日志」分区（日志目录占用 / 轮转策略 / 立即清理）
   var SETTINGS_SECS = ['connect', 'proxy', 'sync', 'personal', 'advanced', 'log', 'free', 'lan', 'about'];
@@ -91,6 +92,10 @@
       error: ''          // ★ M8.6：读取失败时的可见原因
     },
     mounts: [],          // 当前连接的挂载表（诊断 / 主页退化展示用）
+    // ★ M40：诊断 →「多路径」的最近一次 `routes` 结果（当前连接；不发网络）
+    routes: null,
+    routesLoading: false,
+    routesError: '',
     busy: 0,
     home: '',
     appInfo: null,
@@ -3257,6 +3262,10 @@
     setFormValue('f-host', link ? str(link.host) : '');
     setFormValue('f-port', link ? str(link.port) : '');
     setFormValue('f-user', link ? str(link.user) : '');
+    // ★ M40：备选路径回填成「每行一条」（与 Rust `EndpointConfig::to_line` 同一语法）。
+    //   空 endpoints = 只有主地址 → 清空 textarea（不是写一行主地址：主地址由
+    //   host/port/https 三个字段本身表达，重复写进来会改变它的兜底位置）。
+    setFormValue('f-endpoints', endpointsToText(link));
     setFormChecked('f-https', link ? link.https !== false : true);
     setFormChecked('f-insecure', link ? link.insecure === true : false);
     setFormChecked('f-ipv4-only', link ? link.ipv4_only === true : false);
@@ -3552,6 +3561,54 @@
     });
   }
 
+  // --------------------------------------------------- ★ M40：路径行语法
+  //
+  // 与 Rust `EndpointConfig::to_line` / `parse_line` **同一套语法**（不要在这里发明
+  // 第二种写法，否则「回填 → 原样保存」会悄悄改掉用户的配置）：
+  //   行 = [`标签 = `][`http://`|`https://`][`[IPv6]`|主机][`:`端口]
+  // 省略端口 / 协议 = 继承主地址（后端负责），所以回填时**有才写**、没有就不写。
+
+  /** 一条 `EndpointConfig`（link_read 的 link.endpoints[i]）→ textarea 里的一行。 */
+  function endpointToLine(ep) {
+    if (!isObj(ep)) { return ''; }
+    var host = str(ep.host).trim();
+    if (!host) { return ''; }            // 坏配置（空 host）不进表单，免得保存时报错
+    var line = '';
+    var label = str(ep.label).trim();
+    if (label) { line += label + ' = '; }
+    if (ep.https === true) { line += 'https://'; }
+    else if (ep.https === false) { line += 'http://'; }
+    // IPv6 字面量必须带方括号（后端 `to_line` 同样处理；裸 IPv6 会被当成「无端口」）
+    line += (host.indexOf(':') >= 0 && host.charAt(0) !== '[') ? ('[' + host + ']') : host;
+    var port = num(ep.port, 0);
+    if (port > 0) { line += ':' + port; }
+    return line;
+  }
+
+  /** link 配置 → textarea 文本（空 endpoints = 空文本 = 只走主地址）。 */
+  function endpointsToText(link) {
+    var eps = (isObj(link) && Array.isArray(link.endpoints)) ? link.endpoints : [];
+    var lines = [];
+    for (var i = 0; i < eps.length; i++) {
+      var l = endpointToLine(eps[i]);
+      if (l) { lines.push(l); }
+    }
+    return lines.join('\n');
+  }
+
+  /** textarea 文本 → 行数组。空行丢掉；`#` 注释行**保留**（后端 `parse_endpoint_lines`
+   *  会跳过 —— 让后端做唯一的语法裁决，前端不抢着判）。 */
+  function endpointsFromText(text) {
+    var parts = str(text).split(/\r?\n/);
+    var out = [];
+    for (var i = 0; i < parts.length; i++) {
+      var line = str(parts[i]).trim();
+      if (!line) { continue; }
+      out.push(line);
+    }
+    return out;
+  }
+
   function buildLinkInput(withPassword) {
     var host = str($('f-host') ? $('f-host').value : '').trim();
     var user = str($('f-user') ? $('f-user').value : '').trim();
@@ -3564,7 +3621,11 @@
       https: isOn('f-https', true),
       insecure: isOn('f-insecure', false),
       user: user,
-      ipv4_only: isOn('f-ipv4-only', false)
+      ipv4_only: isOn('f-ipv4-only', false),
+      // ★ M40：备选路径**总是显式提交**（`Some([])` = 清空；缺省字段 = 后端保留旧值）。
+      //   旧 GUI 不带这个字段 → 老配置不受影响；这里必须带，否则「删掉某一行」存不进去。
+      //   坏行不在这里拦：后端带行号报错（`路径不合法：第 N 行：…`），比前端猜更准。
+      endpoints: endpointsFromText($('f-endpoints') ? $('f-endpoints').value : '')
     };
     // ★ 编辑态才带 id：新建交给后端自动生成（无连接 → default，否则 nas2/nas3…）
     if (state.editingLinkId) { input.id = str(state.editingLinkId); }
@@ -3691,6 +3752,12 @@
         ['NAS', str(d.link && d.link.user) + '@' + str(d.link && d.link.host) + ':' + str(d.link && d.link.port)],
         ['https', d.link && d.link.https ? '是' : '否']
       ];
+      // ★ M40：如实回显「后端真正存下了几条备选路径」—— 用户删掉一行时能一眼确认
+      //   它真的没了（空 = 只走主地址），而不是「保存成功」却什么都没变。
+      var savedEps = (isObj(d.link) && Array.isArray(d.link.endpoints)) ? d.link.endpoints : [];
+      rows.push([T('routes.form_label'), savedEps.length
+        ? T('routes.count', { n: savedEps.length })
+        : T('routes.none')]);
       // ★ M17：`link_save` 只写 link 文件，不写凭据（凭据是「保存并登录」的职责）。
       //   所以用户在这张表单里填了密钥/验证码时**不能静默丢掉输入**：明确告知
       //   「未保存」，并保留输入框内容，让用户能接着点「保存并登录」。
@@ -4122,6 +4189,221 @@
 
   function refreshMountsIfVisible() {
     if (state.page === 'diag' && state.diag === 'mounts') { refreshMounts(); }
+  }
+
+  // ======================================================== ★ M40 多路径（诊断）
+  //
+  // 数据源只有一条：`ipc({method:'routes'})`。
+  //   * `probe=false`（切页 / 刷新）→ daemon 只读路由表，**零网络请求**，离线也能答；
+  //   * `probe=true`（检测全部路径）→ 每条路径一次 DNS + HTTP（≤3s），有独立 busy。
+  //
+  // 三条硬约定（与 M20/M30 同口径）：
+  //   1. 状态只认后端给的 `state` 字符串；**未知值原样显示**，不吞成空白、更不装成「可达」；
+  //   2. 「未探测」（unknown）不是「失败」（failed）—— 文案与颜色都分开；
+  //   3. 「主地址」是**自动兜底那条**，不等于「当前在用那条」（多路径的意义就在于两者
+  //      可以不同），所以角色列只标 primary，使用中放标签列的徽标 + 整行高亮。
+  var ROUTE_STATE_BADGE = {
+    ok: 'badge-on',
+    failed: 'badge-err',
+    cooling: 'badge-warn',
+    blocked: 'badge-warn',
+    unknown: 'badge-off'
+  };
+
+  function routeStateText(st) {
+    var s = str(st);
+    if (s === 'ok') { return T('routes.state_ok'); }
+    if (s === 'failed') { return T('routes.state_failed'); }
+    if (s === 'cooling') { return T('routes.state_cooling'); }
+    if (s === 'blocked') { return T('routes.state_blocked'); }
+    if (!s || s === 'unknown') { return T('routes.state_unknown'); }
+    return s;                    // 新状态不猜：原样显示，便于发现协议扩展
+  }
+
+  /** 切换原因：failure / probe_recovered / preferred_available / manual —— 未知值原样显示。 */
+  function routeReasonText(reason) {
+    var r = str(reason);
+    if (r === 'failure') { return T('routes.reason.failure'); }
+    if (r === 'probe_recovered') { return T('routes.reason.probe_recovered'); }
+    if (r === 'preferred_available') { return T('routes.reason.preferred_available'); }
+    if (r === 'manual') { return T('routes.reason.manual'); }
+    return r || '—';
+  }
+
+  /** 一条路径的地址（`scheme://host:port`；IPv6 字面量加方括号）。 */
+  function fmtRouteAddr(ep) {
+    var host = str(ep.host);
+    if (!host) { return '—'; }
+    var scheme = (ep.https === true) ? 'https://' : (ep.https === false ? 'http://' : '');
+    if (host.indexOf(':') >= 0 && host.charAt(0) !== '[') { host = '[' + host + ']'; }
+    return scheme + host + ':' + num(ep.port, 0);
+  }
+
+  /** DNS 列：`ip（分类）` 逐条并列；解析结果变化时明确点出来（DDNS 更新的关键证据）。 */
+  function fmtRouteDns(ep) {
+    var ips = Array.isArray(ep.resolved) ? ep.resolved : [];
+    var scopes = Array.isArray(ep.resolved_scopes) ? ep.resolved_scopes : [];
+    if (!ips.length) { return '—'; }
+    var out = [];
+    for (var i = 0; i < ips.length; i++) {
+      var ip = str(ips[i]);
+      var sc = str(scopes[i]);
+      out.push(sc ? (ip + '（' + sc + '）') : ip);
+    }
+    var text = out.join('，');
+    if (ep.resolved_changed === true) { text += ' · ' + T('routes.changed'); }
+    return text;
+  }
+
+  /** 截断长文案：说明列很窄（窗口窄时更窄），但不该把原因截没 —— 完整内容挂到 `title` 上。 */
+  function clipText(v, n) {
+    var s = str(v);
+    return (s.length > n) ? (s.slice(0, n) + '…') : s;
+  }
+
+  /** 说明列：冷却剩余 / 身份提示（指向另一台 NAS、CGNAT 提示）/ 最近失败原因。
+   *  `full=true` 给完整版（含失败时间），只用于 `title`，避免把行撑成三行。 */
+  function fmtRouteNote(ep, full) {
+    var parts = [];
+    var cd = num(ep.cooldown_secs, 0);
+    if (str(ep.state) === 'cooling' && cd > 0) { parts.push(T('routes.cooling_left', { secs: cd })); }
+    if (ep.note) { parts.push(str(ep.note)); }
+    if (ep.last_error) {
+      var err = str(ep.last_error);
+      parts.push(T('routes.last_error', { msg: full ? err : clipText(err, 40) }));
+    }
+    if (full && num(ep.last_fail_unix, 0) > 0) {
+      parts.push(T('routes.last_fail', { when: humanTimeFromEpoch(ep.last_fail_unix) }));
+    }
+    return parts.length ? parts.join('；') : '—';
+  }
+
+  /** 渲染摘要 + 表格 + 四态。`data=null` 只清空（错误态由调用方 setListState 写文案）。 */
+  function renderRoutes(data) {
+    var d = isObj(data) ? data : null;
+    var list = (d && Array.isArray(d.endpoints)) ? d.endpoints.filter(isObj) : [];
+
+    var kv = $('routes-summary-kv');
+    if (kv) {
+      clear(kv);
+      if (!d) {
+        kvText(kv, T('routes.kv_active'), T('routes.kv_none'), 'val-warn');
+      } else {
+        kvText(kv, T('routes.kv_active'), d.active ? str(d.active) : T('routes.kv_none'),
+          d.active ? 'val-ok' : 'val-warn');
+        kvText(kv, T('routes.kv_switches'), num(d.switches, 0));
+        var ls = isObj(d.last_switch) ? d.last_switch : null;
+        kvText(kv, T('routes.kv_last_switch'), ls
+          ? T('routes.switch_once', {
+            from: str(ls.from) || '—',
+            to: str(ls.to) || '—',
+            reason: routeReasonText(ls.reason),
+            when: humanTimeFromEpoch(ls.at_unix) || '—'
+          })
+          : T('routes.kv_no_switch'));
+        kvText(kv, T('routes.kv_probed'),
+          d.probed === true ? T('routes.probed_yes') : T('routes.probed_no'),
+          d.probed === true ? 'val-ok' : 'val-dim');
+      }
+    }
+
+    var tbl = $('tbl-routes');
+    var tb = tbl ? tbl.querySelector('tbody') : null;
+    if (tb) {
+      clear(tb);
+      for (var i = 0; i < list.length; i++) {
+        (function (ep) {
+          var active = ep.active === true;
+          var tr = el('tr', active ? 'route-active' : '');
+          if (active) { tr.setAttribute('aria-current', 'true'); }
+          tr.appendChild(el('td', 'mono',
+            ep.primary === true ? T('routes.role_primary') : T('routes.role_extra')));
+
+          var tdLabel = el('td');
+          // 主地址那行后端给的 label 固定是「主地址」→ 与角色列读起来像重复；
+          // 换成人话说明它指的是 host/port 字段本身（用户自己写进列表的路径会保留标签）。
+          var labelText = (ep.primary === true && str(ep.label) === '主地址')
+            ? T('routes.label_primary_self')
+            : (str(ep.label) || '—');
+          tdLabel.appendChild(el('span', '', labelText));
+          if (active) { tdLabel.appendChild(el('span', 'badge badge-on route-flag', T('routes.badge_active'))); }
+          tr.appendChild(tdLabel);
+
+          tr.appendChild(el('td', 'mono cell-addr', fmtRouteAddr(ep)));
+
+          var tdState = el('td');
+          var st = str(ep.state) || 'unknown';
+          var badge = el('span', 'badge ' + (ROUTE_STATE_BADGE[st] || 'badge-unknown'), routeStateText(st));
+          badge.title = st;            // 原始 state 挂 title：中文文案之外仍能看到协议值
+          tdState.appendChild(badge);
+          tr.appendChild(tdState);
+
+          var dns = fmtRouteDns(ep);
+          var tdDns = el('td', 'cell-dns', dns);
+          if (dns !== '—') { tdDns.title = dns; }
+          tr.appendChild(tdDns);
+
+          var lat = (ep.latency_ms === undefined || ep.latency_ms === null) ? null : num(ep.latency_ms, 0);
+          tr.appendChild(el('td', 'mono', lat === null ? '—' : (lat + ' ms')));
+
+          var note = fmtRouteNote(ep, false);
+          var tdNote = el('td', 'cell-note', note);
+          if (note !== '—') { tdNote.title = fmtRouteNote(ep, true); }
+          tr.appendChild(tdNote);
+
+          tb.appendChild(tr);
+        })(list[i]);
+      }
+    }
+
+    setBusyState('tbl-routes', state.routesLoading === true);
+
+    // 四态：错误 > 读取中（且无旧数据可看）> 有数据 > 真空
+    if (state.routesError) {
+      setListState('routes-empty', 'error', T('routes.error', { msg: state.routesError }));
+    } else if (state.routesLoading && !list.length) {
+      setListState('routes-empty', 'loading', T('routes.loading'));
+    } else if (list.length) {
+      setListState('routes-empty', 'ready');
+    } else {
+      setListState('routes-empty', 'empty', T('routes.empty'));
+    }
+  }
+
+  /** 读多路径状态（`probe=true` 会真的探测，慢且会改状态，只有按钮能触发）。 */
+  function refreshRoutes(probe) {
+    var wantProbe = probe === true;
+    state.routesLoading = true;
+    setListState('routes-empty', 'loading', T('routes.loading'));
+    var req = { method: 'routes' };
+    if (wantProbe) { req.probe = true; }
+    return withBusy({
+      spinners: wantProbe ? ['routes-probe-busy'] : [],
+      buttons: wantProbe ? ['btn-routes-probe', 'btn-routes-refresh'] : ['btn-routes-refresh']
+    }, function () {
+      return ipc(req);
+    }).then(function (r) {
+      state.routesLoading = false;
+      if (!r.ok) {
+        state.routesError = str(r.error) || T('routes.err_generic');
+        state.routes = null;
+        renderRoutes(null);
+        logErr('routes 失败：' + state.routesError);
+        return null;
+      }
+      state.routesError = '';
+      state.routes = isObj(r.data) ? r.data : null;
+      renderRoutes(state.routes);
+      if (wantProbe) {
+        var eps = (state.routes && Array.isArray(state.routes.endpoints)) ? state.routes.endpoints : [];
+        var ok = 0;
+        for (var i = 0; i < eps.length; i++) {
+          if (isObj(eps[i]) && eps[i].state === 'ok') { ok++; }
+        }
+        logInfo(T('routes.probe_done_log', { ok: ok, total: eps.length }));
+      }
+      return state.routes;
+    });
   }
 
   function doMount() {
@@ -5162,6 +5444,9 @@
       else if (state.diag === 'mounts') {
         renderMountTable('tbl-mounts', 'mounts-empty', 'mounts-count', state.mounts);
         renderMountTable('tbl-status-mounts', 'status-mounts-empty', 'mounts-status-count', state.mounts);
+      } else if (state.diag === 'routes') {
+        // 轮询期间用最近一次快照重画（不发请求）；路由表变化只由 daemon 的探测驱动。
+        renderRoutes(state.routes);
       }
     }
   }
@@ -5190,6 +5475,8 @@
     } else if (state.page === 'diag') {
       if (state.diag === 'mounts') { refreshMounts(); }
       else if (state.diag === 'status') { refreshRoots(); }
+      // ★ M40：切连接 / 从别处回来时重读多路径（probe=false，零网络）
+      else if (state.diag === 'routes') { refreshRoutes(false); }
     }
     return Promise.resolve(null);
   }
@@ -6773,6 +7060,9 @@
       if (name === 'status' && prev !== 'status') { refreshRoots(); }
     }
     if (name === 'mounts') { refreshMounts(); }
+    // ★ M40：切到「多路径」就拉一次（probe=false：零网络，只读路由表）。重复点同一
+    //   子页也拉：用户在等 daemon 自动切换时，重试一次比盯着旧快照有用。
+    if (name === 'routes') { refreshRoutes(false); }
   }
 
   // ============================================================ 日志面板
@@ -6987,6 +7277,10 @@
     }
     on('btn-mounts-refresh', 'click', function () { refreshMounts(); });
     on('btn-status-mounts-refresh', 'click', function () { refreshMounts(); });
+
+    // ★ M40：多路径 —— 刷新（零网络）与「检测全部路径」（probe=true，会真发请求）
+    on('btn-routes-refresh', 'click', function () { refreshRoutes(false); });
+    on('btn-routes-probe', 'click', function () { refreshRoutes(true); });
 
     // NAS 同步文件夹面板
     on('btn-roots-refresh', 'click', function () { refreshRoots(); });

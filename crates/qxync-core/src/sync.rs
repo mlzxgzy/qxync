@@ -1197,6 +1197,8 @@ mod tests {
             filter_temp: true,
             peer_listen: None,
             peer_name: None,
+            endpoints: Vec::new(),
+            local_namespace: None,
         };
         let d = mk("default", "nas.example:9834");
         assert_eq!(

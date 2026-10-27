@@ -32,6 +32,7 @@ pub mod logcfg;
 pub mod model;
 pub mod mountbusy;
 pub mod mounts;
+pub mod netpath;
 pub mod purge;
 pub mod roots;
 pub mod rules;
@@ -43,7 +44,10 @@ pub mod tasks;
 pub mod totp;
 pub mod trash;
 
-pub use config::{ConfigPaths, Credentials, LinkConfig, PeerConfig, PeerRegistry};
+pub use config::{
+    link_namespace, ConfigPaths, Credentials, Endpoint, EndpointConfig, LinkConfig, PeerConfig,
+    PeerRegistry, MAX_ENDPOINTS,
+};
 pub use connectivity::{Connectivity, ConnectivitySnapshot};
 pub use decisions::{
     looks_binary, prepare_bytes, sweep_batch, sweep_decision, text_diff, DecisionFacts, DiffLine,
@@ -57,6 +61,7 @@ pub use file_id::{compute_file_id, file_id_for_entry, FileId, ZERO_FILE_ID};
 pub use freespace::{statvfs, AutoFreeDecision, FsSpace};
 pub use model::{parse_listing, parse_max_log, parse_nas_uid, DirEntry, Listing, MaxLog, NasUid};
 pub use mounts::{MountRecord, MountsFile, MOUNTS_VERSION};
+pub use netpath::{ip_scope, is_ip_literal, IpScope};
 pub use purge::{PurgeDbRows, PurgeItem, PurgeOutcome, PurgePlan};
 pub use roots::{client_path_from_share, normalize_root};
 pub use rules::{HideReason, RuleParse, Rules, TEMP_PATTERNS};
