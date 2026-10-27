@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 
+## [0.7.12] - 2026-10-27
+
 ### 新增
 
 - **日志轮转与保留策略（[M39](docs/M39-日志轮转与保留.md)）**。真机
@@ -46,6 +48,18 @@
 
 ### 修复
 
+- **上传队列把「本地内容源缺失」误判成断网（M38）**。真机 2026-10-26：编辑器（WPS）
+  原子保存产生的临时文件被清理后，上传队列里留下一条「内容源指向已删除 `.tmp`」的作业。
+  旧实现把本地 `stat` / `open` 失败包成 `Error::Transport`，上传队列据此判成「网络不可用」
+  —— 作业永不放弃、每轮重试还把连通性标成**离线**：界面一直「网络断开」而 NAS 正常，
+  点「立即同步」永远看不到恢复（同步其实跑了，随即又被僵尸作业翻回离线）。修法三条：
+  ①`qxync-client` 本地 `stat` / `open` 失败改报 `Error::Io`（不是 `Transport`）；
+  ②`qxync-fuse` 内容源不存在 → **立刻放弃并删掉队列行**（`error` 日志留痕），不再无限
+  重试；③按身份改名前先确认内容源还在，避免顶掉新名字上能传的作业。回归测试 3 条
+  （`upload_missing_local_is_io_not_transport` /
+  `missing_content_source_is_given_up_not_offline` /
+  `identity_retarget_skips_dead_content_source`）。现场用缓存副本补回 35 043 字节暂存
+  文件后上传成功、队列清零、远端 `exist=true`。
 - **`accept` 失败不再空转刷屏（M39 伴生防御）**。错误分支原来直接落回 `select!`，下一次
   `accept` 立刻又失败 —— 纯烧 CPU + 刷日志（真机两次 EMFILE 紧循环就是它）。现在失败后
   `sleep(100ms)` 再重试（日志文案 `accept 失败（100ms 后重试）`，三处 `accept` 分支统一），
@@ -1783,6 +1797,7 @@ NAS 设置名 `QSYNC_FOLDERPAIR_USE_SPACE_SAVING`、Windows 客户端注册表�
 - 验收结论从 README 抽出为 [`docs/验收记录.md`](docs/验收记录.md)。
 - 采用 **MIT OR Apache-2.0** 双许可（`LICENSE-MIT` / `LICENSE-APACHE`）。
 
+[0.7.12]: https://github.com/mlzxgzy/qxync/compare/v0.7.11...v0.7.12
 [0.7.4]: https://github.com/mlzxgzy/qxync/compare/v0.7.3...v0.7.4
 [0.7.3]: https://github.com/mlzxgzy/qxync/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/mlzxgzy/qxync/compare/v0.7.1...v0.7.2
