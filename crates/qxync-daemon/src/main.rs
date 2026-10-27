@@ -241,17 +241,43 @@ fn init_logging(
     log::set_max_level(log::LevelFilter::Warn);
 
     let log_dir = qxync_core::ipc::default_log_dir();
+    // ★ M39：日志策略（单文件上限 / 保留天数 / 总占用）来自 settings.json。
+    //   在这里先应用一次，今天的段一打开就受约束；之后 `settings_save` 会热更新
+    //   （写路径每次现读策略，见 `qxync_core::logcfg::policy`）。
+    //   settings.json 坏了/不存在不影响日志：退回默认策略（32MB / 14 天 / 256MB）。
+    //   注意：这一行必须发生在 subscriber 装好**之前**（writer 要按策略决定开局切不切段），
+    //   所以策略文本先存下来，等 subscriber 装好再 `info!` 出去 —— 否则会被丢弃，
+    //   而「这次按什么策略在写」正是排查日志占用时第一眼要看的信息。
+    let mut policy_note: Option<String> = None;
+    if let Ok(paths) = qxync_core::ConfigPaths::discover() {
+        match qxync_core::settings::Settings::load(&paths) {
+            Ok(st) => {
+                let p = qxync_core::logcfg::apply_settings(&st);
+                policy_note = Some(format!(
+                    "单文件 {} MB / 保留 {} 天 / 总量 {} MB",
+                    p.max_file_bytes / 1048576,
+                    p.keep_days,
+                    p.max_total_bytes / 1048576
+                ));
+            }
+            Err(e) => {
+                policy_note = Some(format!("（读取 settings.json 失败，用默认策略: {e}）"));
+            }
+        }
+    }
     // ★ 日志文件建不出来时**绝不能 panic**：daemon 化后 fd 0/1/2 都指向
     //   /dev/null，启动期 panic = 用户只看到「socket 未就绪」且日志零线索
     //   （xv 真机排查过一整轮）。`rolling::daily()` 内部是 `.expect()` → panic，
     //   所以这里用 builder 拿 `Result`，失败就退到只写 stderr。
-    let appender = std::fs::create_dir_all(&log_dir).ok().and_then(|()| {
-        tracing_appender::rolling::RollingFileAppender::builder()
-            .rotation(tracing_appender::rolling::Rotation::DAILY)
-            .filename_prefix(log_prefix_for(link_id))
-            .build(&log_dir)
-            .ok()
-    });
+    //
+    //   ★ M39：换成自己的 `RotatingWriter` —— tracing_appender 只能按**时间**
+    //   轮转，同一天内没有大小上限（真机 2026-10-23 单文件 5.17 GB 就是这样来的）。
+    //   文件名规则不变（`<前缀>.log.<YYYY-MM-DD>`），所以历史文件仍然排得进序列。
+    let prefix = log_prefix_for(link_id);
+    let prefix = prefix.trim_end_matches(".log").to_string();
+    let appender = std::fs::create_dir_all(&log_dir)
+        .ok()
+        .and_then(|()| qxync_core::logcfg::RotatingWriter::new(&log_dir, &prefix).ok());
     let (file_layer, guard) = match appender {
         Some(appender) => {
             let (nb, guard) = tracing_appender::non_blocking(appender);
@@ -278,6 +304,9 @@ fn init_logging(
         .with(file_layer);
     tracing::subscriber::set_global_default(subscriber)
         .map_err(|e| anyhow::anyhow!("设置全局 tracing subscriber 失败: {e}"))?;
+    if let Some(note) = policy_note {
+        tracing::info!("★ M39：日志轮转策略已应用（{note}）");
+    }
     Ok(guard)
 }
 

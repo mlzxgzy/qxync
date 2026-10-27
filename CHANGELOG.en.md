@@ -5,6 +5,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [中文](CHANGELOG.md) · [README](README.en.md) · [Acceptance log](docs/验收记录.md)
 
+## [Unreleased]
+
+### Added
+
+- **Log rotation and retention policy ([M39](docs/M39-日志轮转与保留.md))**. On real hardware
+  `~/.local/state/qxync/log/qxyncd.log.2026-10-23` reached **5.17 GB in a single file**
+  (5,174,393,555 bytes / 52,266,068 lines; the whole directory was 4.9 GiB). The old
+  implementation had nothing but `tracing_appender::rolling::daily`, which has two defects:
+  **no size limit within a single day** (it only rolls when the date changes) and **old files
+  are never deleted** (grow-only). Now:
+  - **The write path is our own `RotatingWriter`** (`qxync-core/src/logcfg.rs`): rotation by day
+    **and by size** — once `log_max_file_mb` (default **32 MiB**) is reached, the current segment
+    is renamed to `<prefix>.log.<date>.<n>` and a fresh one is opened. The naming rule is
+    byte-for-byte the old `daily` one (**UTC dates**, so the switch happens at 08:00 local),
+    and historical files still fit the sequence. If the current day's segment is already
+    oversized at startup it is rotated immediately (exactly the "it exploded yesterday, I
+    restarted today" case).
+  - **Age- and total-size-based pruning**: files older than `log_keep_days` (default **14 days**)
+    or beyond `log_max_total_mb` (default **256 MiB**) are deleted oldest-first by **mtime**
+    (file names are not parsed, so old files and hand-copied files are handled correctly).
+    "Never delete a file that is being written" uses **`flock` probing** (the writer holds
+    `LOCK_EX`; the pruner tries to take the same lock and skips the file when it cannot, recording
+    it in `PruneReport.in_use`, which is surfaced through IPC `LogsData.in_use` to the CLI and the
+    GUI, so they say "skipped (currently being written)" instead of silently doing nothing) — the
+    daemon and the GUI are separate processes and the GUI may
+    not write a line for days, so guessing from mtime or "newest in the family" would misjudge
+    the active file as dead; conversely a 40-day-old orphan from a GUI that exited long ago is
+    now pruned normally.
+  - **The policy lives in `settings.json` and applies without a restart**:
+    `log_max_file_mb` / `log_keep_days` / `log_max_total_mb` (each `0` has its own meaning: no
+    size rotation / no age pruning / no total cap; hard upper bounds are clamped in
+    `Settings::normalize`). The write path re-reads the in-process policy on every write;
+    `settings_save` hot-applies it and **prunes immediately**, so changing retention from 14
+    days to 3 makes the space come back at once.
+  - **Periodic pruning is independent of writing**: the daemon prunes every **3600s**
+    (`QXNYC_LOG_PRUNE_SECS`, minimum 5) according to the policy, so old files are deleted on
+    schedule even when nothing is being logged; this also works for an idle daemon with no
+    connection configured.
+  - **Visible / actionable**: IPC `Request::Logs { prune }` → `LogsData` (directory, usage,
+    policy, prune result, failures, up to 50 files sorted by size); CLI `qxync log` /
+    `qxync log --prune` / `--json`; GUI Settings → "Logs" section (usage, the three policy
+    numbers, save, prune now, file table). Inspecting never triggers network/sync work and works
+    while the daemon is idle.
+  - Boundaries are written down honestly: deletion is best-effort (failures are reported);
+    `flock` is a heuristic — **an old binary still running after an upgrade holds no lock**, so
+    `qxync log --prune` may delete the file that old daemon is writing (diagnostics only, no data
+    loss), hence restart the daemon after upgrading; the total cap is not a hard cap because the
+    active file's protection wins.
+  - ⚠ **M39 bounds file growth and prunes old files; it does not fix the spam root cause**: in
+    that 5.17 GB file **99.998% of all lines are one single message**,
+    `WARN qxyncd::daemon: accept 失败: Too many open files (os error 24)` (52,265,459 of
+    52,266,068 lines) — that is a tight loop after a failed `accept`, not "one line per polling
+    round". The same shape recurred while this documentation was being written (2026-10-27
+    08:34–08:37): **674 MB in two and a half minutes**. **The root cause of the fd exhaustion is
+    not located yet and is tracked separately.**
+
+### Fixed
+
+- **A failing `accept` no longer spins and floods the log (M39 companion fix)**. The error branch
+  used to fall straight back into `select!`, so the next `accept` failed immediately — pure CPU
+  burn plus log spam (that is what both EMFILE tight loops on real hardware were). It now
+  `sleep(100ms)` before retrying (log message `accept 失败（100ms 后重试）`, applied at all three
+  `accept` branches), capping it at roughly 860k lines/day, which is then bounded by the
+  per-file size rotation and the total-size cap. **This stops the bleeding, it does not fix the
+  cause**: why the fds are exhausted is still to be investigated.
+
 ## [0.7.11] - 2026-10-26
 
 ### Fixed

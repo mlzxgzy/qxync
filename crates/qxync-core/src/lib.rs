@@ -28,6 +28,7 @@ pub mod error;
 pub mod file_id;
 pub mod freespace;
 pub mod ipc;
+pub mod logcfg;
 pub mod model;
 pub mod mountbusy;
 pub mod mounts;

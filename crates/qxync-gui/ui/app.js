@@ -46,13 +46,15 @@
   // 诊断页内的子 tab
   var DIAG_PANELS = ['status', 'mounts', 'sync'];
   // ★ M8.4：设置页内的分区（对齐 Qsync 的四个 tab + 连接/筛选/LAN/关于）
-  var SETTINGS_SECS = ['connect', 'proxy', 'sync', 'personal', 'advanced', 'free', 'lan', 'about'];
+  // ★ M39：多了「日志」分区（日志目录占用 / 轮转策略 / 立即清理）
+  var SETTINGS_SECS = ['connect', 'proxy', 'sync', 'personal', 'advanced', 'log', 'free', 'lan', 'about'];
   var SEC_TITLE = {
     connect: T('sec.connect'),
     proxy: T('sec.proxy'),
     sync: T('sec.sync'),
     personal: T('sec.personal'),
     advanced: T('sec.advanced'),
+    log: T('sec.log'),
     free: T('sec.free'),
     lan: T('sec.lan'),
     about: T('sec.about')
@@ -112,6 +114,10 @@
     lanLoading: false,
     spaceLoading: false,
     settingsError: '',
+    // ★ M39：日志分区（占用/文件表来自 `logs` 命令；数字来自 settings）
+    logs: null,
+    logsLoading: false,
+    logsError: '',
     rowMenuTrigger: null, // 右键菜单的焦点来处（关闭时还回去）
     lastErrorKey: '',     // 已通知过的错误条目（去重，按「连接:条目」）
     lastConflictKey: '',  // ★ M28：已通知过的冲突条目（去重，独立于错误键）
@@ -5216,7 +5222,11 @@
       language: '',
       region: '',
       free_space: { auto: false, mode: 'below_pct', below_pct: 10, every_hours: 24 },
-      close_to_tray: true
+      close_to_tray: true,
+      // ★ M39：日志轮转/保留策略（与 `logcfg` 的默认值对齐：32 MiB / 14 天 / 256 MiB）
+      log_max_file_mb: 32,
+      log_keep_days: 14,
+      log_max_total_mb: 256
     };
   }
 
@@ -5321,6 +5331,11 @@
     var bp = $('fs-below-pct'); if (bp) { bp.value = str(num(free.below_pct, 10)); }
     var eh = $('fs-every-hours'); if (eh) { eh.value = str(num(free.every_hours, 24)); }
 
+    // ---- 日志（★ M39）：策略数字来自 settings.json；占用/文件表走另一路（logs 命令）
+    var lf = $('f-log-max-file-mb'); if (lf) { lf.value = str(num(s.log_max_file_mb, 32)); }
+    var lk = $('f-log-keep-days'); if (lk) { lk.value = str(num(s.log_keep_days, 14)); }
+    var lt = $('f-log-max-total-mb'); if (lt) { lt.value = str(num(s.log_max_total_mb, 256)); }
+
     // ---- 冲突策略（全局只是"显示 + 每个任务在哪改"）
     renderConflictKv();
 
@@ -5384,6 +5399,18 @@
     return s;
   }
 
+  /** ★ M39：日志轮转/保留策略的三个数字。
+   *
+   *  前端只夹「非负整数」；上限（4096 MiB / 3650 天 / 100 GiB）由 daemon 的
+   *  `Settings::normalize` 统一收口 —— 前端再抄一份边界，两边迟早对不上。
+   *  `0` 各有语义（不切段 / 不按天删 / 不限总量），所以不能把 0 当「没填」吞掉。 */
+  function collectLog(s) {
+    s.log_max_file_mb = Math.max(0, Math.round(num($('f-log-max-file-mb') ? $('f-log-max-file-mb').value : 32, 32)));
+    s.log_keep_days = Math.max(0, Math.round(num($('f-log-keep-days') ? $('f-log-keep-days').value : 14, 14)));
+    s.log_max_total_mb = Math.max(0, Math.round(num($('f-log-max-total-mb') ? $('f-log-max-total-mb').value : 256, 256)));
+    return s;
+  }
+
   /** 整体回写设置（带 autostart_exe：开机自启要写 GUI 自己的绝对路径）。
    *
    *  ★ M16：settings.json 是所有连接共用的**全局**设置，但每个 daemon 各有一份内存态 ——
@@ -5395,7 +5422,7 @@
       if (exe) { req.autostart_exe = exe; }
       var targets = fanoutTargets();
       return withBusy({
-        buttons: ['btn-proxy-save', 'btn-personal-save', 'btn-advanced-save', 'btn-free-save']
+        buttons: ['btn-proxy-save', 'btn-personal-save', 'btn-advanced-save', 'btn-free-save', 'btn-log-save']
       }, function () {
         return fanout(req, targets);
       }).then(function (rs) {
@@ -5572,6 +5599,136 @@
   function doFreeSave() {
     return saveSettings(collectFree(currentSettings()), 'free-result', '释放空间设置已保存', []).then(function (r) {
       refreshSpace();
+      return r;
+    });
+  }
+
+  // ------------------------------------------------------------ ★ M39：日志（占用 / 轮转 / 清理）
+
+  /** 日志文件表最多显示几行：daemon 最多回 50 条（按大小降序），
+   *  一屏 10 行够看清「谁在占地方」，再长反而把下面的说明挤出视野。 */
+  var LOG_FILES_MAX = 10;
+
+  /**
+   * 读日志目录现状；`prune=true` 顺便让 daemon 按**当前策略**清一次。
+   *
+   * 为什么经 daemon 而不是 GUI 自己扫目录：日志目录是**进程级**资源
+   * （`<state>/log`，daemon 与 GUI 各写一族文件、共用一套策略），路径与策略的真值
+   * 都在 daemon 那边；GUI 自己算一份 = 迟早与 CLI/daemon 各说各话。
+   * 日志目录所有连接共用 → 问哪台 daemon 都一样，取法同 `settings`（settingsLinkId）。
+   */
+  function refreshLogs(prune) {
+    state.logsLoading = true;
+    renderLogs();
+    var args = { linkId: settingsLinkId() };
+    if (prune === true) { args.prune = true; }
+    return withBusy({
+      spinners: ['log-busy'],
+      buttons: prune === true ? ['btn-log-prune'] : ['btn-log-refresh']
+    }, function () {
+      return call('logs', args);
+    }).then(function (r) {
+      state.logsLoading = false;
+      if (!r.ok) {
+        // 旧 daemon 不认识 `logs`（M39 之前）时这里就是「未知的 method: logs」——
+        // 如实显示，别伪装成「没有日志」。
+        state.logs = null;
+        state.logsError = str(r.error);
+        logErr('读取日志目录失败：' + state.logsError);
+        renderLogs();
+        return r;
+      }
+      state.logs = isObj(r.data) ? r.data : {};
+      state.logsError = '';
+      renderLogs();
+      if (prune === true) {
+        var d = state.logs;
+        var deleted = num(d.deleted, 0);
+        setText('log-prune-result', deleted > 0
+          ? T('logs.prune_done', {
+            deleted: deleted,
+            freed: humanSize(num(d.freed_bytes, 0)),
+            size: humanSize(num(d.total_bytes, 0)),
+            files: num(d.file_count, 0)
+          })
+          : T('logs.prune_none', {
+            size: humanSize(num(d.total_bytes, 0)),
+            files: num(d.file_count, 0)
+          }));
+        show('log-prune-result', true);
+        if (deleted > 0) {
+          logOk('日志清理：删除 ' + deleted + ' 个文件，释放 ' + humanSize(num(d.freed_bytes, 0)));
+        }
+      }
+      return r;
+    });
+  }
+
+  function renderLogs() {
+    var tb = $('log-files-tbody');
+    if (!tb) { return; }
+    clear(tb);
+    setBusyState('log-files', state.logsLoading === true);
+    var d = state.logs;
+    if (state.logsError) {
+      setText('log-dir', '—');
+      setText('log-usage-label', '');
+      setListState('log-files-empty', 'error', T('list.error', { msg: state.logsError }));
+      clearAlerts('log-failed');
+      return;
+    }
+    if (!d) {
+      setText('log-dir', '—');
+      setText('log-usage-label', '—');
+      setListState('log-files-empty', 'loading', T('logs.loading'));
+      return;
+    }
+    setText('log-dir', str(d.dir) || '—');
+    setText('log-usage-label', T('logs.count', {
+      size: humanSize(num(d.total_bytes, 0)),
+      files: num(d.file_count, 0)
+    }));
+
+    var files = (d.files || []).filter(isObj).slice(0, LOG_FILES_MAX);
+    if (!files.length) {
+      setListState('log-files-empty', 'empty', T('logs.empty'));
+    } else {
+      setListState('log-files-empty', 'ready');
+    }
+    for (var i = 0; i < files.length; i++) {
+      (function (f) {
+        var tr = el('tr');
+        tr.appendChild(el('td', 'mono', str(f.name) || '—'));
+        tr.appendChild(el('td', 'col-size mono', humanSize(num(f.size, 0))));
+        tr.appendChild(el('td', 'col-time mono', humanTimeFromEpoch(num(f.mtime, 0)) || '—'));
+        tb.appendChild(tr);
+      })(files[i]);
+    }
+    renderLogFailures(d);
+  }
+
+  /** 删不掉的文件（权限 / 被占用）必须醒目列出来 —— 静默跳过会让人以为「策略没生效」。 */
+  function renderLogFailures(d) {
+    clearAlerts('log-failed');
+    // ★ M39：「正被写入」被跳过不是错误（写入器持着 flock，删了会让那一路日志消失）。
+    //   但也不能一声不响 —— 用户看到「总量上限 256 MB，目录还是 300 MB」时会以为策略没生效。
+    var inUse = (d && d.in_use) ? d.in_use : [];
+    if (inUse.length) {
+      addAlert('log-failed', T('logs.in_use', { n: inUse.length }));
+    }
+    var failed = (d && d.failed) ? d.failed : [];
+    if (!failed.length) { return; }
+    addAlert('log-failed', T('logs.failed', { n: failed.length }), 'warn');
+    for (var i = 0; i < failed.length; i++) {
+      addAlert('log-failed', str(failed[i]), 'warn');
+    }
+  }
+
+  function doLogSave() {
+    return saveSettings(collectLog(currentSettings()), 'log-result', T('logs.saved'), []).then(function (r) {
+      // 保存会走 daemon 的 settings_save：它热应用新策略并**顺手清一次**，
+      // 所以这里必须重读，否则「当前占用」还停在旧数字上。
+      refreshLogs();
       return r;
     });
   }
@@ -6577,6 +6734,8 @@
     setText('page-title', T('page.settings_sec', { sec: SEC_TITLE[name] || name }));
     if (name === 'free') { refreshSpace(); }
     if (name === 'lan') { refreshLan(); }
+    // ★ M39：日志分区的占用/文件表每次都重读（它随时在变；缓存反而会误导）
+    if (name === 'log') { refreshLogs(); }
     if (name === 'connect') { loadConnect(); renderConnList(); }
     if (name === 'about') { renderAbout(); }
     if (name === 'sync') { refreshFilters(); }
@@ -6898,6 +7057,10 @@
     on('btn-free-save', 'click', function () { doFreeSave(); });
     on('btn-free-now', 'click', function () { doFreeNow(); });
     on('btn-space-refresh', 'click', function () { refreshSpace(); });
+    // ★ M39：日志分区 —— 保存策略 / 立即清理 / 刷新占用
+    on('btn-log-save', 'click', function () { doLogSave(); });
+    on('btn-log-prune', 'click', function () { refreshLogs(true); });
+    on('btn-log-refresh', 'click', function () { refreshLogs(false); });
     on('btn-flt-save', 'click', function () { doFiltersSave(); });
     on('btn-flt-reload', 'click', function () { refreshFilters(); });
     on('btn-flt-match', 'click', function () { doMatchPreview(); });

@@ -272,6 +272,31 @@ pub struct Settings {
     /// 完全无感）。开启同样有 Baloo 前置门禁（与 tags 共用一套检查）。
     #[serde(default)]
     pub dolphin_overlay: bool,
+    /// ★ M39：单个日志文件上限（MB）。写满就**当场切段**
+    /// （`<前缀>.log.<日期>.<n>`），而不是等跨天。
+    ///
+    /// 旧实现只有 `tracing_appender::rolling::daily` —— 同一天内无上限，真机
+    /// 2026-10-23 的 `qxyncd.log.2026-10-23` 单文件 **5.2 GB** 就是这么来的。
+    /// `0` = 不按大小切段（不推荐；只会被 `log_max_total_mb` 兜住）。
+    #[serde(default = "log_max_file_mb_default")]
+    pub log_max_file_mb: u32,
+    /// ★ M39：日志保留天数（mtime 早于 N 天的删掉）。`0` = 不按天数删。
+    #[serde(default = "log_keep_days_default")]
+    pub log_keep_days: u32,
+    /// ★ M39：日志目录总占用上限（MB）。超了从最旧的删起，直到不超限。
+    /// `0` = 不限制总占用。
+    #[serde(default = "log_max_total_mb_default")]
+    pub log_max_total_mb: u32,
+}
+
+fn log_max_file_mb_default() -> u32 {
+    crate::logcfg::DEFAULT_MAX_FILE_MB
+}
+fn log_keep_days_default() -> u32 {
+    crate::logcfg::DEFAULT_KEEP_DAYS
+}
+fn log_max_total_mb_default() -> u32 {
+    crate::logcfg::DEFAULT_MAX_TOTAL_MB
 }
 
 fn one() -> u32 {
@@ -292,6 +317,9 @@ impl Default for Settings {
             close_to_tray: true,
             dolphin_tags: false,
             dolphin_overlay: false,
+            log_max_file_mb: crate::logcfg::DEFAULT_MAX_FILE_MB,
+            log_keep_days: crate::logcfg::DEFAULT_KEEP_DAYS,
+            log_max_total_mb: crate::logcfg::DEFAULT_MAX_TOTAL_MB,
         }
     }
 }
@@ -329,6 +357,12 @@ impl Settings {
         if !matches!(self.version, 1..=1) {
             self.version = 1;
         }
+        // ★ M39：日志策略只夹上限，不做「非零」校验 —— 0 在这三个字段上各有语义
+        //   （不切段 / 不按天删 / 不限总量），见字段注释。手改 JSON 写了离谱大数时
+        //   在这里收回来，免得把「一个文件 4 PB」这种值当真去建盘。
+        self.log_max_file_mb = self.log_max_file_mb.min(crate::logcfg::MAX_FILE_MB_CAP);
+        self.log_keep_days = self.log_keep_days.min(crate::logcfg::KEEP_DAYS_CAP);
+        self.log_max_total_mb = self.log_max_total_mb.min(crate::logcfg::MAX_TOTAL_MB_CAP);
     }
 
     /// 读设置；**文件不存在 = 全默认**（不是错误）。
@@ -480,13 +514,32 @@ impl Settings {
             // ★ M24：文件图标角标开关。与 `dolphin_tags` 相互独立；前置检查同
             //   前者（daemon 的 settings_save 做），这里只记值。
             "dolphin_overlay" => self.dolphin_overlay = b(v)?,
+            // ★ M39：日志轮转/保留策略（单位见字段注释；0 的语义也写在字段上）。
+            //   热生效：daemon 的 settings_save 会调 `logcfg::apply_settings`，
+            //   写路径每次现读策略，不用重启。
+            "log_max_file_mb" => {
+                self.log_max_file_mb = v
+                    .parse()
+                    .map_err(|_| Error::Io(format!("log_max_file_mb 需要整数（MB），收到 {v:?}")))?
+            }
+            "log_keep_days" => {
+                self.log_keep_days = v
+                    .parse()
+                    .map_err(|_| Error::Io(format!("log_keep_days 需要整数（天），收到 {v:?}")))?
+            }
+            "log_max_total_mb" => {
+                self.log_max_total_mb = v.parse().map_err(|_| {
+                    Error::Io(format!("log_max_total_mb 需要整数（MB），收到 {v:?}"))
+                })?
+            }
             "language" => self.language = v.to_string(),
             "region" => self.region = v.to_string(),
             other => {
                 return Err(Error::Io(format!(
                     "未知设置键 {other:?}（可用：proxy.mode/server/port/auth/user/password、\
                      free.auto/mode/below_pct/every_hours、startup、notifications、debug_log、\
-                     close_to_tray、dolphin_tags、dolphin_overlay、language、region）"
+                     close_to_tray、dolphin_tags、dolphin_overlay、\
+                     log_max_file_mb、log_keep_days、log_max_total_mb、language、region）"
                 )))
             }
         }
@@ -598,6 +651,38 @@ mod tests {
         assert!(s.close_to_tray);
         assert!(!s.free_space.auto);
         assert_eq!(s.version, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ★ M39：日志策略字段 —— 默认值 / `--set` 认键 / normalize 夹上限。
+    #[test]
+    fn log_policy_fields_default_set_and_clamp() {
+        let (paths, dir) = paths_for("m39-log");
+        let s = Settings::load(&paths).unwrap();
+        assert_eq!(s.log_max_file_mb, 32, "默认单文件 32 MB");
+        assert_eq!(s.log_keep_days, 14, "默认保留 14 天");
+        assert_eq!(s.log_max_total_mb, 256, "默认总量 256 MB");
+
+        let mut s = Settings::default();
+        s.set_kv("log_max_file_mb", "8").unwrap();
+        s.set_kv("log_keep_days", "0").unwrap(); // 0 = 不按天数删，合法
+        s.set_kv("log_max_total_mb", "1024").unwrap();
+        assert_eq!(
+            (s.log_max_file_mb, s.log_keep_days, s.log_max_total_mb),
+            (8, 0, 1024)
+        );
+        let e = s.set_kv("log_max_total", "1").unwrap_err().to_string();
+        assert!(e.contains("log_max_total_mb"), "报错要列出可用键: {e}");
+        assert!(s.set_kv("log_keep_days", "两周").is_err());
+
+        // 手改 JSON 写了离谱大数 → normalize 收回上限，不乱建盘
+        s.log_max_file_mb = u32::MAX;
+        s.log_keep_days = u32::MAX;
+        s.log_max_total_mb = u32::MAX;
+        s.normalize();
+        assert_eq!(s.log_max_file_mb, crate::logcfg::MAX_FILE_MB_CAP);
+        assert_eq!(s.log_keep_days, crate::logcfg::KEEP_DAYS_CAP);
+        assert_eq!(s.log_max_total_mb, crate::logcfg::MAX_TOTAL_MB_CAP);
         std::fs::remove_dir_all(&dir).ok();
     }
 

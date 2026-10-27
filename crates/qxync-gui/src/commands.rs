@@ -9,7 +9,7 @@
 
 use crate::ipc;
 use qxync_core::ipc::{
-    ErrorKind, MountInfo, PingData, Request, RequestEnvelope, StatusData, IPC_VERSION,
+    ErrorKind, LogsData, MountInfo, PingData, Request, RequestEnvelope, StatusData, IPC_VERSION,
 };
 use qxync_core::totp::{normalize_otp, Otp};
 use qxync_core::{ConfigPaths, Credentials, LinkConfig, Settings};
@@ -456,6 +456,45 @@ pub async fn ipc_call_with_progress(
         }),
         Err(e) => ipc::err_response(e.kind, e.message),
     }
+}
+
+/// ★ M39：日志目录的占用与轮转策略（设置 →「日志」分区）。
+///
+/// * `prune=true`：让 daemon 立即按**当前策略**清一次（返回里带 `deleted` / `freed_bytes`）；
+/// * 省略 / `false`：只读（不删任何东西），GUI 每次进分区都要调。
+///
+/// 为什么单独一个命令而不是前端直接走 `ipc_call`：GUI 要的是「一个数据对象」，
+/// 由 Rust 侧按 [`LogsData`] 解出来顺手做一次类型校验 —— daemon 侧字段改名/漏字段
+/// 时这里立刻报错，而不是让前端拿到半个对象、把「没读到」显示成「0 B / 0 个文件」。
+/// 日志目录是**进程级**资源（所有连接共用 `<state>/log`），`link_id` 只用来决定问
+/// 哪台 daemon；参数名与其它命令一致（前端传 camelCase `linkId`）。
+#[tauri::command]
+pub async fn logs(link_id: Option<String>, prune: Option<bool>) -> Result<LogsData, String> {
+    let id = link_id
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "default".into());
+    let socket = ipc::socket_path_for(&id);
+    let data = ipc::call_typed::<LogsData>(&socket, Request::Logs { prune })
+        .await
+        .map_err(|e| e.message)?;
+    apply_policy_from_logs(&data);
+    Ok(data)
+}
+
+/// 把 daemon 报的「当前生效策略」同步到 **GUI 本进程**的日志写入器。
+///
+/// 为什么需要：daemon 在 `settings_save` 里已经热应用了策略，但 GUI 是**另一个进程**，
+/// `init_logging` 里那个 `RotatingWriter` 只认本进程的策略单元。不同步的话会出现两套
+/// 真值：界面写着「单文件上限 8 MiB」，GUI 自己的 `qxync-gui.log.*` 却还按启动时的旧
+/// 值（32 MiB）切段。取 daemon 报的**生效值**而不是设置文件，顺带覆盖「策略是 CLI 改的」
+/// 这种情况 —— 用户下一次打开/刷新日志分区就同步过来了。
+fn apply_policy_from_logs(d: &LogsData) {
+    const MIB: u64 = 1024 * 1024;
+    qxync_core::logcfg::set_policy(qxync_core::logcfg::LogPolicy {
+        max_file_bytes: u64::from(d.max_file_mb) * MIB,
+        keep_days: d.keep_days,
+        max_total_bytes: u64::from(d.max_total_mb) * MIB,
+    });
 }
 
 /// 读连接配置（**不含口令**）。
@@ -2488,5 +2527,36 @@ mod tests {
             "被拉起的进程 argv 应含脚本 {script_arg} 与要打开的目录 {target}（实际扫到的进程需含两者）"
         );
         let _ = std::fs::remove_dir_all(&mnt);
+    }
+
+    /// ★ M39：`logs` 命令要把 daemon 报的**生效策略**同步到 GUI 本进程的写入器。
+    ///
+    /// 守的是「两套真值」：daemon 已按新策略切段/清理，而 GUI 自己的
+    /// `qxync-gui.log.*` 还按启动时的旧上限切 —— 界面显示 8 MiB，实际切在 32 MiB。
+    /// 这条只验换算与落盘（MB→字节、三个字段都不丢），不碰真实目录。
+    #[test]
+    fn m39_logs_syncs_gui_log_policy_from_daemon() {
+        // 全局策略单元：跑完复位，别影响同进程里别的测试/写入器。
+        let before = qxync_core::logcfg::policy();
+        let d = LogsData {
+            dir: "/tmp/log".into(),
+            total_bytes: 0,
+            file_count: 0,
+            max_file_mb: 8,
+            keep_days: 3,
+            max_total_mb: 64,
+            pruned: true,
+            deleted: 0,
+            freed_bytes: 0,
+            failed: vec![],
+            in_use: vec![],
+            files: vec![],
+        };
+        apply_policy_from_logs(&d);
+        let p = qxync_core::logcfg::policy();
+        assert_eq!(p.max_file_bytes, 8 * 1024 * 1024, "单文件上限要换成字节");
+        assert_eq!(p.keep_days, 3);
+        assert_eq!(p.max_total_bytes, 64 * 1024 * 1024);
+        qxync_core::logcfg::set_policy(before);
     }
 }

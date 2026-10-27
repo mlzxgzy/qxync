@@ -363,6 +363,17 @@ pub enum Request {
     /// 每个挂载点「是否已排除 / 会不会被索引 / 建议执行的排除命令」。
     /// GUI 开 Dolphin 集成开关前先调它做预检。
     BalooStatus,
+    /// ★ M39：日志目录的占用与轮转策略（设置 →「日志」页的数据源）。
+    ///
+    /// * `prune=true`  → 立即按当前策略清理一次（返回这次删了多少/files 表是清理后的）；
+    /// * `prune=false`/省略 → 只读：目录、文件列表、总占用、当前策略。
+    ///
+    /// 只读模式是 GUI 每次打开设置页都要调的（显示「现在占多少」），
+    /// 所以这一段绝不删东西、也不要求 daemon 处于某个连接状态（空转态也能回答）。
+    Logs {
+        #[serde(default)]
+        prune: Option<bool>,
+    },
     /// 干净退出：卸载所有挂载点、删 socket/pid。
     Shutdown,
 }
@@ -398,6 +409,7 @@ impl Request {
             Request::FileStates { .. } => "file_states",
             Request::Space { .. } => "space",
             Request::BalooStatus => "baloo_status",
+            Request::Logs { .. } => "logs",
             Request::Shutdown => "shutdown",
         }
     }
@@ -1195,6 +1207,49 @@ pub struct SettingsData {
     pub proxy_url: Option<String>,
     /// 一句话说明（例如「改了 peer_listen 需要重启 daemon」）。
     pub note: Option<String>,
+}
+
+/// ★ M39：`logs` 的返回。
+///
+/// `files` 按大小降序（GUI 只展示最占地方的前几个；全部文件也全在 `scan` 里，
+/// 这里限制条数是为了不让一个刷屏现场把 IPC 帧撑爆）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LogsData {
+    /// 日志目录（`<state>/log`）。
+    pub dir: String,
+    /// 目录里 qxync 日志的总字节 / 文件数（**清理后**）。
+    pub total_bytes: u64,
+    pub file_count: usize,
+    /// 当前生效的轮转策略（来自 settings.json）。
+    pub max_file_mb: u32,
+    pub keep_days: u32,
+    pub max_total_mb: u32,
+    /// 本次是否真的执行了清理。
+    pub pruned: bool,
+    /// 刚才删掉的文件数 / 释放字节（只读时都是 0）。
+    pub deleted: usize,
+    pub freed_bytes: u64,
+    /// 想删但没删掉的（权限/占用），如实返回给 UI。
+    pub failed: Vec<String>,
+    /// 因为「正被某个进程持有」而**跳过**的（`flock` 探测到写入器还开着）：
+    /// 不算失败，本次就是不动它 —— 否则用户会看到「策略说总量 256 MB，
+    /// 目录还是 300 MB」却没有任何解释。
+    pub in_use: Vec<String>,
+    /// 最占地方的日志文件（最多 50 条）。
+    pub files: Vec<LogFileInfo>,
+}
+
+/// ★ M39：日志目录里的一个文件。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct LogFileInfo {
+    pub name: String,
+    /// 绝对路径（`dir/name`），方便 UI 直接复制。
+    pub path: String,
+    pub size: u64,
+    /// unix 秒（mtime）。
+    pub mtime: i64,
 }
 
 /// ★ M8.4：待裁决队列里的一条冲突。

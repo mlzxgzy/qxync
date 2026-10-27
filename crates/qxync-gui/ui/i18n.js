@@ -68,6 +68,8 @@
     'sec.sync': '同步与筛选',
     'sec.personal': '个人',
     'sec.advanced': '高级',
+    // ★ M39：日志目录占用 / 轮转策略
+    'sec.log': '日志',
     'sec.free': '释放空间',
     'sec.lan': 'LAN 加速',
     'sec.about': '关于',
@@ -453,6 +455,16 @@
     'purge.kind.data': '数据目录',
     'purge.kind.state': '状态目录',
 
+    // ---- ★ M39：设置 → 日志（占用 / 轮转策略 / 立即清理）
+    'logs.loading': '正在读取日志目录…',
+    'logs.empty': '日志目录里还没有文件（daemon 与界面都还没写过日志）。',
+    'logs.count': '{size} · {files} 个文件',
+    'logs.prune_done': '清理完成：删除 {deleted} 个文件，释放 {freed}（现存 {size} · {files} 个文件）',
+    'logs.prune_none': '清理完成：没有可删的文件（现存 {size} · {files} 个文件）',
+    'logs.failed': '有 {n} 个文件没能删掉（权限 / 被占用），其余已按策略清理',
+    'logs.in_use': '有 {n} 个文件正被 daemon/界面写入，本次跳过（它们不能删）',
+    'logs.saved': '日志策略已保存：daemon 已立即应用并清理一次',
+
     // ---- ★ 设置 → 高级：危险区
     'danger.title': '危险区',
     'danger.hint': '删除本机所有 qxync 数据（连接 / 凭据 / 任务 / 缓存 / 同步状态 / 日志）；NAS 上的数据与挂载点里的文件不动。',
@@ -464,11 +476,21 @@
   // 空表 = 全部回落到 zh-CN。加词条时**只加需要改的**，不用整份复制：
   //   t() 的回落顺序是 en → zh-CN → key 本身。
   // ★ M17：这里只补了两步验证（2SV）的 4 条 —— 其余键继续回落 zh-CN。
+  // ★ M39：补「日志」分区的 8 条（分区名 + 四态/清理结果文案）。
   var EN = {
     'connect.otp_hint': 'Only needed when 2-step verification is enabled: a TOTP secret is saved and used to generate codes later; a 6-digit code is used for this login only. The secret is stored in the 0600 credentials file, same as the password.',
     'connect.otp_configured': '2-step verification: configured',
     'connect.otp_missing': '2-step verification: not configured',
-    'links.otp_badge': '2-step'
+    'links.otp_badge': '2-step',
+    'sec.log': 'Logs',
+    'logs.loading': 'Reading the log directory…',
+    'logs.empty': 'No log files yet (neither the daemon nor the GUI has written one).',
+    'logs.count': '{size} · {files} file(s)',
+    'logs.prune_done': 'Pruned {deleted} file(s), freed {freed} (now {size} · {files} file(s))',
+    'logs.prune_none': 'Nothing to prune (now {size} · {files} file(s))',
+    'logs.failed': '{n} file(s) could not be deleted (permissions / in use); the rest were pruned by the policy',
+    'logs.in_use': '{n} file(s) are being written by the daemon/GUI and were skipped (they must not be deleted)',
+    'logs.saved': 'Log policy saved: the daemon applied it and pruned immediately'
   };
 
   var TABLES = { 'zh-CN': ZH, en: EN };
