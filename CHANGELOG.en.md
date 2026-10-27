@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.12] - 2026-10-27
+
 ### Added
 
 - **Log rotation and retention policy ([M39](docs/M39-日志轮转与保留.md))**. On real hardware
@@ -63,6 +65,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The upload queue mistook a missing local content source for being offline (M38)**. On real
+  hardware (2026-10-26) the editor (WPS) saved atomically: it wrote a temporary file and hard-linked
+  it into place, then the temporary directory was removed — leaving an upload job whose content
+  source pointed at the deleted `.tmp`. The old code wrapped local `stat` / `open` failures as
+  `Error::Transport`, so the upload queue treated it as "the network is unavailable": the job was
+  never failed, never abandoned, and every retry round **marked the connection offline** — the UI
+  showed "网络断开" (network disconnected) forever while the NAS was fine, and "立即同步" (sync now)
+  never appeared to do anything (the sync did run, then the zombie job flipped the state back).
+  Three fixes: ①`qxync-client` reports local `stat` / `open` failures as `Error::Io` (not
+  `Transport`); ②`qxync-fuse` abandons a job whose content source is gone **immediately and
+  deletes the row** (leaving an `error` log line) instead of retrying forever; ③before
+  retargeting a job by identity, confirm the content source still exists so the job at the new
+  name (which can still upload) is not overwritten. Three regression tests
+  (`upload_missing_local_is_io_not_transport` /
+  `missing_content_source_is_given_up_not_offline` /
+  `identity_retarget_skips_dead_content_source`). On the live machine the lost staging file was
+  restored from the cached copy (35,043 bytes, checksum-verified), the upload succeeded, the queue
+  drained to zero and the remote side reports `exist=true`.
 - **A failing `accept` no longer spins and floods the log (M39 companion fix)**. The error branch
   used to fall straight back into `select!`, so the next `accept` failed immediately — pure CPU
   burn plus log spam (that is what both EMFILE tight loops on real hardware were). It now
@@ -2239,6 +2259,7 @@ Verified on **QNAP TS-464C / QTS 5.2.9 / Qsync QPKG 5.0.0.7 (build 20260723)**.
 - Acceptance results were split out of the README into [`docs/验收记录.md`](docs/验收记录.md).
 - Dual-licensed under **MIT OR Apache-2.0** (`LICENSE-MIT` / `LICENSE-APACHE`).
 
+[0.7.12]: https://github.com/mlzxgzy/qxync/compare/v0.7.11...v0.7.12
 [0.7.4]: https://github.com/mlzxgzy/qxync/compare/v0.7.3...v0.7.4
 [0.7.3]: https://github.com/mlzxgzy/qxync/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/mlzxgzy/qxync/compare/v0.7.1...v0.7.2
