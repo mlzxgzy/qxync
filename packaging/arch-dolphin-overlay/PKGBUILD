@@ -14,7 +14,7 @@
 #   makepkg --printsrcinfo > .SRCINFO
 
 pkgname=qxync-dolphin-overlay
-pkgver=0.7.12
+pkgver=0.7.13
 pkgrel=1
 pkgdesc='qxync 的水合状态角标插件：Dolphin 文件图标上的绿对钩 / 蓝云 / 半满圆（KOverlayIconPlugin）'
 arch=('x86_64' 'aarch64')
