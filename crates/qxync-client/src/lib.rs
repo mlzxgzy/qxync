@@ -1072,16 +1072,22 @@ impl Client {
     /// 所以「大文件断网从 0 重来」在当前架构下**没有协议层的解**，
     /// 只能靠退避调参 + 进度上报（`UploadQueue` 侧，属 T8 范围）。
     pub async fn upload_file(&self, dest_path: &str, local: &Path, filename: &str) -> Result<u64> {
+        // ★ M38：**本地**读不到内容源是「本地 IO 失败」，不是网络错误。
+        //
+        // 旧实现把 stat/open 的失败也包成 `Error::Transport` → `is_offline()` 为真
+        // → 上传队列按「断网」处理：作业永远留在队尾、永远不放弃，每轮重试还把
+        // 连通性标成离线。真机 2026-10-26 就卡在这个坑里：一个临时文件的缓存被清理后
+        // 队列里剩了个指不到内容的作业，界面一直显示「网络断开」，而 NAS 明明通着
+        // （登录、对账都正常），用户点「立即同步」也永远看不到恢复。
+        //
         // 长度必须**发之前**拿到：reqwest 据此决定发 Content-Length 还是 chunked。
         let len = tokio::fs::metadata(local)
             .await
-            .map_err(|e| {
-                Error::Transport(format!("upload {filename}: stat {}: {e}", local.display()))
-            })?
+            .map_err(|e| Error::Io(format!("upload {filename}: stat {}: {e}", local.display())))?
             .len();
-        let file = tokio::fs::File::open(local).await.map_err(|e| {
-            Error::Transport(format!("upload {filename}: 打开 {}: {e}", local.display()))
-        })?;
+        let file = tokio::fs::File::open(local)
+            .await
+            .map_err(|e| Error::Io(format!("upload {filename}: 打开 {}: {e}", local.display())))?;
         self.upload_stream_sized(dest_path, filename, file, len)
             .await
     }
@@ -2293,6 +2299,39 @@ mod tests {
         let bad = br#"{"status":"1","files":[{"status":"-1","error":"acceptFileTypes"}]}"#;
         let e = parse_upload_result(bad, "a.txt").unwrap_err();
         assert!(e.to_string().contains("acceptFileTypes"), "{e}");
+    }
+
+    /// ★ M38 回归（真机 2026-10-27）：本地文件不存在必须报「本地 IO 失败」，
+    /// 不能是 `Transport` —— 后者会被上传队列判成「网络断了」：作业永远不放弃，
+    /// 每轮重试还把连通性标成离线（界面显示「网络断开」，而 NAS 一直是通的）。
+    #[tokio::test]
+    async fn upload_missing_local_is_io_not_transport() {
+        let link = qxync_core::LinkConfig {
+            id: "t".into(),
+            host: "nas.invalid".into(),
+            port: 9834,
+            https: true,
+            insecure: true,
+            user: "test1".into(),
+            ipv4_only: false,
+            exclude: Vec::new(),
+            filter_temp: true,
+            peer_listen: None,
+            peer_name: None,
+        };
+        let c = Client::new(&link).unwrap();
+        let missing = std::env::temp_dir().join(format!(
+            "qxync-client-m38-missing-{}.bin",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&missing);
+        let e = c
+            .upload_file("/home/qxync-test", &missing, "missing.bin")
+            .await
+            .expect_err("本地文件不存在必须报错");
+        assert!(matches!(e, Error::Io(_)), "本地文件缺失必须是 Io: {e:?}");
+        assert!(!e.is_offline(), "本地文件缺失不是网络错误: {e}");
+        assert!(e.to_string().contains("本地 IO 失败"), "{e}");
     }
 
     #[test]

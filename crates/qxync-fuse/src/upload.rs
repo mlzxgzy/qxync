@@ -563,6 +563,16 @@ impl UploadQueue {
         if job.file_id == ZERO_FILE_ID {
             return false;
         }
+        // ★ M38：内容源已经没了 → **不许**改指到新名字。
+        //
+        // 调用方按新主键重新落库（`persist_delete(旧)` + `persist_put(新)`），而
+        // 「新名字」上很可能已经有一个内容完好、真能传上去的作业 —— 让它被这个
+        // 发不出去的作业顶掉，目标文件就永远上不了 NAS。真机 2026-10-26 的
+        // WPS 原子保存（临时文件 link 成目标文件、临时目录随即被删）正是这样：
+        // 临时文件的在途作业把目标文件的作业行覆盖了，目标文件一直只在本地。
+        if !job.local.exists() {
+            return false;
+        }
         let resolver = self.name_resolver.lock().unwrap().clone();
         let Some(resolve) = resolver else {
             return false;
@@ -1049,6 +1059,23 @@ impl UploadQueue {
                 continue;
             }
 
+            // ★ M38：内容源已经不存在（典型来源：编辑器原子保存的临时文件被清理，
+            // 排队作业还指着那个已删除的缓存文件）→ 这个作业**永远发不出去**。
+            // 必须立刻放弃并删库行：旧行为把它判成「网络错误」，永远留在队尾、永远
+            // 不放弃，每轮重试还把连通性标成离线（界面「网络断开」，NAS 其实通着），
+            // 于是「立即同步」怎么点都看不到恢复。本地内容已经没了，日志留痕即可。
+            if !job.local.exists() {
+                self.stats.failed.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(
+                    "上传内容源已不存在，放弃该作业（无法上传）: {}（{}）",
+                    job.remote_path(),
+                    job.local.display()
+                );
+                self.persist_delete(&job.remote_path());
+                self.release_popped(job, false);
+                continue;
+            }
+
             // ★ M15/T9：**发出去之前**按身份复查落地位置。排队这几十秒里对方
             // 设备改了名的话，写到旧名字会在 NAS 上留一个内容是新的「幽灵文件」。
             // 主键（remote_path）变了 → 删旧行、落新行，保持「表 = 未完成作业」。
@@ -1521,6 +1548,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// ★ M38 回归（真机 2026-10-26/27）：内容源已经消失的作业必须**立刻放弃**，
+    /// 不能判成「网络不可用」—— 旧行为让它永远留在队尾，每轮重试都把连通性标成
+    /// 离线（界面「网络断开」而 NAS 正常），点「立即同步」永远看不到恢复。
+    #[test]
+    fn missing_content_source_is_given_up_not_offline() {
+        let dir = tmpdir("m38-missing-source");
+        let marker = dir.join("queue");
+        let (q, _rt) = test_queue(&marker);
+        let c = Connectivity::shared();
+        q.set_connectivity(c.clone());
+        // 作业指向的缓存文件**不存在**（编辑器临时文件被清理后的典型残留）
+        q.enqueue(job(&dir, "内容源没了.bin")).unwrap();
+        let h = q.spawn_worker().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && q.snapshot().pending > 0 {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        q.shutdown();
+        let _ = h.join();
+
+        assert_eq!(q.snapshot().pending, 0, "内容源没了的作业不能留在队列里");
+        assert_eq!(q.snapshot().failed, 1, "放弃要计入失败（状态/日志可查）");
+        assert!(
+            c.is_online(),
+            "本地文件缺失不是网络错误，绝不能把连通性标成离线"
+        );
+        let rows = Store::open(marker.join(QUEUE_DB_FILE))
+            .unwrap()
+            .uploads()
+            .unwrap();
+        assert!(
+            rows.is_empty(),
+            "库行必须删掉，重启不能把这个注定发不出去的作业再捞出来"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ M38：内容源没了就**不能**按身份改指到新名字 —— 否则调用方落库时会把
+    /// 「新名字上内容完好、真能传」的作业行覆盖成这个发不出去的作业（真机
+    /// 2026-10-26 WPS 原子保存：临时文件的在途作业顶掉了目标文件的作业）。
+    #[test]
+    fn identity_retarget_skips_dead_content_source() {
+        let dir = tmpdir("m38-retarget-guard");
+        let (q, _rt) = test_queue(&dir.join("queue"));
+        q.set_name_resolver(Arc::new(|_| {
+            Some("/home/qxync-test/新名字.bin".to_string())
+        }));
+
+        // 对照：内容源还在 → 照常改指到新名字
+        std::fs::create_dir_all(dir.join("cache")).unwrap();
+        std::fs::write(dir.join("cache").join("ok.bin"), b"x").unwrap();
+        let mut alive = job(&dir, "ok.bin");
+        alive.file_id = [1u8; 16];
+        assert!(q.retarget_by_identity(&mut alive), "内容源还在就该改指");
+        assert_eq!(alive.remote_path(), "/home/qxync-test/新名字.bin");
+
+        // 内容源没了 → 不改指（否则会把新名字上的好作业顶掉）
+        let mut dead = job(&dir, "gone.bin");
+        dead.file_id = [2u8; 16];
+        assert!(!q.retarget_by_identity(&mut dead), "内容源没了不能改指");
+        assert_eq!(dead.remote_path(), "/home/qxync-test/gone.bin");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// ★ M22：闸门（离线 / 回放未完）落下时 `drain` **提前返回**，不陪等到超时。
     ///
     /// 场景：排队中途断网（连通性还没翻成「已知离线」），`daemon stop` / `umount`
@@ -1777,6 +1869,10 @@ mod tests {
         let dir = tmpdir("retarget");
         let marker = dir.join("queue");
         let (q, _rt) = test_queue(&marker);
+        // ★ M38：内容源必须存在，否则「内容源没了不许改指」的守卫会先拦下
+        //（那条路径由 `identity_retarget_skips_dead_content_source` 覆盖）。
+        std::fs::create_dir_all(dir.join("cache")).unwrap();
+        std::fs::write(dir.join("cache").join("a.txt"), b"x").unwrap();
         let id = qxync_core::file_id::compute_file_id(false, 100, 1_700_000_000, "a.txt", "/home");
 
         // 没注入解析器（daemon 还没接线 / 只读挂载）→ 不重定向
@@ -1817,6 +1913,9 @@ mod tests {
         let dir = tmpdir("rekey");
         let marker = dir.join("queue");
         let (q, _rt) = test_queue(&marker);
+        // ★ M38：内容源必须存在（不存在时按身份改指被守卫拦下，见上）。
+        std::fs::create_dir_all(dir.join("cache")).unwrap();
+        std::fs::write(dir.join("cache").join("x.bin"), b"x").unwrap();
         let id = qxync_core::file_id::compute_file_id(false, 7, 1_700_000_001, "x.bin", "/home");
 
         let mut j = job(&dir, "x.bin");
