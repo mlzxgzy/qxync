@@ -1,6 +1,6 @@
 pkgbase = qxync-dolphin-overlay
 	pkgdesc = qxync 的水合状态角标插件：Dolphin 文件图标上的绿对钩 / 蓝云 / 半满圆（KOverlayIconPlugin）
-	pkgver = 0.7.12
+	pkgver = 0.7.13
 	pkgrel = 1
 	url = https://github.com/mlzxgzy/qxync
 	arch = x86_64
@@ -14,7 +14,7 @@ pkgbase = qxync-dolphin-overlay
 	depends = kio
 	optdepends = qxync-bin: 主程序（提供 user.qxync.overlay xattr；没有它插件没有数据可显示）
 	options = !debug
-	source = qxync-dolphin-overlay-0.7.12.tar.gz::https://github.com/mlzxgzy/qxync/archive/refs/tags/v0.7.12.tar.gz
+	source = qxync-dolphin-overlay-0.7.13.tar.gz::https://github.com/mlzxgzy/qxync/archive/refs/tags/v0.7.13.tar.gz
 	sha256sums = 4a766d615b889d819085485aeffd7811223b153f2dafe7253fd9ce36a90a5c38
 
 pkgname = qxync-dolphin-overlay
