@@ -1167,6 +1167,80 @@ button.link-btn {
 .pathbar input[type="text"] { flex: 1 1 260px; width: auto; }
 .pathbar label.check { flex: 0 0 auto; }
 
+/* --------------------------------------------------- ★ M43 搜索同步文件
+ * 搜索框与路径栏同一套「一行控件」的视觉；过滤项单独一行、允许换行
+ * （窗口窄时宁可折行，也不要把「区分大小写」挤到看不见）。 */
+.searchbar {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.searchbar input[type="search"] { flex: 1 1 320px; width: auto; }
+
+.search-filters {
+  display: flex;
+  gap: 8px 14px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: var(--fg-dim);
+}
+
+.search-filters label {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+  /* 文本在 flex 容器里会变成匿名 flex 项；不给 nowrap 时窄窗会被压成一个字一行
+     （验收截图里「类型」曾竖排）。宁可整条换行，也不要竖排。 */
+  white-space: nowrap;
+  flex: 0 0 auto;
+  font-size: 12px;
+  color: var(--fg-dim);
+}
+
+.search-filters input[type="text"] {
+  flex: 1 1 220px;
+  min-width: 180px;
+  font-size: 12px;
+  padding: 3px 6px;
+}
+
+.search-filters select { font-size: 12px; padding: 3px 4px; }
+
+/* 结果表：百分比列宽 + fixed（同 M40 多路径表的理由 —— 这台机器 WebKit 按
+ * Xft.dpi 把整页放大 ~1.63 倍，1200px 窗口的 CSS 内容区只有 ~590px；px 列宽 +
+ * min-width 会把「大小 / 时间 / 操作」甩进横向滚动里）。
+ * ★ 选择器必须比 `table.tbl`（0,1,1）更具体，否则它的 `table-layout: auto`
+ * 会盖掉这里的 fixed —— M40 那张表在注释里踩过同一个坑。 */
+table.tbl.tbl-search {
+  table-layout: fixed;
+  width: 100%;
+}
+.tbl-search .col-type { width: 9%; }
+.tbl-search .col-path { width: 34%; }   /* 唯一弹性列（其实是百分比，但内容只在这里省略） */
+.tbl-search .col-size { width: 12%; }
+.tbl-search .col-time { width: 19%; }
+.tbl-search .col-act  { width: 26%; }
+
+.tbl-search td.cell-type { line-height: 1.25; }
+.tbl-search td.cell-type .badge { margin-top: 2px; font-size: 10.5px; padding: 0 4px; }
+
+.tbl-search td.cell-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tbl-search td.cell-time { white-space: nowrap; }
+
+/* 三个 mini 按钮在窄内容区里放不下一行时**折行**，而不是被裁掉或互相压住。 */
+.tbl-search td.cell-act { white-space: normal; }
+.tbl-search td.cell-act button.mini { margin: 1px 4px 1px 0; }
+
 .toolbar {
   display: flex;
   gap: 6px;

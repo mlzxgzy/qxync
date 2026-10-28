@@ -91,6 +91,18 @@
       loading: false,
       error: ''          // ★ M8.6：读取失败时的可见原因
     },
+    // ★ M43：文件页「搜索同步文件」的最近一次结果（**当前连接**；只读本地状态库）
+    search: {
+      ran: false,        // 用户还没搜过 → 空态显示「输入关键词」
+      loading: false,
+      error: '',
+      hits: [],
+      total: 0,
+      truncated: false,
+      pattern: '',       // 最近一次真正发出去的查询（重画时用，不重新拼 DOM 表单）
+      under: '',
+      seq: 0             // 连点两次时只认最后一次的响应（避免旧结果覆盖新结果）
+    },
     mounts: [],          // 当前连接的挂载表（诊断 / 主页退化展示用）
     // ★ M40：诊断 →「多路径」的最近一次 `routes` 结果（当前连接；不发网络）
     routes: null,
@@ -1110,6 +1122,8 @@
     state.files = { path: '/home', dir: '/home', entries: [], selected: null, loading: false, error: '' };
     var fp = $('fp-path');
     if (fp) { fp.value = '/home'; }
+    // ★ M43：搜索结果是**按连接**的状态库快照，切连接后必须清掉（否则张冠李戴）。
+    resetSearch();
   }
 
   /** 切换当前连接：换掉所有「按连接」的缓存，并重拉当前页。 */
@@ -5060,9 +5074,182 @@
     });
   }
 
+  // ------------------------------------------------------------ ★ M43 搜索同步文件
+  //
+  // 数据源是本地状态库里的「目录数据库」（`baseline` + `nodes.local_only`），
+  // 匹配/过滤/排序**全部在 Rust 的 `search_local` 里做**（与 CLI `qxync find` 共用
+  // `qxync_core::search`）；前端只负责把表单换成参数、把结果画出来。
+  // 为什么不在前端过滤：3 万行拉回前端也能算，但匹配语义（Unicode 大小写折叠、
+  // glob 里有没有 `/` 的两种含义）一旦两处各写一份，必然只在一边修对。
+
+  /** 表单 → `search_local` 的参数（Tauri v2 的参数名是 camelCase）。 */
+  function searchArgs() {
+    var lim = num($('q-limit') ? $('q-limit').value : 100, 100);
+    return {
+      linkId: currentId(),
+      pattern: str($('q-pattern') ? $('q-pattern').value : '').trim(),
+      glob: isOn('q-glob', false),
+      caseSensitive: isOn('q-case', false),
+      under: str($('q-under') ? $('q-under').value : '').trim() || undefined,
+      kind: str($('q-kind') ? $('q-kind').value : 'any') || 'any',
+      sort: str($('q-sort') ? $('q-sort').value : 'path') || 'path',
+      limit: lim >= 0 ? lim : 100
+    };
+  }
+
+  /**
+   * 清空搜索结果。切连接时必须调用：结果属于**上一个连接的库**，
+   * 留着会让用户以为文件在当前连接里（张冠李戴比空态更难发现）。
+   */
+  function resetSearch() {
+    var seq = (state.search ? num(state.search.seq, 0) : 0) + 1;
+    state.search = {
+      ran: false, loading: false, error: '', hits: [], total: 0,
+      truncated: false, pattern: '', under: '', seq: seq
+    };
+    renderSearch();
+  }
+
+  /** 按当前表单跑一次搜索（回车 / 点「搜索」都会到这里）。 */
+  function refreshSearch() {
+    var args = searchArgs();
+    var seq = num(state.search.seq, 0) + 1;
+    state.search.seq = seq;
+    state.search.loading = true;
+    state.search.error = '';
+    state.search.ran = true;
+    show('search-busy', true);
+    setListState('search-empty', 'loading', T('search.loading'));
+    return withBusy({ buttons: ['btn-search-go', 'btn-search-clear'] }, function () {
+      return call('search_local', args);
+    }).then(function (r) {
+      // 连点两次时只认最后一次：旧响应回来晚了不能覆盖新结果。
+      if (seq !== num(state.search.seq, 0)) { return null; }
+      show('search-busy', false);
+      state.search.loading = false;
+      if (!r.ok) {
+        state.search.hits = [];
+        state.search.total = 0;
+        state.search.truncated = false;
+        state.search.error = str(r.error) || T('search.err_generic');
+        renderSearch();
+        logErr('search_local 失败：' + state.search.error);
+        return null;
+      }
+      var d = isObj(r.data) ? r.data : {};
+      var hits = Array.isArray(d.hits) ? d.hits.filter(isObj) : [];
+      state.search.hits = hits;
+      state.search.total = num(d.total, hits.length);
+      state.search.truncated = d.truncated === true;
+      state.search.pattern = str(d.pattern);
+      state.search.under = str(d.under);
+      renderSearch();
+      logInfo(T('search.done_log', { n: state.search.total, shown: hits.length }));
+      return d;
+    });
+  }
+
+  /**
+   * 结果表里的时间只显示到分钟：列宽只有 ~100px（CSS 视口 ~590px 的 17%），
+   * 带秒会折成两行把行高撑大一倍。
+   */
+  function fmtSearchTime(epoch) {
+    var t = humanTimeFromEpoch(epoch);
+    return t ? t.slice(0, 16) : '—';
+  }
+
+  /** 结果行：类型 / 路径 / 大小 / 时间 / 操作。外部字符串一律 textContent。 */
+  function buildSearchRow(hit) {
+    var tr = el('tr');
+    var isDir = hit.is_dir === true;
+    var localOnly = str(hit.origin) === 'local_only';
+    // 来源并进「类型」列：这台机器 WebKit 按 Xft.dpi 放大 ~1.6 倍，CSS 视口只有
+    // ~730px（内容区 ~590px），单给「来源」一列会把「操作」挤出可视区。
+    var tdType = el('td', 'cell-type');
+    tdType.appendChild(el('div', '', isDir ? T('search.type_dir') : T('search.type_file')));
+    tdType.appendChild(el('span', 'badge ' + (localOnly ? 'badge-always' : 'badge-local'),
+      localOnly ? T('search.origin_local') : T('search.origin_remote')));
+    tr.appendChild(tdType);
+
+    var tdPath = el('td', 'mono cell-path', str(hit.path));
+    if (hit.local_path) { tdPath.title = str(hit.local_path); }
+    tr.appendChild(tdPath);
+
+    tr.appendChild(el('td', 'mono cell-size', isDir ? '—' : humanSize(hit.size)));
+    tr.appendChild(el('td', 'cell-time', fmtSearchTime(hit.mtime)));
+
+    var tdAct = el('td', 'cell-act');
+    // 「定位」= 在下面的目录浏览里打开它（文件取父目录）。本地新建、NAS 上还没有
+    // 副本的条目在 NAS 目录里 ls 不到，点了只会报错，所以直接禁用并说明原因。
+    var btnLocate = el('button', 'mini', T('search.act_locate'));
+    btnLocate.type = 'button';
+    btnLocate.disabled = localOnly;
+    if (localOnly) { btnLocate.title = T('search.locate_disabled'); }
+    btnLocate.addEventListener('click', function () { gotoSearchHit(hit); });
+    tdAct.appendChild(btnLocate);
+
+    if (hit.local_path) {
+      var btnOpen = el('button', 'mini', T('search.act_open'));
+      btnOpen.type = 'button';
+      btnOpen.addEventListener('click', function () { doOpen('path', str(hit.local_path)); });
+      tdAct.appendChild(btnOpen);
+    }
+    var btnCopy = el('button', 'mini', T('search.act_copy'));
+    btnCopy.type = 'button';
+    btnCopy.addEventListener('click', function () {
+      copyText(str(hit.local_path) || str(hit.path));
+    });
+    tdAct.appendChild(btnCopy);
+    tr.appendChild(tdAct);
+    return tr;
+  }
+
+  function renderSearch() {
+    var tb = $('search-tbody');
+    if (!tb) { return; }
+    clear(tb);
+    var hits = (state.search.hits || []).filter(isObj);
+    setBusyState('search-tbody', state.search.loading === true);
+    for (var i = 0; i < hits.length; i++) { tb.appendChild(buildSearchRow(hits[i])); }
+
+    if (state.search.error) {
+      setText('search-info', T('list.error', { msg: state.search.error }));
+      setListState('search-empty', 'error', T('search.error', { msg: state.search.error }));
+      return;
+    }
+    if (state.search.loading && !hits.length) {
+      setText('search-info', T('search.loading'));
+      setListState('search-empty', 'loading', T('search.loading'));
+      return;
+    }
+    if (!state.search.ran) {
+      setText('search-info', '—');
+      setListState('search-empty', 'empty', T('search.empty_idle'));
+      return;
+    }
+    var info = state.search.truncated
+      ? T('search.info_truncated', { total: state.search.total, shown: hits.length })
+      : T('search.info', { total: state.search.total, shown: hits.length });
+    setText('search-info', info);
+    if (hits.length) { setListState('search-empty', 'ready'); }
+    else { setListState('search-empty', 'empty', T('search.empty')); }
+  }
+
+  /** 命中 → 在下面的目录浏览里定位（文件取父目录、目录取自身）。 */
+  function gotoSearchHit(hit) {
+    var remote = str(hit && hit.path);
+    if (!remote) { return; }
+    var dir = (hit && hit.is_dir === true) ? remote : pathParent(remote);
+    state.files.path = dir;
+    var fp = $('fp-path');
+    if (fp) { fp.value = dir; }
+    // 走 switchPage（它内部会 refreshFiles(state.files.path)）：既切到文件页，
+    // 也保证「定位」按钮在别的页时同样可用。
+    switchPage('files');
+  }
+
   // ============================================================ Tab 5 同步
-  function renderSyncPanel(s, sy) {
-    var dl = $('sync-full-kv');
+  function renderSyncPanel(s, sy) {    var dl = $('sync-full-kv');
     if (!dl) { return; }
     clear(dl);
     if (!sy) {
@@ -5424,6 +5611,7 @@
     var label = cur ? linkLabel(cur) : T('links.unconfigured');
     setText('diag-link-hint', T('diag.link_hint', { label: label }));
     setText('files-link-hint', T('files.link_hint', { label: label }));
+    setText('search-scope-hint', T('search.scope_hint', { label: label }));
     var jh = $('journal-link-hint');
     if (jh) { jh.textContent = T('journal.scope_hint'); }
     var eh = $('errors-link-hint');
@@ -7299,6 +7487,32 @@
     on('btn-mkdir', 'click', function () { doMkdir(); });
     on('btn-rm', 'click', function () { doRm(); });
 
+    // ★ M43：搜索同步文件 —— 回车即搜；「清除」只清表单与结果，不触发任何同步动作。
+    var fs = $('form-search');
+    if (fs) {
+      fs.addEventListener('submit', function (ev) {
+        ev.preventDefault();
+        refreshSearch();
+      });
+    }
+    on('btn-search-clear', 'click', function () {
+      ['q-pattern', 'q-under'].forEach(function (id) {
+        var n = $(id);
+        if (n) { n.value = ''; }
+      });
+      ['q-glob', 'q-case'].forEach(function (id) {
+        var n = $(id);
+        if (n) { n.checked = false; }
+      });
+      var kind = $('q-kind');
+      if (kind) { kind.value = 'any'; }
+      var sort = $('q-sort');
+      if (sort) { sort.value = 'path'; }
+      var lim = $('q-limit');
+      if (lim) { lim.value = '100'; }
+      resetSearch();
+    });
+
     // 同步页
     on('btn-sync-once', 'click', function () { doSync({ once: true }, ['btn-sync-once'], '立即同步'); });
     on('btn-sync-force', 'click', function () { doForceDeletes($('btn-sync-force')); });
@@ -7566,6 +7780,8 @@
       return refreshCurrentPage();
     });
     renderFiles();
+    // ★ M43：搜索卡片的首屏状态（「输入关键词」空态；不发请求 —— 搜索是纯本地按需动作）
+    renderSearch();
   }
 
   if (document.readyState === 'loading') {

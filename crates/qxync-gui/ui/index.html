@@ -285,6 +285,77 @@
 
       <!-- ======================= 页面 3：文件 ======================= -->
       <section class="page" id="page-files">
+        <!-- ★ M43：搜索同步文件 —— 直接查本地状态库里的「目录数据库」
+             （baseline + nodes.local_only），不挂载、不联网、daemon 不在也能用。
+             匹配/排序语义在 Rust 侧（qxync_core::search），前端只渲染结果。 -->
+        <div class="card">
+          <h2>搜索同步文件</h2>
+          <p class="hint" id="search-scope-hint"></p>
+          <form id="form-search" class="searchbar" autocomplete="off" role="search">
+            <input type="search" id="q-pattern" class="mono" spellcheck="false"
+                   placeholder="关键词或通配符（如 防火墙、*.pdf）；留空 = 全部"
+                   data-i18n-placeholder="search.placeholder">
+            <button type="submit" id="btn-search-go" class="primary" data-i18n="search.run">搜索</button>
+            <button type="button" id="btn-search-clear" data-i18n="search.clear">清除</button>
+            <span class="busy" id="search-busy" hidden data-i18n="busy.text">进行中…</span>
+          </form>
+          <div class="search-filters">
+            <label>限定目录
+              <input type="text" id="q-under" class="mono" spellcheck="false"
+                     placeholder="不填 = 全部；NAS 路径或挂载点路径">
+            </label>
+            <label>类型
+              <select id="q-kind">
+                <option value="any" data-i18n="search.kind_any">全部</option>
+                <option value="file" data-i18n="search.kind_file">只要文件</option>
+                <option value="dir" data-i18n="search.kind_dir">只要目录</option>
+              </select>
+            </label>
+            <label>排序
+              <select id="q-sort">
+                <option value="path" data-i18n="search.sort_path">路径</option>
+                <option value="size" data-i18n="search.sort_size">大小（大的在前）</option>
+                <option value="mtime" data-i18n="search.sort_mtime">修改时间（新的在前）</option>
+              </select>
+            </label>
+            <label>最多
+              <select id="q-limit">
+                <option value="50">50</option>
+                <option value="100" selected>100</option>
+                <option value="500">500</option>
+                <option value="0" data-i18n="search.limit_all">全部</option>
+              </select>
+            </label>
+            <label class="check"><input type="checkbox" id="q-glob"> 通配符（<code>*</code> 与 <code>?</code>）</label>
+            <label class="check"><input type="checkbox" id="q-case"> 区分大小写</label>
+          </div>
+          <div class="toolbar">
+            <span class="toolbar-info" id="search-info">—</span>
+          </div>
+          <div class="tbl-scroll">
+            <table class="tbl tbl-search">
+              <thead>
+                <tr>
+                  <th class="col-type" data-i18n="search.col_type">类型</th>
+                  <th class="col-path" data-i18n="search.col_path">路径</th>
+                  <th class="col-size" data-i18n="search.col_size">大小</th>
+                  <th class="col-time" data-i18n="search.col_time">修改时间</th>
+                  <th class="col-act" data-i18n="search.col_act">操作</th>
+                </tr>
+              </thead>
+              <tbody id="search-tbody"></tbody>
+            </table>
+          </div>
+          <p class="empty-hint" id="search-empty" hidden data-state="empty"></p>
+          <p class="note">
+            数据来自本地状态库（<strong>目录数据库</strong>），所以
+            <strong>不挂载、不联网、daemon 不在也能搜</strong>；远端变化最多滞后一轮同步
+            （默认 30 秒），刚上传成功的文件会立即出现。只匹配<strong>路径与文件名</strong>，
+            <strong>不搜文件内容</strong>。回车即搜；命中行可「定位」到上面的目录浏览，
+            或直接「打开」（映射到挂载点里的本地路径）。
+          </p>
+        </div>
+
         <div class="card">
           <h2>NAS 上的目录</h2>
           <p class="hint" id="files-link-hint"></p>

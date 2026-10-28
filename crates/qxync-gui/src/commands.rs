@@ -1045,6 +1045,212 @@ fn tasks_for_link(
     qxync_core::tasks::Task::list_for_link(p, link_id, &ids)
 }
 
+// ============================================================ ★ M43 GUI 文件搜索
+
+/// ★ M43：GUI 文件页的「搜索同步树」—— 只读状态库，不挂载、不联网、daemon 不在也能用。
+///
+/// 数据源与匹配语义**与 CLI `qxync find` 完全一致**：`baseline`（远端已确认的路径 +
+/// 签名）+ `nodes.local_only`（本地新建、还没上传成功的行），匹配/过滤/排序全部交给
+/// [`qxync_core::search`] —— 前端和本命令都**不重算**匹配，否则「大小写折叠」「glob 里
+/// 有没有 `/`」这类细节必然只在一边修对（见 docs/M42-本地文件搜索.md §2）。
+///
+/// GUI 比 CLI 多做的只有两件事：
+/// * 每条命中额外给出 `local_path`（某个任务挂载点里的本地路径）供「在文件管理器中打开」；
+/// * `under` 允许直接填挂载点下的**本地路径**（自动换算成远端路径，与 CLI 同规则）。
+///
+/// 错误分类：库不存在 = 明确告诉用户「先跑一轮同步」；匹配参数不合法 = 明确报错。
+/// 两者都不静默返回空结果 —— 空结果会被误读成「文件不存在」。
+#[tauri::command]
+pub async fn search_local(
+    link_id: Option<String>,
+    pattern: Option<String>,
+    glob: Option<bool>,
+    case_sensitive: Option<bool>,
+    under: Option<String>,
+    kind: Option<String>,
+    sort: Option<String>,
+    reverse: Option<bool>,
+    limit: Option<usize>,
+) -> Result<Value, String> {
+    use qxync_core::search::{MatchMode, SearchQuery};
+
+    let p = paths()?;
+    // 缺省 = `default`（与 CLI 的 `--link` 默认值一致）；GUI 正常会明确传当前连接。
+    let lid = link_id
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "default".into());
+    if !LinkConfig::is_valid_id(&lid) {
+        return Err(format!("连接 id 不合法：{lid:?}"));
+    }
+    let link = LinkConfig::load(&p, &lid).map_err(|e| e.to_string())?;
+    let db = p.sync_dir_for(&link).join(qxync_core::store::DB_FILE);
+    let store = qxync_core::Store::open_readonly(&db)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| {
+            format!(
+                "状态库不存在：{}（这个连接还没同步过；先跑一轮同步再搜）",
+                db.display()
+            )
+        })?;
+
+    // 这个连接的全部任务：既用于 `under` 的本地→远端换算，也用于 `local_path` 映射。
+    let tasks = tasks_for_link(&p, &link.id).0;
+    let trimmed = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let kind = parse_search_kind(trimmed(kind).as_deref())?;
+    let sort = parse_search_sort(trimmed(sort).as_deref())?;
+    let query = SearchQuery {
+        pattern: trimmed(pattern),
+        mode: if glob.unwrap_or(false) {
+            MatchMode::Glob
+        } else {
+            MatchMode::Substring
+        },
+        case_sensitive: case_sensitive.unwrap_or(false),
+        under: match trimmed(under) {
+            Some(raw) => Some(search_under_remote(&raw, &tasks)?),
+            None => None,
+        },
+        kind,
+        min_size: None,
+        max_size: None,
+        sort,
+        reverse: reverse.unwrap_or(false),
+        // GUI 的「全部」传 0，与 CLI `--limit 0` 同一约定；core 里用 None 表达不截断。
+        limit: match limit.unwrap_or(qxync_core::search::DEFAULT_LIMIT) {
+            0 => None,
+            n => Some(n),
+        },
+    };
+
+    let page = store.search(&query).map_err(|e| e.to_string())?;
+    let hits: Vec<Value> = page
+        .hits
+        .iter()
+        .map(|h| {
+            let mapped = search_local_hit(&h.path, &tasks);
+            json!({
+                "path": h.path,
+                "local_path": mapped
+                    .as_ref()
+                    .map(|(path, _)| path.to_string_lossy().to_string()),
+                "task_id": mapped.map(|(_, id)| id),
+                "size": h.size,
+                "mtime": h.mtime,
+                "is_dir": h.is_dir,
+                "origin": h.origin.as_str(),
+            })
+        })
+        .collect();
+    Ok(json!({
+        "pattern": query.pattern,
+        "under": query.under,
+        "total": page.total,
+        "truncated": page.truncated(),
+        "hits": hits,
+    }))
+}
+
+/// ★ M43：类型选择（GUI 下拉的 `any|file|dir`）→ core 的过滤枚举；未知值明确报错。
+fn parse_search_kind(raw: Option<&str>) -> Result<qxync_core::search::KindFilter, String> {
+    use qxync_core::search::KindFilter;
+    match raw {
+        None | Some("any") => Ok(KindFilter::Any),
+        Some("file" | "f") => Ok(KindFilter::File),
+        Some("dir" | "d") => Ok(KindFilter::Dir),
+        Some(other) => Err(format!("类型只接受文件（file）或目录（dir）：{other}")),
+    }
+}
+
+/// ★ M43：排序选择（GUI 下拉的 `path|size|mtime`）→ core 的排序枚举；未知值明确报错。
+fn parse_search_sort(raw: Option<&str>) -> Result<qxync_core::search::SortKey, String> {
+    use qxync_core::search::SortKey;
+    match raw {
+        None | Some("path") => Ok(SortKey::Path),
+        Some("size") => Ok(SortKey::Size),
+        Some("mtime" | "time") => Ok(SortKey::Mtime),
+        Some(other) => Err(format!("排序只接受 path / size / mtime：{other}")),
+    }
+}
+
+/// ★ M43：`under` 解析 —— 接受远端路径，也接受挂载点下的本地路径（自动换算成远端）。
+///
+/// 与 CLI `qxync find --under` 同一语义（`crates/qxync-cli/src/main.rs::resolve_under`）：
+/// 用户在 GUI 里看到的多半是挂载点路径，直接粘进搜索框必须能用。
+fn search_under_remote(raw: &str, tasks: &[qxync_core::tasks::Task]) -> Result<String, String> {
+    if !raw.starts_with('/') {
+        return Err(format!(
+            "限定目录需要绝对路径（NAS 路径，或挂载点下的本地路径）：{raw}"
+        ));
+    }
+    let raw = raw.trim_end_matches('/');
+    for t in tasks {
+        let mount = t.mountpoint.to_string_lossy();
+        let mount = mount.trim_end_matches('/');
+        if let Some(rel) = strip_path_prefix(raw, mount) {
+            return Ok(join_remote_path(&t.effective_root(), rel));
+        }
+    }
+    // 不在任何挂载点下：按远端路径原样使用（用户可能抄的是 `qxync ls` 的输出）。
+    Ok(raw.to_string())
+}
+
+/// ★ M43：命中路径 → 某个任务挂载点里的本地路径（第一个能对上的任务）。
+fn search_local_hit(remote: &str, tasks: &[qxync_core::tasks::Task]) -> Option<(PathBuf, String)> {
+    for t in tasks {
+        let root = t.effective_root();
+        if let Some(rel) = strip_remote_root(remote, &root) {
+            let local = if rel.is_empty() {
+                t.mountpoint.clone()
+            } else {
+                t.mountpoint.join(rel)
+            };
+            return Some((local, t.id.clone()));
+        }
+    }
+    None
+}
+
+/// 远端路径在远端根 `root` 下时返回相对部分（按路径段判边界；根 `/` 特判）。
+fn strip_remote_root<'a>(path: &'a str, root: &str) -> Option<&'a str> {
+    let root = root.trim_end_matches('/');
+    if root.is_empty() {
+        return Some(path.trim_start_matches('/'));
+    }
+    if path == root {
+        return Some("");
+    }
+    path.strip_prefix(root)?.strip_prefix('/')
+}
+
+/// 本地绝对路径在本地目录 `prefix` 下时返回相对部分（按路径段判边界）。
+fn strip_path_prefix<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+    if prefix.is_empty() {
+        return Some(path.trim_start_matches('/'));
+    }
+    if path == prefix {
+        return Some("");
+    }
+    path.strip_prefix(prefix)?.strip_prefix('/')
+}
+
+/// 远端根 + 相对路径 → 远端路径（根 `/` 特判）。
+fn join_remote_path(root: &str, rel: &str) -> String {
+    let root = root.trim_end_matches('/');
+    if rel.is_empty() {
+        return if root.is_empty() {
+            "/".to_string()
+        } else {
+            root.to_string()
+        };
+    }
+    if root.is_empty() {
+        format!("/{rel}")
+    } else {
+        format!("{root}/{rel}")
+    }
+}
+
 /// ★ M19：只读打开某个连接的状态库（预览用；库不存在返回 `None`，绝不新建）。
 fn open_link_db(p: &ConfigPaths, link: &LinkConfig) -> Option<qxync_core::Store> {
     let db = p.sync_dir_for(link).join(qxync_core::store::DB_FILE);
@@ -2738,5 +2944,73 @@ mod tests {
         assert_eq!(p.keep_days, 3);
         assert_eq!(p.max_total_bytes, 64 * 1024 * 1024);
         qxync_core::logcfg::set_policy(before);
+    }
+
+    /// ★ M43：搜索结果里的「远端路径 → 挂载点本地路径」映射与 `under` 换算。
+    ///
+    /// 这两处最容易错在**边界**：`/home` 不能吞 `/homework`、根 `/` 要特判、
+    /// 不在任何任务下时要原样保留远端路径（GUI 照样能显示/复制，只是打不开）。
+    /// 匹配/排序本身在 `qxync_core::search` 里已有单测，这里只验 GUI 独有的一层。
+    #[test]
+    fn m43_search_maps_remote_and_under_paths() {
+        use qxync_core::search::{KindFilter, SortKey};
+        let task = |id: &str, mount: &str, root: &str| qxync_core::tasks::Task {
+            id: id.into(),
+            mountpoint: PathBuf::from(mount),
+            root: Some(root.into()),
+            ..qxync_core::tasks::Task::default()
+        };
+        let tasks = vec![
+            task("home", "/home/tester/qxync/default/home", "/home"),
+            task("root", "/home/tester/qxync/default/root", "/"),
+        ];
+
+        // ① 远端 → 本地（第一个能对上的任务）
+        let (local, id) = search_local_hit("/home/2026/29-四川赛/a.zip", &tasks).unwrap();
+        assert_eq!(
+            local,
+            PathBuf::from("/home/tester/qxync/default/home/2026/29-四川赛/a.zip")
+        );
+        assert_eq!(id, "home");
+        // ② 路径段边界：`/homework` 不属于 `/home`，只属于根任务 `/`
+        let (local, id) = search_local_hit("/homework/x.txt", &tasks).unwrap();
+        assert_eq!(id, "root");
+        assert_eq!(
+            local,
+            PathBuf::from("/home/tester/qxync/default/root/homework/x.txt")
+        );
+        // ③ 命中任务根本身（rel 为空）→ 挂载点本身
+        let (local, _) = search_local_hit("/home", &tasks).unwrap();
+        assert_eq!(local, PathBuf::from("/home/tester/qxync/default/home"));
+        // ④ 没有任务覆盖时返回 None（GUI 仍显示远端路径，只是不能「在文件管理器中打开」）
+        assert!(search_local_hit("/Public/a", &[]).is_none());
+
+        // ⑤ under：挂载点下的本地路径 → 远端路径
+        assert_eq!(
+            search_under_remote("/home/tester/qxync/default/home/2026/29-四川赛", &tasks).unwrap(),
+            "/home/2026/29-四川赛"
+        );
+        // ⑥ under：本来就是远端路径 → 原样使用（不因为「对不上挂载点」就报错）
+        assert_eq!(
+            search_under_remote("/home/2026", &[]).unwrap(),
+            "/home/2026"
+        );
+        // ⑦ under：根任务 + 末尾斜杠都要收敛成 `/`
+        assert_eq!(
+            search_under_remote("/home/tester/qxync/default/root/", &tasks).unwrap(),
+            "/"
+        );
+        // ⑧ under：相对路径明确报错，不静默当远端路径
+        assert!(search_under_remote("2026", &tasks)
+            .unwrap_err()
+            .contains("绝对路径"));
+
+        // ⑨ 下拉值 → 枚举；拼错的值必须报错（不能静默变成「全量」骗用户）
+        assert_eq!(parse_search_kind(Some("dir")).unwrap(), KindFilter::Dir);
+        assert_eq!(parse_search_kind(None).unwrap(), KindFilter::Any);
+        assert!(parse_search_kind(Some("folders")).is_err());
+        assert_eq!(parse_search_sort(Some("mtime")).unwrap(), SortKey::Mtime);
+        assert_eq!(parse_search_sort(None).unwrap(), SortKey::Path);
+        assert!(parse_search_sort(Some("random")).is_err());
     }
 }
