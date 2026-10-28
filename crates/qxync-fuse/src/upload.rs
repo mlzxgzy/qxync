@@ -53,6 +53,124 @@ const DEBOUNCE: Duration = Duration::from_millis(250);
 /// 队列单独一个库最省事，迁移老 `.dirty` 也只需扫这一个目录。
 const QUEUE_DB_FILE: &str = "queue.db";
 
+// ---------------------------------------------------------------- M41：日志降噪
+//
+// ★ M41：`已上传 <路径> (N 字节)` 原来是每文件一条 INFO（真机 10-26 1 022 行 / 163 KB），
+// `上传因网络不可用暂停: <路径>` 是每文件每次一条 WARN（941 行 / 358 KB）。这两类日志
+// 的信息量分别只是「传完了」「网断了」，重复到没有边际价值。处理方式：
+//   * 逐文件成功 → `debug!`；
+//   * 聚合由 worker 每 60s 一条心跳承担（`note_upload_heartbeat`）；
+//   * 离线暂停 → **边沿触发**（[`OfflineLatch`]）：一次断网只报一条 WARN，持续期间逐条
+//     降 `debug!`，任一上传成功（= 网络恢复）后重新武装。
+//     不用 `noise::dedupe` 的 60s 窗口：实测长断网时窗口每分钟仍会放行一条，只降约 19%。
+// 为什么签名不能带路径：见 `qxync_core::noise` 模块文档（每条路径都会变成新键）。
+
+/// 心跳文案（纯函数：格式固定、可单测）。
+///
+/// `done_delta`/`bytes_delta` 是**距上一条心跳**的增量，`done`/`bytes` 是累计值
+/// （两者都来自 `stats` 的 AtomicU64 快照；用 `saturating_sub` 是因为计数器只增，
+/// 但热重载/注入场景下不能假设「读到的值一定不比上次大」）。
+fn upload_progress_text(done_delta: u64, bytes_delta: u64, done: u64, bytes: u64) -> String {
+    format!(
+        "近一分钟上传完成 {done_delta} 项 / {bytes_delta} 字节（累计 {done} 项 / {bytes} 字节）"
+    )
+}
+
+/// ★ M41：断网告警的**边沿触发**锁存器（纯状态机，单测不碰日志设施）。
+///
+/// 为什么不用 `noise::dedupe` 的 60s 窗口：长时间断网时窗口仍会每分钟放行一条 ——
+/// 按真机 10-26 的 941 行 / 358 KB 重放估算，60s 窗口只降到约 749 行（-19%），
+/// 仍是全表最吵的一项。断网是**状态**而不是**事件流**：一次断网只该有一条 WARN，
+/// 网络恢复（任一次上传成功）后再断，才算新事件、才值得再报。
+///
+/// 不同错误不重复报：锁存器只关心「在不在断网态」，不按错误种类分键 —— 同一次
+/// 断网里换了个错误（超时 → 连接拒绝）仍是同一次故障，不该再刷一条。
+#[derive(Debug, Default)]
+struct OfflineLatch {
+    warned: bool,
+}
+
+impl OfflineLatch {
+    /// 观察到一次「网络不可用」。返回 `true` = 这是本次断网的**第一条**，调用方打 WARN；
+    /// 返回 `false` = 断网仍在持续，调用方只打 `debug!`（完整路径与错误照旧可查）。
+    fn observe_offline(&mut self) -> bool {
+        if self.warned {
+            false
+        } else {
+            self.warned = true;
+            true
+        }
+    }
+
+    /// 观察到一次上传成功（说明网络确实通了）→ 解除锁存，下一次断网立刻再报。
+    fn observe_success(&mut self) {
+        self.warned = false;
+    }
+}
+
+#[cfg(test)]
+mod m41_upload_noise_tests {
+    use super::*;
+
+    /// 心跳文案：增量与累计各自就位，空格/量词稳定（现场 grep 依赖固定前缀）。
+    #[test]
+    fn upload_progress_text_is_stable() {
+        assert_eq!(
+            upload_progress_text(3, 4096, 120, 1_048_576),
+            "近一分钟上传完成 3 项 / 4096 字节（累计 120 项 / 1048576 字节）"
+        );
+        assert!(upload_progress_text(0, 0, 0, 0).starts_with("近一分钟上传完成 0 项 / 0 字节"));
+    }
+
+    /// 增量用 saturating_sub 计算：计数器回退（理论上不该发生）也不能 panic/下溢。
+    #[test]
+    fn progress_delta_saturates() {
+        let prev_done = 100u64;
+        let now_done = 95u64;
+        assert_eq!(now_done.saturating_sub(prev_done), 0);
+        let text = upload_progress_text(
+            now_done.saturating_sub(prev_done),
+            now_done.saturating_sub(prev_done),
+            now_done,
+            now_done,
+        );
+        assert!(text.contains("完成 0 项 / 0 字节"), "{text}");
+    }
+
+    /// 一次断网只报一条：首次 true，持续期间一直 false（哪怕错误种类在变）。
+    #[test]
+    fn offline_latch_warns_once_per_outage() {
+        let mut latch = OfflineLatch::default();
+        assert!(latch.observe_offline(), "断网第一条必须 WARN");
+        for _ in 0..1000 {
+            assert!(!latch.observe_offline(), "持续断网不得再刷 WARN");
+        }
+    }
+
+    /// 上传成功 = 网络恢复 → 锁存解除，下次断网立刻能再报。
+    #[test]
+    fn offline_latch_rearms_after_success() {
+        let mut latch = OfflineLatch::default();
+        assert!(latch.observe_offline());
+        assert!(!latch.observe_offline());
+        latch.observe_success();
+        assert!(
+            latch.observe_offline(),
+            "恢复后再次断网必须重新报一条（事件不能丢）"
+        );
+        assert!(!latch.observe_offline());
+    }
+
+    /// 没有断网时收到成功不应产生任何可观察影响；连续成功也保持「未锁存」。
+    #[test]
+    fn offline_latch_idle_success_is_harmless() {
+        let mut latch = OfflineLatch::default();
+        latch.observe_success();
+        latch.observe_success();
+        assert!(latch.observe_offline(), "未断网时的成功不影响后续首报");
+    }
+}
+
 /// 一个待上传的改动。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadJob {
@@ -371,10 +489,19 @@ impl UploadQueue {
                 }
                 match s.uploads() {
                     Ok(rows) => {
+                        // ★ M41：逐条 INFO（真机 50 行）→ 一条汇总 + 逐条 debug。
+                        // 崩溃恢复时「恢复了哪些」对现场有用，但 50 行 INFO 里真正被读的
+                        // 只有条数；逐条完整路径留 debug，RUST_LOG=debug 时一条不少。
+                        let restored = rows.len();
                         for r in rows {
                             let job = UploadJob::from_row(&r);
-                            tracing::info!("恢复未完成的上传: {}", job.remote_path());
+                            tracing::debug!("恢复未完成的上传: {}", job.remote_path());
                             pending.push_back(job);
+                        }
+                        if restored > 0 {
+                            tracing::info!(
+                                "恢复未完成的上传 {restored} 项（将按队列顺序继续，逐条明细见 debug）"
+                            );
                         }
                     }
                     Err(e) => {
@@ -904,10 +1031,23 @@ impl UploadQueue {
                     );
                 }
             }
-            None => tracing::warn!(
-                "上传队列无持久化（状态库不可用），入队仅存在于内存: {}",
-                job.remote_path()
-            ),
+            // ★ M41：降级模式（状态库打不开）下每个入队作业都刷一条同样的 WARN，
+            // 大规模改目录时能有上千行。按站点限流 60s，放行那条带示例路径 + 省略计数。
+            None => {
+                let a = qxync_core::noise::dedupe("fuse.queue_persist", "no-store");
+                if a.emit {
+                    tracing::warn!(
+                        "上传队列无持久化（状态库不可用），入队仅存在于内存: {}{}",
+                        job.remote_path(),
+                        a.note()
+                    );
+                } else {
+                    tracing::debug!(
+                        "上传队列无持久化（状态库不可用），入队仅存在于内存: {}",
+                        job.remote_path()
+                    );
+                }
+            }
         }
     }
 
@@ -972,8 +1112,38 @@ impl UploadQueue {
         st.pending.is_empty() && !st.active
     }
 
+    /// ★ M41：上传进度心跳 —— 「近一分钟上传完成 D 项 / B 字节（累计 …）」。
+    ///
+    /// 逐文件「已上传」降为 `debug!` 后，INFO 级别由这条承担聚合：每 60s 至多一条，
+    /// 用本地快照算增量。**空闲时（增量为 0）不占用窗口、也不打印** —— 否则队列闲着
+    /// 也会每分钟刷一条「完成 0 项」，等于把逐文件噪声换成定时噪声。
+    /// 被窗口压掉的增量不会丢：快照只在真正放行时推进，下一条把累计的差值一起报出来。
+    fn note_upload_heartbeat(&self, last_done: &mut u64, last_bytes: &mut u64) {
+        let done = self.stats.done.load(Ordering::Relaxed);
+        let bytes = self.stats.bytes.load(Ordering::Relaxed);
+        let done_delta = done.saturating_sub(*last_done);
+        let bytes_delta = bytes.saturating_sub(*last_bytes);
+        if done_delta == 0 && bytes_delta == 0 {
+            return;
+        }
+        if !qxync_core::noise::every("fuse.upload_progress", Duration::from_secs(60)).emit {
+            return;
+        }
+        *last_done = done;
+        *last_bytes = bytes;
+        tracing::info!(
+            "{}",
+            upload_progress_text(done_delta, bytes_delta, done, bytes)
+        );
+    }
+
     fn worker_loop(self: Arc<Self>) {
+        // ★ M41：心跳增量快照 + 断网告警锁存器（一次断网只报一条 WARN，见 [`OfflineLatch`]）。
+        let mut hb_done: u64 = 0;
+        let mut hb_bytes: u64 = 0;
+        let mut offline_latch = OfflineLatch::default();
         loop {
+            self.note_upload_heartbeat(&mut hb_done, &mut hb_bytes);
             let job = {
                 let mut st = self.state.lock().unwrap();
                 loop {
@@ -1130,7 +1300,11 @@ impl UploadQueue {
                     if let Some(c) = self.connectivity.lock().ok().and_then(|c| c.clone()) {
                         c.mark_online();
                     }
-                    tracing::info!("已上传 {} ({} 字节)", job.remote_path(), n);
+                    // ★ M41：一次成功 = 网络确实通了 → 解除断网锁存，下次断网立刻再报。
+                    offline_latch.observe_success();
+                    // ★ M41：逐文件成功降为 debug；INFO 聚合由 60s 心跳承担
+                    // （`note_upload_heartbeat`），否则每个文件一行、真机 1 022 行 / 163 KB。
+                    tracing::debug!("已上传 {} ({} 字节)", job.remote_path(), n);
                 }
                 Err(e) => {
                     // ★ T8：失败/放弃之后没有在传的作业了 → 清进度。
@@ -1149,10 +1323,21 @@ impl UploadQueue {
                             if let Some(c) = self.connectivity.lock().ok().and_then(|c| c.clone()) {
                                 c.mark_error(&e);
                             }
-                            tracing::warn!(
-                                "上传因网络不可用暂停（不计失败次数，联网后自动继续）: {}: {e}",
-                                job.remote_path()
-                            );
+                            // ★ M41：断网是**状态**不是事件流 —— 一次断网只报一条 WARN，
+                            // 持续期间逐条降 debug（完整路径 + 错误都在，信息不丢）。
+                            // 不用 60s 窗口：长断网时窗口仍会每分钟一条（真机 941 行只降 19%）。
+                            // 恢复后再断由 `observe_success` 重新武装，事件不会丢。
+                            if offline_latch.observe_offline() {
+                                tracing::warn!(
+                                    "上传暂停（网络不可用，联网后自动继续）：{}: {e}",
+                                    job.remote_path()
+                                );
+                            } else {
+                                tracing::debug!(
+                                    "上传因网络不可用暂停（不计失败次数，联网后自动继续）: {}: {e}",
+                                    job.remote_path()
+                                );
+                            }
                             // 没注入 connectivity 的独立用法没有「等联网」闸门，
                             // 这里退避一下避免忙等；注入了也只是一次 500ms 的让路。
                             std::thread::sleep(Duration::from_millis(500));

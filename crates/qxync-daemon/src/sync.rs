@@ -300,6 +300,26 @@ const REPROBE_AFTER_FAILURES: usize = 3;
 /// 前 3 个照实记，其余降 debug（数目仍体现在 `list_failures` 与 note 里）。
 const MAX_HIDDEN_VISIBLE_ERRORS: usize = 3;
 
+/// ★ M41：对账「逐目录业务失败」每轮最多几条进 `errors`（GUI / 用户可见）。
+///
+/// 真机证据（2026-10-27）：`同步「qsync」对账列举失败（第 N/5245 个目录）` 一天
+/// **1260 行 / 295 KB**，每轮约 38 条 —— 根因是同一个 `status=5`（非网络错误），
+/// 信息量只有一句话。网络类失败照旧走 [`record_net_error_or_abort`]（探活 / 中止
+/// 语义不动，另有 [`MAX_NET_ERRORS_PER_ROUND`] 配额）；非网络类失败从「每目录一条
+/// WARN」改成「每轮 3 条样本 + 1 条汇总」，其余逐条仍以 `debug!` 完整输出
+/// （见 [`SyncReport::push_list_failure`]）。
+const MAX_VISIBLE_LIST_FAILURES: usize = 3;
+
+/// ★ M41：轮询汇总行的心跳间隔。
+///
+/// 「有实际动作才 INFO」之后空转轮次全部降 debug；这个心跳只负责「现场不断档」
+/// —— 10 分钟一条足够（真机实测空转 INFO 一天 1449 行 / 280 KB，全是同一句）。
+/// ⚠️ 不要退回 60s：轮询默认 30s 一轮，60s 窗口几乎等于没压。
+const POLL_LINE_HEARTBEAT: Duration = Duration::from_secs(600);
+
+/// ★ M41：「另有 N 条同类错误被省略」汇总行的固定前缀（GUI / 测试 / 签名归一化按它识别）。
+const OMITTED_ERRORS_PREFIX: &str = "本轮另有 ";
+
 impl Default for SyncConfig {
     fn default() -> Self {
         Self {
@@ -416,6 +436,18 @@ pub struct SyncReport {
     /// 而这个判据只有记错误的那一刻知道（`CoreError::is_offline`），事后从文本里
     /// 猜会漏（消息措辞会变）。与 `errors` 一样只保留前 20 条。
     pub error_is_network: Vec<bool>,
+    /// ★ M41：本轮因「每轮最多 [`MAX_VISIBLE_LIST_FAILURES`] 条同类样本」而**没有**
+    /// 逐条进 `errors` 的对账失败条数。
+    ///
+    /// 非零时轮末补一条汇总（[`SyncReport::flush_omitted_errors`]）：GUI / 用户仍能
+    /// 知道「这一轮其实有 N 条失败」，而 WARN 每轮最多 3 条样本 + 1 条汇总；被省略的
+    /// 逐条明细仍以 `debug!` 完整输出（`RUST_LOG=debug` 一条不少）。
+    pub errors_omitted: u64,
+    /// ★ M41：本轮已经作为「样本」写进 `errors` 的逐目录失败条数（只用于采样计数）。
+    ///
+    /// 不参与对外语义，`errors` 的 20 条上限与 `error_is_network` 的逐条对齐都不变；
+    /// `pub(crate)` 只是为了 `daemon` 侧测试能用 `..Default::default()` 构造报告。
+    pub(crate) list_failures_sampled: usize,
 }
 
 impl SyncReport {
@@ -444,6 +476,49 @@ impl SyncReport {
         if self.errors.len() < 20 {
             self.errors.push(s);
             self.error_is_network.push(is_network);
+        }
+    }
+
+    /// ★ M41：记一条**对账逐目录失败**（业务错误，非网络类）。
+    ///
+    /// 真机证据（2026-10-27）：同一个 `status=5` 在一轮里被 38 个目录各记一条 WARN，
+    /// 一天 1260 行 / 295 KB，信息量只有一句话。这里改成**采样**：
+    /// 前 [`MAX_VISIBLE_LIST_FAILURES`] 条照旧进 `errors`（GUI / 用户可见，带上下文），
+    /// 其余只 `debug!` 并计入 [`SyncReport::errors_omitted`]（轮末压成一条汇总）。
+    ///
+    /// ⚠️ **网络类失败不走这里**：它们必须经过 [`record_net_error_or_abort`] 的
+    /// 探活 / 中止判定与 [`MAX_NET_ERRORS_PER_ROUND`] 配额（见
+    /// [`record_list_failure_or_abort`]）。
+    fn push_list_failure(&mut self, context: &str, e: &CoreError) {
+        self.list_failures_sampled += 1;
+        if self.list_failures_sampled <= MAX_VISIBLE_LIST_FAILURES {
+            self.error(format!("{context}: {e}"));
+        } else {
+            self.errors_omitted = self.errors_omitted.saturating_add(1);
+            tracing::debug!(
+                "{context}: {e}（本轮同类失败已记 {MAX_VISIBLE_LIST_FAILURES} 条样本，降为 debug）"
+            );
+        }
+    }
+
+    /// ★ M41：轮末把「被省略的同类失败」压成**一条**汇总（每轮最多 1 条 WARN）。
+    ///
+    /// 插在 `errors` **最前面**而不是末尾：`absorb_round` 取「最后一条非网络错误」
+    /// 当 `last_error`（首页「⚠️ 最近错误」）。追加到末尾会让那条红字从具体错误变成
+    /// 一句摘要 —— 摘要负责「知道还有 N 条」，具体错误负责「是什么错」，两个都要。
+    fn flush_omitted_errors(&mut self) {
+        let omitted = std::mem::take(&mut self.errors_omitted);
+        if omitted == 0 {
+            return;
+        }
+        // 逐条明细已经在 debug 里一条不少；这里只补「还有多少条」。
+        let msg = format!(
+            "{OMITTED_ERRORS_PREFIX}{omitted} 条同类同步错误未逐条列出（每轮最多 {MAX_VISIBLE_LIST_FAILURES} 条样本，明细见 debug 日志）"
+        );
+        tracing::warn!("同步引擎: {msg}");
+        if self.errors.len() < 20 {
+            self.errors.insert(0, msg);
+            self.error_is_network.insert(0, false);
         }
     }
     /// 记一条「跳过一个事件」并归类原因（见 `events_skipped_reasons`）。
@@ -798,6 +873,26 @@ async fn record_net_error_or_abort(
     false
 }
 
+/// ★ M41：对账里「每个目录各失败一次」的失败分流。
+///
+/// * **网络类** → 原样走 [`record_net_error_or_abort`]（探活 / 中止 / 配额语义
+///   **一字不动**：真机事故里就是这条路径识别出「整台不可达」并中止本轮）；
+/// * **业务类**（`status=5` / 权限 / 本地 IO）→ 走采样
+///   （[`SyncReport::push_list_failure`]），每轮最多 3 条进 `errors`，其余 debug。
+async fn record_list_failure_or_abort(
+    client: &Client,
+    net: &mut NetGuard,
+    report: &mut SyncReport,
+    e: &CoreError,
+    context: &str,
+) -> bool {
+    if e.is_offline() {
+        return record_net_error_or_abort(client, net, report, e, context).await;
+    }
+    report.push_list_failure(context, e);
+    false
+}
+
 /// 中止一轮时的收尾：游标只推进到**已完整应用的那一批**（当前批会整批重放，见
 /// [`poll_once`] 的事件循环），长期状态按**未完成轮次**并入。
 ///
@@ -825,6 +920,8 @@ fn finish_aborted_round(
     stats
         .deletes_blocked
         .fetch_add(report.deletes_blocked, Ordering::Relaxed);
+    // ★ M41：中止的轮次同样要补「另有 N 条同类失败」的汇总（对账可能已经跑了一半）。
+    report.flush_omitted_errors();
     absorb_round(stats, report, false);
 }
 
@@ -1147,8 +1244,13 @@ pub async fn poll_once(
     //   这里走到 = 本轮**完整跑完**（拉事件 + 对账 + 巡检），所以陈旧值可以清；
     //   提前 return 的轮次不会经过这里 —— 它们各自调 `absorb_round(..., false)`
     //   （见 [`finish_aborted_round`] 与 max_log 失败那一支）。
+    // ★ M41：把「本轮另有 N 条同类同步错误未逐条列出」压成**一条**汇总再并入长期状态
+    //   （必须在 absorb_round 之前：它读 `errors` 决定 `last_error`）。
+    report.flush_omitted_errors();
     absorb_round(stats, &mut report, true);
-    tracing::info!(
+    // ★ M41：这行以前**每轮**都 INFO（真机空转一天 1449 行 / 280 KB）：空转轮次现在降
+    //   debug，只有「本轮真有动作」或 10 分钟心跳才 INFO。格式串只在这里出现一次。
+    let line = format!(
         "同步轮询: max_log={} events={} refreshed={} uploaded={} conflicts={} deleted={} blocked={} baseline={} dirs={} full_scan={} full_dirs={}",
         report.max_log,
         report.events,
@@ -1162,6 +1264,13 @@ pub async fn poll_once(
         report.full_scan,
         report.full_scan_dirs
     );
+    if poll_line_noteworthy(&report)
+        || qxync_core::noise::every("sync.poll_line", POLL_LINE_HEARTBEAT).emit
+    {
+        tracing::info!("{line}");
+    } else {
+        tracing::debug!("{line}");
+    }
     report
 }
 
@@ -1308,6 +1417,219 @@ pub fn absorb_round(stats: &SyncStats, report: &mut SyncReport, completed: bool)
             tracing::info!("删除保护熔断已解除：本轮删除检查通过");
         }
     }
+}
+
+// ---------------------------------------------------------------- ★ M41 告警去噪
+
+/// ★ M41：这一轮的「同步轮询」汇总行值不值得 INFO？
+///
+/// * `true` = 本轮**真有动作**（拉事件 / 刷新 / 上传 / 冲突 / 删除 / 改名 / 被挡删除 /
+///   全量列举），这种轮次必须留痕；
+/// * `false` = 空转轮次（真机每到一轮就一条 INFO，一天 1449 行 / 280 KB，内容几乎相同）。
+///
+/// 空转由 10 分钟心跳兜底（[`POLL_LINE_HEARTBEAT`]），其余降 `debug!`。
+/// ⚠️ `max_log` / `global_notify` / `baseline_entries` 每轮都在变，**不算**动作。
+pub fn poll_line_noteworthy(r: &SyncReport) -> bool {
+    r.events > 0
+        || r.refreshed > 0
+        || r.uploaded > 0
+        || r.conflicts > 0
+        || r.deleted > 0
+        || r.renamed > 0
+        || r.deletes_blocked > 0
+        || r.full_scan
+}
+
+/// ★ M41：轮询循环里「有异常」的那一行值不值得 WARN。
+///
+/// 条件与旧实现一致（只改「每轮都打」为「迁移才打」，见 [`AnomalyLatch`]）。
+pub fn anomaly_present(r: &SyncReport) -> bool {
+    r.conflicts > 0 || (r.deletes_blocked > 0 && r.delete_block_changed) || !r.errors.is_empty()
+}
+
+/// ★ M41：「轮询有异常」的**状态签名**。
+///
+/// = `conflicts / deletes_blocked / errors 条数` + 首条具体错误的「种类」。
+/// 签名里**绝不能带路径和第 N 个目录**：那两个每轮都变，等于每轮都是「新异常」。
+/// 但错误**种类**真的变了（`status=5` → `网络错误`）时必须算新异常，所以要归一化首条。
+fn anomaly_signature(r: &SyncReport) -> String {
+    format!(
+        "c{} b{} n{} | {}",
+        r.conflicts,
+        r.deletes_blocked,
+        r.errors.len(),
+        anomaly_error_kind(r)
+    )
+}
+
+/// 取「首条具体错误」的归一化种类。
+///
+/// 跳过 [`OMITTED_ERRORS_PREFIX`] 汇总行（它被插在 `errors[0]`，见
+/// [`SyncReport::flush_omitted_errors`]）—— 否则签名永远等于那句固定文案，
+/// 底层错误种类变了也看不出来。
+fn anomaly_error_kind(r: &SyncReport) -> String {
+    let first = r
+        .errors
+        .iter()
+        .find(|e| !e.starts_with(OMITTED_ERRORS_PREFIX))
+        .map(String::as_str);
+    let Some(first) = first else {
+        return "无".to_string();
+    };
+    // 数字归一化：路径 / 第 N 个目录 / status 码都在变，种类不变。
+    let mut out = String::with_capacity(48);
+    let mut prev_digit = false;
+    let mut n = 0usize;
+    for ch in first.chars() {
+        if n >= 40 {
+            break;
+        }
+        if ch.is_ascii_digit() {
+            if !prev_digit {
+                out.push('#');
+                prev_digit = true;
+                n += 1;
+            }
+        } else {
+            prev_digit = false;
+            out.push(ch);
+            n += 1;
+        }
+    }
+    out
+}
+
+/// ★ M41：「轮询有异常」告警的**迁移式门闩**（日志记事件，不记状态）。
+///
+/// ## 为什么不用时间窗口
+///
+/// 真机取证（08:01 那批）：相邻两条「轮询有异常」间隔 **45s**，而 `noise::dedupe`
+/// 的窗口是 60s —— 几乎每轮都跨窗口，只能压掉一半左右，且同一故障持续期间会
+/// 每 45s 复读一遍。这里改用项目里已有的先例（`delete_block_changed`）：
+/// **只有状态迁移才告警**。
+///
+/// ## 语义
+///
+/// * 有异常且签名与上次不同（或 `network_failure_changed` / `delete_block_changed`
+///   表示网络失败/熔断签名变了）→ 返回 `Some(摘要)`，调用方 WARN；
+/// * 同一签名持续 → `None`，调用方写 `debug!` 全文；
+/// * **没有异常的一轮 → 清回 `None`**：下次复发立刻再报（复发是事件，不能吞）。
+#[derive(Debug, Default)]
+pub struct AnomalyLatch {
+    last_sig: Option<String>,
+}
+
+impl AnomalyLatch {
+    /// 观察一轮报告；需要 WARN 时返回**现成的摘要消息**。
+    pub fn observe(&mut self, r: &SyncReport) -> Option<String> {
+        if !anomaly_present(r) {
+            // 恢复正常：清状态，下次复发立刻放行。
+            self.last_sig = None;
+            return None;
+        }
+        let sig = anomaly_signature(r);
+        // 网络失败 / 熔断的签名变化是 absorb_round 算出来的真事件 → 强制放行，
+        // 哪怕 c/b/n 恰好没变（例如同一批删除被挡的原因变了）。
+        let forced = r.network_failure_changed || r.delete_block_changed;
+        if self.last_sig.as_deref() == Some(sig.as_str()) && !forced {
+            return None;
+        }
+        self.last_sig = Some(sig);
+        Some(format!(
+            "轮询有异常: conflicts={} blocked={} errors={}",
+            r.conflicts,
+            r.deletes_blocked,
+            qxync_core::noise::summarize_errors(&r.errors, 120)
+        ))
+    }
+}
+
+/// ★ M41：会话失效告警的**迁移式门闩**。
+///
+/// 真机证据：sid 过期后每轮都是「轮询遇会话失效」，直到重登恢复 —— 同一次失效
+/// 只需要一条 WARN。只有「正常 → 失效」这一次迁移放行；持续失效的后续轮次降
+/// `debug!`；重登成功 / 恢复在线后调用 [`AuthLatch::reset`]，下次真失效立刻再报
+/// （**不吞复发**：凭据真坏了的时候必须每轮都看得见）。
+#[derive(Debug, Default)]
+pub struct AuthLatch {
+    latched: bool,
+}
+
+impl AuthLatch {
+    /// 观察一轮报告；`Some(摘要)` = 本次是「正常 → 失效」的迁移，调用方 WARN。
+    pub fn observe(&mut self, r: &SyncReport) -> Option<String> {
+        if !r.auth_failed {
+            // 恢复了（或本轮本来就没失效）—— 清状态。
+            self.latched = false;
+            return None;
+        }
+        if self.latched {
+            return None;
+        }
+        self.latched = true;
+        Some(format!(
+            "轮询遇会话失效（本轮已记录），立即重登后下一轮继续: {}",
+            qxync_core::noise::summarize_errors(&r.errors, 120)
+        ))
+    }
+
+    /// 重登成功 / 恢复在线：清门闩，让下一次失效重新告警。
+    pub fn reset(&mut self) {
+        self.latched = false;
+    }
+}
+
+/// ★ M41：离线缓冲区回放「中断」告警的门闩（进程内单例）。
+///
+/// ## 为什么需要
+///
+/// 会话失效时 `flush_offline_backlog` 每 3 秒重试一次，而 `flush_outbox` 每次都会
+/// 为首个受阻行打一条**带路径**的 WARN —— 一次失效持续 3 分钟就是几十条，真机
+/// 2026-10-25~27 三天两类合计约 21 KB + 34 KB，全是同一件事。
+///
+/// 语义与其它门闩一致：**每次打断只打一条**（签名 = 中断种类 + 原因，不含路径），
+/// 持续中断的后续重试降 `debug!`；回放清空 / 成功时 [`replay_interrupt_reset`]
+/// 复位，下次真中断立刻再报。
+#[derive(Debug, Default)]
+pub struct ReplayInterruptLatch {
+    last: Option<String>,
+}
+
+impl ReplayInterruptLatch {
+    /// 返回 `true` = 这是一次**新**中断，应打 WARN；`false` = 同一中断持续，降 debug。
+    pub fn observe(&mut self, signature: &str) -> bool {
+        if self.last.as_deref() == Some(signature) {
+            return false;
+        }
+        self.last = Some(signature.to_string());
+        true
+    }
+
+    /// 回放成功 / 清空：复位（下次中断立刻放行）。
+    pub fn reset(&mut self) {
+        self.last = None;
+    }
+}
+
+fn replay_interrupt_latch() -> &'static Mutex<ReplayInterruptLatch> {
+    static LATCH: Mutex<ReplayInterruptLatch> = Mutex::new(ReplayInterruptLatch { last: None });
+    &LATCH
+}
+
+/// ★ M41：进程内回放中断门闩判定（见 [`ReplayInterruptLatch`]）。
+fn replay_interrupt_observe(signature: &str) -> bool {
+    replay_interrupt_latch()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .observe(signature)
+}
+
+/// ★ M41：回放成功 / 缓冲清空 → 复位回放中断门闩（daemon 在 flush 成功后调用）。
+pub(crate) fn replay_interrupt_reset() {
+    replay_interrupt_latch()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .reset();
 }
 
 /// ★ 判「`qbox_get_max_log` 这次失败 = 会话没了」。
@@ -1971,7 +2293,9 @@ pub async fn flush_outbox(client: &Client, store: &Store, max_rows: usize) -> Ou
             }
             report.dropped += 1;
             let msg = format!("离线时间戳操作已由上传落地后对齐，跳过: {}", row.path);
-            tracing::info!("{msg}");
+            // ★ M41：逐条回放明细一律 debug（daemon 有「离线操作回放：应用 N｜…」汇总，
+            //   一次回放几百行不该刷几百条 INFO）；用户可见信息仍在 `notes` 里。
+            tracing::debug!("{msg}");
             report.notes.push(msg);
             continue;
         }
@@ -1983,7 +2307,10 @@ pub async fn flush_outbox(client: &Client, store: &Store, max_rows: usize) -> Ou
                 match outcome {
                     ReplayOutcome::Applied => {
                         report.applied += 1;
-                        tracing::info!(
+                        // ★ M41：逐条 INFO → debug（真机 10-26 一天 615 行 / 116 KB；
+                        //   汇总行见 daemon `flush_offline_backlog` 的
+                        //   「离线操作回放：应用 N｜幂等命中 N｜…」）。
+                        tracing::debug!(
                             "离线操作已回放: {} {} -> {}",
                             row.kind,
                             row.path,
@@ -1992,7 +2319,8 @@ pub async fn flush_outbox(client: &Client, store: &Store, max_rows: usize) -> Ou
                     }
                     ReplayOutcome::AlreadyDone => {
                         report.already_done += 1;
-                        tracing::info!(
+                        // ★ M41：同上，逐条降 debug。
+                        tracing::debug!(
                             "离线操作回放命中幂等（远端已是目标状态）: {} {}",
                             row.kind,
                             row.path
@@ -2020,11 +2348,22 @@ pub async fn flush_outbox(client: &Client, store: &Store, max_rows: usize) -> Ou
             }
             Err(ReplayError::Offline(e)) => {
                 report.offline = Some(e.to_string());
-                tracing::warn!(
-                    "离线缓冲回放中断（网络不可用，剩余操作保留）: {} {}: {e}",
-                    row.kind,
-                    row.path
-                );
+                // ★ M41：一次网络中断在「flush 每 3 秒重试」期间会为首个受阻行反复打
+                //   同一条带路径的 WARN。门闩按「中断种类 + 原因」（**不含路径**）去重：
+                //   每次打断只一条 WARN，其余重试降 debug（明细一条不少）。
+                if replay_interrupt_observe(&format!("offline|{e}")) {
+                    tracing::warn!(
+                        "离线缓冲回放中断（网络不可用，剩余操作保留）: 首个受阻操作 {} {}；联网后自动继续（同一中断的后续重试见 debug）: {e}",
+                        row.kind,
+                        row.path
+                    );
+                } else {
+                    tracing::debug!(
+                        "离线缓冲回放中断持续中（同一原因已告警过，不重复 WARN）: {} {}: {e}",
+                        row.kind,
+                        row.path
+                    );
+                }
                 break;
             }
             Err(ReplayError::Auth(why)) => {
@@ -2046,21 +2385,40 @@ pub async fn flush_outbox(client: &Client, store: &Store, max_rows: usize) -> Ou
                     }
                     report.auth_failed = true;
                     report.waiting = Some(why.clone());
-                    tracing::warn!(
-                        "离线缓冲回放中断（会话失效，重登后下一轮继续）: {} {}: {why}",
-                        row.kind,
-                        row.path
-                    );
+                    // ★ M41：同一次会话失效在重登成功前会被重试几十次 —— 只打第一条
+                    //   WARN（带首个受阻操作，便于现场定位卡在哪一行），其余 debug。
+                    if replay_interrupt_observe(&format!("auth|{why}")) {
+                        tracing::warn!(
+                            "离线缓冲回放中断（会话失效，重登后下一轮继续）: 首个受阻操作 {} {}；回放将在重登成功后继续（同一中断的后续重试见 debug）: {why}",
+                            row.kind,
+                            row.path
+                        );
+                    } else {
+                        tracing::debug!(
+                            "离线缓冲回放仍因会话失效中断（同一原因已告警过，不重复 WARN）: {} {}: {why}",
+                            row.kind,
+                            row.path
+                        );
+                    }
                     break;
                 }
             }
             Err(ReplayError::Transient(why)) => {
                 report.waiting = Some(why.clone());
-                tracing::warn!(
-                    "离线缓冲回放中断（服务端未就绪，稍后继续）: {} {}: {why}",
-                    row.kind,
-                    row.path
-                );
+                // ★ M41：服务端未就绪会持续多轮（每 3 秒重试）→ 同样只打第一条 WARN。
+                if replay_interrupt_observe(&format!("transient|{why}")) {
+                    tracing::warn!(
+                        "离线缓冲回放中断（服务端未就绪，稍后继续）: 首个受阻操作 {} {}；NAS 就绪后自动继续（同一中断的后续重试见 debug）: {why}",
+                        row.kind,
+                        row.path
+                    );
+                } else {
+                    tracing::debug!(
+                        "离线缓冲回放仍因服务端未就绪中断（同一原因已告警过，不重复 WARN）: {} {}: {why}",
+                        row.kind,
+                        row.path
+                    );
+                }
                 break;
             }
             Err(ReplayError::Pending(why)) => {
@@ -2119,6 +2477,11 @@ pub async fn flush_outbox(client: &Client, store: &Store, max_rows: usize) -> Ou
                 }
             }
         }
+    }
+    // ★ M41：这次回放**没有被中断**（`offline` / `waiting` 都没置）→ 复位中断门闩，
+    //   下次真中断立刻再报一条 WARN（不吞复发）。缓冲清空时 daemon 也会再复位一次。
+    if report.offline.is_none() && report.waiting.is_none() {
+        replay_interrupt_reset();
     }
     report
 }
@@ -2411,7 +2774,7 @@ async fn reconcile_view(
                             let ctx = format!(
                                 "同步「{label}」对账列举失败（stat 确认也失败，第 {attempted}/{total_dirs} 个目录）→ 本轮不判定该目录及其内容"
                             );
-                            if record_net_error_or_abort(client, net, report, &e2, &ctx).await {
+                            if record_list_failure_or_abort(client, net, report, &e2, &ctx).await {
                                 offline_abort = true;
                                 break;
                             }
@@ -2435,7 +2798,7 @@ async fn reconcile_view(
                 let ctx = format!(
                     "同步「{label}」对账列举失败（第 {attempted}/{total_dirs} 个目录，已列 {scanned} 个）"
                 );
-                if record_net_error_or_abort(client, net, report, &e, &ctx).await {
+                if record_list_failure_or_abort(client, net, report, &e, &ctx).await {
                     offline_abort = true;
                     break;
                 }
@@ -8271,5 +8634,248 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&work);
+    }
+
+    // ------------------------------------------------- ★ M41 日志降噪（daemon 侧）
+
+    /// ★ M41：轮询汇总行只有「本轮真有动作」才值得 INFO（空转由 10 分钟心跳兜底）。
+    ///
+    /// 真机证据：空转轮次一天 1449 行 / 280 KB，内容几乎逐字节相同。
+    #[test]
+    fn poll_line_noteworthy_only_for_real_work() {
+        fn after(f: impl FnOnce(&mut SyncReport)) -> bool {
+            let mut r = SyncReport::default();
+            f(&mut r);
+            poll_line_noteworthy(&r)
+        }
+
+        // max_log / baseline / 扫过的目录数每轮都在变，**不算**动作 —— 这正是旧实现
+        // 「每轮必 INFO」的借口，必须明确排除。
+        assert!(
+            !after(|r| {
+                r.max_log = 123_456;
+                r.global_notify = 9;
+                r.baseline_entries = 3_000;
+                r.dirs_scanned = 200;
+            }),
+            "空转轮次不该 INFO"
+        );
+
+        assert!(after(|r| r.events = 1), "拉到了事件");
+        assert!(after(|r| r.refreshed = 1), "刷新了内容");
+        assert!(after(|r| r.uploaded = 1), "上传了文件");
+        assert!(after(|r| r.conflicts = 1), "产生了冲突副本");
+        assert!(after(|r| r.deleted = 1), "删了条目");
+        assert!(after(|r| r.renamed = 1), "迁移了改名");
+        assert!(after(|r| r.deletes_blocked = 1), "有删除被挡");
+        assert!(after(|r| r.full_scan = true), "跑了全量列举");
+    }
+
+    /// ★ M41：异常签名不能带「第 N 个目录 / 路径」这类每轮都变的数字（否则等于没去重），
+    /// 但错误**种类**变了必须算新异常；插在 `errors[0]` 的汇总行不能主导签名。
+    #[test]
+    fn anomaly_signature_normalizes_volatile_numbers() {
+        let with_err = |e: &str| {
+            let mut r = SyncReport::default();
+            r.errors.push(e.to_string());
+            r
+        };
+        let a = with_err("同步「qsync」对账列举失败（第 4/5245 个目录，已列 0 个）: status=5");
+        let b = with_err("同步「qsync」对账列举失败（第 37/5245 个目录，已列 0 个）: status=5");
+        assert_eq!(
+            anomaly_signature(&a),
+            anomaly_signature(&b),
+            "同一种失败、只是目录序号不同 → 必须同签名: {} vs {}",
+            anomaly_signature(&a),
+            anomaly_signature(&b)
+        );
+
+        let c = with_err("同步「qsync」对账列举失败（第 4/5245 个目录）: 网络错误: 请求发送失败");
+        assert_ne!(
+            anomaly_signature(&a),
+            anomaly_signature(&c),
+            "错误种类变了必须算新异常"
+        );
+
+        // errors[0] 是「本轮另有 N 条…」汇总时，签名必须看后面的**具体错误**。
+        let mut d = SyncReport::default();
+        d.errors.push(format!(
+            "{OMITTED_ERRORS_PREFIX}7 条同类同步错误未逐条列出（每轮最多 3 条样本，明细见 debug 日志）"
+        ));
+        d.errors
+            .push("同步「qsync」对账列举失败（第 9/5245 个目录，已列 0 个）: status=5".into());
+        assert_eq!(
+            anomaly_error_kind(&d),
+            anomaly_error_kind(&a),
+            "汇总行不能主导签名（否则底层错误种类变了也看不出来）"
+        );
+    }
+
+    /// ★ M41：「轮询有异常」是**迁移式**告警 —— 同一签名持续只 WARN 一次，
+    /// 中间干净一轮后复发要重新 WARN，签名变化也要 WARN。
+    #[test]
+    fn anomaly_latch_warns_once_per_state_then_rearms() {
+        let mut latch = AnomalyLatch::default();
+        let mk = |n: usize| {
+            let mut r = SyncReport::default();
+            r.errors.push(format!(
+                "同步「qsync」对账列举失败（第 {n}/5245 个目录，已列 0 个）: status=5"
+            ));
+            r
+        };
+
+        let first = latch.observe(&mk(1)).expect("首次异常必须 WARN");
+        assert!(first.contains("轮询有异常"), "{first}");
+        assert!(
+            first.contains("共 1 条"),
+            "放行消息要用摘要而不是整串数组: {first}"
+        );
+        assert!(latch.observe(&mk(2)).is_none(), "同一签名持续必须压掉");
+
+        // 恢复正常的一轮 → 清状态（日志记事件：恢复后复发也是事件）
+        assert!(latch.observe(&SyncReport::default()).is_none());
+        assert!(latch.observe(&mk(3)).is_some(), "恢复后复发必须重新 WARN");
+
+        // 签名变化（不同错误种类）→ 新事件
+        let mut other = SyncReport::default();
+        other.errors.push("网络错误: 请求发送失败".into());
+        assert!(latch.observe(&other).is_some(), "签名变化必须 WARN");
+    }
+
+    /// ★ M41：`network_failure_changed` / `delete_block_changed` 是 absorb_round 算出来的
+    /// **真事件**：哪怕 c/b/n 恰好没变，也必须强制放行（否则「网络刚恢复又断」被吞）。
+    #[test]
+    fn anomaly_latch_forced_by_network_or_delete_block_change() {
+        let mut latch = AnomalyLatch::default();
+        let mut base = SyncReport::default();
+        base.errors.push("网络错误: 请求发送失败".into());
+
+        assert!(latch.observe(&base).is_some(), "首次");
+        assert!(latch.observe(&base).is_none(), "完全相同的报告 → 压掉");
+
+        let mut net_changed = base.clone();
+        net_changed.network_failure_changed = true;
+        assert!(
+            latch.observe(&net_changed).is_some(),
+            "网络失败签名变化必须强制放行"
+        );
+
+        let mut block_changed = base.clone();
+        block_changed.delete_block_changed = true;
+        assert!(
+            latch.observe(&block_changed).is_some(),
+            "熔断签名变化必须强制放行"
+        );
+
+        assert!(
+            latch.observe(&base).is_none(),
+            "强制放行不改变「同一签名持续」的压制"
+        );
+    }
+
+    /// ★ M41：会话失效只按「正常 → 失效」迁移告警；重登成功后清状态（不吞复发）。
+    #[test]
+    fn auth_latch_only_on_transition_and_resets() {
+        let mut latch = AuthLatch::default();
+        let mut bad = SyncReport::default();
+        bad.auth_failed = true;
+        bad.errors.push("qbox_get_max_log 失败: status=3".into());
+
+        let first = latch.observe(&bad).expect("首次失效必须 WARN");
+        assert!(first.contains("共 1 条"), "要用摘要: {first}");
+        assert!(latch.observe(&bad).is_none(), "持续失效必须压掉");
+        assert!(latch.observe(&bad).is_none(), "同上");
+
+        // 恢复一轮（本轮没失效）→ 清状态
+        assert!(latch.observe(&SyncReport::default()).is_none());
+        assert!(latch.observe(&bad).is_some(), "恢复后再次失效必须重新 WARN");
+
+        // 重登成功后显式 reset → 下一次失效立刻再报
+        latch.reset();
+        assert!(latch.observe(&bad).is_some(), "reset 后必须重新放行");
+    }
+
+    /// ★ M41：对账逐目录失败的采样 —— 前 3 条进 `errors`（GUI 可见），其余只计数，
+    /// 轮末压成一条汇总；汇总插在最前，`absorb_round` 的 `last_error` 仍是具体错误。
+    #[test]
+    fn list_failure_sampling_caps_samples_and_flushes_summary() {
+        let mut r = SyncReport::default();
+        for n in 1..=5 {
+            r.push_list_failure(
+                &format!("同步「qsync」对账列举失败（第 {n}/5245 个目录）"),
+                &CoreError::Io("status=5".into()),
+            );
+        }
+        assert_eq!(
+            r.errors.len(),
+            MAX_VISIBLE_LIST_FAILURES,
+            "前 3 条必须照旧进 errors（GUI / 用户可见）: {:?}",
+            r.errors
+        );
+        assert_eq!(r.errors_omitted, 2, "其余只计数");
+        assert!(
+            r.error_is_network.iter().all(|v| !v),
+            "样本是非网络错误（网络类不走采样，走 record_net_error_or_abort）"
+        );
+
+        r.flush_omitted_errors();
+        assert_eq!(
+            r.errors_omitted, 0,
+            "汇总后必须清零（每轮最多一条汇总 WARN）"
+        );
+        assert_eq!(r.errors.len(), MAX_VISIBLE_LIST_FAILURES + 1);
+        assert!(
+            r.errors[0].starts_with(OMITTED_ERRORS_PREFIX),
+            "汇总插在最前: {:?}",
+            r.errors[0]
+        );
+        assert!(
+            r.errors[0].contains('2'),
+            "汇总里要有省略条数: {:?}",
+            r.errors[0]
+        );
+
+        // last_error 仍是「具体错误」而不是摘要：摘要负责「还有 N 条」，
+        // 具体错误负责「是什么错」，两个都要。
+        let stats = SyncStats::default();
+        let mut r2 = r.clone();
+        absorb_round(&stats, &mut r2, true);
+        let last = stats.snapshot().last_error.unwrap_or_default();
+        assert!(
+            last.contains("第 3/5245 个目录"),
+            "last_error 必须是具体错误样本，不能是摘要: {last}"
+        );
+
+        // 没有省略 → flush 不产生任何东西（不制造空 WARN）。
+        let mut clean = SyncReport::default();
+        clean.flush_omitted_errors();
+        assert!(clean.errors.is_empty(), "无省略时不该追加汇总");
+    }
+
+    /// ★ M41：回放中断门闩 —— 首次 WARN、持续 debug、种类变化再 WARN、成功后复位。
+    ///
+    /// 真机证据：会话失效期间 flush 每 3 秒重试，一次中断能刷几十条带路径的 WARN。
+    #[test]
+    fn replay_interrupt_latch_first_suppresses_repeats_and_rearms() {
+        let mut latch = ReplayInterruptLatch::default();
+        assert!(latch.observe("auth|status=4"), "首次打断 → WARN");
+        assert!(
+            !latch.observe("auth|status=4"),
+            "同一打断的后续重试 → debug"
+        );
+        assert!(!latch.observe("auth|status=4"));
+        assert!(
+            latch.observe("offline|网络错误: 请求发送失败"),
+            "中断种类变了 → 新事件必须 WARN"
+        );
+        assert!(
+            !latch.observe("offline|网络错误: 请求发送失败"),
+            "同种类持续 → debug"
+        );
+        latch.reset(); // 回放成功 / 缓冲清空
+        assert!(
+            latch.observe("auth|status=4"),
+            "复位后再次打断必须重新 WARN"
+        );
     }
 }

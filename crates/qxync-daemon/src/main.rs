@@ -311,6 +311,38 @@ fn init_logging(
     Ok(guard)
 }
 
+/// ★ M41：fuser 桥同一诊断的限流窗口（**10 分钟**）。
+///
+/// 真机取证：`[Not Implemented]` 这类行 10-26 共 225 条、随机分布在整天 ——
+/// 60s 桶只能压掉约一半，且它们是「某个 FUSE 操作没实现」的长期已知诊断，
+/// 重复频率没有诊断价值。同一归一化签名 10 分钟一条，足够提示「还在发生」。
+const FUSER_BRIDGE_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// ★ M41：fuser 日志的**归一化签名**（限流用，不含 opcode 数字 / 具体路径）。
+///
+/// * 多行消息只取第一行（真机栈式诊断的第一行才是「是什么」）；
+/// * 连续数字压成 `#`：`Unknown FUSE opcode 0x15` 与 `0x16` 属于同一类诊断，
+///   否则每个 opcode 各自一个键 = 等于没限流。
+///
+/// 具体值不丢：放行的那条消息是**完整原文**（见 [`FuserLogBridge::log`]）。
+fn fuser_log_signature(msg: &str) -> String {
+    let first = msg.lines().next().unwrap_or("");
+    let mut out = String::with_capacity(first.len().min(256));
+    let mut prev_digit = false;
+    for ch in first.chars().take(240) {
+        if ch.is_ascii_digit() {
+            if !prev_digit {
+                out.push('#');
+                prev_digit = true;
+            }
+        } else {
+            prev_digit = false;
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// `log` → `tracing` 桥（只装一次，见 [`init_logging`]）。
 ///
 /// fuser 0.17 的所有诊断（未实现的 FUSE 操作、未知 opcode、会话错误）
@@ -324,15 +356,111 @@ impl log::Log for FuserLogBridge {
         if !self.enabled(record.metadata()) {
             return;
         }
+        // ★ M41：同一诊断（归一化签名）10 分钟最多一条；被压的写 debug（原文不丢），
+        //   放行的那条在末尾带上「过去窗口内另省略 N 条」。
+        //
+        // 桥里只做 `format!` + 一次 `noise` 的 HashMap 判定（锁内不碰 IO），
+        // 不改变 log → tracing 的级别映射。
+        let msg = record.args().to_string();
+        let adm = qxync_core::noise::dedupe_in(
+            "fuser.bridge",
+            &fuser_log_signature(&msg),
+            FUSER_BRIDGE_WINDOW,
+        );
+        if !adm.emit {
+            tracing::debug!(target: "fuser", "{msg}");
+            return;
+        }
+        let suffix = adm.note();
         match record.level() {
             log::Level::Error => {
-                tracing::error!(target: "fuser", "{}", record.args())
+                tracing::error!(target: "fuser", "{}{}", msg, suffix)
             }
-            log::Level::Warn => tracing::warn!(target: "fuser", "{}", record.args()),
-            log::Level::Info => tracing::info!(target: "fuser", "{}", record.args()),
-            log::Level::Debug => tracing::debug!(target: "fuser", "{}", record.args()),
-            log::Level::Trace => tracing::trace!(target: "fuser", "{}", record.args()),
+            log::Level::Warn => tracing::warn!(target: "fuser", "{}{}", msg, suffix),
+            log::Level::Info => tracing::info!(target: "fuser", "{}{}", msg, suffix),
+            log::Level::Debug => tracing::debug!(target: "fuser", "{}{}", msg, suffix),
+            log::Level::Trace => tracing::trace!(target: "fuser", "{}{}", msg, suffix),
         }
     }
     fn flush(&self) {}
+}
+
+// ---------------------------------------------------------------- 单测
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ------------------------------------------------------------ ★ M41 fuser 签名
+
+    /// 同一 opcode 族（数字不同）与多行消息的首行 → 同一签名（否则限流无效）。
+    #[test]
+    fn fuser_signature_normalizes_numbers_and_multiline() {
+        assert_eq!(
+            fuser_log_signature("[Not Implemented] ioctl(0x15)\nbacktrace: a\nb"),
+            fuser_log_signature("[Not Implemented] ioctl(0x16)"),
+            "多行只取首行、数字归一化后必须同签名"
+        );
+        assert_eq!(
+            fuser_log_signature("Unknown FUSE opcode 42"),
+            fuser_log_signature("Unknown FUSE opcode 7")
+        );
+        // 原文不丢的前提：签名只是键，放行消息仍是完整原文（另测）
+        assert_eq!(fuser_log_signature("no digits here"), "no digits here");
+    }
+
+    /// 不同诊断必须各自放行（不能把「未实现」和「会话错误」压成一条）。
+    #[test]
+    fn fuser_signature_keeps_distinct_diagnostics_apart() {
+        let a = fuser_log_signature("[Not Implemented] link(...)");
+        let b = fuser_log_signature("Unknown FUSE opcode 0x15");
+        let c = fuser_log_signature("Session destroyed by peer");
+        assert_ne!(a, b);
+        assert_ne!(b, c);
+        assert_ne!(a, c);
+    }
+
+    /// 限流窗口必须是 10 分钟（不是 60s：真机 `[Not Implemented]` 间隔随机，60s 只压一半）。
+    #[test]
+    fn fuser_bridge_window_is_ten_minutes() {
+        assert_eq!(FUSER_BRIDGE_WINDOW, std::time::Duration::from_secs(600));
+    }
+
+    /// 同一签名 10 分钟内压掉、不同 opcode 各自放行。
+    #[test]
+    fn fuser_bridge_dedupes_same_signature_within_window() {
+        let site = "test.fuser.bridge.dedupe";
+        qxync_core::noise::reset_site(site);
+        let sig = fuser_log_signature("[Not Implemented] ioctl(0x15)");
+        assert!(
+            qxync_core::noise::dedupe_in(site, &sig, FUSER_BRIDGE_WINDOW).emit,
+            "首次必须放行"
+        );
+        assert!(
+            !qxync_core::noise::dedupe_in(site, &sig, FUSER_BRIDGE_WINDOW).emit,
+            "同一签名 10 分钟内必须压掉"
+        );
+        let other = fuser_log_signature("Unknown FUSE opcode 0x15");
+        assert!(
+            qxync_core::noise::dedupe_in(site, &other, FUSER_BRIDGE_WINDOW).emit,
+            "另一种诊断必须各自放行"
+        );
+        qxync_core::noise::reset_site(site);
+    }
+
+    /// 窗口到期后再放行，并如实带上「过去窗口内另省略 N 条」。
+    #[test]
+    fn fuser_bridge_reemits_after_window_expires() {
+        let site = "test.fuser.bridge.expiry";
+        qxync_core::noise::reset_site(site);
+        // 用 20ms 的窗口验证「到期即放行」语义（生产常量是 600s，见上一个测试）。
+        let win = std::time::Duration::from_millis(20);
+        assert!(qxync_core::noise::dedupe_in(site, "sig", win).emit);
+        assert!(!qxync_core::noise::dedupe_in(site, "sig", win).emit);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let a = qxync_core::noise::dedupe_in(site, "sig", win);
+        assert!(a.emit, "窗口到期必须再放行");
+        assert_eq!(a.suppressed, 1, "放行时要报出被压掉的条数");
+        qxync_core::noise::reset_site(site);
+    }
 }

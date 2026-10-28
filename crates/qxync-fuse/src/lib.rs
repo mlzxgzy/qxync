@@ -68,6 +68,129 @@ pub const DEFAULT_DIR_TTL: Duration = Duration::from_secs(30);
 /// ★ M9：后台内容刷新连续失败多少次之后，退回「丢掉旧内容、读到时按需水合」。
 const REFRESH_MAX_ATTEMPTS: u32 = 3;
 
+// ---------------------------------------------------------------- M41：日志降噪
+//
+// ★ M41：为什么要有这一段。
+//
+// M39 管住了日志文件的**体积**（切段 + 按天/总量删旧），但没管内容：2026-10-25 的
+// 真机日志里，「创建缓存文件失败 <路径>: Too many open files」一条就占 48 983 行 / 9.5 MB
+// —— 每条带一个不同路径，信息量却只有「fd 泄漏了」这一句。10-26 的
+// 「水合位图落盘失败 <路径>」2 394 行、「读取水合位图失败 <路径>」1 043 行同理。
+//
+// 处理办法见 [`qxync_core::noise`]：同一 (site, signature) 只放行「首次 + 每窗口一条」，
+// 放行那条带上「过去一个窗口内另省略 N 条同类」；**被压掉的每一条仍然写 `debug!`**
+// （`RUST_LOG=debug` 时一条不少，信息不丢）。签名里绝不能带路径 —— 每条路径都是新键，
+// 等于没限流；所以下面把错误归成「错误种类」枚举值，路径只出现在放行/明细那行消息里。
+
+/// 把 IO 错误归类成**不含路径/数字**的限流签名（用于 [`qxync_core::noise::dedupe`]）。
+///
+/// 只区分运维真正会分头处理的那几类：`EMFILE`（fd 泄漏，10-25 那 9.5 MB 的元凶）、
+/// `ENOSPC`（磁盘满）、`ENOENT`（文件被并发删了）、`EACCES`（权限）、`EIO`（其它 IO）。
+/// 其余一律 `other`：签名越细，键越多、限流越弱，而日志能给的诊断价值并不增加。
+fn io_err_signature(e: &io::Error) -> &'static str {
+    match e.raw_os_error() {
+        Some(libc::EMFILE) | Some(libc::ENFILE) => "EMFILE",
+        Some(libc::ENOSPC) | Some(libc::EDQUOT) => "ENOSPC",
+        Some(libc::ENOENT) => "ENOENT",
+        Some(libc::EACCES) | Some(libc::EPERM) | Some(libc::EROFS) => "EACCES",
+        Some(libc::EIO) => "EIO",
+        Some(_) => "other-os",
+        None => match e.kind() {
+            io::ErrorKind::NotFound => "ENOENT",
+            io::ErrorKind::PermissionDenied => "EACCES",
+            io::ErrorKind::StorageFull => "ENOSPC",
+            _ => "other",
+        },
+    }
+}
+
+/// 缓存文件创建/改大小失败的签名：`<操作种类>/<错误种类>`。
+///
+/// 两个操作共用站点 `fuse.cache_create`（它们永远成对出现在同一条失败链上），
+/// 但签名分开 —— 否则「创建失败 EMFILE」会把「set_len 失败 ENOSPC」的窗口吃掉，
+/// 让真正换了错误种类的那次被静默压掉。
+fn cache_op_err_signature(op: &str, e: &io::Error) -> String {
+    format!("{op}/{}", io_err_signature(e))
+}
+
+#[cfg(test)]
+mod m41_noise_tests {
+    use super::*;
+
+    /// 错误归类：fd 泄漏/磁盘满/文件消失/权限/其它各自成键，且 `ENFILE` 与 `EMFILE` 合并
+    /// （对运维来说都是「fd 用完了」，没有分开的必要）。
+    #[test]
+    fn io_err_signature_maps_common_kinds() {
+        let sig = |code| io_err_signature(&io::Error::from_raw_os_error(code));
+        assert_eq!(sig(libc::EMFILE), "EMFILE");
+        assert_eq!(sig(libc::ENFILE), "EMFILE");
+        assert_eq!(sig(libc::ENOSPC), "ENOSPC");
+        assert_eq!(sig(libc::EDQUOT), "ENOSPC");
+        assert_eq!(sig(libc::ENOENT), "ENOENT");
+        assert_eq!(sig(libc::EACCES), "EACCES");
+        assert_eq!(sig(libc::EROFS), "EACCES", "只读卷与权限不足同属「不让写」");
+        assert_eq!(sig(libc::EIO), "EIO");
+        assert_eq!(sig(libc::EPIPE), "other-os");
+        // 没有 raw_os_error 的合成错误按 ErrorKind 归类
+        assert_eq!(
+            io_err_signature(&io::Error::from(io::ErrorKind::NotFound)),
+            "ENOENT"
+        );
+        assert_eq!(
+            io_err_signature(&io::Error::from(io::ErrorKind::PermissionDenied)),
+            "EACCES"
+        );
+        assert_eq!(
+            io_err_signature(&io::Error::from(io::ErrorKind::StorageFull)),
+            "ENOSPC"
+        );
+        assert_eq!(
+            io_err_signature(&io::Error::from(io::ErrorKind::Other)),
+            "other"
+        );
+    }
+
+    /// ★ 签名必须「同错同类、与路径无关」：同样错误种类得到同一个字符串，
+    /// 且字符串里不带任何路径分隔符（带路径 = 每条新键 = 限流失效）。
+    #[test]
+    fn io_err_signature_is_stable_and_path_free() {
+        let a = io_err_signature(&io::Error::from_raw_os_error(libc::EMFILE));
+        let b = io_err_signature(&io::Error::from_raw_os_error(libc::EMFILE));
+        assert_eq!(a, b, "同一错误种类必须得到同一签名（限流的前提）");
+        for s in [
+            a,
+            io_err_signature(&io::Error::from_raw_os_error(libc::ENOSPC)),
+            io_err_signature(&io::Error::from_raw_os_error(libc::ENOENT)),
+            io_err_signature(&io::Error::from_raw_os_error(libc::EPIPE)),
+        ] {
+            assert!(!s.contains('/'), "签名里不能有路径片段: {s}");
+            assert!(
+                !s.contains('1') && !s.contains('0'),
+                "签名里不能有数字: {s}"
+            );
+            assert!(s.is_ascii(), "签名只放 ASCII，避免现场 grep 歧义: {s}");
+        }
+    }
+
+    /// 两个缓存操作即使错误种类相同也各自成键（创建失败 ≠ 改大小失败）。
+    #[test]
+    fn cache_op_signature_keeps_operations_apart() {
+        let e = io::Error::from_raw_os_error(libc::EMFILE);
+        assert_eq!(cache_op_err_signature("create", &e), "create/EMFILE");
+        assert_eq!(cache_op_err_signature("set_len", &e), "set_len/EMFILE");
+        assert_ne!(
+            cache_op_err_signature("create", &e),
+            cache_op_err_signature("set_len", &e),
+            "不同操作的失败不能互相吞掉省略计数"
+        );
+        // 同操作同错误冒烟：幂等（纯函数，可直接判等）
+        assert_eq!(
+            cache_op_err_signature("create", &io::Error::from_raw_os_error(libc::ENOSPC)),
+            "create/ENOSPC"
+        );
+    }
+}
+
 // ---------------------------------------------------------------- 水合位图落盘
 //
 // ★ M9 的根因修复。`chunks_done` 以前只活在内存里：daemon 一重启、或者节点被重新
@@ -277,7 +400,18 @@ fn state_load(cache: &Path) -> Option<ChunkState> {
         Ok(b) => b,
         Err(e) => {
             if e.kind() != io::ErrorKind::NotFound {
-                tracing::warn!("读取水合位图失败 {}: {e}", state_path(cache).display());
+                // ★ M41：每个缓存文件一条 WARN 太吵（真机 10-25 有 1 043 行）。
+                // 窗口内同类错误只放行首条 + 每 60s 一条（带省略计数），逐条明细降 debug。
+                let a = qxync_core::noise::dedupe("fuse.state_load", io_err_signature(&e));
+                if a.emit {
+                    tracing::warn!(
+                        "读取水合位图失败 {}: {e}{}",
+                        state_path(cache).display(),
+                        a.note()
+                    );
+                } else {
+                    tracing::debug!("读取水合位图失败 {}: {e}", state_path(cache).display());
+                }
             }
             return None;
         }
@@ -630,7 +764,14 @@ fn persist_chunk_state(
         )
     };
     if let Err(e) = state_save(&cache, &st) {
-        tracing::warn!("水合位图落盘失败 {}: {e}", cache.display());
+        // ★ M41：`persist_chunk_state` 每就绪一个区间就调一次，失败时就会
+        // 「每区间一条 WARN」（真机 10-25 有 2 394 行 / 450 KB）。同错误种类限流。
+        let a = qxync_core::noise::dedupe("fuse.state_save", io_err_signature(&e));
+        if a.emit {
+            tracing::warn!("水合位图落盘失败 {}: {e}{}", cache.display(), a.note());
+        } else {
+            tracing::debug!("水合位图落盘失败 {}: {e}", cache.display());
+        }
         return;
     }
     // ★ M9 补丁：索引与磁盘位图同步 —— `status` 的「已缓存 N」当场就准，
@@ -3966,7 +4107,18 @@ impl QxyncFs {
         if let Some(q) = &self.delete_queue {
             q.set_backlog_blocked(true);
         }
-        tracing::info!("离线操作已进入缓冲区（待联网回放）: {kind} {path} -> {target}");
+        // ★ M41：离线期间「新建目录 + 往里写文件」会逐个操作入队（真机 10-26 有 664 行）。
+        // 按 kind 限流 30s：用户可见的那条带 kind + 示例 path/target + 省略计数，
+        // 逐条完整明细留给 debug（信息不丢）。
+        let a = qxync_core::noise::dedupe_in("fuse.outbox_add", kind, Duration::from_secs(30));
+        if a.emit {
+            tracing::info!(
+                "离线操作已进入缓冲区（待联网回放）: {kind} {path} -> {target}{}",
+                a.note()
+            );
+        } else {
+            tracing::debug!("离线操作已进入缓冲区（待联网回放）: {kind} {path} -> {target}");
+        }
         Ok(())
     }
 
@@ -4948,10 +5100,17 @@ impl QxyncFs {
         // ★ M2c：本地大批删除熔断。`rm -rf` 超过阈值后拒绝继续删，
         //   避免「本地误删 → 立即同步清空远端」这种最危险的组合。
         if !self.delete_guard.allow() {
-            tracing::warn!(
-                "本地删除被熔断（{}）: {name}",
-                self.delete_guard.reason().unwrap_or_default()
-            );
+            // ★ M41：熔断后每个被拒的删除都会打一条 WARN（`rm -rf` 一次能刷 830 行）。
+            // 窗口 60s，签名用固定值 `blocked`：熔断原因文本里带着配置数字（如「60 秒内
+            // 删除超过 100 项」），而签名里不能有数字（见模块约定）；同一守卫只有一种
+            // 熔断原因，固定签名与「原因字符串」等价，原因本身仍完整写在消息里。
+            let reason = self.delete_guard.reason().unwrap_or_default();
+            let a = qxync_core::noise::dedupe("fuse.delete_breaker", "blocked");
+            if a.emit {
+                tracing::warn!("本地删除被熔断（{reason}）: {name}{}", a.note());
+            } else {
+                tracing::debug!("本地删除被熔断（{reason}）: {name}");
+            }
             return reply.error(fuser::Errno::EACCES);
         }
         // ★ M17：删除前只冻结**这个路径**上的上传，不再排空整个队列。
@@ -5715,11 +5874,31 @@ impl QxyncFs {
             .truncate(false)
             .open(&path)
             .map_err(|e| {
-                tracing::error!("创建缓存文件失败 {}: {e}", path.display());
+                // ★ M41：fd 泄漏时这里每打开一个文件就失败一次，真机 10-25 刷了 48 983 行
+                // / 9.5 MB，每条只差一个路径。按「操作/错误种类」限流：窗口内放行一条
+                // （带示例路径 + 省略计数），其余逐条 debug 完整保留。
+                let a = qxync_core::noise::dedupe(
+                    "fuse.cache_create",
+                    &cache_op_err_signature("create", &e),
+                );
+                if a.emit {
+                    tracing::error!("创建缓存文件失败 {}: {e}{}", path.display(), a.note());
+                } else {
+                    tracing::debug!("创建缓存文件失败 {}: {e}", path.display());
+                }
                 fuser::Errno::EIO
             })?;
         f.set_len(n.attr.size).map_err(|e| {
-            tracing::error!("设置缓存文件大小失败 {}: {e}", path.display());
+            // ★ M41：同上（与 create 共用站点，但签名分开，见 `cache_op_err_signature`）。
+            let a = qxync_core::noise::dedupe(
+                "fuse.cache_create",
+                &cache_op_err_signature("set_len", &e),
+            );
+            if a.emit {
+                tracing::error!("设置缓存文件大小失败 {}: {e}{}", path.display(), a.note());
+            } else {
+                tracing::debug!("设置缓存文件大小失败 {}: {e}", path.display());
+            }
             fuser::Errno::EIO
         })?;
         n.chunks_done = vec![false; want];
