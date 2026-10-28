@@ -5,7 +5,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [中文](CHANGELOG.md) · [README](README.en.md) · [Acceptance log](docs/验收记录.md)
 
-## [Unreleased]
+## [0.8.0] - 2026-10-28
 
 ### Added
 
@@ -2344,6 +2344,7 @@ Verified on **QNAP TS-464C / QTS 5.2.9 / Qsync QPKG 5.0.0.7 (build 20260723)**.
 - Acceptance results were split out of the README into [`docs/验收记录.md`](docs/验收记录.md).
 - Dual-licensed under **MIT OR Apache-2.0** (`LICENSE-MIT` / `LICENSE-APACHE`).
 
+[0.8.0]: https://github.com/mlzxgzy/qxync/compare/v0.7.14...v0.8.0
 [0.7.14]: https://github.com/mlzxgzy/qxync/compare/v0.7.13...v0.7.14
 [0.7.12]: https://github.com/mlzxgzy/qxync/compare/v0.7.11...v0.7.12
 [0.7.4]: https://github.com/mlzxgzy/qxync/compare/v0.7.3...v0.7.4
