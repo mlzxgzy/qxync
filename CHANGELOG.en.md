@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.14] - 2026-10-28
+
+### Changed
+
+- **Log noise reduction ([M41](docs/M41-日志降噪.md))**. M39 bounded the size of log
+  files (rotation / retention) but not what gets written into them: on 2026-10-25,
+  **10.33 MB of the day's 11.19 MB** was the same `创建缓存文件失败 … Too many open files`
+  line (48,983 copies differing only by path); on 10-26, 3,677 per-directory
+  `对账列举失败` lines and 941 per-file `上传暂停` lines made up most of 4.46 MB.
+  M41 cuts the noise **at the source** without losing diagnostics:
+  - New `qxync_core::noise`: one `(site, signature)` is admitted "first time + once per
+    window", with the admitted line carrying "another N similar lines suppressed in the
+    last window"; every suppressed line is still written via `debug!` (nothing is lost
+    under `RUST_LOG=debug`). Signatures never contain paths/numbers (otherwise rate
+    limiting is a no-op), state is bounded (512 keys), and a poisoned lock never stops
+    logging.
+  - **Edge-triggered** alerts: poll anomalies / session expiry / upload pause / outbox
+    replay interruption are logged once on "went bad / changed / recovered" and stay
+    silent while the condition persists; a later recurrence is logged again.
+  - Per-directory reconcile failures: at most 3 samples + 1 "N more" summary per round;
+    `SyncReport.errors` semantics and its 20-entry cap are unchanged, so IPC / GUI error
+    lists / journal are unaffected.
+  - Idle `同步轮询` INFO lines → only when something actually happened + a 10-minute
+    heartbeat; per-file `已上传` → `debug!` + a 60-second "N items / B bytes in the last
+    minute" heartbeat; per-item offline-buffer / delete-circuit-breaker / hydration
+    bitmap / EMFILE family / fuser "not implemented" lines → signature-based rate
+    limiting; `已删除` name lists truncated to 120 chars; `accept` failures (the fd
+    exhaustion flood behind M39's 5 GB file) are rate-limited by errno to one line per
+    60 s, so even a renewed fd leak can no longer produce "5 GB in a day" (worst case
+    ~1.5 MB/day).
+  - Measured (same real logs replayed offline under the new rules,
+    `xtask/probe/m41_log_volume.py`): 16.35 MB → 0.58 MB over three days (**-96.5%**),
+    per-day -87% to -99%. The EMFILE root cause (fd leak) is **not** fixed, but it no
+    longer floods the log (M39 already keeps it from filling the disk).
+
 ## [0.7.13] - 2026-10-27
 
 ### Added
@@ -2291,6 +2326,7 @@ Verified on **QNAP TS-464C / QTS 5.2.9 / Qsync QPKG 5.0.0.7 (build 20260723)**.
 - Acceptance results were split out of the README into [`docs/验收记录.md`](docs/验收记录.md).
 - Dual-licensed under **MIT OR Apache-2.0** (`LICENSE-MIT` / `LICENSE-APACHE`).
 
+[0.7.14]: https://github.com/mlzxgzy/qxync/compare/v0.7.13...v0.7.14
 [0.7.12]: https://github.com/mlzxgzy/qxync/compare/v0.7.11...v0.7.12
 [0.7.4]: https://github.com/mlzxgzy/qxync/compare/v0.7.3...v0.7.4
 [0.7.3]: https://github.com/mlzxgzy/qxync/compare/v0.7.2...v0.7.3
