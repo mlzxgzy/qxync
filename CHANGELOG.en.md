@@ -5,6 +5,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [中文](CHANGELOG.md) · [README](README.en.md) · [Acceptance log](docs/验收记录.md)
 
+## [Unreleased]
+
+### Fixed
+
+- **Unreadable paths in GUI search results ([M43.1](docs/M42-本地文件搜索.md))**: the result
+  table's path column was a single tail-ellipsized line, so every row showed the same long
+  prefix (`/home/.Qsync/2024/06-…`) and the file name was cut off. It is now **two lines**:
+  the file name first (tail ellipsis), then the parent directory (11px, dimmed); when the
+  directory is too long the UI **shows the tail and hides the front** (`fitSearchDirs` cuts
+  by real pixel width from the left and prefixes "…"; re-fits on resize). A `direction: rtl`
+  CSS ellipsis is not used because WebKit paints it outside the content box and clips half of
+  it (confirmed by real-window screenshots), hence the JS-side truncation. The column header
+  is now "File / path". Pure GUI layout change — core / SQLite schema / IPC / daemon / FUSE /
+  CLI untouched.
+
 ## [0.8.0] - 2026-10-28
 
 ### Added
