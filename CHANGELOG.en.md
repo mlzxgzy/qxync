@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Local file search ([M42](docs/M42-本地文件搜索.md))**: new `qxync find` command that
+  **reads the sync state database only** (`baseline` + `nodes.local_only`) and searches the
+  NAS sync tree by path/file-name substring or glob — no mount, no network and no running
+  daemon required. Supports subtree (`--under`, a local mount path is translated too), size
+  (`--min-size` / `--max-size`) and type (`--type f|d`) filters, sorting by path/size/mtime,
+  `--local` to print mount-point paths, `--json` for scripting, and `--limit 0` for all
+  matches. Measured on the real database (28,136 files + 5,891 directories):
+  `qxync find 防火墙` returns in ~**0.1 s**. No schema / IPC / daemon changes (pure read);
+  freshness lags at most one poll round (uploads are persisted immediately).
+
 ## [0.7.14] - 2026-10-28
 
 ### Changed

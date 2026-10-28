@@ -37,6 +37,7 @@ pub mod noise;
 pub mod purge;
 pub mod roots;
 pub mod rules;
+pub mod search;
 pub mod settings;
 pub mod status;
 pub mod store;

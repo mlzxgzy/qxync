@@ -100,6 +100,13 @@ jobs:
       - name: M40 多路径 e2e（隔离 XDG）
         run: bash xtask/tests/m40-multipath.sh
 
+      # ★ M42：本地文件搜索（qxync find）的隔离 e2e —— 不需要 NAS / /dev/fuse / daemon。
+      # 状态库由 python3 直接造；断言子串 / 大小写 / --glob / --under（本地路径换算）/
+      # --type / --limit 截断提示 / --local 映射 / --json 字段 / local_only / 墓碑 /
+      # 离线可用 / 缺库报错 / --via-daemon 被拒绝。
+      - name: M42 本地文件搜索 e2e（隔离 XDG）
+        run: bash xtask/tests/m42-search.sh
+
       # ★ M21：离线可重启 daemon 的隔离 e2e —— 假 NAS（127.0.0.1:9）+ 真 FUSE 挂载。
       # 断言：离线启动后挂载点从 mounts.json + listings 表恢复、离线 ls / 写缓冲、
       # 第二次离线重启幂等。需要 /dev/fuse 与 python3，缺任一自动 SKIP。
