@@ -281,6 +281,7 @@ The GUI currently ships Chinese UI strings only — see "Known limitations".
 | `qxync journal --level error` | sync log / error list |
 | `qxync conflicts --resolve <id> --as keep_local\|keep_remote\|keep_both` | resolve a conflict |
 | `qxync file-states <remote-dir>` | file states: online-only / locally available / always available |
+| `qxync find <keyword>` | search synced files in the local state DB (works offline, no mount; `--local` prints mount-point paths, `--json` for scripts) |
 | `qxync settings` / `settings --set k=v` | view / change settings (proxy, automatic space freeing, log rotation and retention, …) |
 | `qxync log` / `log --prune` / `--json` | log usage, rotation policy (default 32 MiB / 14 days / 256 MiB total) and prune now |
 | `qxync links` | list all NAS connections (with their daemon / login state) |

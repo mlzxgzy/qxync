@@ -16,8 +16,9 @@ use qxync_core::ipc::{
     RouteInfo, RoutesData, RulesData, SettingsData, ShutdownData, SpaceData, StatusData, StoreData,
     SyncInfo, TasksData,
 };
+use qxync_core::search::{KindFilter, MatchMode, SearchQuery, SortKey};
 use qxync_core::settings::{Settings, PROXY_AUTO, PROXY_MANUAL, PROXY_NONE};
-use qxync_core::{ConfigPaths, Credentials, DirEntry, LinkConfig, HOME_ROOT};
+use qxync_core::{ConfigPaths, Credentials, DirEntry, LinkConfig, Task, HOME_ROOT};
 use qxync_fuse::{CacheMode, QxyncFs};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -101,6 +102,58 @@ enum Cmd {
     },
     /// 单文件 stat（注意：需要 `目录 + 文件名`，不是全路径）
     Stat { dir: String, name: String },
+    /// ★ M42：本地文件搜索（只读同步状态库 —— 不挂载、不联网、不用 daemon）
+    ///
+    /// 搜的是同步**元数据**（baseline + 本地新建），不是文件内容：
+    /// 按路径/文件名子串（默认）或通配符匹配，可按子树、大小、类型过滤，
+    /// 并能把命中换算成挂载点里的本地路径（`--local`）。
+    ///
+    /// 新鲜度：baseline 每轮对账/每次上传成功都会落盘，远端侧最多滞后一轮（默认 30s）；
+    /// 要绝对新鲜先跑一轮 `qxync sync --once`。
+    #[command(visible_alias = "search")]
+    Find {
+        /// 子串（默认，大小写不敏感）；省略 = 全部
+        pattern: Option<String>,
+        /// 通配符模式：`*` 任意序列、`?` 单字符；模式里没有 `/` 时只匹配文件名
+        #[arg(long)]
+        glob: bool,
+        /// 大小写敏感（默认不敏感）
+        #[arg(long)]
+        case_sensitive: bool,
+        /// 只搜这棵子树（远端路径，或挂载点下的本地路径）
+        #[arg(long, value_name = "PATH")]
+        under: Option<String>,
+        /// 只搜这个任务（任务 id，同时决定 --local 的映射）
+        #[arg(long, value_name = "ID")]
+        task: Option<String>,
+        /// 只要文件（f）或目录（d）
+        #[arg(long = "type", value_name = "f|d")]
+        r#type: Option<String>,
+        /// 最小文件大小（K/M/G/T，1024 进制）
+        #[arg(long, value_name = "SIZE")]
+        min_size: Option<String>,
+        /// 最大文件大小（K/M/G/T，1024 进制）
+        #[arg(long, value_name = "SIZE")]
+        max_size: Option<String>,
+        /// 排序：path（路径升序，默认）/ size（大的在前）/ mtime（新的在前）
+        #[arg(long, value_name = "path|size|mtime", default_value = "path")]
+        sort: String,
+        /// 反向排序
+        #[arg(long)]
+        reverse: bool,
+        /// 最多返回多少条（0 = 全部）
+        #[arg(long, value_name = "N", default_value_t = 100)]
+        limit: usize,
+        /// 输出挂载点里的本地路径（映射不到时回退远端路径）
+        #[arg(long)]
+        local: bool,
+        /// 长格式：类型 大小 时间 路径
+        #[arg(long)]
+        long: bool,
+        /// 输出 JSON（脚本用）
+        #[arg(long)]
+        json: bool,
+    },
     /// 下载文件
     Get {
         /// 远端目录
@@ -816,6 +869,14 @@ async fn main() -> Result<()> {
     if matches!(cli.cmd, Cmd::Verify { .. }) {
         return run_verify(&cli).await;
     }
+    // ★ M42：`find` 也是纯本地（只读状态库，不问 NAS、不用 daemon）——
+    //   路由前短路，daemon 没起、没挂载、断网时照常可用。
+    if matches!(cli.cmd, Cmd::Find { .. }) {
+        if cli.via_daemon {
+            bail!("`find` 是纯本地命令（只读同步状态库），不支持 --via-daemon");
+        }
+        return run_find(&cli);
+    }
     let use_ipc = if cli.direct {
         false
     } else if cli.via_daemon {
@@ -1056,6 +1117,7 @@ async fn main() -> Result<()> {
             print_settings(&st, &paths, *json, saved)?;
         }
         Cmd::Verify { .. } => unreachable!("verify 在路由前已短路"),
+        Cmd::Find { .. } => unreachable!("find 在路由前已短路（纯本地）"),
         Cmd::Routes { probe, json } => run_routes_direct(&cli, *probe, *json).await?,
         Cmd::Pin { .. }
         | Cmd::State { .. }
@@ -1551,8 +1613,9 @@ fn to_request(cli: &Cli) -> Option<Request> {
             dry_run: Some(*dry_run),
             mountpoint: mount.clone(),
         },
-        // verify / state / daemon 都不走 IPC
+        // verify / state / find / daemon 都不走 IPC
         Cmd::Verify { .. }
+        | Cmd::Find { .. }
         | Cmd::State { .. }
         | Cmd::Daemon { .. }
         | Cmd::Links { .. }
@@ -1598,6 +1661,280 @@ async fn run_verify(cli: &Cli) -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// ★ M42：`qxync find` —— 只读同步状态库的本地文件搜索。
+///
+/// 为什么纯本地、不走 daemon：状态库（`sync.db`）里已经有 `baseline`（远端路径 +
+/// 签名）与 `nodes.local_only`（本地新建），只读打开即可回答「同步树里有哪些文件」。
+/// 这样 daemon 不在、没挂载、断网时都能用；代价是远端侧最多滞后一轮轮询
+/// （默认 30s，上传成功会立即落盘）。
+fn run_find(cli: &Cli) -> Result<()> {
+    let Cmd::Find {
+        pattern,
+        glob,
+        case_sensitive,
+        under,
+        task,
+        r#type,
+        min_size,
+        max_size,
+        sort,
+        reverse,
+        limit,
+        local,
+        long,
+        json,
+    } = &cli.cmd
+    else {
+        bail!("内部错误：run_find 只能处理 find");
+    };
+
+    let p = paths()?;
+    let link = LinkConfig::load(&p, &cli.link)?;
+    let db = p.sync_dir_for(&link).join(qxync_core::DB_FILE);
+    let store = qxync_core::Store::open_readonly(&db)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "状态库不存在：{}（这个连接还没同步过；先 `qxync sync --once` 跑一轮对账再搜）",
+            db.display()
+        )
+    })?;
+
+    // 任务：--task 指定时只搜它；否则这个连接的全部任务（用于 --under 换算与 --local 映射）。
+    let ids = all_link_ids(&p, &cli.link);
+    let tasks: Vec<Task> = match task {
+        Some(tid) => {
+            let t = Task::load(&p, tid).map_err(|e| anyhow::anyhow!("任务 {tid} 加载失败：{e}"))?;
+            if !t.belongs_to(&cli.link, &ids) {
+                bail!(
+                    "任务 {tid} 不属于连接 {}（换 --link 或换 --task）",
+                    cli.link
+                );
+            }
+            vec![t]
+        }
+        None => qxync_core::tasks::Task::list_for_link(&p, &cli.link, &ids).0,
+    };
+
+    let kind = match r#type.as_deref() {
+        None => KindFilter::Any,
+        Some("f" | "file" | "files") => KindFilter::File,
+        Some("d" | "dir" | "dirs" | "directory" | "directories") => KindFilter::Dir,
+        Some(other) => bail!("--type 只接受 f（文件）或 d（目录）：{other}"),
+    };
+    let sort_key = match sort.as_str() {
+        "path" => SortKey::Path,
+        "size" => SortKey::Size,
+        "mtime" | "time" => SortKey::Mtime,
+        other => bail!("--sort 只接受 path / size / mtime：{other}"),
+    };
+    let query = SearchQuery {
+        pattern: pattern.clone(),
+        mode: if *glob {
+            MatchMode::Glob
+        } else {
+            MatchMode::Substring
+        },
+        case_sensitive: *case_sensitive,
+        under: match under {
+            Some(raw) => Some(resolve_under(raw, &tasks)?),
+            None => None,
+        },
+        kind,
+        min_size: min_size.as_deref().map(parse_size_arg).transpose()?,
+        max_size: max_size.as_deref().map(parse_size_arg).transpose()?,
+        sort: sort_key,
+        reverse: *reverse,
+        // CLI 的 `--limit 0` = 不截断（core 里用 None 表达）。
+        limit: if *limit == 0 { None } else { Some(*limit) },
+    };
+
+    let page = store.search(&query)?;
+
+    if *json {
+        let hits: Vec<serde_json::Value> = page
+            .hits
+            .iter()
+            .map(|h| {
+                let mapped = local_hit(&h.path, &tasks);
+                serde_json::json!({
+                    "path": h.path,
+                    "local_path": mapped.as_ref().map(|(p, _)| p.display().to_string()),
+                    "task_id": mapped.as_ref().map(|(_, id)| id.clone()),
+                    "size": h.size,
+                    "mtime": h.mtime,
+                    "mtime_text": format_unix_secs(h.mtime),
+                    "is_dir": h.is_dir,
+                    "origin": h.origin.as_str(),
+                })
+            })
+            .collect();
+        let out = serde_json::json!({
+            "pattern": pattern.clone(),
+            "under": query.under.clone(),
+            "total": page.total,
+            "truncated": page.truncated(),
+            "hits": hits,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    if store.baseline_len()? == 0 && !page.hits.is_empty() {
+        eprintln!(
+            "提示：状态库里还没有对账数据（只搜到了本地新建的文件）；\
+             先 `qxync sync --once` 或等一轮同步再搜远端文件"
+        );
+    }
+
+    let mut unmapped = 0usize;
+    for h in &page.hits {
+        let mapped = if *local {
+            local_hit(&h.path, &tasks)
+        } else {
+            None
+        };
+        if *local && mapped.is_none() {
+            unmapped += 1;
+        }
+        let shown = mapped
+            .map(|(path, _)| path.display().to_string())
+            .unwrap_or_else(|| h.path.clone());
+        if *long {
+            println!(
+                "{} {:>10}  {}  {}",
+                if h.is_dir { "d" } else { "f" },
+                human_size(h.size),
+                format_unix_secs(h.mtime),
+                shown
+            );
+        } else {
+            println!("{shown}");
+        }
+    }
+    if *local && unmapped > 0 {
+        eprintln!(
+            "提示：{unmapped} 条命中没有可映射的挂载任务，已显示远端路径\
+             （`qxync find --task <id>` 指定任务可强制映射）"
+        );
+    }
+    if page.truncated() {
+        eprintln!(
+            "…共 {} 条，已显示 {} 条（--limit 0 显示全部）",
+            page.total,
+            page.hits.len()
+        );
+    }
+    Ok(())
+}
+
+/// ★ M42：`--under` 解析 —— 接受远端路径，也接受挂载点下的本地路径（自动换算成远端）。
+fn resolve_under(raw: &str, tasks: &[Task]) -> Result<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        bail!("--under 不能为空");
+    }
+    if !raw.starts_with('/') {
+        bail!("--under 需要绝对路径（远端路径，或挂载点下的本地路径）：{raw}");
+    }
+    let raw = raw.trim_end_matches('/');
+    for t in tasks {
+        let mount = t.mountpoint.to_string_lossy();
+        let mount = mount.trim_end_matches('/');
+        if let Some(rel) = strip_local_prefix(raw, mount) {
+            let root = t.effective_root();
+            return Ok(join_remote(&root, rel));
+        }
+    }
+    // 不在任何挂载点下：按远端路径原样使用（用户可能抄的是 `qxync ls` 的输出）。
+    Ok(raw.to_string())
+}
+
+/// `path`（本地绝对路径）在 `prefix`（挂载点）下时返回相对部分；按路径段判边界。
+fn strip_local_prefix<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+    if prefix.is_empty() {
+        return Some(path.trim_start_matches('/'));
+    }
+    if path == prefix {
+        return Some("");
+    }
+    path.strip_prefix(prefix)?.strip_prefix('/')
+}
+
+/// 远端根 + 相对路径 → 远端路径（根 `/` 特判）。
+fn join_remote(root: &str, rel: &str) -> String {
+    let root = root.trim_end_matches('/');
+    if rel.is_empty() {
+        return if root.is_empty() {
+            "/".to_string()
+        } else {
+            root.to_string()
+        };
+    }
+    if root.is_empty() {
+        format!("/{rel}")
+    } else {
+        format!("{root}/{rel}")
+    }
+}
+
+/// ★ M42：命中路径 → 某个任务挂载点里的本地路径（第一个能对上的任务）。
+fn local_hit(remote: &str, tasks: &[Task]) -> Option<(PathBuf, String)> {
+    for t in tasks {
+        let root = t.effective_root();
+        if let Some(rel) = strip_remote_root(remote, &root) {
+            let local = if rel.is_empty() {
+                t.mountpoint.clone()
+            } else {
+                t.mountpoint.join(rel)
+            };
+            return Some((local, t.id.clone()));
+        }
+    }
+    None
+}
+
+/// 远端路径在远端根 `root` 下时返回相对部分（按路径段判边界；根 `/` 特判）。
+fn strip_remote_root<'a>(path: &'a str, root: &str) -> Option<&'a str> {
+    let root = root.trim_end_matches('/');
+    if root.is_empty() {
+        return Some(path.trim_start_matches('/'));
+    }
+    if path == root {
+        return Some("");
+    }
+    path.strip_prefix(root)?.strip_prefix('/')
+}
+
+/// ★ M42：`--min-size` / `--max-size` 的大小解析（K/M/G/T，1024 进制）。
+fn parse_size_arg(raw: &str) -> Result<u64> {
+    let s = raw.trim();
+    if s.is_empty() {
+        bail!("大小不能为空（示例：1024 / 10K / 2M / 1G）");
+    }
+    let (num, mul) = match s.chars().next_back().map(|c| c.to_ascii_lowercase()) {
+        Some('k') => (&s[..s.len() - 1], 1024u64),
+        Some('m') => (&s[..s.len() - 1], 1024 * 1024),
+        Some('g') => (&s[..s.len() - 1], 1024 * 1024 * 1024),
+        Some('t') => (&s[..s.len() - 1], 1024u64.pow(4)),
+        _ => (s, 1),
+    };
+    let n: u64 = num.trim().parse().map_err(|_| {
+        anyhow::anyhow!("大小格式不对：{raw}（示例：1024 / 10K / 2M / 1G；1024 进制）")
+    })?;
+    n.checked_mul(mul)
+        .ok_or_else(|| anyhow::anyhow!("大小太大：{raw}"))
+}
+
+/// ★ M42：某个连接的全部 id（含「文件在但解析失败」的兜底），与 GUI 的同名辅助一致。
+fn all_link_ids(p: &ConfigPaths, link_id: &str) -> Vec<String> {
+    let (links, _bad) = LinkConfig::list(p);
+    let mut ids: Vec<String> = links.into_iter().map(|l| l.id).collect();
+    if !ids.iter().any(|id| id == link_id) {
+        ids.push(link_id.to_string());
+    }
+    ids.sort();
+    ids
 }
 
 /// 人读格式的 verify 报告。
@@ -1706,8 +2043,9 @@ async fn route_via_daemon(
     };
     let socket = socket.to_path_buf();
     match &cli.cmd {
-        // verify 走不到这里（路由前已短路）
+        // verify / find 走不到这里（路由前已短路）
         Cmd::Verify { .. } => unreachable!(),
+        Cmd::Find { .. } => unreachable!(),
         Cmd::Login => {
             let d: qxync_core::ipc::LoginData = match ipc_client::call(&socket, req).await {
                 Ok(d) => d,

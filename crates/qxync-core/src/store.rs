@@ -1395,6 +1395,41 @@ impl Store {
         Ok(out)
     }
 
+    /// ★ M42：**全部**「本地新建、远端还没有副本」的路径（`qxync find` 的数据源之一）。
+    ///
+    /// 与 [`Self::node_local_only_under`] 的区别：那个是 FUSE 物化某个目录时要的
+    /// 「这棵子树里的本地新建」；这里是搜索要的「整库里的本地新建」（通常只有个位数，
+    /// `nodes_local_only` 是局部索引，代价可忽略）。**不保证顺序**。
+    pub fn nodes_local_only(&self) -> Result<Vec<NodeRow>> {
+        let sql = format!(
+            "SELECT {} FROM nodes WHERE local_only <> 0",
+            Self::NODE_COLS
+        );
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&sql).map_err(Error::from)?;
+        let rows = stmt
+            .query_map([], |r| Self::node_from_row(r))
+            .map_err(Error::from)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(Error::from)?);
+        }
+        Ok(out)
+    }
+
+    /// ★ M42：本地文件搜索（只读；`qxync find` 的唯一入口）。
+    ///
+    /// 装载 `baseline` + `nodes.local_only`，交给
+    /// [`crate::search::run`] 做纯函数匹配。**不写库、不联网**，daemon 不在跑也能用。
+    ///
+    /// 注意新鲜度：`baseline` 每轮对账结束落盘、上传成功立即落盘，所以远端侧的变化
+    /// 最多滞后一轮轮询（默认 30 s）；要绝对新鲜先跑 `qxync sync --once`。
+    pub fn search(&self, query: &crate::search::SearchQuery) -> Result<crate::search::SearchPage> {
+        let baseline = self.baseline()?;
+        let local_only = self.nodes_local_only()?;
+        Ok(crate::search::run(&baseline, &local_only, query))
+    }
+
     /// ★ M36：这个路径在持久化索引里是不是「本地新建、远端还没有副本」。
     ///
     /// 路径不在表里 → `false`（没有证据就按「远端有」处理：这是旧行为，也是
@@ -3654,5 +3689,85 @@ mod m11_file_backed_tests {
         );
         assert_eq!(s2.integrity_check().unwrap(), "ok");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ★ M42：`nodes_local_only()` 取全量「本地新建、远端还没有」的行（顺序不保证）。
+    #[test]
+    fn nodes_local_only_returns_only_local_rows() {
+        let s = Store::open_in_memory().unwrap();
+        let put = |path: &str, local_only: bool| {
+            s.node_upsert(&NodeRow {
+                file_id: crate::file_id::compute_file_id(false, 1, 1, path, "/home"),
+                path: path.into(),
+                remote_path: path.into(),
+                size: 1,
+                mtime: 1,
+                is_folder: false,
+                updated_at: 0,
+                local_only,
+            })
+            .unwrap();
+        };
+        put("/home/local-only.txt", true);
+        put("/home/remote-known.txt", false);
+        put("/home/another-local.txt", true);
+
+        let mut got: Vec<String> = s
+            .nodes_local_only()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.path)
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                "/home/another-local.txt".to_string(),
+                "/home/local-only.txt".to_string()
+            ]
+        );
+    }
+
+    /// ★ M42：`Store::search` —— baseline（现存）+ `nodes.local_only` 的端到端装载与命中。
+    ///
+    /// 钉住三件事：墓碑（present=0）不返回、本地新建能搜到、过滤/截断语义来自
+    /// [`crate::search`]（这里只验证装载没出错、数据没串）。
+    #[test]
+    fn store_search_reads_baseline_and_local_only() {
+        let s = Store::open_in_memory().unwrap();
+        let mut b = Baseline::default();
+        b.put("/home/.Qsync/试题.pdf", Sig::file(12218, 1000));
+        b.put("/home/.Qsync/已删除.txt", Sig::MISSING);
+        s.save_baseline(&b).unwrap();
+        s.node_upsert(&NodeRow {
+            file_id: crate::file_id::compute_file_id(false, 7, 9, "草稿.txt", "/home/.Qsync"),
+            path: "/home/.Qsync/草稿.txt".into(),
+            remote_path: "/home/.Qsync/草稿.txt".into(),
+            size: 7,
+            mtime: 9,
+            is_folder: false,
+            updated_at: 0,
+            local_only: true,
+        })
+        .unwrap();
+
+        let mut q = crate::search::SearchQuery::default();
+        q.pattern = Some("Qsync".into());
+        q.limit = None;
+        let page = s.search(&q).unwrap();
+        assert_eq!(page.total, 2, "墓碑不算：试题 + 本地草稿");
+        assert!(page.hits.iter().any(|h| h.path == "/home/.Qsync/草稿.txt"));
+        assert!(page
+            .hits
+            .iter()
+            .any(|h| h.origin == crate::search::Origin::LocalOnly));
+
+        q.pattern = Some("试题".into());
+        q.limit = Some(1);
+        let page = s.search(&q).unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.hits.len(), 1);
+        assert_eq!(page.hits[0].size, 12218);
+        assert!(!page.truncated());
     }
 }

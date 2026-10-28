@@ -245,6 +245,7 @@ qxync-gui
 | `qxync journal --level error` | 同步日志 / 错误列表 |
 | `qxync conflicts --resolve <id> --as keep_local\|keep_remote\|keep_both` | 处理冲突 |
 | `qxync file-states <远端目录>` | 文件三态：仅在线 / 本地可用 / 始终可用 |
+| `qxync find 关键词` | 在本地状态库里搜同步文件（不挂载、离线可用；`--local` 出挂载点路径，`--json` 给脚本） |
 | `qxync settings` / `settings --set k=v` | 查看 / 修改设置（代理、自动释放空间、日志轮转与保留等） |
 | `qxync log` / `log --prune` / `--json` | 日志占用、轮转策略（默认 32 MiB / 14 天 / 总量 256 MiB）与立即清理 |
 | `qxync links` | 列出所有 NAS 连接（含各自 daemon / 登录状态） |
