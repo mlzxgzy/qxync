@@ -33,6 +33,7 @@ pub mod model;
 pub mod mountbusy;
 pub mod mounts;
 pub mod netpath;
+pub mod noise;
 pub mod purge;
 pub mod roots;
 pub mod rules;

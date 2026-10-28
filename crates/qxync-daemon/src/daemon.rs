@@ -34,7 +34,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, Mutex, Notify};
 
 use crate::peer_host::PeerHost;
-use crate::sync::{self, MountView, SyncConfig, SyncState, SyncStats};
+use crate::sync::{self, AnomalyLatch, AuthLatch, MountView, SyncConfig, SyncState, SyncStats};
 
 /// ★ M8.3：journal 的保留上限（**必须有**：同步日志是无限增长型数据，
 /// 不加约束会把 `sync.db` 撑大）。默认 1 万条 / 30 天，环境变量可调。
@@ -1393,8 +1393,27 @@ async fn hold_deadline(hold_secs: u64) {
 /// 「accept 持续失败」不会变成一场日志洪水 —— 100ms 退避后一天最多 ~86 万条，
 /// 且都被 `log_max_file_mb` 切段 + `log_max_total_mb` 兜住。
 async fn accept_backoff(e: &std::io::Error) {
-    tracing::warn!("accept 失败（100ms 后重试）: {e}");
+    // ★ M41：M39 只加了 100ms 退避 —— 持续 EMFILE 时一天仍可写约 86 万行（≈ 86 MB）。
+    // 这里再按**错误种类**限流：同类 60s 一条（带省略计数），逐条明细仍 debug。
+    // 这样即使 fd 再泄漏，accept 洪水最坏也只有 1 条/分钟（≈ 1.5 MB/天）。
+    // 签名用 errno（`os24` = EMFILE）而不是消息全文：errno 是稳定的错误分类，
+    // 不是「每轮都变的数字」，且种类很少；不用 `io_err_signature`（在 fuse crate，
+    // daemon 不反向依赖它）。
+    let a = qxync_core::noise::dedupe("daemon.accept", &accept_err_signature(e));
+    if a.emit {
+        tracing::warn!("accept 失败（100ms 后重试）: {e}{}", a.note());
+    } else {
+        tracing::debug!("accept 失败（同类过去 60s 已告警过，本轮降为 debug）: {e}");
+    }
     tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
+/// ★ M41：`accept` 失败的限流签名（errno 优先，没有 errno 才用 ErrorKind）。
+fn accept_err_signature(e: &std::io::Error) -> String {
+    match e.raw_os_error() {
+        Some(code) => format!("os{code}"),
+        None => format!("{:?}", e.kind()),
+    }
 }
 
 /// CLI 用来判断「socket 在但进程已死」。
@@ -3783,13 +3802,17 @@ async fn flush_offline_backlog(state: &Arc<State>, client: &Arc<qxync_client::Cl
             state
                 .connectivity
                 .mark_offline(format!("离线缓冲区回放中断（网络不可用）: {err}"));
-            tracing::warn!("离线缓冲区回放中断（网络不可用，剩余操作保留、队列继续冻结）: {err}");
+            // ★ M41：与 `sync::flush_outbox` 里那条是**同一次中断**的两层上报 ——
+            //   `flush_outbox` 已经按门闩打过「首个受阻操作 kind + 路径」的 WARN，
+            //   这条降 debug（别一次中断两条 WARN）。
+            tracing::debug!("离线缓冲区回放中断（网络不可用，剩余操作保留、队列继续冻结）: {err}");
         } else if let Some(why) = &report.waiting {
             // ★ 会话失效 / 服务端未就绪：**网络是通的**，别把挂载点切到离线
             // （否则 FUSE 会把用户的写操作也攒起来，明明能连 NAS）。
             state.connectivity.mark_online();
             if report.auth_failed {
-                tracing::warn!("离线缓冲区回放遇会话失效，立即重登后下一轮继续: {why}");
+                // ★ M41：同上，`flush_outbox` 已带「首个受阻操作 + why」打过 WARN，这条降 debug。
+                tracing::debug!("离线缓冲区回放遇会话失效，立即重登后下一轮继续: {why}");
                 if let Err(e) = login_internal(state, None, None, None).await {
                     tracing::warn!("离线缓冲回放重登失败: {}", e.message);
                 }
@@ -3797,12 +3820,24 @@ async fn flush_offline_backlog(state: &Arc<State>, client: &Arc<qxync_client::Cl
                 // ★ 结构操作在互相等（父 mkdir / 改名还没落地）：网络与会话都正常，
                 //   **绝不重登**。真机 2026-10-25 这里每 3 秒打一次「会话失效」，
                 //   6 分钟打了 95 次「登录成功」，把 NAS 的失败登录封锁风险拉满。
-                tracing::info!(
-                    "离线缓冲区回放等待本地结构操作先落地（{} 项，不重登，队列继续冻结）: {why}",
-                    report.parent_pending
-                );
+                //
+                // ★ M41：flush 每 3 秒重试一次，这行以前也就每 3 秒一条（同一状态复读）
+                //   → 改成「首次 + 10 分钟心跳」，其余降 debug。
+                if qxync_core::noise::every("daemon.replay_pending", Duration::from_secs(600)).emit
+                {
+                    tracing::info!(
+                        "离线缓冲区回放等待本地结构操作先落地（{} 项，不重登，队列继续冻结）: {why}",
+                        report.parent_pending
+                    );
+                } else {
+                    tracing::debug!(
+                        "离线缓冲区回放仍等待本地结构操作（同一状态，不重复 INFO）: {} 项: {why}",
+                        report.parent_pending
+                    );
+                }
             } else {
-                tracing::warn!("离线缓冲区回放中断（服务端未就绪，稍后继续）: {why}");
+                // ★ M41：`flush_outbox` 的 Transient 分支已经按门闩打过 WARN → 这条 debug。
+                tracing::debug!("离线缓冲区回放中断（服务端未就绪，稍后继续）: {why}");
             }
             // 队列继续冻结：结构操作没回放完，上传/删除不能抢跑。
         }
@@ -3814,6 +3849,8 @@ async fn flush_offline_backlog(state: &Arc<State>, client: &Arc<qxync_client::Cl
         set_mount_queues_blocked(state, false);
         wake_mount_queues(state);
         state.connectivity.mark_online();
+        // ★ M41：回放清空 = 中断结束 → 复位门闩，下次真中断立刻再报一条。
+        sync::replay_interrupt_reset();
         tracing::info!(
             "离线缓冲区已清空：应用 {}｜幂等命中 {}｜冲突副本 {}｜放弃 {}（上传/删除队列已放行）",
             report.applied,
@@ -4181,6 +4218,12 @@ fn spawn_poller(state: Arc<State>, mut gen: EngineGen) -> tokio::task::JoinHandl
         //   不等常规间隔（默认 30s / 用户可能配成 600s）。首次同步要尽快把缓存建起来。
         //   注意只认「预算用完还有进展」：有目录列举失败时等常规间隔重试，不能 2 秒打一次 NAS。
         let mut full_scan_next = false;
+        // ★ M41：轮询告警门闩（日志记**事件**，不记状态）。
+        //   真机取证：08:01 那批「轮询有异常」相邻间隔 45s，60s 时间窗口几乎每轮都跨窗口
+        //   → 只能压掉一半。这里改用状态迁移：同一次异常持续期间只 WARN 一条，
+        //   恢复正常后清状态、下次复发立刻再报（见 `sync::AnomalyLatch` / `sync::AuthLatch`）。
+        let mut anomaly_latch = AnomalyLatch::default();
+        let mut auth_latch = AuthLatch::default();
         loop {
             let secs = *state.sync_interval.lock().unwrap();
             let mut recovered = false;
@@ -4230,7 +4273,12 @@ fn spawn_poller(state: Arc<State>, mut gen: EngineGen) -> tokio::task::JoinHandl
                         }
                     }
                 }
-                tracing::info!("离线探活成功：先回放离线缓冲区，再补一轮对账");
+                // ★ M41：「离线探活成功」与下面的「网络恢复：开始回放离线缓冲区」是
+                //   同一次恢复事件的两层上报，真机成对出现（约 136 行/天）。保留信息更全
+                //   的那条 INFO（网络恢复），这条降 debug。
+                tracing::debug!("离线探活成功：先回放离线缓冲区，再补一轮对账");
+                // ★ M41：恢复在线 → 清会话失效门闩（下次真失效立刻再报）。
+                auth_latch.reset();
                 recovered = true;
             } else if secs == 0 {
                 full_scan_next = false;
@@ -4297,22 +4345,35 @@ fn spawn_poller(state: Arc<State>, mut gen: EngineGen) -> tokio::task::JoinHandl
                     //   sid 过期后每 30s 一条 `qbox_get_max_log 失败: status=3`，
                     //   直到 120s 会话保活重登才恢复 —— 这里看到标志就立刻重登一次。
                     if r.auth_failed {
-                        tracing::warn!(
-                            "轮询遇会话失效（本轮已记录），立即重登后下一轮继续: {:?}",
-                            r.errors
-                        );
+                        // ★ M41：会话失效按**状态迁移**告警（「正常 → 失效」才一条 WARN，
+                        //   持续失效的后续轮次降 debug）。以前每轮都把 `{:?}` 的 errors
+                        //   数组整串抄一遍（真机 10-27 单行 1.8 KB × 33 行）。
+                        match auth_latch.observe(&r) {
+                            Some(msg) => tracing::warn!("{msg}"),
+                            // 未放行：逐条全文仍进 debug（RUST_LOG=debug 一条不少）。
+                            None => tracing::debug!(
+                                "轮询仍会话失效（持续中，已在上次迁移时告警）: {:?}",
+                                r.errors
+                            ),
+                        }
                         if let Err(e2) = login_internal(&state, None, None, None).await {
                             tracing::warn!("轮询重登失败: {}", e2.message);
+                        } else {
+                            // ★ M41：重登成功 → 清门闩：下次真失效必须立刻再报（不吞复发）。
+                            auth_latch.reset();
                         }
                     }
                     // ★ 熔断告警只在**签名变化**的那一轮打 WARN（重复轮次在
                     //   absorb_round 里已降为 debug），否则真机每 30s 刷一条。
-                    if r.conflicts > 0
-                        || (r.deletes_blocked > 0 && r.delete_block_changed)
-                        || !r.errors.is_empty()
-                    {
-                        tracing::warn!(
-                            "轮询有异常: conflicts={} blocked={} errors={:?}",
+                    // ★ M41：整行也改成**迁移式**——同一次异常持续期间只一条 WARN
+                    //   （签名 = conflicts / deletes_blocked / errors 条数 + 归一化首条
+                    //   错误种类；网络失败与熔断签名变化强制放行），其余轮次 debug 全文。
+                    if let Some(msg) = anomaly_latch.observe(&r) {
+                        tracing::warn!("{msg}");
+                    } else if sync::anomaly_present(&r) {
+                        // 未放行：逐条全文仍进 debug（`RUST_LOG=debug` 一条不少）。
+                        tracing::debug!(
+                            "轮询有异常（同一签名持续中，本轮降到 debug）: conflicts={} blocked={} errors={:?}",
                             r.conflicts,
                             r.deletes_blocked,
                             r.errors
@@ -6906,6 +6967,28 @@ async fn space_cmd(state: &Arc<State>, now: bool) -> Result<serde_json::Value, I
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ★ M41：`accept` 失败的限流签名 —— 同 errno 同键（持续 EMFILE 只占一个窗口），
+    /// 不同 errno/ErrorKind 各自成键（EINVAL 不能被 EMFILE 的窗口吃掉）。
+    #[test]
+    fn accept_err_signature_is_stable_and_errno_based() {
+        let emfile = std::io::Error::from_raw_os_error(libc::EMFILE);
+        assert_eq!(accept_err_signature(&emfile), "os24");
+        assert_eq!(
+            accept_err_signature(&std::io::Error::from_raw_os_error(libc::EMFILE)),
+            accept_err_signature(&emfile),
+            "同一错误种类必须同签名（限流前提）"
+        );
+        assert_ne!(
+            accept_err_signature(&std::io::Error::from_raw_os_error(libc::EINVAL)),
+            accept_err_signature(&emfile),
+            "不同 errno 不能互相吞省略计数"
+        );
+        // 合成错误（没有 raw_os_error）按 ErrorKind 归类，不 panic、不为空。
+        let synthetic = accept_err_signature(&std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(!synthetic.is_empty());
+        assert_eq!(synthetic, "NotFound");
+    }
 
     /// ★ 离线探活退避：刚断网要快（3s），离线越久越慢（10s → 30s）。
     ///

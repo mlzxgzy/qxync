@@ -192,10 +192,18 @@ impl DeleteQueue {
         if let Some(s) = &store {
             match s.deletes() {
                 Ok(rows) => {
+                    // ★ M41：逐条 INFO → 一条汇总 + 逐条 debug（与上传队列同口径）。
+                    // 崩溃恢复（尤其 `rm -rf` 中途被杀）可能一次恢复很多条，逐条 INFO 无边际价值。
+                    let restored = rows.len();
                     for r in rows {
                         let job = DeleteJob::from_row(&r);
-                        tracing::info!("恢复未完成的删除: {}", job.remote_path());
+                        tracing::debug!("恢复未完成的删除: {}", job.remote_path());
                         pending.push_back(job);
+                    }
+                    if restored > 0 {
+                        tracing::info!(
+                            "恢复未完成的删除 {restored} 项（将按队列顺序继续，逐条明细见 debug）"
+                        );
                     }
                 }
                 Err(e) => {
@@ -545,17 +553,28 @@ impl DeleteQueue {
                     if let Some(c) = self.connectivity.lock().ok().and_then(|c| c.clone()) {
                         c.mark_online();
                     }
+                    // ★ M41：保持「每批一条」，但名单截到 120 字符（`rm -rf` 一批的
+                    // 名字拼起来能有几 KB）；被截掉的完整名单在 debug 里给全。
+                    let names = batch
+                        .items
+                        .iter()
+                        .map(|(n, _, _)| n.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     tracing::info!(
                         "已删除 {}/{}（{} 项）",
                         batch.dir,
-                        batch
-                            .items
-                            .iter()
-                            .map(|(n, _, _)| n.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", "),
+                        deleted_names_text(&names, DELETED_NAMES_MAX_CHARS),
                         batch.items.len()
                     );
+                    if names.chars().count() > DELETED_NAMES_MAX_CHARS {
+                        tracing::debug!(
+                            "已删除完整名单（{} 项）: {}/{}",
+                            batch.items.len(),
+                            batch.dir,
+                            names
+                        );
+                    }
                 }
                 Err(e) if e.is_offline() => {
                     // ★ M20：网络错误不是一次失败 —— 整批原样退回（attempts 不变、
@@ -691,13 +710,24 @@ impl DeleteQueue {
         }
         if dropped > 0 {
             let kept_names: Vec<&str> = kept.iter().map(|(n, _, _)| n.as_str()).collect();
+            let kept_text = kept_names.join(", ");
+            // ★ M41：同上 —— 本批名单也可能很长，INFO 只留截断版。
             tracing::info!(
                 "{}/{}：{} 个子项的父目录同批被删，跳过（避免必然失败的删除）；本批实际发 {} 项",
                 batch.dir,
-                kept_names.join(", "),
+                deleted_names_text(&kept_text, DELETED_NAMES_MAX_CHARS),
                 dropped,
                 kept.len()
             );
+            // 被截掉的完整名单留给 debug（信息不丢）。
+            if kept_text.chars().count() > DELETED_NAMES_MAX_CHARS {
+                tracing::debug!(
+                    "{}：本批完整名单（{} 项）: {}",
+                    batch.dir,
+                    kept.len(),
+                    kept_text
+                );
+            }
         }
         Batch {
             dir: batch.dir,
@@ -824,6 +854,50 @@ impl DeleteQueue {
 
 fn join_remote(dir: &str, name: &str) -> String {
     format!("{}/{}", dir.trim_end_matches('/'), name)
+}
+
+/// ★ M41：删除批次日志里的名单截断上限（字符）。
+///
+/// `rm -rf` 一批能带几百个名字，拼进一行是几 KB —— 而 INFO 行真正要回答的是
+/// 「这一批像什么」，不是「逐个叫什么」。完整名单仍由 `debug!` 承担（信息不丢），
+/// 截断本身走 [`qxync_core::noise::truncate`]（按 char 边界，不会切坏 UTF-8 中文名）。
+const DELETED_NAMES_MAX_CHARS: usize = 120;
+
+/// 把「名字列表」压成日志里可用的短串（纯函数，单测固定行为）。
+fn deleted_names_text(names: &str, max_chars: usize) -> String {
+    qxync_core::noise::truncate(names, max_chars)
+}
+
+#[cfg(test)]
+mod m41_delete_noise_tests {
+    use super::*;
+
+    /// 短名单原样保留：截断只在真长的时候发生（常见批次不受影响）。
+    #[test]
+    fn deleted_names_text_keeps_short_lists() {
+        let names = "a.txt, b.txt, 报告.docx";
+        assert_eq!(deleted_names_text(names, DELETED_NAMES_MAX_CHARS), names);
+    }
+
+    /// 超长名单按字符数截断并以 `…` 收尾（不会切坏中文/emoji）。
+    #[test]
+    fn deleted_names_text_truncates_long_lists() {
+        let names = (0..200)
+            .map(|i| format!("文件{i}.txt"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let out = deleted_names_text(&names, DELETED_NAMES_MAX_CHARS);
+        assert_eq!(out.chars().count(), DELETED_NAMES_MAX_CHARS + 1, "{out}");
+        assert!(out.ends_with('…'), "{out}");
+        // 前缀仍是完整名字（不是半个字符）
+        assert!(out.starts_with("文件0.txt"));
+    }
+
+    /// 空名单 = 空串（调用方不该据此打出「」）。
+    #[test]
+    fn deleted_names_text_handles_empty() {
+        assert_eq!(deleted_names_text("", DELETED_NAMES_MAX_CHARS), "");
+    }
 }
 
 #[cfg(test)]
