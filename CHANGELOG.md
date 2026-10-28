@@ -5,7 +5,7 @@
 
 [English](CHANGELOG.en.md) · [README](README.md) · [验收记录](docs/验收记录.md)
 
-## [Unreleased]
+## [0.8.0] - 2026-10-28
 
 ### 新增
 
@@ -1863,6 +1863,7 @@ NAS 设置名 `QSYNC_FOLDERPAIR_USE_SPACE_SAVING`、Windows 客户端注册表�
 - 验收结论从 README 抽出为 [`docs/验收记录.md`](docs/验收记录.md)。
 - 采用 **MIT OR Apache-2.0** 双许可（`LICENSE-MIT` / `LICENSE-APACHE`）。
 
+[0.8.0]: https://github.com/mlzxgzy/qxync/compare/v0.7.14...v0.8.0
 [0.7.14]: https://github.com/mlzxgzy/qxync/compare/v0.7.13...v0.7.14
 [0.7.12]: https://github.com/mlzxgzy/qxync/compare/v0.7.11...v0.7.12
 [0.7.4]: https://github.com/mlzxgzy/qxync/compare/v0.7.3...v0.7.4
