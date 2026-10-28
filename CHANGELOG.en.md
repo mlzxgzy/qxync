@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matches. Measured on the real database (28,136 files + 5,891 directories):
   `qxync find 防火墙` returns in ~**0.1 s**. No schema / IPC / daemon changes (pure read);
   freshness lags at most one poll round (uploads are persisted immediately).
+- **GUI file search ([M42 §8](docs/M42-本地文件搜索.md) / M43)**: the Files page gained a
+  "Search synced files" card — keyword (Enter to search) / glob / scope directory (NAS path
+  or mount path) / type / sort / limit; every hit shows its source (synced vs. new locally)
+  and offers Locate / Open / Copy path, with hits mapped to real mount-point paths. Shares
+  `qxync_core::search` with the CLI, so it works **without a mount, network or daemon**;
+  switching connections clears stale results.
 
 ## [0.7.14] - 2026-10-28
 

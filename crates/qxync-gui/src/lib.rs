@@ -57,6 +57,8 @@ pub fn run() {
             commands::links_status,
             commands::tasks_config,
             commands::link_delete,
+            // ★ M43：本地文件搜索（只读状态库；不挂载、不联网、daemon 不在也能用）
+            commands::search_local,
             // ★ M19：删除相关数据（预览 / 任务级 / 全局）
             commands::purge_plan,
             commands::task_purge,
@@ -1419,6 +1421,59 @@ mod tests {
         assert!(
             app.contains("method: 'routes'"),
             "app.js 没有调用 routes IPC"
+        );
+    }
+
+    /// ★ M43：文件页的「搜索同步文件」必须真的接上 —— 表单、结果表、四态、命令调用、
+    /// 连接切换时清结果，缺一个都会变成「有搜索框但搜不出东西」。
+    #[test]
+    fn m43_search_page_is_wired() {
+        let index = include_str!("../ui/index.html");
+        let app = include_str!("../ui/app.js");
+        for needle in [
+            "id=\"form-search\"",
+            "id=\"q-pattern\"",
+            "id=\"q-under\"",
+            "id=\"q-kind\"",
+            "id=\"q-sort\"",
+            "id=\"q-limit\"",
+            "id=\"q-glob\"",
+            "id=\"q-case\"",
+            "id=\"btn-search-go\"",
+            "id=\"btn-search-clear\"",
+            "id=\"search-tbody\"",
+            "id=\"search-empty\"",
+            "id=\"search-info\"",
+            "id=\"search-scope-hint\"",
+            "id=\"page-files\"",
+            "data-i18n=\"search.col_path\"",
+        ] {
+            assert!(index.contains(needle), "index.html 缺少 {needle}");
+        }
+        for needle in [
+            "function searchArgs(",
+            "function refreshSearch(",
+            "function renderSearch(",
+            "function buildSearchRow(",
+            "function gotoSearchHit(",
+            "function resetSearch(",
+            "call('search_local'",
+        ] {
+            assert!(app.contains(needle), "app.js 缺少 {needle}");
+        }
+        // 切连接必须清搜索结果（否则上一个连接的命中会串台），且搜索用的是当前连接。
+        assert!(
+            app.contains("resetSearch();"),
+            "app.js 没有在切连接时清搜索结果"
+        );
+        assert!(
+            app.contains("linkId: currentId(),"),
+            "app.js 的搜索没有绑定当前连接"
+        );
+        // 结果里的外部字符串只能走 textContent（`el()`），不能拼 HTML。
+        assert!(
+            !app.contains("search-tbody').innerHTML"),
+            "结果表不许用 innerHTML 拼接"
         );
     }
 }
