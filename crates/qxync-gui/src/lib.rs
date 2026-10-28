@@ -1470,6 +1470,47 @@ mod tests {
             app.contains("linkId: currentId(),"),
             "app.js 的搜索没有绑定当前连接"
         );
+        // ★ M43.1：路径列拆两行（文件名 + 目录），目录过长默认显示尾部。
+        // 两行排版在 style.css、裁左侧在 app.js 的 `fitSearchDirs`（WebKit 的 RTL
+        // 省略号会被左边缘裁掉半个，所以不能只靠 CSS），两边都点名查。
+        let app_code = strip_comments(&app);
+        for needle in [
+            "var remote = str(hit.path);",
+            "'mono hit-name'",
+            "pathBase(remote)",
+            "setAttribute('data-full', pathParent(remote))",
+            "function fitSearchDirs(",
+            "fitSearchDirs();",
+            "clientWidth",
+        ] {
+            assert!(app_code.contains(needle), "app.js 缺少 {needle}");
+        }
+        // 「…」必须是裁切后自己拼上去的，否则就不是「显示尾部」。
+        assert!(
+            app_code.contains("'…' + chars.slice(lo).join('')"),
+            "app.js 的目录裁切没有拼省略号"
+        );
+        let css_code = strip_comments(include_str!("../ui/style.css"));
+        for needle in [".tbl-search .hit-name {", ".tbl-search .hit-dir {"] {
+            assert!(css_code.contains(needle), "style.css 缺少 {needle}");
+        }
+        // 文件名行：单行、尾部省略；目录行：单行、溢出隐藏（裁左侧由 JS 负责）。
+        let name_rule = css_code
+            .split(".tbl-search .hit-name {")
+            .nth(1)
+            .and_then(|s| s.split('}').next())
+            .unwrap_or_default();
+        for needle in ["text-overflow: ellipsis", "white-space: nowrap"] {
+            assert!(name_rule.contains(needle), "`.hit-name` 缺少 {needle}");
+        }
+        let dir_rule = css_code
+            .split(".tbl-search .hit-dir {")
+            .nth(1)
+            .and_then(|s| s.split('}').next())
+            .unwrap_or_default();
+        for needle in ["overflow: hidden", "white-space: nowrap", "font-size: 11px"] {
+            assert!(dir_rule.contains(needle), "`.hit-dir` 缺少 {needle}");
+        }
         // 结果里的外部字符串只能走 textContent（`el()`），不能拼 HTML。
         assert!(
             !app.contains("search-tbody').innerHTML"),

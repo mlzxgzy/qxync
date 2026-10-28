@@ -5158,7 +5158,15 @@
     return t ? t.slice(0, 16) : '—';
   }
 
-  /** 结果行：类型 / 路径 / 大小 / 时间 / 操作。外部字符串一律 textContent。 */
+  /**
+   * 结果行：类型 / 路径 / 大小 / 时间 / 操作。外部字符串一律 textContent。
+   *
+   * ★ M43.1：路径列拆成两行 —— 第一行文件名（最该看清的），第二行目录（小字暗色）。
+   * 只显示一排时，34% 的列宽只放得下 `/home/.Qsync/2024/06-台州实训…`：前缀每行
+   * 都一样，文件名全被省略号吃掉，等于看不出命中是哪个文件。目录行过长时**默认显示
+   * 尾部、裁掉开头**（`fitSearchDirs` 量像素后从左侧裁，前面补「…」），最近几级目录
+   * 永远可见；完整路径（有本地路径就是本地路径）仍在 title 里，悬停可看。
+   */
   function buildSearchRow(hit) {
     var tr = el('tr');
     var isDir = hit.is_dir === true;
@@ -5171,8 +5179,14 @@
       localOnly ? T('search.origin_local') : T('search.origin_remote')));
     tr.appendChild(tdType);
 
-    var tdPath = el('td', 'mono cell-path', str(hit.path));
-    if (hit.local_path) { tdPath.title = str(hit.local_path); }
+    var remote = str(hit.path);
+    var tdPath = el('td', 'cell-path');
+    tdPath.title = str(hit.local_path) || remote;
+    tdPath.appendChild(el('div', 'mono hit-name', pathBase(remote)));
+    // 目录文本先放到 data-full，渲染完由 fitSearchDirs() 按真实列宽裁左侧。
+    var tdDir = el('div', 'hit-dir');
+    tdDir.setAttribute('data-full', pathParent(remote));
+    tdPath.appendChild(tdDir);
     tr.appendChild(tdPath);
 
     tr.appendChild(el('td', 'mono cell-size', isDir ? '—' : humanSize(hit.size)));
@@ -5204,6 +5218,90 @@
     return tr;
   }
 
+  /**
+   * ★ M43.1：目录行「太长就显示尾部」的按像素裁切。
+   *
+   * 为什么不用 CSS 的 `text-overflow: ellipsis` + `direction: rtl`（第一版真试过）：
+   * WebKit 把省略号画在内容框左边缘的**外面**，左半边会被 `overflow: hidden` 裁掉 ——
+   * 真窗口截图里是一道被切碎的「…」。所以按真实像素宽度从左侧裁字符：短路径原样
+   * 左对齐，长路径变成「…最近的几级目录」。完整路径仍在 title 里。
+   *
+   * 量宽度用 canvas `.measureText()`（与 span.offsetWidth 的实测一致，449.32 vs 449）：
+   * 读隐藏 span 的 offsetWidth 每次都会触发一次布局，500 行要 ~1.5 s；canvas 只算
+   * 字形宽度，同样的 500 行 ~0.14 s。拿不到 2d context 时才退回隐藏 span。
+   */
+  function fitSearchDirs() {
+    var tb = $('search-tbody');
+    if (!tb) { return; }
+    var boxes = tb.querySelectorAll('.hit-dir');
+    if (!boxes.length) { return; }
+    var cs = window.getComputedStyle(boxes[0]);
+    // fixed 布局下每个目录列等宽：**只量第一行一次**（循环里再读 clientWidth 会在每次
+    // 改完文本后触发整表重排，500 行同样要 1 s 以上）。
+    var avail = boxes[0].clientWidth - 2;
+    var widthOf = null;
+    var meas = null;
+    try {
+      var canvas = document.createElement('canvas');
+      var ctx = canvas.getContext('2d');
+      if (ctx) {
+        ctx.font = cs.fontStyle + ' ' + cs.fontWeight + ' ' + cs.fontSize + ' ' + cs.fontFamily;
+        widthOf = function (text) { return ctx.measureText(text).width; };
+      }
+    } catch (e) { widthOf = null; }
+    if (!widthOf) {
+      meas = el('span');
+      meas.style.position = 'absolute';
+      meas.style.left = '-99999px';
+      meas.style.top = '0';
+      meas.style.visibility = 'hidden';
+      meas.style.whiteSpace = 'pre';
+      meas.style.fontFamily = cs.fontFamily;
+      meas.style.fontSize = cs.fontSize;
+      document.body.appendChild(meas);
+      widthOf = function (text) { meas.textContent = text; return meas.offsetWidth; };
+    }
+    for (var i = 0; i < boxes.length; i++) {
+      var box = boxes[i];
+      var full = str(box.getAttribute('data-full'));
+      // 列宽拿不到（页面不可见）时保留全文，别把每条都裁成「…」。
+      if (!full || avail <= 0 || widthOf(full) <= avail) {
+        box.textContent = full;
+        continue;
+      }
+      // 按码点切，别把 emoji 之类的代理对劈成半个字符。
+      var chars = [];
+      for (var k = 0; k < full.length; k++) {
+        var code = full.charCodeAt(k);
+        if (code >= 0xd800 && code <= 0xdbff && k + 1 < full.length) {
+          chars.push(full.slice(k, k + 2));
+          k++;
+        } else {
+          chars.push(full.charAt(k));
+        }
+      }
+      // 二分找「最少裁掉多少个字符」：裁得越多宽度越小，所以判据是单调的。
+      var lo = 0;
+      var hi = chars.length;
+      while (lo < hi) {
+        var mid = Math.floor((lo + hi) / 2);
+        if (widthOf('…' + chars.slice(mid).join('')) <= avail) { hi = mid; } else { lo = mid + 1; }
+      }
+      box.textContent = '…' + chars.slice(lo).join('');
+    }
+    if (meas && meas.parentNode) { meas.parentNode.removeChild(meas); }
+  }
+
+  // 窗口变宽/变窄后按新列宽重裁（只重裁文本，不重跑搜索）。
+  var searchFitRaf = 0;
+  window.addEventListener('resize', function () {
+    if (searchFitRaf) { return; }
+    searchFitRaf = window.requestAnimationFrame(function () {
+      searchFitRaf = 0;
+      if (state.search && state.search.ran) { fitSearchDirs(); }
+    });
+  });
+
   function renderSearch() {
     var tb = $('search-tbody');
     if (!tb) { return; }
@@ -5211,6 +5309,7 @@
     var hits = (state.search.hits || []).filter(isObj);
     setBusyState('search-tbody', state.search.loading === true);
     for (var i = 0; i < hits.length; i++) { tb.appendChild(buildSearchRow(hits[i])); }
+    fitSearchDirs();
 
     if (state.search.error) {
       setText('search-info', T('list.error', { msg: state.search.error }));

@@ -1229,10 +1229,28 @@ table.tbl.tbl-search {
 .tbl-search td.cell-type { line-height: 1.25; }
 .tbl-search td.cell-type .badge { margin-top: 2px; font-size: 10.5px; padding: 0 4px; }
 
+/* ★ M43.1：路径列两行 —— 第一行文件名（尾省略），第二行目录（小字暗色）。
+ * 目录过长要「显示尾部、隐藏开头」，但 WebKit 里 `text-overflow: ellipsis` +
+ * `direction: rtl` 的省略号会被内容框左边缘裁掉半个（真窗口截图里是一道碎「…」），
+ * 所以裁切放在 JS 里按像素做（`fitSearchDirs`）；这里只管两行的排版与字色。 */
 .tbl-search td.cell-path {
+  overflow: hidden;
+  white-space: nowrap;
+  line-height: 1.25;
+}
+
+.tbl-search .hit-name {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.tbl-search .hit-dir {
+  overflow: hidden;
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg-dim);
 }
 
 .tbl-search td.cell-time { white-space: nowrap; }
