@@ -13,7 +13,7 @@
 # 验的是什么（对应 docs/M8-向Qsync-Client-6靠拢.md 的 M8.2 验收 ①–④）:
 #   ① 迁移/兼容：**不带 task 参数的挂载不登记任务**（= M7 行为一字不变）；
 #   ② daemon 重启后 `--restore-tasks` 能把启用任务自动恢复挂载；
-#      负向对照：**不开 flag 时不恢复**（默认关是刻意的，防止旧挂载复活）；
+#      默认**恢复**（M15/T5）；负向对照：`--no-restore-mounts` 后不恢复；
 #   ③ 暂停一个任务只影响它自己：t1 卸载、t2 仍然挂着；
 #   ④ `qxync task list/add/rm/pause/resume/mount --json` 全可用；
 #   ⑤ 安全：非法 id（`../x`）被拒；`rm` 只删登记、不动挂载点里的数据。
@@ -136,18 +136,43 @@ else
   Q umount "$M3" >/dev/null 2>&1
 fi
 
-# ---------------------------------------------------------------- 5. 默认不恢复（负向对照）
-echo "== 5. 重启恢复：负向对照（不开 flag） =="
+# ---------------------------------------------------------------- 5. 默认恢复 / 负向对照
+# ★ M15/T5 起「启动恢复挂载」**默认开启**（幂等，且只恢复 mounts.json 里真挂过的）。
+#   所以这里分两段验：默认=恢复；显式 --no-restore-mounts=不恢复（负向对照）。
+#   旧版断言「默认不恢复」在 T5 之后就过期了 —— 别再按老语义判失败。
+echo "== 5a. 重启恢复：默认开启（M15/T5 语义） =="
 stop_daemon
-start_daemon ""; check $? "daemon 重启（无 --restore-tasks）"
+start_daemon ""; check $? "daemon 重启（默认恢复挂载）"
 Q --via-daemon login >/dev/null 2>&1
 sleep 1.5
 if [ "$NO_FUSE" = "1" ]; then
-  skip "默认不自动恢复（--no-fuse）"
+  skip "默认自动恢复（--no-fuse）"
 else
-  L2=$(Q task list --json 2>/dev/null)
-  check "$([ "$(echo "$L2" | jqv '.tasks[0].mounted')" = "false" ] && echo 0 || echo 1)" \
-    "默认**不**自动恢复挂载（mounted=false）—— 防止上次残余的挂载复活"
+  DROK=1
+  for _ in $(seq 1 40); do
+    if awk -v mp="$MNT1" '$2==mp{found=1} END{exit !found}' /proc/mounts; then DROK=0; break; fi
+    sleep 0.5
+  done
+  check "$DROK" "默认**自动**恢复上次挂过的挂载（$MNT1 回到 /proc/mounts）"
+fi
+
+echo "== 5b. 重启恢复：负向对照（--no-restore-mounts） =="
+stop_daemon
+start_daemon "--no-restore-mounts"; check $? "daemon 重启（--no-restore-mounts）"
+Q --via-daemon login >/dev/null 2>&1
+sleep 1.5
+if [ "$NO_FUSE" = "1" ]; then
+  skip "显式关闭后不恢复（--no-fuse）"
+else
+  NROK=1
+  for _ in $(seq 1 10); do
+    if awk -v mp="$MNT1" '$2==mp{found=1} END{exit !found}' /proc/mounts; then NROK=0; break; fi
+    sleep 0.5
+  done
+  check "$([ "$NROK" = 1 ] && echo 0 || echo 1)" \
+    "--no-restore-mounts 后**不**自动恢复（防止旧挂载复活）"
+  check "$([ "$(Q task list --json 2>/dev/null | jqv '.tasks[0].mounted')" = "false" ] && echo 0 || echo 1)" \
+    "list 里 mounted=false"
 fi
 
 # ---------------------------------------------------------------- 6. --restore-tasks 自动恢复

@@ -31,7 +31,10 @@ SOCK="$RUNDIR/s.sock"
 LOG="$RUNDIR/daemon.log"
 MNT="$RUNDIR/mnt"
 SUB="/home/qxync-test/m84"        # 远端绝对路径（daemon/CLI 用）
-RELV="/qxync-test/m84"            # 挂载点里的相对路径（单根 /home 直通）
+# ★ 任务根收窄到本矩阵自己的远端目录（原来是 /home）：/home 有 5505 个目录，
+#   新状态库首轮全量对账在 WAN 上要十几~几十分钟，`sync --once` 会把整节拖死（本轮实测）。
+#   收窄后挂载点根就是 /home/qxync-test/m84，RELV 为空，下面的 "$MNT$RELV" 写法不用改。
+RELV=""                           # 挂载点里的相对路径（任务根 = $SUB，故为空）
 SUB_LOCAL="$RUNDIR/local"
 PROXY_PORT="${QXNYC_TEST_PROXY_PORT:-18484}"
 
@@ -67,6 +70,13 @@ cp "$SRC_XDG/qxync/links/$LINK.json" "$RUNDIR/config/qxync/links/"
 
 export XDG_CONFIG_HOME="$RUNDIR/config" XDG_DATA_HOME="$RUNDIR/data" XDG_STATE_HOME="$RUNDIR/state"
 export QXNYC_SOCKET="$SOCK" RUST_LOG="${RUST_LOG:-warn}"
+# ★ M15/T5 起 daemon 启动**默认恢复挂载**（含启用任务）。本矩阵各节都是「先卸再挂」，
+#   恢复会把上一节的任务重新挂回同一个 $MNT，下一节 `task add --mountpoint $MNT` 就撞
+#   「已经挂载」→ 整节连带失败（本轮实测）。验收矩阵要干净起点，按官方开关关掉恢复。
+export QXNYC_TASK_RESTORE=0
+# 轮询间隔：默认留给引擎（30s）。第 5 节的三态读取需要「CLI 上传 → 挂载点马上能看到」，
+# 那里单独用 start_daemon 注入 QXNYC_POLL_INTERVAL=2；第 6 节的冲突三向时序测试必须保持
+# 默认值（后台轮询抢跑会把手工编排的 race 打散）。
 DAEMON_PID=""; PROXY_PID=""; GUI_PID=""
 SETTINGS="$XDG_CONFIG_HOME/qxync/settings.json"
 AUTOSTART="$XDG_CONFIG_HOME/autostart/qxync.desktop"
@@ -80,6 +90,20 @@ fi
 Q() { "$QS" --socket "$SOCK" "$@"; }
 qj() { Q "$@" --json 2>/dev/null; }
 jqr() { jq -r "$1" 2>/dev/null; }
+wait_visible() {  # $1=挂载点内路径  $2=最多等秒数 → 文件真的出现在挂载点里
+  local i
+  for i in $(seq 1 $(( ${2:-30} * 2 ))); do [ -e "$1" ] && return 0; sleep 0.5; done
+  return 1
+}
+wait_state() {    # $1=远端目录 $2=文件名 $3=期望三态 $4=最多等秒数
+  local i s
+  for i in $(seq 1 $(( ${4:-30} * 2 ))); do
+    s=$(qj file-states "$1" | jqr ".entries[]|select(.name==\"$2\")|.state")
+    [ "$s" = "$3" ] && return 0
+    sleep 0.5
+  done
+  return 1
+}
 # NAS 测试目录里的文件名（`qxync ls` 每行最后是文件名，前面两空格分隔）
 remote_names() { Q ls "$SUB" 2>/dev/null | tail -n +2 | sed 's/.*  //'; }
 remote_body() { Q get "$SUB" "$1" --out "$RUNDIR/get-$1" >/dev/null 2>&1; cat "$RUNDIR/get-$1" 2>/dev/null; }
@@ -357,13 +381,16 @@ check "$([ "$(echo "$M2" | jqr .match_hidden)" = "false" ] && echo 0 || echo 1)"
 if [ "$NO_FUSE" = "1" ]; then
   skip "筛选器的真挂载不可见段（--no-fuse）"
 else
-  Q task add --id m84flt --mountpoint "$MNT" --root /home --no-mount >/dev/null 2>&1
+  Q task add --id m84flt --mountpoint "$MNT" --root "$SUB" --no-mount >/dev/null 2>&1
   Q task mount m84flt >/dev/null 2>&1
   check $? "带筛选器的任务挂载成功"
-  ls "$MNT/qxync-test/m84" >/dev/null 2>&1
+  ls "$MNT" >/dev/null 2>&1
   check "$([ "$(ls "$MNT$RELV" 2>/dev/null | grep -c 'hidden.iso')" = "0" ] && echo 0 || echo 1)" "★ 挂载点里看不到被排除的 hidden.iso"
   check "$([ "$(ls "$MNT$RELV" 2>/dev/null | grep -c 'visible.txt')" -ge 1 ] && echo 0 || echo 1)" "★ 挂载点里能看到 visible.txt"
   Q umount "$MNT" >/dev/null 2>&1; sleep 1
+  # ★ 卸载 ≠ 解除占用：任务登记还在，「一个本地文件夹只能配一个任务」，下一节还要用同一个
+  #   $MNT 登记 m84free，会撞「目的地冲突」（本轮实测）。rm 只删登记、不动挂载点里的数据。
+  Q task rm m84flt >/dev/null 2>&1
 fi
 
 # ---------------------------------------------------------------- 5. 自动释放空间
@@ -376,26 +403,42 @@ else
   head -c 262144 /dev/urandom > "$SUB_LOCAL/space-pinned.bin"
   Q put "$SUB_LOCAL/space-normal.bin" "$SUB" --name space-normal.bin >/dev/null 2>&1
   Q put "$SUB_LOCAL/space-pinned.bin" "$SUB" --name space-pinned.bin >/dev/null 2>&1
+  # ★ 慢链路竞态：上传走队列，紧接着 start_daemon 会强停旧 daemon；没传完就被打断的话，
+  #   挂载点里根本没有这两个文件，后面的「水合→三态→自动释放」全是假结果（本轮实测）。
+  #   先等远端真的看到两个文件，再继续。
+  UPOK=0
+  for _ in $(seq 1 120); do
+    _n=$(Q ls "$SUB" 2>/dev/null | grep -c 'space-')
+    [ "${_n:-0}" -ge 2 ] && { UPOK=1; break; }
+    sleep 0.5
+  done
+  check "$([ "$UPOK" = 1 ] && echo 0 || echo 1)" "两个 space 文件已上传到远端（可继续验三态）"
   # 恢复无排除规则（上一步加了 *.iso）
   jq '.exclude = []' "$XDG_CONFIG_HOME/qxync/links/$LINK.json" >"$RUNDIR/link.tmp" \
     && mv "$RUNDIR/link.tmp" "$XDG_CONFIG_HOME/qxync/links/$LINK.json"
 
   # 第一步：**自动释放先关着**（settings 里 free.auto 此时为 false，见第 1 节末尾的复位），
   # 先把「水合 → 三态」这一段验干净，否则 1s 一轮的自动释放会抢在断言之前把文件脱水。
-  start_daemon "QXNYC_TEST_FAKE_STATVFS=avail_pct=5 QXNYC_AUTO_FREE_INTERVAL=1 QXNYC_AUTO_FREE_RECENT=0" ""
+  start_daemon "QXNYC_TEST_FAKE_STATVFS=avail_pct=5 QXNYC_AUTO_FREE_INTERVAL=1 QXNYC_AUTO_FREE_RECENT=0 QXNYC_POLL_INTERVAL=2" ""
   check $? "daemon 带注入点起来（avail_pct=5 / 每 1s 扫 / 最近访问保护=0）"
   login
   Q settings --set free.auto=false >/dev/null 2>&1
-  Q task add --id m84free --mountpoint "$MNT" --root /home --read-write >/dev/null 2>&1
+  Q task add --id m84free --mountpoint "$MNT" --root "$SUB" --read-write >/dev/null 2>&1
   check $? "读写任务挂载成功（$MNT）"
   # 水合两个文件（head -c 让 FUSE 抓 128 KiB 区间）
-  ls "$MNT/qxync-test/m84" >/dev/null 2>&1
+  # 先等目录清单刷新到能看见这两个文件 —— 否则 head 直接 ENOENT，三态只会是 online。
+  ls "$MNT" >/dev/null 2>&1
+  wait_visible "$MNT$RELV/space-normal.bin" 90
+  check $? "挂载点里能看到 space-normal.bin（轮询已刷新）"
+  wait_visible "$MNT$RELV/space-pinned.bin" 90
+  check $? "挂载点里能看到 space-pinned.bin（轮询已刷新）"
   head -c 100 "$MNT$RELV/space-normal.bin" >/dev/null 2>&1
   head -c 100 "$MNT$RELV/space-pinned.bin" >/dev/null 2>&1
   Q pin "$SUB/space-pinned.bin" pinned >/dev/null 2>&1
-  FS1=$(qj file-states "$SUB")
-  check "$([ "$(echo "$FS1" | jqr '.entries[]|select(.name=="space-normal.bin")|.state')" = "local" ] && echo 0 || echo 1)" "水合后 space-normal.bin = 本地可用"
-  check "$([ "$(echo "$FS1" | jqr '.entries[]|select(.name=="space-pinned.bin")|.state')" = "always" ] && echo 0 || echo 1)" "pin 后 space-pinned.bin = 始终可用"
+  wait_state "$SUB" space-normal.bin local 30
+  check $? "水合后 space-normal.bin = 本地可用"
+  wait_state "$SUB" space-pinned.bin always 30
+  check $? "pin 后 space-pinned.bin = 始终可用"
   # 第二步：打开自动释放（阈值 50%，注入的可用空间 5% → 必然触发）
   Q settings --set free.auto=true --set free.mode=below_pct --set free.below_pct=50 >/dev/null 2>&1
   check $? "打开自动释放（当空间少于 50%）"
@@ -426,6 +469,8 @@ else
   Q space --json >/dev/null 2>&1
   check "$([ $? -ne 0 ] && echo 0 || echo 1)" "非法注入值 → space 报错（不是静默回退真 statvfs）"
   Q umount "$MNT" >/dev/null 2>&1; sleep 1
+  # 本节用过的任务登记也清掉（下一节还要复用 $MNT / $MNT3）
+  Q task rm m84free >/dev/null 2>&1
 fi
 
 # ---------------------------------------------------------------- 6. 冲突策略五选
@@ -451,7 +496,7 @@ else
     rm -rf "$mnt"; mkdir -p "$mnt"
     printf 'BASE-BASE' > "$SUB_LOCAL/base.txt"
     Q put "$SUB_LOCAL/base.txt" "$SUB" --name "$name" >/dev/null 2>&1
-    Q task add --id "m84c-$pol" --mountpoint "$mnt" --root /home --read-write --conflict "$pol" --no-mount >/dev/null 2>&1
+    Q task add --id "m84c-$pol" --mountpoint "$mnt" --root "$SUB" --read-write --conflict "$pol" --no-mount >/dev/null 2>&1
     Q task mount "m84c-$pol" >/dev/null 2>&1
     ls "$mnt$RELV" >/dev/null 2>&1
     Q sync --once >/dev/null 2>&1                                       # ① 建 baseline
@@ -553,18 +598,21 @@ else
   MNT3="$RUNDIR/mnt3"; rm -rf "$MNT3"; mkdir -p "$MNT3"
   printf 'AAAA-1111' > "$SUB_LOCAL/tri.txt"
   Q put "$SUB_LOCAL/tri.txt" "$SUB" --name tri.txt >/dev/null 2>&1
-  Q task add --id m84tri --mountpoint "$MNT3" --root /home --read-write --no-mount >/dev/null 2>&1
+  Q task add --id m84tri --mountpoint "$MNT3" --root "$SUB" --read-write --no-mount >/dev/null 2>&1
   Q task mount m84tri 2>&1 | tail -1
   check $? "三态测试挂载成功"
-  ls "$MNT3/qxync-test/m84" >/dev/null 2>&1
-  sleep 0.5
+  ls "$MNT3" >/dev/null 2>&1
+  wait_visible "$MNT3$RELV/tri.txt" 90
+  check $? "挂载点里能看到 tri.txt（轮询已刷新）"
+  wait_state "$SUB" tri.txt online 30
   S=$(qj file-states "$SUB" | jqr '.entries[]|select(.name=="tri.txt")|.state')
   check "$([ "$S" = "online" ] && echo 0 || echo 1)" "★ 新建（未读）→ 仅在线（$S）"
   head -c 4 "$MNT3$RELV/tri.txt" >/dev/null 2>&1
-  sleep 0.3
+  wait_state "$SUB" tri.txt local 30
   S=$(qj file-states "$SUB" | jqr '.entries[]|select(.name=="tri.txt")|.state')
   check "$([ "$S" = "local" ] && echo 0 || echo 1)" "★ head -c 之后 → 本地可用（$S）"
   Q pin "$SUB/tri.txt" pinned >/dev/null 2>&1
+  wait_state "$SUB" tri.txt always 30
   S=$(qj file-states "$SUB" | jqr '.entries[]|select(.name=="tri.txt")|.state')
   check "$([ "$S" = "always" ] && echo 0 || echo 1)" "★ pin 之后 → 始终可用（$S）"
   Q pin "$SUB/tri.txt" unspecified >/dev/null 2>&1

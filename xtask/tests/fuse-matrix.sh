@@ -24,6 +24,11 @@ FIXTURE="${QXNYC_TEST_FIXTURE:-/home/qxync-test}"     # NAS 上的路径
 # 造夹具时落盘的本地副本（由 qs_fixture.py 生成，**不在仓库里**）。
 # 默认沿用探测工具的输出目录；换机器时用 QXNYC_TEST_LOCAL_FIXTURE 指过去。
 LOCAL_FIXTURE="${QXNYC_TEST_LOCAL_FIXTURE:-$REPO/xtask/probe/probe-out/fixture/local}"
+# ★ 挂载根默认**只挂测试夹具**（不再挂整个 /home）：/home 有 5505 个目录，新状态库首轮
+#   全量对账要十几分钟，M2c 的 30s 刷新窗口全被扫描堵死（实测）。夹具只有十几个目录，
+#   语义不变（所有断言都在夹具内），一轮对账 <1s。要看整棵树时 QXNYC_REMOTE_ROOT=/home。
+REMOTE_ROOT="${QXNYC_REMOTE_ROOT:-$FIXTURE}"
+REL="${FIXTURE#"$REMOTE_ROOT"}"            # 夹具相对挂载根的路径（默认空）
 BIG=0
 KEEP=0
 # 大文件整文件水合受带宽限制：对端 ~1.1MB/s 时 128MiB 要 ~116s，
@@ -55,6 +60,17 @@ export XDG_STATE_HOME="${QXNYC_TEST_STATE_HOME:-$RUNDIR/fuse-state}"
 [ -n "${QXNYC_TEST_STATE_HOME:-}" ] || rm -rf "$XDG_STATE_HOME"
 export RUST_LOG="${RUST_LOG:-info}"
 LOG="$RUNDIR/fuse-matrix.log"
+
+# ★ 私有 XDG_RUNTIME_DIR（M45 补漏）：本脚本多处 `daemon stop/start`，不隔离的话
+#   「default socket」就是你桌面上的守护 —— 实测跑到一半会把它停掉，再用本脚本的
+#   XDG_CONFIG_HOME（测试配置）起一台 debug daemon 顶在同一个 socket 上，用户守护
+#   再也回不来。私有 runtime 后，测试的 default socket 落在 $RUNDIR/fuse-runtime/qxync/，
+#   与桌面守护各占各的。fusermount 等工具不需要透传 Wayland/X11 socket。
+export XDG_RUNTIME_DIR="${QXNYC_TEST_RUNTIME_HOME:-$RUNDIR/fuse-runtime}"
+mkdir -p "$XDG_RUNTIME_DIR/qxync"
+chmod 700 "$XDG_RUNTIME_DIR"
+SOCK="$XDG_RUNTIME_DIR/qxync/qxyncd.sock"
+export QXNYC_SOCKET="$SOCK"
 
 if ! [ -x "$QS" ]; then echo "缺少 $QS，先 cargo build"; exit 1; fi
 
@@ -102,6 +118,8 @@ unmount_retry() {
 
 cleanup() {
   if [ "$KEEP" = "0" ]; then unmount_retry "$MNT" >/dev/null 2>&1; fi
+  # 只停本脚本私有 runtime 里那台（$SOCK），绝不碰用户桌面上的守护。
+  "$QS" --socket "$SOCK" daemon stop --force >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -110,14 +128,14 @@ echo "=== 挂载（只读 + on-demand，60s 水合超时）==="
 #   下载」「#11 不吐假数据」等断言假失败（实测踩过：上轮的 qnap.kdajv.com/ 留下，
 #   cat 命中已下载区间 → EIO 前吐了 128 KiB 真数据）。
 rm -rf "$CACHE"/*
-"$QS" mount "$MNT" --remote "${QXNYC_REMOTE_ROOT:-/home}" --cache-dir "$CACHE" \
+"$QS" mount "$MNT" --remote "$REMOTE_ROOT" --cache-dir "$CACHE" \
       --threads 4 --auto-unmount ${QXNYC_MOUNT_EXTRA:-} >"$LOG" 2>&1 &
 MOUNT_PID=$!
 for _ in $(seq 1 30); do is_mounted "$MNT" && break; sleep 0.5; done
 is_mounted "$MNT" || { echo "挂载失败，日志："; cat "$LOG"; exit 1; }
 echo "  mounted: $(awk -v mp="$MNT" '$2==mp' /proc/mounts | head -1)"
 
-M="$MNT$( echo "$FIXTURE" | sed 's#^/home##' )"   # /home -> 挂载点根
+M="$MNT$REL"
 
 echo
 echo "=== #1 占位符：ls 显示真实大小、且未下载 ==="
@@ -196,10 +214,10 @@ echo "=== #11 水合失败 → EIO，不挂死、不零填充 ==="
 MNT2="$RUNDIR/mnt-timeout"
 mkdir -p "$MNT2"
 rm -rf "$CACHE"/*          # 别让上一个挂载的缓存把这步短路
-"$QS" mount "$MNT2" --remote "${QXNYC_REMOTE_ROOT:-/home}" --cache-dir "$CACHE" \
+"$QS" mount "$MNT2" --remote "$REMOTE_ROOT" --cache-dir "$CACHE" \
       --threads 2 --auto-unmount --hydrate-timeout 0 >>"$LOG" 2>&1 &
 for _ in $(seq 1 30); do is_mounted "$MNT2" && break; sleep 0.5; done
-M2="$MNT2$( echo "$FIXTURE" | sed 's#^/home##' )"
+M2="$MNT2$REL"
 timeout 30 cat "$M2/big.bin" >"$RUNDIR/eio.out" 2>"$RUNDIR/eio.err"
 rc=$?
 n=$(wc -c <"$RUNDIR/eio.out")
@@ -215,7 +233,7 @@ if [ "$BIG" = "1" ]; then
   echo "=== 128 MiB 整文件水合 + md5（水合超时 ${HYD}s）==="
   unmount_retry "$MNT"
   rm -f "$CACHE"/*; : >"$LOG"
-  RUST_LOG=debug "$QS" mount "$MNT" --remote "${QXNYC_REMOTE_ROOT:-/home}" --cache-dir "$CACHE" \
+  RUST_LOG=debug "$QS" mount "$MNT" --remote "$REMOTE_ROOT" --cache-dir "$CACHE" \
         --threads 4 --auto-unmount --hydrate-timeout "$HYD" >>"$LOG" 2>&1 &
   for _ in $(seq 1 30); do is_mounted "$MNT" && break; sleep 0.5; done
   read_big() {  # 输出 "字节数 md5"；失败输出 "0 -"
@@ -244,7 +262,7 @@ if [ "$BIG" = "1" ]; then
   # 重新挂载以清掉内核 page cache，否则读到的是内核缓存，测不出并发
   rm -rf "$CACHE"/* "$RUNDIR"/dedup-*.txt
   : >"$LOG"
-  RUST_LOG=debug "$QS" mount "$MNT" --remote "${QXNYC_REMOTE_ROOT:-/home}" --cache-dir "$CACHE" \
+  RUST_LOG=debug "$QS" mount "$MNT" --remote "$REMOTE_ROOT" --cache-dir "$CACHE" \
         --threads 4 --auto-unmount --hydrate-timeout "$HYD" >>"$LOG" 2>&1 &
   for _ in $(seq 1 30); do is_mounted "$MNT" && break; sleep 0.5; done
   # 注意：不能裸用 wait —— 后台还挂着 FUSE 挂载进程，wait 会一直等它。
@@ -266,22 +284,25 @@ echo
 echo "=== M2b 写路径（读写挂载：create / read-modify-write / mkdir / rename / move / unlink）==="
 MNTW="$RUNDIR/mnt-rw"; CACHEW="$RUNDIR/cache-rw"
 mkdir -p "$MNTW"; rm -rf "$CACHEW"
-"$QS" mount "$MNTW" --remote "${QXNYC_REMOTE_ROOT:-/home}" --cache-dir "$CACHEW" \
+"$QS" mount "$MNTW" --remote "$REMOTE_ROOT" --cache-dir "$CACHEW" \
       --threads 4 --rw >>"$LOG" 2>&1 &
 for _ in $(seq 1 40); do is_mounted "$MNTW" && break; sleep 0.5; done
 if ! is_mounted "$MNTW"; then
   bad "读写挂载失败（跳过写路径检查）"
 else
-  MW="$MNTW$(echo "$FIXTURE" | sed 's#^/home##')"
+  MW="$MNTW$REL"
   # $1=dir $2=name $3=期望(1=存在,0=不存在)，最多等 30s
-  wait_remote() {
-    local i
-    for i in $(seq 1 60); do
-      if "$QS" --direct stat "$1" "$2" >/dev/null 2>&1; then
-        [ "$3" = "1" ] && return 0
-      else
-        [ "$3" = "0" ] && return 0
+  wait_remote() {  # $1=远端目录 $2=文件名 $3=期望(1=存在 0=不存在)
+    local i present
+    for i in $(seq 1 120); do
+      present=0
+      "$QS" stat "$1" "$2" >/dev/null 2>&1 && present=1
+      # daemon 的 stat 会命中目录清单缓存（默认 30s 才刷新），新上传/改名会假阴性；
+      # 每 5 轮（≈2.5s）用直连拿一次远端真值，既快又准。
+      if [ "$present" = 0 ] && [ $((i % 5)) -eq 0 ]; then
+        "$QS" --direct stat "$1" "$2" >/dev/null 2>&1 && present=1
       fi
+      [ "$present" = "$3" ] && return 0
       sleep 0.5
     done
     return 1
@@ -367,7 +388,7 @@ export QXNYC_POLL_INTERVAL=2             # 快轮询，验收更快
 "$QS" daemon stop >/dev/null 2>&1
 "$QS" daemon start >/dev/null 2>&1
 "$QS" --direct mkdir "$FIXTURE" mx2 >/dev/null 2>&1
-MC="$MNTC$(echo "$FIXTURE" | sed 's#^/home##')/mx2"
+MC="$MNTC$REL/mx2"
 
 xattr_state() {  # $1=挂载点内路径 → 打印 user.qxync.state
   python3 -c "
@@ -376,7 +397,7 @@ try: print(os.getxattr('$1','user.qxync.state').decode())
 except OSError as e: print('ERR%d'%e.errno)"
 }
 
-if ! "$QS" mount "$MNTC" --remote "${QXNYC_REMOTE_ROOT:-/home}" --cache-dir "$CACHEC" \
+if ! "$QS" mount "$MNTC" --remote "$REMOTE_ROOT" --cache-dir "$CACHEC" \
         --threads 4 --rw >/dev/null 2>&1; then
   bad "M2c：daemon 读写挂载失败（跳过 M2c 检查）"
 else
@@ -418,7 +439,7 @@ else
   # ---- M2c-2 远端删除 → 本地节点消失（单条删除不触发保护）
   "$QS" --direct rm "$M2C" r.txt >/dev/null 2>&1
   ok3=0
-  for _ in $(seq 1 30); do
+  for _ in $(seq 1 120); do
     [ ! -e "$MC/r.txt" ] && { ok3=1; break; }
     sleep 0.5
   done
@@ -529,14 +550,14 @@ export QXNYC_DEHYDRATE_IDLE=0            # 先关掉自动扫描，测试要可�
 export QXNYC_DEHYDRATE_INTERVAL=5
 "$QS" daemon stop >/dev/null 2>&1
 "$QS" daemon start >/dev/null 2>&1
-M3="$MNT3$(echo "$FIXTURE" | sed 's#^/home##')"
+M3="$MNT3$REL"
 DAEMONLOG=$(ls -t "$XDG_STATE_HOME"/qxync/log/qxyncd.log.* 2>/dev/null | head -1)
 
 # 注意：缓存是稀疏文件，`du -sb`（apparent size）会把 128 MiB 的稀疏缓存算成 128 MiB；
 # 这里要的是**真实磁盘占用**，所以用 --block-size=1 的默认（allocated）口径。
 cache_bytes() { du -s --block-size=1 "$1" 2>/dev/null | cut -f1; }
 
-if "$QS" mount "$MNT3" --remote "${QXNYC_REMOTE_ROOT:-/home}" --cache-dir "$CACHE3" \
+if "$QS" mount "$MNT3" --remote "$REMOTE_ROOT" --cache-dir "$CACHE3" \
         --threads 4 --rw >/dev/null 2>&1; then
 
   # ---- M3-1 水合 → 脱水 → 占位符仍显示真实大小 → 再读数据正确
@@ -655,9 +676,9 @@ fi
 # ---- M3-8 direct 模式（绕过 page cache）：数据正确 + mmap 不可用
 MNT3D="$RUNDIR/mnt-m3-direct"; CACHE3D="$RUNDIR/cache-m3-direct"
 mkdir -p "$MNT3D"; rm -rf "$CACHE3D"
-if "$QS" mount "$MNT3D" --remote "${QXNYC_REMOTE_ROOT:-/home}" --cache-dir "$CACHE3D" \
+if "$QS" mount "$MNT3D" --remote "$REMOTE_ROOT" --cache-dir "$CACHE3D" \
         --threads 2 --cache-mode direct >/dev/null 2>&1; then
-  M3D="$MNT3D$(echo "$FIXTURE" | sed 's#^/home##')"
+  M3D="$MNT3D$REL"
   check "$(cmp -s <(cat "$M3D/1k.bin" 2>/dev/null) "$LOCAL_FIXTURE/1k.bin" && echo 0 || echo 1)" "M3-8 direct 模式读取正确"
   check "$(python3 -c "
 import mmap,sys
@@ -714,9 +735,9 @@ print("ok" if r.get("ok") else "error:" + str((r.get("error") or {}).get("messag
 PYEOF
 }
 
-if "$QS" mount "$MNT23" --remote "${QXNYC_REMOTE_ROOT:-/home}" --cache-dir "$CACHE23" \
+if "$QS" mount "$MNT23" --remote "$REMOTE_ROOT" --cache-dir "$CACHE23" \
         --threads 2 >/dev/null 2>&1; then
-  M23="$MNT23$(echo "$FIXTURE" | sed 's#^/home##')"
+  M23="$MNT23$REL"
 
   # ★ 开跑先重置到已知状态：门禁只在「关→开」边沿拦（产品语义，见
   #   settings_save_cmd 注释），若上一轮跑挂在中途 / 外部验证把 dolphin_tags

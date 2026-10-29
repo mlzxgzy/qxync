@@ -7,6 +7,7 @@
 //! export QXNYC_TEST_PORT=9834
 //! export QXNYC_TEST_USER=test1
 //! export QXNYC_TEST_PASSWORD='...'
+//! export QXNYC_TEST_OTP=<TOTP 密钥或 6 位码>   # 账号开了两步验证时
 //! export QXNYC_TEST_FIXTURE=/home/qxync-test
 //! cargo test -p qxync-proto-test --test versioning -- --ignored --nocapture
 //! ```
@@ -57,7 +58,12 @@ fn fixture_root() -> String {
 async fn logged_in() -> Option<Client> {
     let (link, pw) = env_creds()?;
     let mut c = Client::new(&link).expect("构造 client");
-    c.login(&link.user, &pw).await.expect("登录失败");
+    // ★ 2SV 账号：QXNYC_TEST_OTP 可给 TOTP 密钥（Base32）或 6 位一次性验证码；
+    //   不给则按老路径登录（未开两步验证的账号行为不变）。
+    let otp = std::env::var("QXNYC_TEST_OTP").ok();
+    c.login_with_otp(&link.user, &pw, otp.as_deref())
+        .await
+        .expect("登录失败");
     Some(c)
 }
 

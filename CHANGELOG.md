@@ -49,6 +49,26 @@
   默认档实测 **24s**（原同集合串行约 28s，且不再有重复执行），`gui-matrix --no-window`
   从「3 处失败」变成 **43/43**、跑完维护者 daemon pid 不变。真机 `fuse` / `nas` 两档
   本轮未跑（本环境无 `/dev/fuse`，且会写真机 NAS 测试目录），入口会如实 SKIP。
+- **端到端验收：守护隔离、超时收尾与真机套件提速（[M46](docs/M46-端到端验收的守护隔离与提速.md)）**：
+  M45 合并入口后真正跑了一遍 `--tier all`，又挖出四类问题并修掉。① **跑 fuse 档会把用户
+  桌面上的 daemon 顶掉**：`fuse-matrix.sh` 有 6 处 `daemon stop/start` 却没隔离
+  `XDG_RUNTIME_DIR`，`daemon stop` 命中的是用户默认 socket（日志实锤「IPC shutdown」），
+  再用测试配置起一台 debug daemon 顶上——已改成私有 runtime + 私有 socket。② **超时只杀子
+  shell**：`bash 套件.sh` 变孤儿继续跑，9 分钟后执行到 `daemon stop` 才停掉用户守护——入口改
+  成 `setsid` 起独立进程组、超时杀整棵树（`kill -- -$pid` + 递归 + 按脚本路径兜底），并在开跑前
+  清理上次残留的套件进程。③ **真机套件挂整棵 `/home`（5505 个目录）**，新状态库首轮全量对账
+  把套件拖到 10～30 分钟——`fuse` / `m83` / `m84` 默认改为只挂夹具目录（`QXNYC_REMOTE_ROOT`
+  可覆盖回 `/home`），`m83` **619s → 16s**、`m84` **30 分钟超时 → 198s / 99 通过 0 失败**。
+  ④ **过期断言**：`m82` 的「默认不恢复挂载」（M15/T5 起默认开启，负向对照改用
+  `--no-restore-mounts`）、`m83`/`m5` 的「schema 必须 = v3」（已到 v7，改为 `>= 3`）、
+  `m5` 真机探针不支持 2SV（`versioning.rs` 支持 `QXNYC_TEST_OTP`，m5 从凭据带 `otp_secret`）、
+  `m84` 的「卸载=清空」（一个本地文件夹只能配一个任务，卸载后需 `task rm`；上传后要等远端可见
+  再水合；三态段按需注入 `QXNYC_POLL_INTERVAL=2`，冲突段保持默认 30s 以免打散手工 race）、
+  `fuse` 的 `wait_remote` 每次 `--direct` 都重新登录（慢链路 2～4s/次，改为 daemon 快查 +
+  每 5 轮直连取真值）。实跑：**gate 11/0（38s）、gui-matrix 160/0（153s）、m82 40/0、m83 27/0、
+  m84 99/0、m5 30/0、m7 60/0**，全程桌面 daemon pid 不变。`fuse` 从「900s 超时」变为
+  **72 通过 / 5 失败（744s）**，剩余 5 项集中在跨目录 move 可见性与 M2c 熔断/冲突时序，
+  文档 §6 如实记录并给了确定性注入点的后续方案。
 
 ## [0.8.0] - 2026-10-28
 

@@ -20,6 +20,11 @@ RUNDIR="${QXNYC_TEST_RUNDIR:-$REPO/.local-run}/m83"
 SOCK="$RUNDIR/s.sock"
 LOG="$RUNDIR/daemon.log"
 MNT="$RUNDIR/mnt"
+# ★ 默认只挂测试夹具（QXNYC_REMOTE_ROOT=/home 可看整棵树）：/home 有 5505 个目录，
+#   新状态库首轮全量对账在 WAN 上要十几分钟，sync --once 跑完也没有一条 journal 记录。
+FIXTURE="${QXNYC_TEST_FIXTURE:-/home/qxync-test}"
+REMOTE_ROOT="${QXNYC_REMOTE_ROOT:-$FIXTURE}"
+REL="${FIXTURE#"$REMOTE_ROOT"}"
 
 NO_FUSE=0
 for a in "$@"; do case "$a" in --no-fuse) NO_FUSE=1 ;; *) echo "未知参数: $a"; exit 2 ;; esac; done
@@ -92,7 +97,9 @@ check "$([ "$(python3 -c "import sqlite3,sys;print(sqlite3.connect(sys.argv[1]).
 start_daemon ""; check $? "qxyncd 起来"
 Q --via-daemon login >/dev/null 2>&1
 VER=$(python3 -c "import sqlite3,sys;print(sqlite3.connect(sys.argv[1]).execute('PRAGMA user_version').fetchone()[0])" "$DB")
-check "$([ "$VER" = "3" ] && echo 0 || echo 1)" "打开后 schema 升到 v3（实际 $VER）"
+# ★ 只断言「至少升过 v3」：v3 是 M8.3 当时的迁移目标，之后 M31/M32 等又加了迁移，
+#   写死 VER=3 在后续里程碑必然假失败（本轮实测已到 v7）。
+check "$([ "$VER" -ge 3 ] && echo 0 || echo 1)" "打开后 schema 至少升到 v3（实际 $VER）"
 HAS=$(python3 -c "
 import sqlite3,sys
 c=sqlite3.connect(sys.argv[1])
@@ -121,8 +128,8 @@ echo "== 3. 挂载后跑一轮 → 有记录 =="
 if [ "$NO_FUSE" = "1" ]; then
   skip "挂载相关项（--no-fuse）"
 else
-  Q mount "$MNT" --remote /home >/dev/null 2>&1; check $? "挂载成功"
-  ls "$MNT" >/dev/null 2>&1
+  Q mount "$MNT" --remote "$REMOTE_ROOT" >/dev/null 2>&1; check $? "挂载成功"
+  ls "$MNT$REL" >/dev/null 2>&1
   Q sync --once >/dev/null 2>&1
   sleep 1.2
   J1=$(Q journal --json 2>/dev/null)
