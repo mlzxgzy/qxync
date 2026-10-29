@@ -7,6 +7,8 @@
 
 ## [未发布]
 
+## [0.8.1] - 2026-10-29
+
 ### 修复
 
 - **GUI 搜索结果路径看不清（[M43.1](docs/M42-本地文件搜索.md)）**：用户反馈「搜索出来的
@@ -1949,6 +1951,7 @@ NAS 设置名 `QSYNC_FOLDERPAIR_USE_SPACE_SAVING`、Windows 客户端注册表�
 - 验收结论从 README 抽出为 [`docs/验收记录.md`](docs/验收记录.md)。
 - 采用 **MIT OR Apache-2.0** 双许可（`LICENSE-MIT` / `LICENSE-APACHE`）。
 
+[0.8.1]: https://github.com/mlzxgzy/qxync/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/mlzxgzy/qxync/compare/v0.7.14...v0.8.0
 [0.7.14]: https://github.com/mlzxgzy/qxync/compare/v0.7.13...v0.7.14
 [0.7.12]: https://github.com/mlzxgzy/qxync/compare/v0.7.11...v0.7.12
