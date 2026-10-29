@@ -312,6 +312,9 @@ else
   printf 'matrix rw test\nline2\n' >"$MW/mx-new.txt"
   wait_remote "$FIXTURE" mx-new.txt 1
   check "$([ $? = 0 ] && echo 0 || echo 1)" "新文件已上传"
+  # ★ M46：先删上一轮的本地产物再 get —— get 失败时 cmp 会拿陈旧文件假通过
+  #   （真机踩过：mv 后 get 不到，cmp 对着 10:52 的旧 mx-mv.out 报「内容一致」）。
+  rm -f "$RUNDIR/mx-new.out"
   "$QS" --direct get "$FIXTURE" mx-new.txt -o "$RUNDIR/mx-new.out" >/dev/null 2>&1
   if cmp -s <(printf 'matrix rw test\nline2\n') "$RUNDIR/mx-new.out"; then
     ok "新文件内容一致"
@@ -361,6 +364,7 @@ sys.exit(0 if got==bytes(exp) else 1)"; then
   if mv "$MW/mx-a/m.txt" "$MW/mx-b/m2.txt" 2>/dev/null; then
     wait_remote "$FIXTURE/mx-b" m2.txt 1
     check "$([ $? = 0 ] && echo 0 || echo 1)" "跨目录 move + 改名生效"
+    rm -f "$RUNDIR/mx-mv.out"     # ★ M46：同上，防陈旧产物假通过
     "$QS" --direct get "$FIXTURE/mx-b" m2.txt -o "$RUNDIR/mx-mv.out" >/dev/null 2>&1
     if cmp -s <(printf 'movable\n') "$RUNDIR/mx-mv.out"; then
       ok "移动后内容一致"
@@ -372,7 +376,7 @@ sys.exit(0 if got==bytes(exp) else 1)"; then
   fi
 
   # 6) 清理产物
-  rm -f "$MW/mx-b/m2.txt" "$MW/MX-RENAMED.TXT" "$MW/mx-rmw.bin"
+  rm -f "$MW/mx-b/m2.txt" "$MW/mx-new.txt" "$MW/MX-RENAMED.TXT" "$MW/mx-rmw.bin"
   rmdir "$MW/mx-a" "$MW/mx-b" 2>/dev/null
   wait_remote "$FIXTURE" mx-rmw.bin 0
   check "$([ $? = 0 ] && echo 0 || echo 1)" "测试产物已清理"
@@ -385,6 +389,11 @@ MNTC="$RUNDIR/mnt-m2c"; CACHEC="$RUNDIR/cache-m2c"
 mkdir -p "$MNTC"; rm -rf "$CACHEC"
 M2C="$FIXTURE/mx2"                       # 远端沙盒目录
 export QXNYC_POLL_INTERVAL=2             # 快轮询，验收更快
+# ★ M46：M2c-4 的三向冲突要「本地改动还没传上去」这个窗口。真实写路径写完几乎立刻
+#   上传（窗口几十毫秒），端到端只能靠竞速 —— 现在用 M8.4 的注入点把上传 hold 住，
+#   冲突变成确定性构造（M46 §6 的建议落地）。只影响本段：M2c 里走队列的只有 cf.txt
+#   （M2c-1/2/3 全是 --direct put/rm），M3 起的 daemon 在下面 unset 后不再受影响。
+export QXNYC_TEST_UPLOAD_HOLD_MS="${QXNYC_TEST_UPLOAD_HOLD_MS:-20000}"
 "$QS" daemon stop >/dev/null 2>&1
 "$QS" daemon start >/dev/null 2>&1
 "$QS" --direct mkdir "$FIXTURE" mx2 >/dev/null 2>&1
@@ -451,9 +460,13 @@ else
     printf 'keep%s\n' "$i" >"$RUNDIR/m2c-keep.bin"
     "$QS" --direct put "$RUNDIR/m2c-keep.bin" "$M2C" --name "keep$i.txt" >/dev/null 2>&1
   done
-  ls "$MC" >/dev/null 2>&1                       # 让挂载点建立本地节点
+  # ★ M46：先 `sync --once` 再 `ls`/`cat`。轮询已暂停时挂载点吃的是**暂停前的旧清单**
+  #   （里面没有刚 put 的 keep1-6）—— 旧顺序（先 ls/cat 再 sync）根本建不出本地节点，
+  #   keep1 从未水合，熔断断言查的是不存在的文件（真机 3 轮复现的 M2c-3/3b 假失败）。
+  #   先跑一轮对账把新清单推给挂载点，节点才建得出来。
+  "$QS" sync --once >/dev/null 2>&1              # 采纳 baseline + 推新清单（keep1-6 进快照）
+  ls "$MC" >/dev/null 2>&1                       # 现在才建本地节点
   cat "$MC/keep1.txt" >/dev/null 2>&1            # keep1 水合（有本地缓存）
-  "$QS" sync --once >/dev/null 2>&1              # 采纳 baseline
   for i in 1 2 3 4 5; do
     "$QS" --direct rm "$M2C" "keep$i.txt" >/dev/null 2>&1
   done
@@ -472,23 +485,30 @@ else
   "$QS" sync --max-deletes 50 >/dev/null 2>&1
 
   # ---- M2c-4 冲突副本：远端/本地都改 → 远端占原名，本地内容另存副本并上传
+  # ★ M46 重排（确定性冲突）：旧顺序「等上传完成 → 改远端 → sync」永远构不出冲突 ——
+  #   上传落地时 success hook 已把 baseline 推进到本地签名，远端再变只是 RefreshRemote
+  #   （真机日志实锤：updating=1，冲突计数 0）。现在用 QXNYC_TEST_UPLOAD_HOLD_MS 把
+  #   上传摄在 hold 窗口里，窗口内改远端 → 本地仍是「未上传的改动」→ 三向判定必为
+  #   Conflict；resolve_conflict 会取消被 hold 的作业、等它醒来丢弃、再重判。
   printf 'BASE-CONTENT\n' >"$RUNDIR/m2c-cf-base.bin"
   "$QS" --direct put "$RUNDIR/m2c-cf-base.bin" "$M2C" --name cf.txt >/dev/null 2>&1
   "$QS" sync --interval 0 --once >/dev/null 2>&1     # baseline = BASE
   cat "$MC/cf.txt" >/dev/null 2>&1                    # 水合（本地有节点）
   head -c 4194304 /dev/zero | tr '\0' 'L' >"$RUNDIR/m2c-cf-local.bin"   # 4 MiB 本地改动
-  cp "$RUNDIR/m2c-cf-local.bin" "$MC/cf.txt"          # 脏 + 入队上传
-  wait_upload=0
-  for _ in $(seq 1 240); do
+  cp "$RUNDIR/m2c-cf-local.bin" "$MC/cf.txt"          # 脏 + 入队上传（被 hold 摄住）
+  # 前置：本地改动确实被队列接住了（在途/待传，而不是已传完）
+  held=0
+  for _ in $(seq 1 20); do
     "$QS" status >"$RUNDIR/m2c-up.txt" 2>&1
-    if grep -q '上传队列.*待上传 0｜上传中 no｜完成 [1-9]' "$RUNDIR/m2c-up.txt"; then wait_upload=1; break; fi
+    if grep -qE '上传队列.*(待上传 [1-9]|上传中 yes)' "$RUNDIR/m2c-up.txt"; then held=1; break; fi
     sleep 0.5
   done
+  # hold 窗口内改远端（本地改动还没传上去 —— 这才是「双方都改」）
   printf 'REMOTE-AFTER\n' >"$RUNDIR/m2c-cf-remote.bin"
   "$QS" --direct put "$RUNDIR/m2c-cf-remote.bin" "$M2C" --name cf.txt >/dev/null 2>&1
   "$QS" sync --once >"$RUNDIR/m2c-conflict.txt" 2>&1
-  echo "  冲突：本地已上传=$wait_upload  $(grep -o '冲突 [1-9][0-9]*' "$RUNDIR/m2c-conflict.txt" | head -1)"
-  check "$([ "$wait_upload" = 1 ] && echo 0 || echo 1)" "M2c-4 本地 4 MiB 改动已上传（冲突前置）"
+  echo "  冲突：本地改动在途=$held  $(grep -o '冲突 [1-9][0-9]*' "$RUNDIR/m2c-conflict.txt" | head -1)"
+  check "$([ "$held" = 1 ] && echo 0 || echo 1)" "M2c-4 本地 4 MiB 改动在途（冲突前置，hold 摄住）"
   check "$(grep -qE '冲突 [1-9]' "$RUNDIR/m2c-conflict.txt" && echo 0 || echo 1)" "M2c-4b 引擎识别冲突并生成副本（冲突计数 ≥ 1）"
   "$QS" --direct get "$M2C" cf.txt -o "$RUNDIR/m2c-cf-orig.out" >/dev/null 2>&1
   if cmp -s "$RUNDIR/m2c-cf-orig.out" "$RUNDIR/m2c-cf-remote.bin"; then
@@ -496,9 +516,27 @@ else
   else
     bad "M2c-4c 原名内容不是远端版本"
   fi
+  # ★ M46：等冲突副本真正传上去（队列排空）再判定与收尾。上一轮没等这一步，
+  #   收尾就把 mx2 删了：副本作业在后续 daemon 里对已删目录无限重试（status=20），
+  #   M3 的队列永远排不空（M3-4b/4c/5b 连带失败），mnt-m2c 的卸载被在途作业拖死、
+  #   mounts.json 记录没清掉 —— 每个新 daemon 都恢复它，M23 的 Baloo 门禁看到
+  #   这个未排除的挂载点把保存全拒（M23-2b/3* 连带失败）。WAN 抖动时 4 MiB 也要
+  #   传 80s+（真机实测），所以预算给足 240s。
+  drained=0
+  for _ in $(seq 1 120); do
+    "$QS" status >"$RUNDIR/m2c-drain.txt" 2>&1
+    if grep -q '上传队列.*待上传 0｜上传中 no' "$RUNDIR/m2c-drain.txt"; then drained=1; break; fi
+    sleep 2
+  done
+  check "$([ "$drained" = 1 ] && echo 0 || echo 1)" "M2c-4e 冲突副本已上传（队列排空）"
+  # 排空后推一轮清单：副本在远端了，sync 把它带进挂载点（apply_listing），
+  # M2c-4d 的 cat 才读得到（副本节点不是本地建的，只能从远端清单物化）。
+  "$QS" sync --once >/dev/null 2>&1
   copy_ok=0; copy_name=""
-  for _ in $(seq 1 60); do
-    [ -n "$copy_name" ] || copy_name=$(ls "$MC" 2>/dev/null | grep 'conflicted copy' | head -1)
+  for _ in $(seq 1 30); do
+    # ★ M46：锚定 cf 的副本名 —— NAS 夹具跨轮存活，上一轮残留的别的冲突副本
+    #   （真机见过 r.txt 的）会被宽 grep 捞进来，`head -1` 锁死在错误名字上。
+    [ -n "$copy_name" ] || copy_name=$(ls "$MC" 2>/dev/null | grep '^cf (conflicted copy' | head -1)
     if [ -n "$copy_name" ] && cat "$MC/$copy_name" >"$RUNDIR/m2c-cf-copy.out" 2>/dev/null \
        && cmp -s "$RUNDIR/m2c-cf-copy.out" "$RUNDIR/m2c-cf-local.bin"; then
       copy_ok=1; break
@@ -540,6 +578,7 @@ else
   unmount_retry "$MNTC"
 fi
 "$QS" daemon stop >/dev/null 2>&1
+unset QXNYC_TEST_UPLOAD_HOLD_MS        # ★ M46：hold 只服务 M2c-4，别漏给后面的 daemon
 
 echo
 echo "=== M3 脱水（先 inval_inode 再清内容 + 安全检查链 + 闲置/限额 + direct 模式）==="

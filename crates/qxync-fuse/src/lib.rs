@@ -4205,7 +4205,25 @@ impl QxyncFs {
         queue.set_progress_hook(Arc::new(move |remote: &str, p: Option<(u64, u64)>| {
             note_node_progress(&inner, remote, p);
         }));
-        self.upload = Some(queue);
+        self.upload = Some(queue.clone());
+        // ★ M46：**默认 success hook** —— 上传成功后把三件「FUSE 侧的事实」做掉：
+        //   ① 清单条目刷成这版签名（note_uploaded_listing）；
+        //   ② `remote_known = true`（mark_remote_known，含持久化证据）；
+        //   ③ 队列里没有下一版时清掉 dirty（clear_dirty）。
+        //
+        //   为什么必须有默认版：success hook 以前**只在 daemon 挂载时接线**
+        //   （daemon.rs 的 set_success_hook），直连模式（CLI `qxync mount`，没有
+        //   daemon）上传成功后 `remote_known` 永远停在 `false` —— 紧接着的
+        //   改名/删除会被判成「远端没有老副本」走**纯本地**分支：NAS 上留着旧名字、
+        //   删除也跳过远端（真机复现：`mv` 后 NAS 仍是 `rn-a.txt`，`rn-b.txt`
+        //   从未出现）。daemon 挂载时会用带 baseline 推进的完整 hook **覆盖**这里，
+        //   所以 daemon 行为一个字节不变。
+        let h = self.handle();
+        queue.set_success_hook(Arc::new(move |remote: &str, sig: (u64, i64)| {
+            h.note_uploaded_listing(remote, sig.0, sig.1);
+            h.mark_remote_known(remote);
+            h.clear_dirty(remote);
+        }));
         self
     }
 

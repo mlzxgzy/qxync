@@ -9073,6 +9073,109 @@ mod tests {
 
     // ------------------------------------------------- ★ M41 日志降噪（daemon 侧）
 
+    /// ★ M46 探针（`#[ignore]`，真机）：跨目录 move + rename 两步落地后，
+    /// stat / list / download 三条通道各自要多久才能看见**新名字**。
+    ///
+    /// 背景：fuse-matrix 的「跨目录 move + 改名生效」用 stat 当 oracle，真机 3 轮
+    /// 复现 60s 内 stat 都看不见 `m2.txt`、但紧随其后的 download 能取到正确内容 ——
+    /// 怀疑是 NAS 侧 move+rename 的**可见性延迟**（数据没丢，只是 stat 的索引慢）。
+    /// 这个探针把三条通道的可见时间打出来，给 fuse-matrix 选对 oracle 用。
+    /// 只动 `/home/qxync-test/m46-probe` 下的临时文件，结束即清理。
+    #[tokio::test]
+    #[ignore]
+    async fn m46_move_rename_visibility_probe() {
+        let Some(client) = logged_in().await else {
+            println!("跳过：没有 QXNYC_TEST_* 环境变量");
+            return;
+        };
+        let root = fixture_root();
+        let dir = format!("{root}/m46-probe");
+        let _ = client.mkdir(&root, "m46-probe").await;
+        let _ = client.mkdir(&dir, "a").await;
+        let _ = client.mkdir(&dir, "b").await;
+        let content = b"M46-PROBE-MOVABLE\n".to_vec();
+        client
+            .upload_bytes(&format!("{dir}/a"), "m.txt", content.clone())
+            .await
+            .expect("上传探针文件失败");
+
+        // 与 FUSE rename 的在线路径同一套两步：move（保持原名）→ 目标目录里 rename
+        client
+            .move_into(&format!("{dir}/a"), "m.txt", &format!("{dir}/b"))
+            .await
+            .expect("move 失败");
+        client
+            .rename(&format!("{dir}/b"), "m.txt", "m2.txt")
+            .await
+            .expect("rename 失败");
+
+        let t0 = std::time::Instant::now();
+        let (mut stat_ok, mut list_ok, mut get_ok) = (None, None, None);
+        for _ in 0..36 {
+            // stat：占位条目 exist=0 也算「看不见」
+            if stat_ok.is_none()
+                && client
+                    .stat(&format!("{dir}/b"), "m2.txt")
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some()
+            {
+                stat_ok = Some(t0.elapsed().as_secs_f64());
+            }
+            // list：目录清单里出现新名字
+            if list_ok.is_none() {
+                if let Ok(entries) = client.list(&format!("{dir}/b")).await {
+                    if entries.iter().any(|e| e.filename == "m2.txt" && e.exist) {
+                        list_ok = Some(t0.elapsed().as_secs_f64());
+                    }
+                }
+            }
+            // download：数据面直接取内容
+            if get_ok.is_none() {
+                let dest = std::env::temp_dir().join("qxync-m46-probe-get.bin");
+                if let Ok(n) = client
+                    .download_to_file(&format!("{dir}/b"), "m2.txt", &dest)
+                    .await
+                {
+                    let got = std::fs::read(&dest).unwrap_or_default();
+                    if n as usize == content.len() && got == content {
+                        get_ok = Some(t0.elapsed().as_secs_f64());
+                    }
+                }
+            }
+            if stat_ok.is_some() && list_ok.is_some() && get_ok.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2_000)).await;
+        }
+        println!(
+            "★ M46 move+rename 可见性：stat={}s list={}s get={}s",
+            stat_ok
+                .map(|v| format!("{v:.1}"))
+                .unwrap_or_else(|| ">72".into()),
+            list_ok
+                .map(|v| format!("{v:.1}"))
+                .unwrap_or_else(|| ">72".into()),
+            get_ok
+                .map(|v| format!("{v:.1}"))
+                .unwrap_or_else(|| ">72".into()),
+        );
+
+        // 清理（尽力而为；残留由 fuse-matrix 的夹具清理兜底）
+        let _ = client.delete_entry(&format!("{dir}/b"), "m2.txt").await;
+        let _ = client.delete_entry(&dir, "b").await;
+        let _ = client.delete_entry(&dir, "a").await;
+        let _ = client.delete_entry(&root, "m46-probe").await;
+
+        // 探针本身不做强断言（它就是用来**测量**的）；只有数据面 72s 都取不到
+        // 才说明 move 真失败了 —— 那是产品 bug，不是可见性问题。
+        assert!(
+            get_ok.is_some(),
+            "move+rename 后 72s 内数据面仍取不到内容 —— 不是可见性延迟，是 move 失败"
+        );
+    }
+
     /// ★ M41：轮询汇总行只有「本轮真有动作」才值得 INFO（空转由 10 分钟心跳兜底）。
     ///
     /// 真机证据：空转轮次一天 1449 行 / 280 KB，内容几乎逐字节相同。

@@ -89,6 +89,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **900s timeout to 72 passed / 5 failed (744s)**; the remaining five are cross-directory-move
   visibility and M2c circuit-breaker/conflict timing cases, recorded honestly in the doc with a
   follow-up proposal for deterministic injection points.
+- **E2E acceptance: the five remaining fuse-tier failures fully diagnosed and fixed
+  ([M46 §6.5](docs/M46-端到端验收的守护隔离与提速.md))**: the previously suspected "NAS-side
+  move visibility delay" was **disproven** by a real-machine probe
+  (`m46_move_rename_visibility_probe`) — after a pure two-step HTTP move+rename, stat/list/get
+  all see the new name within 0.1–0.3s; the problem was entirely in our own pipeline. Four fixes:
+  ① **Product bug: direct-mode mounts (CLI `qxync mount`, no daemon) diverge from the NAS on
+  rename/delete** — the upload success hook was only wired in daemon mode, so in direct mode
+  `remote_known` stayed `false` forever and renames took the "no remote copy" local-only branch
+  (minimal repro: after `mv`, the NAS keeps the old name and never sees the new one). Fix:
+  `with_upload_queue` now installs a default success hook (listing entry refresh +
+  `remote_known=true` + clear-dirty); daemon mounts override it with the full hook, so daemon
+  behavior is byte-identical. ② M2c-3's circuit-breaker assertion was checking a keep1 that
+  **never existed** (`sync --once` came after `ls`/`cat`, so with polling paused the mount served
+  the stale listing) — reordered. ③ M2c-4's "conflict" could **never be constructed** (waiting
+  for the upload to finish lets the hook advance the baseline, so a later remote change is just
+  a RefreshRemote) — now uses `QXNYC_TEST_UPLOAD_HOLD_MS=20000` to hold the upload and change
+  the remote inside the window, making the conflict deterministic. ④ Two **false passes**:
+  `$RUNDIR`-persistent `mx-mv.out` made `cmp` pass against a stale file when get failed, and a
+  leftover conflict copy from a previous round polluted `grep 'conflicted copy'` — fixed with
+  `rm -f` before get and anchoring the grep to `^cf (conflicted copy`. ⑤ **One stuck job
+  poisoned three sections**: M2c-4's conflict-copy upload stalled 80s+ on the WAN and the
+  cleanup did not wait for the queue — the mount record was never cleared, every later daemon
+  restored mnt-m2c, M3's queue retried forever against the deleted directory (M3-4b/4c/5b
+  cascade failures), and M23's Baloo gate rejected every save because of the unexcluded
+  mount point (M23-2b/3* cascade failures). Fix: settle inside the M2c-4 section — a new
+  M2c-4e assertion waits for the queue to drain (240s budget), then one more `sync --once`
+  pushes the listing before checking 4d, so the cleanup runs with an empty queue, unmounts
+  cleanly, and clears the record.
 
 ## [0.8.0] - 2026-10-28
 
