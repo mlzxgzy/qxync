@@ -69,6 +69,27 @@
   m84 99/0、m5 30/0、m7 60/0**，全程桌面 daemon pid 不变。`fuse` 从「900s 超时」变为
   **72 通过 / 5 失败（744s）**，剩余 5 项集中在跨目录 move 可见性与 M2c 熔断/冲突时序，
   文档 §6 如实记录并给了确定性注入点的后续方案。
+- **端到端验收：fuse 档剩余 5 项失败全部定位并修复（[M46 §6.5](docs/M46-端到端验收的守护隔离与提速.md)）**：
+  上一轮怀疑的「NAS 侧 move 可见性延迟」被真机探针
+  （`m46_move_rename_visibility_probe`）**证伪**——纯 HTTP 两步 move+rename 后
+  stat/list/get 全部 0.1～0.3s 可见，问题全在我们自己链路。挖出并修掉四件事：
+  ① **产品 bug：直连挂载（CLI `qxync mount`，不经 daemon）的改名/删除与 NAS 分叉** ——
+  上传成功的 success hook 只在 daemon 挂载时接线，直连模式 `remote_known` 永远停在
+  `false`，改名被判成「远端没有老副本」走纯本地分支（最小复现：`mv` 后 NAS 上旧名字
+  原样留着、新名字从未出现）。修法：`with_upload_queue` 装默认 success hook（清单条目
+  刷签名 + `remote_known=true` + 清脏），daemon 挂载时用完整 hook 覆盖、行为不变。
+  ② M2c-3 熔断断言查的 keep1 **从未存在**（`sync --once` 放在 `ls`/`cat` 之后，轮询已
+  暂停、挂载点吃的是旧清单）——重排顺序。③ M2c-4 的「冲突」**永远构不出来**（等上传
+  完成后 baseline 已被 hook 推进，远端再变只是 RefreshRemote）——改用
+  `QXNYC_TEST_UPLOAD_HOLD_MS=20000` 把上传 hold 摄住、窗口内改远端，冲突变成确定性
+  构造。④ 两处**假通过**：`$RUNDIR` 跨轮存活的 `mx-mv.out` 让 get 失败时 `cmp` 对着
+  旧文件报「内容一致」；NAS 夹具里上一轮残留的冲突副本污染 `grep 'conflicted copy'`——
+  分别改为 get 前 `rm -f`、锚定 `^cf (conflicted copy`。⑤ **一条卡住的作业毒化三个段**：
+  M2c-4 的冲突副本上传在 WAN 上卡了 80s+，收尾没等队列 → 挂载记录没清掉、每个新
+  daemon 都恢复 mnt-m2c → M3 的队列对已删目录无限重试（M3-4b/4c/5b 连带失败）、
+  M23 的 Baloo 门禁看到未排除的挂载点把保存全拒（M23-2b/3* 连带失败）——修法是
+  M2c-4 段内闭环：新增 M2c-4e 等队列排空（240s 预算）+ 排空后推一轮清单再判 4d，
+  收尾时队列已空、卸载干净、记录清掉。
 
 ## [0.8.0] - 2026-10-28
 
