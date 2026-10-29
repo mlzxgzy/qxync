@@ -102,7 +102,8 @@ purge_all() {
   done < <(remote_names)
 }
 
-stop_daemon(){ [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null; pkill -x qxyncd 2>/dev/null; sleep 0.6; rm -f "$SOCK"; DAEMON_PID=""; }
+# 只停本脚本 socket 上的 daemon；**不用 pkill -x qxyncd**（会连用户桌面正在同步的那台一起杀，M45 修）
+stop_daemon(){ [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null; "$QS" --socket "$SOCK" daemon stop --force >/dev/null 2>&1 || true; sleep 0.6; rm -f "$SOCK"; DAEMON_PID=""; }
 start_daemon() { # $1 = 额外环境变量串（可空），$2 = 额外参数
   stop_daemon
   # shellcheck disable=SC2086
@@ -231,7 +232,9 @@ if [ "$NO_GUI" = "1" ] || [ ! -x "$GUI" ]; then
   skip "托盘/通知（--no-gui 或缺 $GUI）"
 else
   start_daemon "" ""; login
-  pkill -x qxync-gui 2>/dev/null; sleep 0.5
+  # 只收自己的窗口；不再 pkill -x qxync-gui（会把用户托盘一起带走）
+  [ -n "${GUI_PID:-}" ] && { kill "$GUI_PID" 2>/dev/null; wait "$GUI_PID" 2>/dev/null; GUI_PID=""; }
+  sleep 0.2
   # 矩阵全局 RUST_LOG=warn 会吞掉 info 级的「托盘可用」判据 → 这里单独放开 qxync_gui 模块
   RUST_LOG="qxync_gui=info,warn" "$GUI" >"$RUNDIR/gui-tray.log" 2>&1 &
   GUI_PID=$!

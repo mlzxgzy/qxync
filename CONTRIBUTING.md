@@ -50,7 +50,10 @@ cargo clippy --workspace --all-targets
 cargo test --workspace
 ```
 
-**改了这些路径，必须附上对应验收矩阵的复跑结果**（脚本在 `xtask/tests/`）：
+**发版/大改动前先跑统一入口**：`bash xtask/tests/e2e.sh`（gate 档 = 单测 + 格式 + 隔离 e2e，
+实测 ~24s）。**改了这些路径，还必须附上对应验收矩阵的复跑结果**（脚本在 `xtask/tests/`；
+可以用 `bash xtask/tests/e2e.sh --only <套件>` 或 `--tier gui|fuse|nas` 点跑，
+`--list` 看全部套件，见 [`docs/M45`](docs/M45-端到端测试入口合并.md)）：
 
 | 改了什么 | 必须跑 |
 |---|---|
@@ -154,8 +157,11 @@ cargo clippy --workspace --all-targets
 cargo test --workspace
 ```
 
-**If you touched any of the paths below, attach the corresponding acceptance-matrix run**
-(scripts in `xtask/tests/`):
+**Before a release or a large change, run the unified entry point**:
+`bash xtask/tests/e2e.sh` (gate tier = unit tests + formatting + isolated e2e, ~24s).
+**If you touched any of the paths below, you must also attach the corresponding matrix run**
+(scripts live in `xtask/tests/`; run a subset with `bash xtask/tests/e2e.sh --only <suite>` or
+`--tier gui|fuse|nas`, list them with `--list` — see [`docs/M45`](docs/M45-端到端测试入口合并.md)):
 
 | You changed | You must run |
 |---|---|

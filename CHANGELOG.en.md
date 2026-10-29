@@ -38,6 +38,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cases: ghost cleanup + conservative boundary); `cargo fmt --all --check` 0 diff. Real-machine
   check pending deployment (first round should log "清理失效目录 …").
 
+### Changed
+
+- **End-to-end acceptance collapsed into one entry point; running it no longer kills your own
+  daemon ([M45](docs/M45-端到端测试入口合并.md))**: the user asked "can all the e2e be simplified
+  or merged — the pre-release test run takes too long now". The audit showed individual suites are
+  not slow (1–16s for isolated ones); the cost was in *how* they were run: 19 shell scripts plus 3
+  node suites had to be invoked by hand, serially, each with its own environment requirements, and
+  `gui-matrix` re-ran four of its sub-suites internally. Worse, `gui-matrix` / `m82` / `m83` / `m84`
+  contained 8 `pkill -x qxyncd` / `pkill -x qxync-gui` calls — **one acceptance run killed the
+  developer's own syncing daemon and tray** (real incident on 2026-10-29), and `gui-matrix` started
+  its daemon on a non-default socket, so its negative control permanently failed on any desktop
+  where a daemon *was* running. Fixes: ① new `xtask/tests/e2e.sh` entry point — suite registry, five
+  tiers (`gate` = unit + isolated e2e, `fast`, `gui`, `fuse`, `nas`), capability-based SKIPs,
+  parallel `fast` tier, no re-running of suites already covered by a bigger matrix, one summary
+  table, failed logs appended automatically, and **daemon protection** (if a suite takes down your
+  daemon the entry point exits 3 and names the likely culprit); ② those four scripts now only stop
+  the daemon on their own socket and only close their own windows; ③ `gui-matrix` gets a private
+  `XDG_RUNTIME_DIR` (daemon listens on the default socket the GUI actually uses) plus a private
+  config copy (only this link, stale NAS identity and duplicate-link leftovers cleared); ④ CI's
+  seven e2e/node steps become one: `e2e.sh --tier fast --jobs 4`. The default gate measures **24s**
+  (same set used to take ~28s serially and re-ran nested suites); `gui-matrix --no-window` went from
+  3 failures to **43/43** while leaving the maintainer's daemon pid untouched. The real-machine
+  `fuse` / `nas` tiers were not run this round (no `/dev/fuse` here, and they write to the real NAS
+  test folder); the entry point SKIPs them explicitly.
+
 ## [0.8.0] - 2026-10-28
 
 ### Added

@@ -37,8 +37,10 @@
   贴真实输出，不要只写「测试通过」。
   改了 FUSE / 同步 / 状态库 / 多根 / 规则 / 任务 / 设置 / ui 的，请附对应矩阵结果，例如：
 
-  xtask/tests/fuse-matrix.sh        → 68/68 全过
-  cargo test --workspace            → 全绿
+  bash xtask/tests/e2e.sh                  → gate：通过 10 / 跳过 1 / 失败 0（24s）
+  bash xtask/tests/e2e.sh --tier fuse      → fuse 档（缺 /dev/fuse 会 SKIP 并说明）
+  bash xtask/tests/e2e.sh --only m42-search → 单个套件
+  （`--list` 看全部套件；档位/依赖/映射表见 docs/M45-端到端测试入口合并.md）
 
   跑不了的矩阵请直接说明原因（没有 NAS / 没有 /dev/fuse / 没有 DISPLAY），
   不要假装跑过。

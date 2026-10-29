@@ -55,14 +55,16 @@ DAEMON_PID=""
 Q() { "$QS" --socket "$SOCK" "$@"; }
 jqr() { jq -r "$1" 2>/dev/null; }
 start_daemon() {
-  pkill -x qxyncd 2>/dev/null; sleep 0.4; rm -f "$SOCK"
+  # 只停「占着本脚本 socket」的那台；**不用 pkill -x qxyncd**（会连用户桌面守护一起杀，M45 修）
+  "$QS" --socket "$SOCK" daemon stop --force >/dev/null 2>&1 || true
+  sleep 0.4; rm -f "$SOCK"
   # shellcheck disable=SC2086
   "$DAEMON" --link "$LINK" --socket "$SOCK" --foreground $1 >>"$LOG" 2>&1 &
   DAEMON_PID=$!
   for _ in $(seq 1 60); do [ -S "$SOCK" ] && return 0; sleep 0.25; done
   return 1
 }
-stop_daemon(){ [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null; pkill -x qxyncd 2>/dev/null; sleep 0.6; rm -f "$SOCK"; DAEMON_PID=""; }
+stop_daemon(){ [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null; "$QS" --socket "$SOCK" daemon stop --force >/dev/null 2>&1 || true; sleep 0.6; rm -f "$SOCK"; DAEMON_PID=""; }
 trap 'stop_daemon; fusermount3 -u "$MNT" 2>/dev/null' EXIT
 
 if [ ! -x "$DAEMON" ] || [ ! -x "$QS" ]; then echo "❌ 缺少二进制，先 cargo build --workspace"; exit 1; fi
