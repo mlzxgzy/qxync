@@ -71,7 +71,9 @@ Q() { "$QS" --socket "$SOCK" "$@"; }
 jqv() { jq -r "$1" 2>/dev/null; }
 
 start_daemon() {  # $1: 额外参数（如 --restore-tasks / --auto-login）
-  pkill -x qxyncd 2>/dev/null; sleep 0.4; rm -f "$SOCK"
+  # 只停「占着本脚本 socket」的那台；**不用 pkill -x qxyncd**（会连用户桌面守护一起杀，M45 修）
+  "$QS" --socket "$SOCK" daemon stop --force >/dev/null 2>&1 || true
+  sleep 0.4; rm -f "$SOCK"
   # shellcheck disable=SC2086
   "$DAEMON" --link "${QXNYC_TEST_LINK:-default}" --socket "$SOCK" --foreground $1 >>"$LOG" 2>&1 &
   DAEMON_PID=$!
@@ -80,7 +82,7 @@ start_daemon() {  # $1: 额外参数（如 --restore-tasks / --auto-login）
 }
 stop_daemon() {
   [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null
-  pkill -x qxyncd 2>/dev/null
+  "$QS" --socket "$SOCK" daemon stop --force >/dev/null 2>&1 || true
   sleep 0.6; rm -f "$SOCK"; DAEMON_PID=""
 }
 trap 'stop_daemon; for m in "$MNT1" "$MNT2"; do fusermount3 -u "$m" 2>/dev/null; done' EXIT

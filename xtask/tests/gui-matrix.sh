@@ -11,6 +11,14 @@
 #   * 真机凭据：先 `qxync login`（本脚本只读 $XDG_CONFIG_HOME/qxync/ 下的 link + credentials）
 #   * 窗口项额外需要：DISPLAY + xdotool + ImageMagick（import/identify/compare）
 #
+# ★ M45（2026-10-29）两条重要变化：
+#   1. **不再执行 `pkill -x qxyncd` / `pkill -x qxync-gui`**：以前这套矩阵约定「独占本机
+#      daemon」，结果跑一次验收就把用户正在同步的守护和托盘一起杀掉（真事故）。现在只停
+#      自己 socket 上的 daemon、只收自己的窗口。
+#   2. **私有 XDG_RUNTIME_DIR**：GUI 只按 `$XDG_RUNTIME_DIR/qxync/qxyncd.sock` 认 default
+#      daemon，所以脚本把自己的 daemon 就起在这个默认路径上（不再是 `$RUNDIR/*.sock`），
+#      你桌面那台与它互不可见。Wayland socket / dbus 总线用符号链接透传，窗口照常能开。
+#
 # 验的是什么:
 #   1. `qxync-gui --self-test`：前端资源真的嵌进二进制了 + GUI 自己的 IPC 通道能拿到
 #      daemon 状态、真实 NAS 的 ls、挂载表、同步状态（这四条就是 GUI 的数据源）；
@@ -37,7 +45,6 @@ GUI="$REPO/target/debug/qxync-gui"
 DAEMON="$REPO/target/debug/qxyncd"
 QS="$REPO/target/debug/qxync"
 RUNDIR="${QXNYC_TEST_RUNDIR:-$REPO/.local-run}"
-SOCK="$RUNDIR/gui-matrix.sock"
 SHOTS="$RUNDIR/gui-shots"
 LINK="${QXNYC_TEST_LINK:-default}"
 LOG="$RUNDIR/gui-matrix.log"
@@ -54,12 +61,48 @@ for a in "$@"; do
   esac
 done
 
-export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$RUNDIR/config}"
+# ★ 私有配置副本（M45）：真机凭据从 $SRC_CFG 复制一份**只含本连接**的副本过来。
+#   两个原因：① login_flow 见到「同 host/端口/账号的第二个连接」会直接拒绝登录
+#   （`.local-run/config` 里常留着 m6.json 这类历史连接）；② 自检会写 link/凭据 ——
+#   直接跑在源配置上等于让验收改你的真实配置。跑完只影响 $RUNDIR/guicfg 这份副本。
+#   源配置默认是**测试连接**目录 `$REPO/.local-run/config`（与旧行为一致，绝不隐式拿 ~/.config
+#   里的主账号跑验收）；显式设了 XDG_CONFIG_HOME / QXNYC_TEST_SRC_CONFIG 才用你指定的。
+SRC_CFG="${QXNYC_TEST_SRC_CONFIG:-${XDG_CONFIG_HOME:-$REPO/.local-run/config}}"
+if [ ! -f "$SRC_CFG/qxync/links/$LINK.json" ]; then
+  echo "❌ 没有连接配置 $SRC_CFG/qxync/links/$LINK.json —— 先跑一次："
+  echo "   XDG_CONFIG_HOME=$SRC_CFG cargo run -p qxync-cli -- --host <NAS> --port 9834 --insecure --user <用户> --password '<口令>' login"
+  exit 2
+fi
+export XDG_CONFIG_HOME="$RUNDIR/guicfg"
+rm -rf "$XDG_CONFIG_HOME"; mkdir -p "$XDG_CONFIG_HOME/qxync/links"
+cp -f "$SRC_CFG/qxync/links/$LINK.json" "$XDG_CONFIG_HOME/qxync/links/$LINK.json"
+[ -f "$SRC_CFG/qxync/credentials.json" ] && cp -f "$SRC_CFG/qxync/credentials.json" "$XDG_CONFIG_HOME/qxync/"
+[ -f "$SRC_CFG/qxync/links/$LINK.credentials.json" ] && cp -f "$SRC_CFG/qxync/links/$LINK.credentials.json" "$XDG_CONFIG_HOME/qxync/links/"
 export XDG_DATA_HOME="${XDG_DATA_HOME:-$RUNDIR/data}"
 export XDG_STATE_HOME="${XDG_STATE_HOME:-$RUNDIR/state}"
-export QXNYC_SOCKET="$SOCK"
+# ★ 清掉上次留下的 NAS 身份记录（M45）：本矩阵的状态目录是 .local-run 下的一次性目录，
+#   而 M40 的身份守卫把「UID 与上次不同」当另一台 NAS 拦掉 —— 换过 NAS / 固件升级 /
+#   旧夹具都会留下过期 UID，矩阵就变成「时好时坏」。清掉后第一轮登录重新登记。
+#   只清身份文件，不动 sync.db（避免一次全量重扫）。
+rm -rf "$XDG_STATE_HOME/qxync/link-identity"
 export RUST_LOG="${RUST_LOG:-warn}"
 DAEMON_PID=""; GUI_PID=""
+
+# ★ 私有 XDG_RUNTIME_DIR：本脚本的 daemon 就起在「default socket」路径上，GUI 找得到它；
+#   同时与用户桌面上的 qxyncd 完全隔离（各占各的 $XDG_RUNTIME_DIR/qxync/）。
+#   注意：Wayland socket / 会话 bus 在 runtime 目录下，必须符号链接透传，否则 GUI 开不出窗口。
+REAL_RUNTIME="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export XDG_RUNTIME_DIR="$RUNDIR/runtime"
+mkdir -p "$XDG_RUNTIME_DIR/qxync"
+chmod 700 "$XDG_RUNTIME_DIR"
+for _e in "$REAL_RUNTIME"/*; do
+  [ -e "$_e" ] || continue
+  _b="$(basename "$_e")"
+  [ "$_b" = "qxync" ] && continue
+  [ -e "$XDG_RUNTIME_DIR/$_b" ] || ln -s "$_e" "$XDG_RUNTIME_DIR/$_b" 2>/dev/null || true
+done
+SOCK="$XDG_RUNTIME_DIR/qxync/qxyncd.sock"
+export QXNYC_SOCKET="$SOCK"
 
 PASS=0; FAIL=0
 ok()   { echo "  ✅ $1"; PASS=$((PASS+1)); }
@@ -72,10 +115,9 @@ mkdir -p "$RUNDIR" "$SHOTS"
 cleanup() {
   [ -n "$GUI_PID" ] && kill "$GUI_PID" 2>/dev/null
   [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null
-  pkill -x qxync-gui 2>/dev/null
   # --self-test-login 里的 login_flow 会自己拉起 daemon（pid 不在脚本手里）→ 一并收掉。
-  # 本脚本约定独占本机 qxyncd（第 1 步已经 pkill 过一次），所以这里是安全的。
-  pkill -x qxyncd 2>/dev/null
+  # 只停「本脚本私有 runtime 里的 default socket」这一台 —— 不再 pkill 全局进程名（M45）。
+  "$QS" --socket "$SOCK" daemon stop --force >/dev/null 2>&1 || true
   sleep 0.3
   rm -f "$SOCK"
   return 0
@@ -89,12 +131,7 @@ for b in "$GUI" "$DAEMON" "$QS"; do
   [ -x "$b" ] || { echo "  ❌ 缺少可执行文件 $b（先 CARGO_HOME=\$PWD/.cargo-home cargo build --workspace）"; miss=1; }
 done
 check "$miss" "三个二进制都在（qxync-gui / qxyncd / qxync）"
-if [ ! -f "$XDG_CONFIG_HOME/qxync/links/$LINK.json" ]; then
-  echo "  ❌ 没有连接配置 $XDG_CONFIG_HOME/qxync/links/$LINK.json —— 先跑一次："
-  echo "     XDG_CONFIG_HOME=$XDG_CONFIG_HOME cargo run -p qxync-cli -- --host <NAS> --port 9834 --insecure --user <用户> --password '<口令>' login"
-  exit 2
-fi
-ok "连接配置存在（$LINK.json）"
+check "$([ -f "$XDG_CONFIG_HOME/qxync/links/$LINK.json" ] && echo 0 || echo 1)" "连接配置已复制到私有目录（源：$SRC_CFG，$LINK.json）"
 [ "$NO_WINDOW" = "1" ] && skip "窗口/截图项（--no-window）" || true
 if [ "$NO_WINDOW" = "0" ] && { [ -z "${DISPLAY:-}" ] || ! command -v xdotool >/dev/null || ! command -v import >/dev/null; }; then
   echo "  ⚠️  没有 DISPLAY / xdotool / import → 自动跳过窗口与截图项"
@@ -106,7 +143,7 @@ fi
 
 # ---------------------------------------------------------------- 起 daemon + 登录
 echo "== 1. daemon + 登录 =="
-pkill -x qxyncd 2>/dev/null; rm -f "$SOCK"; sleep 0.5
+"$QS" --socket "$SOCK" daemon stop --force >/dev/null 2>&1 || true; rm -f "$SOCK"; sleep 0.5
 "$DAEMON" --link "$LINK" --socket "$SOCK" --foreground >"$LOG" 2>&1 &
 DAEMON_PID=$!
 ready=1
@@ -261,7 +298,8 @@ echo "== 3. 真窗口（$(echo $TABS | wc -w) 个目的地） =="
 # 起一次 GUI、等窗口、截图、做尺寸/非空白断言。$1=QXNYC_GUI_TAB 值 $2=输出 png $3=日志/文件名 slug
 shot_page() {
   local t="$1" out="$2" slug="$3" wid=""
-  pkill -x qxync-gui 2>/dev/null; sleep 0.6
+  [ -n "$GUI_PID" ] && { kill "$GUI_PID" 2>/dev/null; wait "$GUI_PID" 2>/dev/null; GUI_PID=""; }
+  sleep 0.2
   QXNYC_GUI_TAB="$t" "$GUI" >"$RUNDIR/gui-window-$slug.log" 2>&1 &
   GUI_PID=$!
   for _ in $(seq 1 40); do
@@ -324,7 +362,8 @@ else
 
   # 3c. ★ M8.6：键盘可达性 —— Tab 一次，skip-link/焦点环必须显形（画面有变化）
   echo "== 3c. M8.6 键盘可达性（真窗口 Tab） =="
-  pkill -x qxync-gui 2>/dev/null; sleep 0.6
+  [ -n "$GUI_PID" ] && { kill "$GUI_PID" 2>/dev/null; wait "$GUI_PID" 2>/dev/null; GUI_PID=""; }
+  sleep 0.2
   QXNYC_GUI_TAB=home "$GUI" >"$RUNDIR/gui-window-kbd.log" 2>&1 &
   GUI_PID=$!
   KWID=""

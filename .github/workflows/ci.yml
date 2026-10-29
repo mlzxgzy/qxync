@@ -70,60 +70,26 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --locked
 
-      # ★ M18：GUI 前端的**纯函数**单测（任务默认 id / 本地文件夹 / 水合缓存按连接与 id 派生）。
-      # 不依赖浏览器、不连 NAS —— GitHub runner 自带 node，直接跑。
-      # 无头浏览器集成（chromium + 打桩后端）仍在 xtask/tests/gui-task-defaults.sh 里手动跑。
-      - name: node 前端纯函数单测（task-defaults）
-        run: node xtask/tests/task-defaults.test.mjs
-
-      # ★ M33：右下角下载进度卡片 —— 源文本级单测（抠 app.js 真实函数 + 假时钟/假 DOM），
-      # 覆盖 3 秒静默期 / 10Hz 节流 / 滑窗速度 / 未知总量 / finish 语义。
-      - name: node 前端源文本单测（M33 下载进度卡片）
-        run: node xtask/tests/m33-dl-toast.test.mjs
-
-      # ★ M19：删除相关数据（purge）的隔离 e2e —— 不需要 NAS / 不需要真窗口。
-      # 覆盖任务级 / 连接级 / daemon 在跑（IPC）/ 全局四条路径，并断言
-      # 「挂载点里的用户文件不会被动」这条安全底线。缺 sqlite3 时脚本会跳过行数断言。
-      - name: M19 删除相关数据 e2e（隔离 XDG）
-        run: bash xtask/tests/m19-purge.sh
-
-      # ★ M20：离线缓冲区 / 离线状态的隔离 e2e —— NAS 指向 127.0.0.1:9（必定不可达），
-      # 不需要真实设备。断言：离线时 status 不卡网络、如实显示离线、缓冲区计数可见、
-      # 跨 daemon 重启行不丢且网络错误不消耗重试次数。缺 sqlite3 时跳过行数断言。
-      - name: M20 离线状态 / 缓冲区 e2e（隔离 XDG）
-        run: bash xtask/tests/m20-offline.sh
-
-      # ★ M40：多路径连接（内网 / 公网 / DDNS）的隔离 e2e —— Python 假 NAS + 隔离 XDG。
-      # 覆盖额外路径优先、失败自动切路、优先路径恢复自动切回、DDNS 主机名解析分类、
-      # NAS 身份守卫（错误 NAS 被 blocked）、旧配置行为不变、全路径不可达离线、
-      # daemon 不在时 `routes --probe` 直连回落。不需要真实 NAS / /dev/fuse。
-      - name: M40 多路径 e2e（隔离 XDG）
-        run: bash xtask/tests/m40-multipath.sh
-
-      # ★ M42：本地文件搜索（qxync find）的隔离 e2e —— 不需要 NAS / /dev/fuse / daemon。
-      # 状态库由 python3 直接造；断言子串 / 大小写 / --glob / --under（本地路径换算）/
-      # --type / --limit 截断提示 / --local 映射 / --json 字段 / local_only / 墓碑 /
-      # 离线可用 / 缺库报错 / --via-daemon 被拒绝。
-      - name: M42 本地文件搜索 e2e（隔离 XDG）
-        run: bash xtask/tests/m42-search.sh
-
-      # ★ M21：离线可重启 daemon 的隔离 e2e —— 假 NAS（127.0.0.1:9）+ 真 FUSE 挂载。
-      # 断言：离线启动后挂载点从 mounts.json + listings 表恢复、离线 ls / 写缓冲、
-      # 第二次离线重启幂等。需要 /dev/fuse 与 python3，缺任一自动 SKIP。
+      # ★ M45（2026-10-29）：端到端验收统一入口。以前这里是 7 个散 step（2 个 node 单测 +
+      # M19/M20/M40/M42/M21 五个脚本），加/删套件要改 YAML、跑的时间也只能串行叠加。
+      # 现在都登记在 `xtask/tests/e2e.sh` 的注册表里：并行跑、按环境自动 SKIP、
+      # 失败自动贴日志尾部、最后汇总一张表。CI 只跑 **fast 档**（不需要真机凭据 / 真窗口），
+      # 覆盖的套件与改动前完全一致（另外补上此前没进 CI 的 pair-1to1 与 M28 源文本单测）。
+      # 新增隔离 e2e 只需在注册表加一行，不用再往这里堆 step。
       #
-      # ★ v0.7.0 首跑抓到的坑（2026-10-20）：runner 的 /dev/fuse **是有的**（这步
-      #   真跑了，不是 SKIP），但 stock /etc/fuse.conf 没有 `user_allow_other` ——
-      #   脚本 fixture 的 mounts.json 忠实还原 task add 流程（auto_unmount=true），
-      #   fuser 据此传 allow_other → fusermount3 拒绝非特权挂载 → 恢复挂载失败，
-      #   9 条断言连锁挂。本地能过是因为开发机的 /etc/fuse.conf 已启用它。
-      #   修法：跑之前把这行放开（runner 是 sudo 免密的）。
+      # ★ v0.7.0 首跑抓到的坑（2026-10-20）：runner 的 /dev/fuse **是有的**（M21 会真跑，
+      #   不是 SKIP），但 stock /etc/fuse.conf 没有 `user_allow_other` —— 脚本 fixture 的
+      #   mounts.json 忠实还原 task add 流程（auto_unmount=true），fuser 据此传 allow_other
+      #   → fusermount3 拒绝非特权挂载 → 恢复挂载失败，9 条断言连锁挂。本地能过是因为开发机
+      #   的 /etc/fuse.conf 已启用它。修法：跑之前把这行放开（runner 是 sudo 免密的）。
       - name: 启用 FUSE user_allow_other（auto_unmount 挂载需要）
         run: |
           sudo sed -i 's/^#user_allow_other$/user_allow_other/' /etc/fuse.conf || true
           grep -q '^user_allow_other' /etc/fuse.conf || echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
           grep '^user_allow_other' /etc/fuse.conf
-      - name: M21 离线重启 e2e（隔离 XDG + 真 FUSE，无 /dev/fuse 时 SKIP）
-        run: bash xtask/tests/m21-offline-restart.sh
+
+      - name: 隔离 e2e（xtask/tests/e2e.sh --tier fast，并行 4）
+        run: bash xtask/tests/e2e.sh --tier fast --jobs 4
 
   # ---------------------------------------------------------------- MSRV
   msrv:

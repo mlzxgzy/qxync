@@ -30,6 +30,26 @@
   验收：`cargo test --workspace --locked` **660 passed / 0 failed**（新增 3 例：幽灵清理 / 本地有内容不清 / 视图为空安全闸）；
   `cargo fmt --all --check` 0 diff。真机验证待部署后第一轮（日志应出现「清理失效目录 …」）。
 
+### 变更
+
+- **端到端验收合并成一个入口；跑验收不再杀掉你自己的守护（[M45](docs/M45-端到端测试入口合并.md)）**：
+  用户反馈「看看所有的 e2e 能不能化简一下或者合并一下，现在发布前的测试提交太久了」。
+  审计发现单跑都不慢（隔离套件 1～16s），慢在「怎么跑」：19 个脚本 + 3 个 node 套件要靠
+  人肉一个个敲、串行叠加、还要记住各自要什么环境；`gui-matrix` 内部还重复跑 4 个子套件。
+  更糟的是 `gui-matrix` / `m82` / `m83` / `m84` 共 8 处 `pkill -x qxyncd` / `pkill -x qxync-gui`
+  ——**跑一次验收会把桌面上正在同步的守护和托盘一起杀掉**（2026-10-29 真事故）；
+  `gui-matrix` 又把 daemon 起在非 default socket 上，导致负向对照在「有 daemon 的桌面」
+  上恒失败。改法：① 新增 `xtask/tests/e2e.sh` 统一入口——套件注册表 + 五档
+  （`gate`=单测+隔离 e2e / `fast` / `gui` / `fuse` / `nas`）+ 能力探测自动 SKIP + fast 档
+  并行 + 大矩阵已覆盖的不重复跑 + 汇总表 + 失败贴日志尾部 + **守护保护**（跑完发现你的
+  daemon 被带走 → 退出码 3 并点名疑似加害者）；② 上述 4 个脚本改成只停自己 socket 上的
+  daemon、只收自己窗口；③ `gui-matrix` 私有 `XDG_RUNTIME_DIR`（daemon 起在 GUI 认的
+  default socket 上）+ 私有配置副本（只复制本连接，且开跑前清过期 NAS 身份记录与重复连接
+  干扰）；④ CI 的 7 个 e2e/node step 合并成 1 个：`e2e.sh --tier fast --jobs 4`。
+  默认档实测 **24s**（原同集合串行约 28s，且不再有重复执行），`gui-matrix --no-window`
+  从「3 处失败」变成 **43/43**、跑完维护者 daemon pid 不变。真机 `fuse` / `nas` 两档
+  本轮未跑（本环境无 `/dev/fuse`，且会写真机 NAS 测试目录），入口会如实 SKIP。
+
 ## [0.8.0] - 2026-10-28
 
 ### 新增
