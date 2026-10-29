@@ -65,15 +65,15 @@ SUITES=(
   "gui-purge|gui|chromium,node|180|M19 删除相关数据无头集成（真 app.js + 打桩后端）"
   "m33-dl-toast-gui|gui|chromium,node|240|M33 下载进度卡片无头浏览器集成（真 app.js）"
   "gui-matrix|gui|creds|900|M4/M8.1/M8.4/M8.6 GUI 矩阵（自检 + 9 目的地真窗口截图）"
-  "fuse-matrix|fuse|fuse,creds,fixture|300|M1 FUSE 只读 + on-demand（真挂载；--big 需手动）"
-  "m82-matrix|nas|creds|300|M8.2 同步任务模型 + 持久化（真机 + 可选真挂载）"
-  "m83-matrix|nas|creds|300|M8.3 journal / 文件更新中心 / 错误列表（真机 + 可选真挂载）"
-  "m84-matrix|nas|creds,python3,jq|420|M8.4 设置中心 / 代理 / 托盘 / 冲突 / 三态（真机）"
-  "m5-matrix|nas|creds,jq|300|M5 SQLite 元数据 + librsync delta（真机，可 --no-nas）"
-  "m7-matrix|nas|creds|420|M7 选择性同步 + 设备配对 / LAN 直连（真机 + 可选真挂载）"
-  "m20-real-nas|nas|fuse,realnas,python3|420|M20 离线可用 / 缓冲区的真机版（会写 QXNYC_REAL_ROOT）"
-  "m21-real-nas|nas|fuse,realnas,python3|600|M21 离线可重启的真机版（真挂载 + 真 NAS）"
-  "m40-real-nas|nas|realnas,python3|240|M40 多路径 / DDNS 真机只读探测（不写 NAS）"
+  "fuse-matrix|fuse|fuse,creds,fixture|1800|M1 FUSE 只读 + on-demand（真挂载；--big 需手动）"
+  "m82-matrix|nas|creds|1200|M8.2 同步任务模型 + 持久化（真机 + 可选真挂载）"
+  "m83-matrix|nas|creds|1200|M8.3 journal / 文件更新中心 / 错误列表（真机 + 可选真挂载）"
+  "m84-matrix|nas|creds,python3,jq|1500|M8.4 设置中心 / 代理 / 托盘 / 冲突 / 三态（真机）"
+  "m5-matrix|nas|creds,jq|1200|M5 SQLite 元数据 + librsync delta（真机，可 --no-nas）"
+  "m7-matrix|nas|creds|1500|M7 选择性同步 + 设备配对 / LAN 直连（真机 + 可选真挂载）"
+  "m20-real-nas|nas|fuse,realnas,python3|900|M20 离线可用 / 缓冲区的真机版（会写 QXNYC_REAL_ROOT）"
+  "m21-real-nas|nas|fuse,realnas,python3|1200|M21 离线可重启的真机版（真挂载 + 真 NAS）"
+  "m40-real-nas|nas|realnas,python3|600|M40 多路径 / DDNS 真机只读探测（不写 NAS）"
 )
 
 TIER_GATE="unit fast"
@@ -188,6 +188,11 @@ suite_env() {
   return 0
 }
 
+# 套件在自己进程组里跑（见 run_one 的 setsid），所以这两个函数和它们用到的变量要导出。
+export REPO TESTS QS QD QG TEST_CFG TEST_LINK
+export CAP_FUSE CAP_NODE CAP_PY CAP_SQLITE CAP_JQ CAP_CHROMIUM CAP_DISPLAY CAP_CREDS CAP_REALNAS CAP_FIXTURE
+export -f suite_env suite_exec
+
 # ------------------------------------------------------------------ 参数
 TIERS_ARG=(); ONLY_ARG=""; SKIP_ARG=""; JOBS=4; TIMEOUT_OVERRIDE=""
 FAIL_FAST=0; ALLOW_AMBIENT_STOP=0; DRY_RUN=0; LIST_ONLY=0
@@ -278,6 +283,23 @@ for c in "${!COVERED[@]}"; do
 done
 
 # ------------------------------------------------------------------ 准备
+# 上一次跑到一半被中断留下的套件进程（孤儿）：会继续改状态、甚至执行 daemon stop
+# 把用户桌面守护带走（实测事故根因）。开跑前按「argv[1]=bash，argv[2]=本目录下 *.sh」精确清掉，
+# 不去 pkill 任何按名字模糊匹配的进程。
+for _d in /proc/[0-9]*; do
+  _p="${_d#/proc/}"
+  [ "$_p" = "$$" ] && continue
+  [ -r "$_d/cmdline" ] || continue
+  mapfile -d '' -t _av <"$_d/cmdline" 2>/dev/null || continue
+  [ "${#_av[@]}" -ge 2 ] || continue
+  case "${_av[0]}" in *bash|*/bash) ;; *) continue ;; esac
+  case "${_av[1]}" in "$TESTS"/*.sh) ;; *) continue ;; esac
+  case "${_av[1]}" in *e2e.sh) continue ;; esac
+  echo "⚠️  清理上次残留的套件进程 pid=$_p：${_av[*]}"
+  kill -TERM "$_p" 2>/dev/null
+done
+unset _d _p _av
+
 RUN_DIR="$REPO/.local-run/e2e/$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$RUN_DIR/logs" "$RUN_DIR/status"
 AMBIENT_DAEMON_BEFORE="$(pgrep -x qxyncd 2>/dev/null | sort | tr '\n' ' ')"
@@ -328,16 +350,30 @@ run_one() {  # $1=name  → 结果写入 $RUN_DIR/status/<name>
   fi
 
   t0=$(date +%s)
-  ( suite_env "$name"; cd "$REPO" && suite_exec "$name" ) >"$log" 2>&1 &
+  # 套件跑在自己的进程组里（setsid）：超时要杀的是**整棵树**，不是只有那层子 shell。
+  # 教训（本次实测）：`kill $pid` 只杀子 shell，`bash fuse-matrix.sh` 会变成孤儿继续往下跑，
+  # 十几分钟后自己执行到 `daemon stop` —— 用旧脚本的默认 socket 把用户桌面守护停掉。
+  # setsid 之后 `kill -- -$pid` 一次带走套件 + 它派生的 CLI / daemon / fusermount。
+  setsid bash -c 'suite_env "$1"; cd "$2" && suite_exec "$1"' _ "$name" "$REPO" >"$log" 2>&1 &
   local pid=$!
   local waited=0
+  kill_tree() {  # 递归杀子孙再杀自己（兜底 setsid 之前派生的进程）
+    local p="$1" c
+    for c in $(pgrep -P "$p" 2>/dev/null); do kill_tree "$c"; done
+    kill -TERM "$p" 2>/dev/null
+  }
   while kill -0 "$pid" 2>/dev/null; do
     if [ "$waited" -ge "$tmo" ]; then
-      kill -TERM "$pid" 2>/dev/null; sleep 1; kill -KILL "$pid" 2>/dev/null
+      kill -- -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+      kill_tree "$pid"
+      sleep 1
+      kill -- -"$pid" 2>/dev/null; kill -KILL "$pid" 2>/dev/null
       wait "$pid" 2>/dev/null
+      # 兜底：按脚本路径再扫一遍（防止 daemon 自己 setsid 逃出进程组）
+      pkill -f "$TESTS/$name.sh" 2>/dev/null
       t1=$(date +%s)
       printf 'TIMEOUT\t%s\t超时 %ss > %ss\n' "$((t1-t0))" "$((t1-t0))" "$tmo" >"$RUN_DIR/status/$name"
-      echo "FAIL $name —— 超时（${tmo}s），日志 $log"
+      echo "FAIL $name —— 超时（${tmo}s），已杀整棵进程树，日志 $log"
       return 1
     fi
     sleep 1; waited=$((waited+1))

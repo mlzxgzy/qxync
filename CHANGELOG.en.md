@@ -62,6 +62,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   3 failures to **43/43** while leaving the maintainer's daemon pid untouched. The real-machine
   `fuse` / `nas` tiers were not run this round (no `/dev/fuse` here, and they write to the real NAS
   test folder); the entry point SKIPs them explicitly.
+- **End-to-end acceptance: daemon isolation, timeout cleanup, and faster real-NAS suites
+  ([M46](docs/M46-端到端验收的守护隔离与提速.md))**: after M45 merged the entry point, `--tier all`
+  was actually run and exposed four more classes of problems. ① **Running the fuse tier replaced the
+  user's desktop daemon**: `fuse-matrix.sh` issued six `daemon stop/start` calls without isolating
+  `XDG_RUNTIME_DIR`, so `daemon stop` hit the user's default socket (confirmed by the "IPC shutdown"
+  log line) and then started a debug daemon built from the test config on the same socket — now uses
+  a private runtime and socket. ② **Timeouts only killed the wrapper shell**: `bash suite.sh` became
+  an orphan that kept running and issued its own `daemon stop` nine minutes later — the entry point
+  now launches each suite in its own session with `setsid`, kills the whole tree on timeout
+  (`kill -- -$pid` + recursion + a script-path sweep), and cleans up orphaned suites before a run.
+  ③ **Real-NAS suites mounted all of `/home` (5,505 directories)**, so a fresh state DB had to do a
+  full reconciliation that pushed suites to 10–30 minutes — `fuse` / `m83` / `m84` now mount only the
+  fixture directory by default (`QXNYC_REMOTE_ROOT` overrides back to `/home`), taking `m83` from
+  **619s to 16s** and `m84` from a **30-minute timeout to 198s / 99 passed, 0 failed**. ④ **Stale
+  assertions**: `m82`'s "mounts are not restored by default" (default-on since M15/T5; the negative
+  control now uses `--no-restore-mounts`), `m83`/`m5`'s "schema must be v3" (now v7; assert `>= 3`),
+  `m5`'s real-machine probe not supporting 2SV (`versioning.rs` accepts `QXNYC_TEST_OTP`;
+  `m5` passes the stored `otp_secret`), `m84`'s "unmount = freed" (one local folder maps to one task;
+  `task rm` after unmount; wait for uploads to reach the NAS before hydrating; opt-in
+  `QXNYC_POLL_INTERVAL=2` for the three-state section while the conflict section keeps the default
+  30s so hand-choreographed races are not disturbed), and `fuse`'s `wait_remote` re-logging in on
+  every `--direct` call (2–4s each on a slow link; now a fast daemon check plus a `--direct` ground
+  truth every fifth round). Results: **gate 11/0 (38s), gui-matrix 160/0 (153s), m82 40/0, m83 27/0,
+  m84 99/0, m5 30/0, m7 60/0**, with the desktop daemon pid unchanged throughout. `fuse` went from a
+  **900s timeout to 72 passed / 5 failed (744s)**; the remaining five are cross-directory-move
+  visibility and M2c circuit-breaker/conflict timing cases, recorded honestly in the doc with a
+  follow-up proposal for deterministic injection points.
 
 ## [0.8.0] - 2026-10-28
 

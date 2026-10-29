@@ -114,7 +114,8 @@ check "$([ "$(sj .baseline_entries)" = "3" ] && echo 0 || echo 1)" "baseline 3 �
 # ★ M8.3/M8.4：schema 升到 v3（v2 新增 journal 表，v3 新增 decisions 表）。
 #   老库在打开时**自动补表**（CREATE TABLE IF NOT EXISTS），不写迁移代码。
 #   已有数据一行不动 —— 这正是下面几条要断言的。
-check "$([ "$(sj .schema_version)" = "3" ] && echo 0 || echo 1)" "schema 版本 v3（M8.4 起：+decisions 冲突待裁决队列）"
+# ★ 只断言「至少 v3」：v3 之后 M31/M32 等又加了迁移，写死 =3 在后续里程碑必然假失败。
+check "$([ "$(sj .schema_version)" -ge 3 ] && echo 0 || echo 1)" "schema 版本至少 v3（实际 $(sj .schema_version)）"
 HASJ=$(python3 -c "
 import sqlite3,sys
 c=sqlite3.connect(sys.argv[1])
@@ -186,6 +187,10 @@ else
     export QXNYC_TEST_USER="$(jq -r .user "$LINKF")"
     export QXNYC_TEST_PASSWORD="$(jq -r .password "$CRED")"
     export QXNYC_TEST_FIXTURE="${QXNYC_TEST_FIXTURE:-/home/qxync-test}"
+    # ★ 2SV 账号（本轮实测）：探针只传口令会被 NAS 拒（need_2sv=1）。凭据里有 otp_secret
+    #   就带上；没有就保持老行为（未开 2SV 的机器不受影响）。
+    _OTP=$(jq -r '.otp_secret // empty' "$CRED" 2>/dev/null)
+    if [ -n "$_OTP" ]; then export QXNYC_TEST_OTP="$_OTP"; fi
     ( cd "$REPO" && cargo test -p qxync-proto-test --test versioning -- --ignored --nocapture 2>&1 | tail -40 >"$M5/t-versioning.log" )
     grep -aq "test result: ok. 1 passed" "$M5/t-versioning.log"; check $? "真机 versioning 探测测试通过（1 passed）"
     grep -ao "gate: .*" "$M5/t-versioning.log" | head -1 | sed 's/^/     /'
