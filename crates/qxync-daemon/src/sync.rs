@@ -310,6 +310,17 @@ const MAX_HIDDEN_VISIBLE_ERRORS: usize = 3;
 /// （见 [`SyncReport::push_list_failure`]）。
 const MAX_VISIBLE_LIST_FAILURES: usize = 3;
 
+/// ★ M44：说明行里最多列几个「无法核对」的目录路径样例。
+///
+/// 这类目录（列举 + stat 都返回 4/5/6）在真机上是一批**固定的**路径（例：
+/// `2026/29-四川赛/.lo` 整棵被移走后留下的 30 个目录），每轮都会命中同一批。
+/// 用户要的是「到底是哪几个」，而不是一条没有路径的「同步错误」——但全列出来
+/// 会把说明行撑成几千字，所以只给前 3 个样例 + 总数。
+const MAX_UNREACHABLE_SAMPLES: usize = 3;
+
+/// ★ M44：说明行里「清理了多少条失效记录」的展示上限（防止一次异常列出上万条）。
+const MAX_GHOST_CLEANED_REPORTED: u64 = 10_000;
+
 /// ★ M41：轮询汇总行的心跳间隔。
 ///
 /// 「有实际动作才 INFO」之后空转轮次全部降 debug；这个心跳只负责「现场不断档」
@@ -448,6 +459,22 @@ pub struct SyncReport {
     /// 不参与对外语义，`errors` 的 20 条上限与 `error_is_network` 的逐条对齐都不变；
     /// `pub(crate)` 只是为了 `daemon` 侧测试能用 `..Default::default()` 构造报告。
     pub(crate) list_failures_sampled: usize,
+    /// ★ M44：本轮「存在性无法核对」的目录数（列举 + stat 都返回 4/5/6）。
+    ///
+    /// 这类目录**不是同步出错**：它们是「远端看不见了，可能是删了、也可能没权限」，
+    /// 保守起见本轮不判定其内容，但别的目录照常同步。M41 之后它们每轮仍有 3 条样本
+    /// 进 `errors` → GUI 的「⚠️ 同步错误」红字常驻，而用户既看不懂是哪几个目录、
+    /// 也修不了（真机原话：「显示了也解决不了，显示他干啥」）。M44 起：
+    /// 能确认「远端已删且本地也没有内容」的直接清状态，其余只进说明行（带路径样例）。
+    pub unreachable_count: u64,
+    /// 说明行里列的路径样例（相对挂载根，最多 [`MAX_UNREACHABLE_SAMPLES`] 个）。
+    pub unreachable_dirs: Vec<String>,
+    /// ★ M44：本轮确认「远端已删、本地也没有内容」而被清掉的 baseline 行数。
+    ///
+    /// 只清同步状态（baseline + 清单快照），**不碰任何文件**：远端已经列不出来、
+    /// 本地也没有节点，这些行只是历史残留（真机：`.lo` 整棵被移进 `.build-tmp`
+    /// 后留下的 80 行）。不清的话它们每轮都会让父目录「列不成功」，永远刷同一条错误。
+    pub ghost_cleaned: u64,
 }
 
 impl SyncReport {
@@ -498,6 +525,22 @@ impl SyncReport {
             tracing::debug!(
                 "{context}: {e}（本轮同类失败已记 {MAX_VISIBLE_LIST_FAILURES} 条样本，降为 debug）"
             );
+        }
+    }
+
+    /// ★ M44：记一个「无法核对」的目录 —— 只进说明行，**不进 `errors`**。
+    ///
+    /// 真机证据（2026-10-29）：`status=5` 的一批目录（`.lo` 移走后的 30 个空目录）
+    /// 每轮都在 `errors` 里留下「同步错误」，而它们既不影响别的目录同步、也不是用户
+    /// 能修的东西。现在整轮汇总成一条说明（带路径样例），红字只在真出错时出现。
+    fn unreachable(&mut self, path: &str, root: &str) {
+        self.unreachable_count = self.unreachable_count.saturating_add(1);
+        if self.unreachable_dirs.len() < MAX_UNREACHABLE_SAMPLES {
+            let short = path
+                .strip_prefix(root)
+                .unwrap_or(path)
+                .trim_start_matches('/');
+            self.unreachable_dirs.push(short.to_string());
         }
     }
 
@@ -2509,11 +2552,22 @@ async fn reconcile_view(
 
     // 候选路径：本地节点 + baseline 条目
     let mut candidates: BTreeSet<String> = BTreeSet::new();
+    // ★ M44：「本地还剩什么」的完整快照（**不按 hidden 过滤**）—— 判定一个目录是不是
+    //   「纯历史残留」时，本地只要还有任何节点（哪怕它在排除规则里）就不能清状态。
+    let mut local_paths: Vec<String> = Vec::new();
     for n in view.view.nodes() {
-        if under_root(&n.remote) && n.remote != root && view.hidden(&n.remote, n.is_dir).is_none() {
-            candidates.insert(n.remote);
+        if under_root(&n.remote) && n.remote != root {
+            local_paths.push(n.remote.clone());
+            if view.hidden(&n.remote, n.is_dir).is_none() {
+                candidates.insert(n.remote);
+            }
         }
     }
+    // ★ M44 安全闸：挂载视图一个节点都没有（= 本地状态没接上：刚启动/挂载没恢复/
+    //   视图重建失败）时，**不做任何幽灵清理**。否则「本地视图是空的」会被误当成
+    //   「本地什么都没有」—— 一次权限抖动就能把整份 baseline 清空。真机常态是
+    //   34 000 个节点，这个闸不会误伤。
+    let view_has_nodes = !local_paths.is_empty();
     for p in baseline.entries.keys() {
         if under_root(p) && p != &root && view.hidden(p, false).is_none() {
             candidates.insert(p.clone());
@@ -2637,6 +2691,12 @@ async fn reconcile_view(
     // ★ 存在性**未知**的目录（列举 4/5/6 且 stat 也失败）：目录条目自身本轮也不能判，
     //   否则「父目录列举漏了它 + stat 抖动」会把整棵子树连缓存一起删。
     let mut unresolved_dirs: BTreeSet<String> = BTreeSet::new();
+    // ★ M44：本轮被判定为「纯历史残留」并清理掉的目录子树 —— 窗口里排在它后面的后代
+    //   不再尝试（它们已经从 baseline 里消失，再列一次只会得到同一条 status=5）。
+    let mut cleaned_ghosts: Vec<String> = Vec::new();
+    // ★ M44：本轮有多少个目录的 4/5 **可能是**会话失效（延迟到轮末判定 —— 只要本轮
+    //   至少成功列过一个目录，就说明会话是好的，不能因为某几个路径回 5 就每轮重登）。
+    let mut notfound_auth_votes = 0usize;
     // ★ 时间预算驱动的列举：预算耗尽即收（远端根除外——顶层变化必须每轮可见，
     //   根是窗口第一项，正常情况下预算开始时必然还没耗）。
     //
@@ -2667,6 +2727,15 @@ async fn reconcile_view(
     while window_idx < scan_window.len() {
         let dir = scan_window[window_idx].clone();
         window_idx += 1;
+        // ★ M44：刚清理掉的幽灵子树里的后代不必再列（结果必然还是同一条 status=5）。
+        if !cleaned_ghosts.is_empty()
+            && cleaned_ghosts
+                .iter()
+                .any(|c| dir == *c || dir.starts_with(&format!("{c}/")))
+        {
+            tracing::trace!("对账：跳过本轮刚清理的失效目录子树 {dir}");
+            continue;
+        }
         if dir != root
             && rotating_listed >= 1
             && scan_budget > Duration::ZERO
@@ -2761,22 +2830,69 @@ async fn reconcile_view(
                             }
                         }
                         Err(e2) => {
-                            list_failures += 1;
-                            // stat 也失败：目录是否存在**未知** → 目录条目自身也不能判。
-                            if e2.is_auth() {
-                                report.auth_failed = true;
-                            }
-                            unresolved_dirs.insert(dir.clone());
-                            // ★ 与 `Err(e)` 分支同一口径（M2）：stat 的网络失败也可能是
-                            //   「整台断了」的第一现场，同样要探活/中止，而不是每个目录
-                            //   各记一条、各等一次超时。非网络错误（status/会话）照常记。
-                            tracing::debug!("对账列举 {dir} 失败（{e}），stat 确认也失败");
-                            let ctx = format!(
-                                "同步「{label}」对账列举失败（stat 确认也失败，第 {attempted}/{total_dirs} 个目录）→ 本轮不判定该目录及其内容"
-                            );
-                            if record_list_failure_or_abort(client, net, report, &e2, &ctx).await {
-                                offline_abort = true;
-                                break;
+                            // stat 也失败：目录是否存在**未知** —— 目录条目自身也不能判。
+                            //
+                            // ★ M44：先分清「这目录真的没了」和「只是我们看不到」：
+                            //   * 网络类失败（`is_offline`）照旧走 [`record_list_failure_or_abort`]，
+                            //     探活 / 中止语义**一字不动**；
+                            //   * 业务类（4/5/6）：只要**本地这棵子树没有任何节点**、且父目录
+                            //     本轮没有把它列出来，就判定为「纯历史残留」→ 清状态（不动文件）。
+                            //     安全性来自「本地没有内容」：远端就算还在，删掉的也只是我们对
+                            //     它的跟踪记录，远端文件一个不丢，将来可见时会重新登记。
+                            //     ⚠️ 不能等「父目录本轮也列到了」才清 —— 轮转一圈要 ~40 轮
+                            //     （20 分钟），用户会一直看着同一条红字。
+                            //   * 本地还有内容，或父目录清单里**明明看得见**它（只是列不进去，
+                            //     典型是权限）→ 不删、不判定，只进说明行（不再每轮一条红字）。
+                            let parent = parent_dir(&dir);
+                            let parent_complete = observed_dirs.contains(&parent);
+                            let in_parent_listing = remote_map.contains_key(&dir);
+                            let has_local = local_paths.iter().any(|p| {
+                                p == &dir
+                                    || p.strip_prefix(&dir).is_some_and(|r| r.starts_with('/'))
+                            });
+                            if e2.is_offline() {
+                                list_failures += 1;
+                                unresolved_dirs.insert(dir.clone());
+                                tracing::debug!(
+                                    "对账列举 {dir} 失败（{e}），stat 确认也失败（网络类）"
+                                );
+                                let ctx = format!(
+                                    "同步「{label}」对账列举失败（stat 确认也失败，第 {attempted}/{total_dirs} 个目录）→ 本轮不判定该目录及其内容"
+                                );
+                                if record_list_failure_or_abort(client, net, report, &e2, &ctx)
+                                    .await
+                                {
+                                    offline_abort = true;
+                                    break;
+                                }
+                            } else if view_has_nodes
+                                && !has_local
+                                && !(parent_complete && in_parent_listing)
+                            {
+                                // 纯历史残留：远端列不出来、本地也没有内容。
+                                // 只清同步状态 —— 不动任何文件、不进 errors。
+                                // ⚠️ `view_has_nodes` 是安全闸：本地视图整体为空时一律不清
+                                //   （见声明处的注释）。
+                                let removed = purge_ghost_dir(view, baseline, &dir);
+                                report.ghost_cleaned = report.ghost_cleaned.saturating_add(removed);
+                                cleaned_ghosts.push(dir.clone());
+                                tracing::info!(
+                                    "对账：清理失效目录 {dir}（远端列不出来、本地也没有内容）→ 清掉 {removed} 条同步状态记录，不动任何文件"
+                                );
+                            } else {
+                                // 存在性无法核对：本轮不判定（数据安全），但**不算同步错误**。
+                                list_failures += 1;
+                                if e2.is_auth() {
+                                    notfound_auth_votes += 1;
+                                }
+                                unresolved_dirs.insert(dir.clone());
+                                report.unreachable(&dir, &root);
+                                tracing::debug!(
+                                    "对账列举 {dir} 失败（{e}），stat 确认也失败：父目录{}、清单里{}、本地{}内容 → 本轮不判定",
+                                    if parent_complete { "已列举" } else { "未列到" },
+                                    if in_parent_listing { "有" } else { "没有" },
+                                    if has_local { "有" } else { "无" }
+                                );
                             }
                         }
                     }
@@ -2810,6 +2926,57 @@ async fn reconcile_view(
         }
     }
     report.dirs_scanned += scanned;
+    // ★ M44：存在性无法核对的目录 —— 汇总成**一条说明**（不进 `errors` / `last_error`）。
+    //
+    // 真机症状（2026-10-29）：每天 163 次「轮询遇会话失效 → 立即重登」+ GUI 常驻红字
+    // 「同步错误（…）：对账列举失败（stat 确认也失败，第 71/5505 个目录）」。根因是
+    // 一批固定目录（`.lo` 移走后的 30 个空目录）每轮都回 status=5，被当成同步错误。
+    // 这些目录不影响别的目录同步、用户也修不了 —— 说明行 + 路径样例才是对的信息。
+    if report.unreachable_count > 0 {
+        let mut samples = report.unreachable_dirs.join("、");
+        let rest =
+            (report.unreachable_count as usize).saturating_sub(report.unreachable_dirs.len());
+        if rest > 0 {
+            samples.push_str(&format!("…（另有 {rest} 个未列出）"));
+        }
+        report.note(format!(
+            "对账：{} 个目录无法核对（远端可能已删除，或当前账号没有权限），其内容本轮不判定（不影响其他目录）；样例：{samples}",
+            report.unreachable_count
+        ));
+        // 日志只留「首次 + 10 分钟一条」的 WARN 供排障；同一批目录每轮重复没有信息量。
+        let adm = qxync_core::noise::dedupe_in(
+            "sync.unreachable",
+            "unreachable",
+            Duration::from_secs(600),
+        );
+        if adm.emit {
+            tracing::warn!(
+                "同步引擎: 对账有 {} 个目录无法核对（样例：{}）{}",
+                report.unreachable_count,
+                samples,
+                adm.note()
+            );
+        } else {
+            tracing::debug!(
+                "同步引擎: 对账有 {} 个目录无法核对（样例：{}；同一批已告警过，降为 debug）",
+                report.unreachable_count,
+                samples
+            );
+        }
+    }
+    if report.ghost_cleaned > 0 {
+        report.note(format!(
+            "对账：清理了 {} 条失效的同步记录（远端已经列不出来、本地也没有内容；只清状态，未动任何文件）",
+            report.ghost_cleaned.min(MAX_GHOST_CLEANED_REPORTED)
+        ));
+    }
+    // ★ M44：4/5 只有在**本轮一个目录都没列成**时才算「会话失效」—— 只要列成过一个，
+    //   会话就是好的，某几个路径回 5 只是权限/不存在。旧实现不看这个，幽灵目录每轮
+    //   都触发一次「立即重登」（真机 10-28：163 次，一天 163 次登录）。
+    if notfound_auth_votes > 0 && scanned == 0 {
+        report.auth_failed = true;
+    }
+
     if full {
         report.full_scan = true;
         report.full_scan_dirs = report.full_scan_dirs.saturating_add(attempted);
@@ -4252,6 +4419,31 @@ fn decide_with_state(
 /// 其它错误（网络/超时/解析）绝不能当成删除。
 fn is_not_found(e: &CoreError) -> bool {
     matches!(e, CoreError::Status { status, .. } if matches!(status.0, 4 | 5 | 6))
+}
+
+/// ★ M44：清掉一个「远端已不存在、本地也没有内容」的目录（**只清同步状态，不动文件**）。
+///
+/// 判定为幽灵的**前提由调用方保证**：父目录本轮列出全集且不含它、本地节点快照里也
+/// 没有它的子树。这里只做两件事：
+/// * baseline 的整棵子树（目录本身 + 后代）—— 不清的话每轮都会让父目录「列不成功」；
+/// * 挂载视图里对应的清单快照 —— 不清的话离线重启后 `ls` 会把已删除的子树「复活」
+///   出来（`listing_drop_subtree` 存在的同一理由）。
+///
+/// 不调用 `remove_remote`：那条 API 会连本地节点一起删；幽灵的前提正是「本地没有
+/// 节点」，调用它只会返回 false，而清单快照还得逐个丢。
+fn purge_ghost_dir(view: &MountView, baseline: &mut Baseline, dir: &str) -> u64 {
+    let prefix = format!("{}/", dir.trim_end_matches('/'));
+    let victims: Vec<String> = baseline
+        .entries
+        .keys()
+        .filter(|p| p.as_str() == dir || p.starts_with(&prefix))
+        .cloned()
+        .collect();
+    for v in &victims {
+        view.view.drop_listing(v);
+    }
+    remove_baseline_tree(baseline, dir);
+    victims.len() as u64
 }
 
 fn remove_baseline_tree(baseline: &mut Baseline, path: &str) {
@@ -7510,6 +7702,12 @@ mod tests {
     }
 
     /// stat 确认也失败 → 目录存在性未知：目录条目与内容都不判定（保守方向）。
+    ///
+    /// ★ M44：这类「列不出来 + stat 也失败 + 本地还有内容」的目录**不再算同步错误**。
+    /// 真机 2026-10-29：同一批 `status=5` 目录每轮 3 条红字进 `errors` → GUI
+    /// 「⚠️ 同步错误」常驻；`e2.is_auth()` 又把每次命中都当会话失效 → 一天 163 次
+    /// 「立即重登」。现在只进说明行（带路径样例）；4/5 只在**本轮一个目录都没列成**
+    /// 时才算会话失效（这里根目录列成功 = 会话有效）。
     #[tokio::test]
     async fn stat_failure_keeps_directory_and_subtree() {
         let home = HOME_ROOT;
@@ -7570,11 +7768,248 @@ mod tests {
             assert!(baseline.get(dir).exists);
             assert!(baseline.get(&child).exists);
         }
+        // 网络类（HTTP 500）照旧进 errors；业务类（status 5）只进说明行。
         assert!(
-            report.errors.iter().any(|x| x.contains("stat 确认也失败")),
+            report.error_is_network.iter().all(|net| *net),
+            "非网络错误不该再进 errors（会变成 GUI 常驻红字）: {report:?}"
+        );
+        assert!(
+            report.errors.iter().any(|x| x.contains("HTTP 500")),
+            "网络失败仍要记一条（断网不是静默）: {report:?}"
+        );
+        assert_eq!(
+            report.unreachable_count, 1,
+            "status 5 目录算「无法核对」: {report:?}"
+        );
+        assert!(
+            report
+                .unreachable_dirs
+                .iter()
+                .any(|p| p.contains("unknown_auth")),
+            "说明行要带路径样例（用户才知道是哪几个目录）: {report:?}"
+        );
+        assert!(
+            report.notes.iter().any(|n| n.contains("无法核对")),
             "要说明为什么没判定: {report:?}"
         );
-        assert!(report.auth_failed, "stat 也回 4/5 时要触发重登: {report:?}");
+        assert!(
+            !report.auth_failed,
+            "根目录列成功 = 会话有效；4/5 不能每轮触发重登: {report:?}"
+        );
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// ★ M44 核心：确认「远端已删、本地也没有内容」的目录 → **清状态，不动文件**。
+    ///
+    /// 真机形态（2026-10-29 现场）：`2026/29-四川赛/.lo` 整棵被移进 `.build-tmp` 后，
+    /// baseline 里留下 80 行旧路径；远端父目录列举里已经没有 `.lo`、本地也没有节点，
+    /// 但每次列 `.lo` 都回 status=5 + stat 也失败 → 每轮 3 条红字 + 每轮一次重登。
+    /// 修法：父目录本轮列出全集且不含它 + 本地无任何节点 → 清掉 baseline 子树（只清状态）。
+    #[tokio::test]
+    async fn reconcile_purges_ghost_dir_when_parent_listing_confirms_and_local_empty() {
+        let home = HOME_ROOT;
+        let ghost = format!("{home}/ghost");
+        let ghost_child = format!("{ghost}/old.txt");
+        let keep = format!("{home}/keep");
+        let keep_file = format!("{keep}/keep.txt");
+        // 根目录的列举**只有** keep —— ghost 已经不在了（真机 `.lo` 的形态）
+        let mut listings: BTreeMap<String, Vec<qxync_core::DirEntry>> = BTreeMap::new();
+        listings.insert(
+            home.to_string(),
+            vec![qxync_core::DirEntry::local("keep", true, 0, 0)],
+        );
+        listings.insert(
+            keep.clone(),
+            vec![qxync_core::DirEntry::local("keep.txt", false, 10, 100)],
+        );
+        let mut force: BTreeMap<String, i64> = BTreeMap::new();
+        force.insert(ghost.clone(), 5);
+        let mut stat_status: BTreeMap<String, i64> = BTreeMap::new();
+        stat_status.insert(ghost.clone(), 5);
+        let (host, port, _seen, srv) = spawn_nas_server(MockNasSpec {
+            listings,
+            force_status: force,
+            stat_status,
+            ..Default::default()
+        })
+        .await;
+
+        let work = tmpdir("reconcile-ghost");
+        let view = FakeLocal::new(home, work.join("stash"));
+        // 本地只剩 keep（ghost 一个节点都没有 —— 真机 `.lo` 移走后就是这个状态）
+        view.add_dir(&keep);
+        view.add_file(&keep_file, 10, 100, false, None);
+        let mut baseline = Baseline::default();
+        baseline.put(ghost.clone(), Sig::dir());
+        baseline.put(ghost_child.clone(), Sig::file(10, 100));
+        baseline.put(keep.clone(), Sig::dir());
+        baseline.put(keep_file.clone(), Sig::file(10, 100));
+        let store = Mutex::new(SyncState::load(work.join("state")).unwrap());
+        let mv = mount_view(view.clone(), home, "/tmp/reconcile-ghost");
+        let client = client_for(&host, port);
+        let cfg = SyncConfig::default();
+        let mut report = SyncReport::default();
+        reconcile_view(
+            &client,
+            &mv,
+            &cfg,
+            &mut baseline,
+            &mut report,
+            &store,
+            &mut NetGuard::default(),
+        )
+        .await;
+
+        assert_eq!(
+            report.ghost_cleaned, 2,
+            "ghost 目录 + 它的子项一共 2 条状态记录要被清掉: {report:?}"
+        );
+        assert!(!baseline.get(&ghost).exists, "失效目录要从 baseline 清掉");
+        assert!(
+            !baseline.get(&ghost_child).exists,
+            "失效目录的后代也要一起清（否则每轮都会复活）"
+        );
+        assert!(baseline.get(&keep).exists, "正常目录不能误清");
+        assert!(baseline.get(&keep_file).exists, "正常文件不能误清");
+        assert!(
+            report.errors.is_empty(),
+            "确认删掉的目录是「清理状态」，不是同步错误: {report:?}"
+        );
+        assert_eq!(
+            report.unreachable_count, 0,
+            "已确认清掉的目录不算「无法核对」"
+        );
+        assert!(
+            report.notes.iter().any(|n| n.contains("失效的同步记录")),
+            "要说明清了多少、且没动文件: {report:?}"
+        );
+        // 本地一个文件都不许动（清理只碰状态）
+        assert!(
+            view.node(&keep_file).is_some(),
+            "本地节点不能被清理动作带走"
+        );
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// ★ M44 数据安全边界：同样的 ghost，只要**本地还有节点**就不许清 baseline。
+    ///
+    /// 本地有内容 = 可能是「用户本地改了、远端被删」，清掉状态会让这份内容变成
+    /// 「本地新增」被悄悄重传，或永远没人管。所以保守方向是：不删、不判定，只报说明。
+    #[tokio::test]
+    async fn reconcile_keeps_ghost_when_local_still_has_content() {
+        let home = HOME_ROOT;
+        let ghost = format!("{home}/ghost");
+        let ghost_file = format!("{ghost}/mine.txt");
+        let mut listings: BTreeMap<String, Vec<qxync_core::DirEntry>> = BTreeMap::new();
+        listings.insert(home.to_string(), Vec::new()); // 父目录列到了，里面没有 ghost
+        let mut force: BTreeMap<String, i64> = BTreeMap::new();
+        force.insert(ghost.clone(), 5);
+        let mut stat_status: BTreeMap<String, i64> = BTreeMap::new();
+        stat_status.insert(ghost.clone(), 5);
+        let (host, port, _seen, srv) = spawn_nas_server(MockNasSpec {
+            listings,
+            force_status: force,
+            stat_status,
+            ..Default::default()
+        })
+        .await;
+
+        let work = tmpdir("reconcile-ghost-local");
+        let view = FakeLocal::new(home, work.join("stash"));
+        view.add_dir(&ghost);
+        view.add_file(&ghost_file, 10, 100, false, None);
+        let mut baseline = Baseline::default();
+        baseline.put(ghost.clone(), Sig::dir());
+        baseline.put(ghost_file.clone(), Sig::file(10, 100));
+        let store = Mutex::new(SyncState::load(work.join("state")).unwrap());
+        let mv = mount_view(view.clone(), home, "/tmp/reconcile-ghost-local");
+        let client = client_for(&host, port);
+        let cfg = SyncConfig::default();
+        let mut report = SyncReport::default();
+        reconcile_view(
+            &client,
+            &mv,
+            &cfg,
+            &mut baseline,
+            &mut report,
+            &store,
+            &mut NetGuard::default(),
+        )
+        .await;
+
+        assert_eq!(report.ghost_cleaned, 0, "本地有内容时绝不能清状态");
+        assert!(baseline.get(&ghost).exists);
+        assert!(baseline.get(&ghost_file).exists);
+        assert!(
+            view.node(&ghost_file).is_some(),
+            "本地文件不能被当成远端删除"
+        );
+        assert_eq!(report.deleted, 0);
+        assert!(
+            report.errors.is_empty(),
+            "「本地有内容、远端看不到」不是同步错误（红字），是说明: {report:?}"
+        );
+        assert_eq!(report.unreachable_count, 1);
+        assert!(report.notes.iter().any(|n| n.contains("无法核对")));
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// ★ M44 安全闸：挂载视图**一个节点都没有**（本地状态没接上）时，绝不做幽灵清理。
+    ///
+    /// 否则「本地视图是空的」会被误当成「本地什么都没有」—— 一次权限抖动就能把整份
+    /// baseline 清空。真机常态是 34 000 个节点，这个闸不会误伤。
+    #[tokio::test]
+    async fn reconcile_never_purges_when_local_view_is_empty() {
+        let home = HOME_ROOT;
+        let ghost = format!("{home}/ghost");
+        let mut listings: BTreeMap<String, Vec<qxync_core::DirEntry>> = BTreeMap::new();
+        listings.insert(home.to_string(), Vec::new());
+        let mut force: BTreeMap<String, i64> = BTreeMap::new();
+        force.insert(ghost.clone(), 5);
+        let mut stat_status: BTreeMap<String, i64> = BTreeMap::new();
+        stat_status.insert(ghost.clone(), 5);
+        let (host, port, _seen, srv) = spawn_nas_server(MockNasSpec {
+            listings,
+            force_status: force,
+            stat_status,
+            ..Default::default()
+        })
+        .await;
+
+        let work = tmpdir("reconcile-ghost-emptyview");
+        // 挂载视图故意留空（模拟「daemon 刚起、挂载还没恢复」）
+        let view = FakeLocal::new(home, work.join("stash"));
+        let mut baseline = Baseline::default();
+        baseline.put(ghost.clone(), Sig::dir());
+        // 子项必须也在 baseline 里：`dirs` 只收「父目录」，没有子项的话 ghost 自己
+        // 不会被列（也就走不到 M44 的分支）。
+        baseline.put(format!("{ghost}/f.txt"), Sig::file(10, 100));
+        let store = Mutex::new(SyncState::load(work.join("state")).unwrap());
+        let mv = mount_view(view.clone(), home, "/tmp/reconcile-ghost-emptyview");
+        let client = client_for(&host, port);
+        let cfg = SyncConfig::default();
+        let mut report = SyncReport::default();
+        reconcile_view(
+            &client,
+            &mv,
+            &cfg,
+            &mut baseline,
+            &mut report,
+            &store,
+            &mut NetGuard::default(),
+        )
+        .await;
+
+        assert_eq!(
+            report.ghost_cleaned, 0,
+            "本地视图为空时绝不清状态（安全闸）: {report:?}"
+        );
+        assert!(baseline.get(&ghost).exists, "baseline 一行都不许动");
+        assert_eq!(report.unreachable_count, 1, "只进说明行");
+        assert!(report.notes.iter().any(|n| n.contains("无法核对")));
         srv.abort();
         let _ = std::fs::remove_dir_all(&work);
     }

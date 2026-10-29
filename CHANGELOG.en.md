@@ -19,6 +19,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it (confirmed by real-window screenshots), hence the JS-side truncation. The column header
   is now "File / path". Pure GUI layout change — core / SQLite schema / IPC / daemon / FUSE /
   CLI untouched.
+- **Persistent "reconcile listing failed (stat also failed)" red banner — and a re-login every
+  round ([M44](docs/M44-同步错误可处置.md))**: the user reported "it keeps showing errors, I
+  can't tell what's wrong, and even when it's shown I can't fix anything — what's it even for?
+  So annoying". Root cause: 30 **ghost directories** (a `2026/29-四川赛/.lo` tree was moved into
+  `.build-tmp`, leaving 80 stale baseline rows behind). Both listing and stat return `status=5`,
+  and the data-safety rule ("existence unknown → don't judge anything this round") meant they
+  could never be resolved → 3 sampled errors entered `errors` every round → permanent GUI red
+  banner; on top of that `status=5` was treated as session expiry → **163** "re-login now"
+  events in one day. Three fixes: ① **automatic ghost cleanup** — remote listing fails, no local
+  nodes anywhere under the subtree, and the parent listing doesn't contain it → drop the
+  baseline subtree and its listing snapshots (**state only, no file is touched**; kept if local
+  content exists or the parent listing shows it = permission issue); ② anything not cleanable
+  goes to the **notes line** instead (paths + total, yellow), never into `errors` / `last_error`
+  / the journal error list; ③ `status=4/5` only counts as session expiry when **not a single
+  directory could be listed** this round (decided at the end of the round) — no more per-round
+  re-login. Verification: `cargo test --workspace --locked` **660 passed / 0 failed** (3 new
+  cases: ghost cleanup + conservative boundary); `cargo fmt --all --check` 0 diff. Real-machine
+  check pending deployment (first round should log "清理失效目录 …").
 
 ## [0.8.0] - 2026-10-28
 
