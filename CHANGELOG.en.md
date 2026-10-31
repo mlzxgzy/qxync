@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Delete breaker: see the list before deciding ([M2c](docs/M2c-变更发现.md) §5.3)**: user
+  feedback (translated): "Deletes are blocked by the breaker: 99 items this round… add a
+  window that shows which files are about to be batch-deleted, so I can look and then decide
+  whether to delete." Previously the alert only said "N deletions blocked this round" plus a
+  "Release deletes" button — **the actual paths were visible nowhere**, so "confirm these
+  deletions are really intended, then release" meant guessing blindly (the real-machine
+  526-item incident was the same). Now: ① the engine snapshots the whole `deletes` batch into
+  memory at the moment the breaker trips (ascending order, first 200 paths + full count;
+  multi-view same-round trips **merge** instead of overwriting; same lifecycle as the breaker
+  signature: replaced on signature change, cleared on resolve/release, kept across
+  early-return rounds); ② new IPC `blocked_deletes` (zero
+  network, reads the in-memory snapshot) returns the list + reason + view label + first-seen
+  time + truncation flag; ③ new GUI `#blocked-modal` dialog (42vh scrolling list, mono
+  paths, "will delete" badges) with a "View list" button added to all four alert spots
+  (home / status page / diagnostics page / task card) — `addAlert`'s action parameter now
+  accepts an array ("View list" first, "Release deletes" second, order = suggested order);
+  the dialog auto-refreshes with status polling while open; its "Release" button goes
+  through the same `doForceDeletes` confirmation chain, not a shortcut around it;
+  ④ CLI `qxync sync --blocked-list` (`--json` works) for the terminal. Acceptance:
+  `cargo test -p qxync-daemon -p qxync-gui` green (5 new cases: list stored/kept/cleared
+  with the signature, multi-view merge + truncation, breaker rounds must carry the list,
+  IPC field mapping, GUI four-entry wiring); `qxync status`'s breaker line now
+  mentions `--blocked-list`. The FUSE-side local `rm -rf` breaker (`DeleteGuard`) is out of
+  scope — it rejects each unlink individually with `EACCES`, there is no "pending batch" to
+  list.
+
 ## [0.8.1] - 2026-10-29
 
 ### Fixed

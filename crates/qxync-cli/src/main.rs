@@ -11,10 +11,10 @@ use clap::{Parser, Subcommand};
 use progress::DownloadProgress;
 use qxync_client::Client;
 use qxync_core::ipc::{
-    socket_path_for, CacheInfo, CursorInfo, DecisionsData, DehydrateData, ErrorKind,
-    FileStatesData, GetData, LsData, MountInfo, PeerData, PingData, PutData, Request, RootsData,
-    RouteInfo, RoutesData, RulesData, SettingsData, ShutdownData, SpaceData, StatusData, StoreData,
-    SyncInfo, TasksData,
+    socket_path_for, BlockedDeletesData, CacheInfo, CursorInfo, DecisionsData, DehydrateData,
+    ErrorKind, FileStatesData, GetData, LsData, MountInfo, PeerData, PingData, PutData, Request,
+    RootsData, RouteInfo, RoutesData, RulesData, SettingsData, ShutdownData, SpaceData, StatusData,
+    StoreData, SyncInfo, TasksData,
 };
 use qxync_core::search::{KindFilter, MatchMode, SearchQuery, SortKey};
 use qxync_core::settings::{Settings, PROXY_AUTO, PROXY_MANUAL, PROXY_NONE};
@@ -220,6 +220,9 @@ enum Cmd {
         /// 解除删除保护熔断（放行这一轮的批量删除；同时解除 FUSE 侧本地删除熔断）
         #[arg(long)]
         force_deletes: bool,
+        /// 列出熔断挡下的路径清单（放行前先看要删的是哪些；只读，不跑同步）
+        #[arg(long)]
+        blocked_list: bool,
         /// 临时改「一次对账最多删多少项」
         #[arg(long)]
         max_deletes: Option<usize>,
@@ -2318,7 +2321,32 @@ async fn route_via_daemon(
                 print_peer(&d);
             }
         }
-        Cmd::Sync { once, json, .. } => {
+        Cmd::Sync {
+            once,
+            blocked_list,
+            json,
+            ..
+        } => {
+            // ★ `--blocked-list` 是独立的只读查询（不跑同步、不改任何状态）：
+            //   放行前先看清单，看完再决定要不要 `--force-deletes`。
+            if *blocked_list {
+                let raw: serde_json::Value =
+                    ipc_client::call(&socket, Request::BlockedDeletes).await?;
+                if *json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&raw).map_err(|e| {
+                            qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string())
+                        })?
+                    );
+                } else {
+                    let d: BlockedDeletesData = serde_json::from_value(raw).map_err(|e| {
+                        qxync_core::ipc::IpcError::new(ErrorKind::Parse, e.to_string())
+                    })?;
+                    print_blocked_deletes(&d);
+                }
+                return Ok(());
+            }
             let raw: serde_json::Value = ipc_client::call(&socket, req).await?;
             if *json {
                 println!(
@@ -3293,7 +3321,7 @@ fn print_sync(s: &SyncInfo) {
         println!("  事件设备: {}", s.devices.join("  "));
     }
     if let Some(r) = &s.delete_block_reason {
-        println!("  ⚠️  {r}（`qxync sync --force-deletes` 放行）");
+        println!("  ⚠️  {r}（`qxync sync --blocked-list` 看清单，`--force-deletes` 放行）");
     }
     if let Some(n) = &s.note {
         // ★ M30：网络失败不再进「最近错误」（红字），而是「说明」里的一行
@@ -3303,6 +3331,48 @@ fn print_sync(s: &SyncInfo) {
     if let Some(e) = &s.last_error {
         println!("  ⚠️  最近错误: {e}");
     }
+}
+
+/// ★ M2c：`qxync sync --blocked-list` —— 熔断挡下的路径清单。
+///
+/// 与 `print_sync` 的告警行配套：那行说「本轮有 N 项删除被保护挡住」，
+/// 这里回答「是哪 N 项」。清单是判定那一刻的快照（不重新列目录），
+/// 所以开头先报状态与时间，让用户能对上「这就是刚才那条告警说的那批」。
+fn print_blocked_deletes(d: &BlockedDeletesData) {
+    if d.count == 0 {
+        println!("当前没有被熔断挡住的删除。");
+        return;
+    }
+    let label = d.label.as_deref().unwrap_or("同步");
+    let since = if d.first_seen_unix > 0 {
+        let age = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|t| t.as_secs())
+            .unwrap_or(0)
+            .saturating_sub(d.first_seen_unix.max(0) as u64);
+        format!("，首次挡下于 {} 前", human_age_secs(age))
+    } else {
+        String::new()
+    };
+    println!(
+        "⛔ 删除保护熔断：{} 项将被删除（视图「{label}」{since}）",
+        d.count
+    );
+    if let Some(r) = &d.reason {
+        println!("  原因: {r}");
+    }
+    println!("  —— 以下为对账判定的删除候选（尚未删除任何文件）——");
+    for p in &d.paths {
+        println!("    {p}");
+    }
+    if d.truncated {
+        println!(
+            "    …（共 {} 项，只列出前 {} 项；完整判定见 daemon 日志或 `--json`）",
+            d.count,
+            d.paths.len()
+        );
+    }
+    println!("  放行：`qxync sync --once --force-deletes`（只放行这一轮，下一轮超阈值会再次熔断）");
 }
 
 /// ★ M40：daemon 不在 / 不认识 `routes` 时的直连探测。

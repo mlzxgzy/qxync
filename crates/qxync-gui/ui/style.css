@@ -1526,6 +1526,24 @@ button.primary.danger:hover:not(:disabled) {
   filter: brightness(1.08);
 }
 
+/* ============================================================================
+ * ★ M2c：删除熔断清单弹窗（#blocked-modal）
+ *
+ * 「放行删除」前看**是哪些**要被删。清单可能几百项（真机 526），所以：
+ * 列表更高（42vh，与 NAS 目录选择器同高）、mono + 允许断行（路径长）、
+ * 每项前缀「将删除」徽标让滚动中也能认出这是删除候选。
+ * ==========================================================================*/
+#blocked-items {
+  max-height: 42vh;
+  overflow: auto;
+  word-break: break-all;
+}
+
+.blocked-item { margin: 2px 0; }
+.blocked-item-path { color: var(--fg); }
+.blocked-item .badge { vertical-align: baseline; margin-right: 6px; }
+#blocked-extra { margin-top: 8px; }
+
 /* 危险区卡片：左侧一条红边，和普通设置卡片区分开（内层仍是同一套卡片样式） */
 .danger-card { border-left: 3px solid var(--err); }
 

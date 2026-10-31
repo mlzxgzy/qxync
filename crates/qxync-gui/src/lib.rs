@@ -989,6 +989,31 @@ pub fn ui_spec() -> Value {
         "in_secs": app.contains("'log',"),
     });
 
+    // 8) ★ M2c：删除熔断清单弹窗 —— 「放行删除」前先看是哪些要被删。
+    //    只查「有没有按钮」不够：弹窗缺 `blocked-items` 时用户看不到清单，
+    //    等于盲放行；app.js 没调 `blocked_deletes` 时弹窗永远空；
+    //    告警行没挂「查看清单」时弹窗根本打不开。
+    let blocked_list_ok = index.contains("id=\"blocked-modal\"")
+        && index.contains("id=\"blocked-items\"")
+        && index.contains("id=\"blocked-force\"")
+        && index.contains("id=\"blocked-close\"")
+        && app.contains("function openBlockedDialog")
+        && app.contains("function wireBlockedModal")
+        && app.contains("'blocked_deletes'")
+        && app.contains("T('blocked.view_list')")
+        && app.contains("wireBlockedModal();");
+    let blocked_list = json!({
+        "ok": blocked_list_ok,
+        "modal": index.contains("blocked-modal"),
+        "items_slot": index.contains("blocked-items"),
+        "force_button": index.contains("blocked-force"),
+        "close_button": index.contains("blocked-close"),
+        "dialog_helper": app.contains("function openBlockedDialog"),
+        "ipc_call": app.contains("'blocked_deletes'"),
+        "alert_entry": app.contains("T('blocked.view_list')"),
+        "wired_in_boot": app.contains("wireBlockedModal();"),
+    });
+
     json!({
         "ok": sinks.is_empty()
             && i18n_ok
@@ -996,7 +1021,8 @@ pub fn ui_spec() -> Value {
             && states_ok
             && task_defaults_ok
             && purge_ok
-            && logs_ok,
+            && logs_ok
+            && blocked_list_ok,
         "html_sinks": sinks,
         "i18n": {
             "ok": i18n_ok,
@@ -1013,6 +1039,7 @@ pub fn ui_spec() -> Value {
         "task_defaults": task_defaults,
         "purge": purge,
         "logs": logs,
+        "blocked_list": blocked_list,
     })
 }
 
@@ -1515,6 +1542,65 @@ mod tests {
         assert!(
             !app.contains("search-tbody').innerHTML"),
             "结果表不许用 innerHTML 拼接"
+        );
+    }
+
+    /// ★ M2c：删除熔断清单弹窗必须真的接上 —— 弹窗本体 + 清单槽 + 两个出口按钮
+    /// + `blocked_deletes` IPC 调用 + 告警行的「查看清单」入口 + boot 里接线。
+    ///
+    /// 为什么逐项点名（而不是只看 `ui_spec.blocked_list.ok`）：最容易漏的是
+    /// 「弹窗有了但告警行没挂入口」—— 用户看到「有删除被熔断挡住」却找不到
+    /// 哪里看清单，等于这个功能不存在。四个告警位（首页 / 状态页 / 诊断页 /
+    /// 任务卡）都要有入口，少一个就是「这页看不到」。
+    #[test]
+    fn m2c_blocked_list_dialog_is_wired() {
+        let index = include_str!("../ui/index.html");
+        let app = include_str!("../ui/app.js");
+        for needle in [
+            "id=\"blocked-modal\"",
+            "id=\"blocked-title\"",
+            "id=\"blocked-message\"",
+            "id=\"blocked-items\"",
+            "id=\"blocked-extra\"",
+            "id=\"blocked-force\"",
+            "id=\"blocked-close\"",
+        ] {
+            assert!(index.contains(needle), "index.html 缺少 {needle}");
+        }
+        for needle in [
+            "function openBlockedDialog(",
+            "function renderBlockedList(",
+            "function closeBlockedDialog(",
+            "function wireBlockedModal(",
+            "wireBlockedModal();",
+            "'blocked_deletes'",
+        ] {
+            assert!(app.contains(needle), "app.js 缺少 {needle}");
+        }
+        // IPC 方法名必须是 blocked_deletes（拼错 = 弹窗永远空）。
+        assert!(
+            app.contains("method: 'blocked_deletes'"),
+            "app.js 没有调用 blocked_deletes IPC"
+        );
+        // 四个告警位都要有「查看清单」入口：首页 / 状态页(sync-alerts) /
+        // 诊断页(sync2-alerts) / 任务卡。任务卡是动态按钮，查 T('blocked.view_list')
+        // 的出现次数 ≥ 4（每处一个）。
+        let entries = app.matches("T('blocked.view_list')").count();
+        assert!(
+            entries >= 4,
+            "「查看清单」入口必须覆盖四个告警位（首页/状态/诊断/任务卡），当前只有 {entries} 处"
+        );
+        // 弹窗里的「放行」必须走 doForceDeletes（同一条二次确认链），不许自造捷径。
+        assert!(
+            app.contains("closeBlockedDialog();\n        doForceDeletes(force, lid);"),
+            "弹窗里的放行必须先关弹窗再走 doForceDeletes 的二次确认"
+        );
+        let s = ui_spec();
+        assert_eq!(
+            s["blocked_list"]["ok"],
+            serde_json::Value::Bool(true),
+            "ui_spec.blocked_list: {:#}",
+            s["blocked_list"]
         );
     }
 }

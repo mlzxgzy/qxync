@@ -25,6 +25,13 @@ use std::path::PathBuf;
 /// 本文件新增的 `DecisionsData.removed_one` 与 `DiffData` 属于第一类，故仍是 1。
 pub const IPC_VERSION: u32 = 1;
 
+/// ★ M2c：`blocked_deletes` 返回的路径清单上限。
+///
+/// 真机熔断动辄几百项（526 / 812），全量塞进 IPC 响应 + 弹窗渲染都受不住；
+/// 清单的用途是「看一眼是哪一片、有没有不该删的」，前 200 条 + 截断标记
+/// 已经覆盖任何「整棵子树被清空」的场景（BTreeMap 升序 = 同目录的聚在一起）。
+pub const BLOCKED_LIST_MAX: usize = 200;
+
 // ---------------------------------------------------------------- 路径规则
 
 /// 默认 socket 路径：`$XDG_RUNTIME_DIR/qxync/qxyncd.sock`，退到 state 目录。
@@ -382,6 +389,15 @@ pub enum Request {
         #[serde(default)]
         prune: Option<bool>,
     },
+    /// ★ M2c：删除熔断时被挡住的**路径清单**（「放行删除」前先看清单的窗口）。
+    ///
+    /// 熔断告警只说「本轮有 N 项删除被保护挡住」—— 用户看不到**是哪些**，
+    /// 只能凭原因字符串盲猜（真机 526 项那次，用户原话「确认这些删除确实需要，
+    /// 再放行」—— 没有清单根本没法确认）。daemon 在对账判熔断时把整批
+    /// `deletes` 路径记下来（内存，签名变化时替换），这里取出来。
+    ///
+    /// 只读、零网络：清单是熔断那一轮对账的**判定结果快照**，不重新列目录。
+    BlockedDeletes,
     /// 干净退出：卸载所有挂载点、删 socket/pid。
     Shutdown,
 }
@@ -419,6 +435,7 @@ impl Request {
             Request::Space { .. } => "space",
             Request::BalooStatus => "baloo_status",
             Request::Logs { .. } => "logs",
+            Request::BlockedDeletes => "blocked_deletes",
             Request::Shutdown => "shutdown",
         }
     }
@@ -879,6 +896,31 @@ pub struct SyncInfo {
     /// 删除保护熔断的原因（有值 = 当前有删除被挡住，`--force-deletes` 可放行）。
     pub delete_block_reason: Option<String>,
     pub note: Option<String>,
+}
+
+/// ★ M2c：`blocked_deletes` 的返回 —— 熔断挡下的**路径清单** + 判定上下文。
+///
+/// 为什么带 `reason` / `count` / `first_seen`：清单是**判定那一刻**的快照，
+/// 而告警行是**最近一次完整轮询**的结论 —— 两者可能短暂不一致（比如熔断
+/// 解除后、下一轮还没跑时，`delete_block_reason` 已清空但清单还留着）。
+/// 前端把三个字段一起展示，用户才能对上「这就是刚才那条告警说的那批」。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BlockedDeletesData {
+    /// 当前是否处于熔断中（`delete_block_reason` 有值）。
+    pub blocked: bool,
+    /// daemon 给的人话原因（与告警行同源）。
+    pub reason: Option<String>,
+    /// 清单条数（`paths` 截断后仍报**全量**数，与 `deletes_blocked` 的口径一致）。
+    pub count: u64,
+    /// 被挡路径（相对挂载根的远端路径，升序；最多 [`BLOCKED_LIST_MAX`] 条）。
+    pub paths: Vec<String>,
+    /// 清单对应的挂载视图短名（`MountView::label`：任务目录名或远端根最后一段）。
+    pub label: Option<String>,
+    /// 清单落下的 unix 秒（熔断**首次**出现那一轮；同签名重复轮次不刷新）。
+    pub first_seen_unix: i64,
+    /// `paths` 被截断时为真（前端据此显示「只列出前 N 条」）。
+    pub truncated: bool,
 }
 
 /// ★ M3：本地缓存 / 脱水状态。
