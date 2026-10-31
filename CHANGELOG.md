@@ -7,6 +7,8 @@
 
 ## [未发布]
 
+## [0.8.2] - 2026-10-31
+
 ### 新增
 
 - **删除熔断能「先看清单再决定」（[M2c](docs/M2c-变更发现.md) §5.3）**：用户反馈
@@ -1973,6 +1975,7 @@ NAS 设置名 `QSYNC_FOLDERPAIR_USE_SPACE_SAVING`、Windows 客户端注册表�
 - 验收结论从 README 抽出为 [`docs/验收记录.md`](docs/验收记录.md)。
 - 采用 **MIT OR Apache-2.0** 双许可（`LICENSE-MIT` / `LICENSE-APACHE`）。
 
+[0.8.2]: https://github.com/mlzxgzy/qxync/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/mlzxgzy/qxync/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/mlzxgzy/qxync/compare/v0.7.14...v0.8.0
 [0.7.14]: https://github.com/mlzxgzy/qxync/compare/v0.7.13...v0.7.14
