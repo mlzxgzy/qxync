@@ -252,6 +252,36 @@ GUI：三处「有删除被熔断挡住」告警一直亮着（问题恢复/放�
   baseline 里已有的回收站条目做一次性清理（**只清状态，不动文件**）。
   QTS 清理自己的回收站时，不会再在本端产生成批「远端删除」候选。
 
+### 5.3 熔断清单：放行前先看「是哪些」（2026-10-31 补充）
+
+> 用户反馈：「删除被熔断挡住：本轮有 99 项删除被保护挡住……加个能够看到啥（文件）
+> 被批量删除的窗口，然后看到后可以决定是否删除。」
+
+§5.1 把出口挂在了提示上，但那个出口（「放行删除」）仍然是**盲放行** —— 告警只说
+「本轮有 N 项删除被保护挡住」，**是哪 N 项任何地方都看不到**；那句「确认这些删除
+确实需要，再放行」没有清单就是空话（真机 526 项那次，用户只能凭「NAS 上确实清过
+一个文件夹」的记忆赌一把）。清单在引擎里其实**一直都有** —— `reconcile_view`
+判熔断那一刻手里握着完整的 `deletes`，只是以前数完数就扔了。
+
+| 决策 | 做法 |
+|---|---|
+| 捕获点 = 判熔断那一刻 | `reconcile_view` 在 `check()` 失败分支把 `deletes` 快照进 `SyncReport.delete_block_list`（升序 = BTreeSet 迭代序、截断到 `BLOCKED_LIST_MAX`=200 条、`count` 永远是全量数）；多视图同轮熔断（罕见但可能）走 `merge_blocked_list` **合并**而不是覆盖（`deletes_blocked` 是逐路累加的，清单只留最后一路会让 count 与 paths 对不上；label 不同并成「多路」）；`--force-deletes` 放行的轮次**不产生**清单（那轮已经真删了，清单会像「还有东西被挡」） |
+| 生命周期 = 熔断签名 | `absorb_round`：签名变化 → 用本轮快照**替换**（`first_seen_unix` 记现在）；同签名重复轮次 → **保留旧的**（first_seen 不漂移，「挡了多久」的起点不能变）；完整跑完且没再被挡 → 清空；提前返回的轮次不清（连对账都没跑完）。`--force-deletes` 手动放行时与 reason/签名一起清 |
+| 内存态，不落库 | daemon 重启后清单没了，但下一轮对账会重新算出同一批判定（baseline 没动），清单自己回来 —— 不为它付持久化成本 |
+| IPC：`blocked_deletes` | 只读内存快照，零网络。返回 `blocked`（与 `delete_block_reason` 同源）/ `reason` / `count` / `paths` / `label`（视图短名）/ `first_seen_unix` / `truncated`。空转待命的 daemon 回空表而不是报错 |
+| GUI：`#blocked-modal` | 独立弹窗（不复用 `#purge-modal` —— 那是「确认 + 复选框」的形状，这里要「长清单 + 滚动」）：42vh 滚动、mono 路径、「将删除」徽标、截断说明（「共 N 项，只列出前 200 项 —— 同目录的排在一起，看前几条通常就能认出是哪一片」）。开着时随状态轮询自动刷新 |
+| 四个告警位都有入口 | 首页 / 状态页 / 诊断页 / 任务卡都加「查看清单」按钮，顺序在「放行删除」**前面**（先看再决定）。`addAlert` 的 `action` 参数支持数组，按钮顺序 = 数组顺序 |
+| 弹窗里的「放行」不是捷径 | 走 `doForceDeletes()` 同一条二次确认链（原始原因 + 「误清空别放行」提示），关掉弹窗再确认 —— 弹窗是**看**的地方，不是绕过确认的后门 |
+| CLI：`qxync sync --blocked-list` | 终端同样能看（`--json` 可用）；`qxync status` / `qxync sync` 的熔断行同步提示这个参数 |
+| 范围 | 只覆盖**对账侧**的批量删除熔断（`DeleteProtection`）。FUSE 侧本地 `rm -rf` 熔断（`DeleteGuard`）不在内 —— 它逐项回 `EACCES`，没有「一批待删清单」可看 |
+
+覆盖测试：`absorb_round_manages_blocked_list_with_signature`（存取 / 保留 / 清空 /
+提前返回不清）、`merge_blocked_list_combines_views_and_caps`（多视图合并 + 截断 +
+label 幂等）、`reconcile_captures_blocked_paths_when_tripped`（升序 + 全量计数）、
+`daemon::m2c_blocked_deletes_data_maps_stats_fields`（IPC 字段映射 + 截断标记）、
+`m2c_engine_refresh_conflict_delete_protection`（真机：熔断轮带清单、放行轮不带、
+放行后清空）、`m2c_blocked_list_dialog_is_wired`（GUI 四个入口 + IPC + boot 接线）。
+
 ---
 
 ## 6. 远端变更如何作用到 FUSE

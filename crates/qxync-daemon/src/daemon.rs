@@ -7,13 +7,14 @@ use qxync_client::peer::PeerEvent;
 use qxync_client::{Client, Router, Session};
 use qxync_core::dehydrate::{Block, CacheLimit, Policy};
 use qxync_core::ipc::{
-    decode_line, encode_line, mask_sid, mask_token, BalooMountInfo, BalooStatusData, CacheInfo,
-    CursorInfo, DaemonInfo, DecisionInfo, DecisionsData, DehydrateData, DiffData, EndpointInfo,
-    ErrorKind, FileStateInfo, FileStatesData, GetData, HydroStats, IpcError, JournalData, LinkInfo,
-    LogFileInfo, LoginData, LogsData, LsData, MountInfo, OfflineInfo, OverlayPluginInfo, PeerData,
-    PingData, ProgressData, ProgressLine, PutData, Request, RequestEnvelope, Response, RootsData,
-    RoutesData, RulesData, ServerInfo, SessionInfo, SettingsData, ShutdownData, SpaceData,
-    StatusData, StoreData, SyncCursors, SyncInfo, TaskInfo, TasksData, IPC_VERSION,
+    decode_line, encode_line, mask_sid, mask_token, BalooMountInfo, BalooStatusData,
+    BlockedDeletesData, CacheInfo, CursorInfo, DaemonInfo, DecisionInfo, DecisionsData,
+    DehydrateData, DiffData, EndpointInfo, ErrorKind, FileStateInfo, FileStatesData, GetData,
+    HydroStats, IpcError, JournalData, LinkInfo, LogFileInfo, LoginData, LogsData, LsData,
+    MountInfo, OfflineInfo, OverlayPluginInfo, PeerData, PingData, ProgressData, ProgressLine,
+    PutData, Request, RequestEnvelope, Response, RootsData, RoutesData, RulesData, ServerInfo,
+    SessionInfo, SettingsData, ShutdownData, SpaceData, StatusData, StoreData, SyncCursors,
+    SyncInfo, TaskInfo, TasksData, IPC_VERSION,
 };
 use qxync_core::mounts::{MountRecord, MountsFile};
 use qxync_core::rules::Rules;
@@ -811,6 +812,10 @@ async fn handle_idle_conn(
                     // ★ M39：日志目录是纯本地的，空转待命也要能看/能清
                     //   （「daemon 空转待命」恰恰是日志最可能攒着没人管的时候）。
                     Request::Logs { prune } => logs_cmd(prune.unwrap_or(false)),
+                    // ★ M2c：空转待命没有同步引擎在跑，也就不可能有熔断清单。
+                    //   回空表而不是报错 —— GUI 的弹窗在「未配置连接」时打开
+                    //   也不该炸（`blocked=false, count=0` 就是「没有被挡的删除」）。
+                    Request::BlockedDeletes => to_value(BlockedDeletesData::default()),
                     Request::Shutdown => {
                         // 与同步模式一致：先回响应，再触发退出
                         let tx = shutdown.clone();
@@ -1684,6 +1689,9 @@ async fn dispatch(
             )
             .await
         }
+        // ★ M2c：熔断清单是纯内存快照（`SyncStats::delete_block_list`），
+        //   零网络、零落库 —— 只要把 `SyncStats` 里的东西拼成响应。
+        Request::BlockedDeletes => blocked_deletes_cmd(state),
         Request::Rm { dir, name } => rm(state, dir, name).await,
         Request::Store { integrity } => store_info(state, integrity.unwrap_or(false)),
         Request::Dehydrate {
@@ -4128,6 +4136,10 @@ async fn sync_cmd(
         state.sync_stats.delete_block_reason.lock().unwrap().take();
         // 签名也一起清：解除之后再出现熔断要能重新 WARN / 记 journal。
         state.sync_stats.delete_block_sig.lock().unwrap().take();
+        // ★ 清单也清：放行后这一轮会真的执行删除，旧清单留在界面上
+        //   会像「还有东西被挡」。放行后的下一轮要么正常、要么重新熔断
+        //   （新签名 → 新清单），两种情况都不需要旧快照。
+        *state.sync_stats.delete_block_list.lock().unwrap() = sync::BlockedList::default();
         tracing::warn!("删除保护已解除（--force-deletes，仅放行一轮）");
     }
     if once {
@@ -4144,6 +4156,39 @@ async fn sync_cmd(
         );
     }
     to_value(sync_info(state))
+}
+
+/// ★ M2c：`Request::BlockedDeletes` —— 熔断挡下的路径清单（「放行删除」前先看要删什么）。
+///
+/// 只读 `SyncStats`：`blocked` 与 `status.sync.delete_block_reason` 同源（有值 = 在熔断），
+/// 清单本体是对账判熔断那一刻的快照。两者可能短暂不一致 —— 比如熔断解除后、
+/// 下一轮对账还没跑时，reason 已清空但清单还留着 —— 所以分开返回，前端各自展示。
+/// 空转待命的 daemon 走不到这里（`handle_idle_conn` 有自己的应答）。
+fn blocked_deletes_cmd(state: &Arc<State>) -> Result<serde_json::Value, IpcError> {
+    to_value(blocked_deletes_data(&state.sync_stats))
+}
+
+/// `blocked_deletes_cmd` 的纯读半边（单测直接喂 `SyncStats`，不用起整个 State）。
+///
+/// `blocked` 与 `status.sync.delete_block_reason` 同源（有值 = 在熔断）；清单本体是
+/// 对账判熔断那一刻的快照。两者可能短暂不一致 —— 熔断解除后、下一轮对账还没跑时，
+/// reason 已清空但清单还留着 —— 所以分开返回，前端各自展示。
+fn blocked_deletes_data(stats: &sync::SyncStats) -> BlockedDeletesData {
+    let reason = stats.delete_block_reason.lock().unwrap().clone();
+    let lst = stats.delete_block_list.lock().unwrap();
+    BlockedDeletesData {
+        blocked: reason.is_some(),
+        reason,
+        count: lst.count,
+        paths: lst.paths.clone(),
+        label: if lst.label.is_empty() {
+            None
+        } else {
+            Some(lst.label.clone())
+        },
+        first_seen_unix: lst.first_seen_unix,
+        truncated: lst.paths.len() < lst.count as usize,
+    }
 }
 
 /// 后台轮询：按 `sync_interval` 周期跑 `run_sync_once`；未登录时静默跳过。
@@ -7398,6 +7443,42 @@ mod tests {
                 h.mountpoint.display()
             );
         }
+    }
+
+    /// ★ M2c：`blocked_deletes` IPC 的读半边 —— 字段映射必须与 `SyncStats` 对得上。
+    ///
+    /// `blocked` 与 reason 同源；`truncated` 只看 `paths.len() < count`（截断标记
+    /// 由读侧现算，不存两份）；空 label 序列化成 `None`（前端不用判空串）。
+    #[test]
+    fn m2c_blocked_deletes_data_maps_stats_fields() {
+        use sync::{BlockedList, SyncStats};
+        // 空状态：没有熔断 → blocked=false、count=0、label=None
+        let d = blocked_deletes_data(&SyncStats::default());
+        assert!(!d.blocked);
+        assert_eq!(d.count, 0);
+        assert!(d.paths.is_empty());
+        assert_eq!(d.label, None);
+        assert!(!d.truncated);
+
+        // 熔断中：reason 有值、清单带截断
+        let stats = SyncStats::default();
+        *stats.delete_block_reason.lock().unwrap() = Some("本轮有 526 项删除被保护挡住".into());
+        *stats.delete_block_list.lock().unwrap() = BlockedList {
+            count: 526,
+            paths: (0..qxync_core::ipc::BLOCKED_LIST_MAX)
+                .map(|i| format!("/home/web/{i}.html"))
+                .collect(),
+            label: "qsync".into(),
+            first_seen_unix: 1_700_000_000,
+        };
+        let d = blocked_deletes_data(&stats);
+        assert!(d.blocked);
+        assert_eq!(d.count, 526);
+        assert_eq!(d.paths.len(), qxync_core::ipc::BLOCKED_LIST_MAX);
+        assert!(d.truncated, "count > paths.len() 必须带截断标记");
+        assert_eq!(d.label.as_deref(), Some("qsync"));
+        assert_eq!(d.first_seen_unix, 1_700_000_000);
+        assert_eq!(d.reason.as_deref(), Some("本轮有 526 项删除被保护挡住"));
     }
 
     /// ★ T8：待裁决冲突只数 `resolution IS NULL` 的行。

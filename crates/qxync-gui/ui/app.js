@@ -1596,9 +1596,14 @@
       act.appendChild(bDel);
     }
 
-    // ★ 只有状态行真的在讲「删除被熔断」时才给这个按钮：它是这条提示的**出口**，
-    //   放在别的状态下就是个语义错位的危险按钮（而它确实会真删东西）。
+    // ★ 只有状态行真的在讲「删除被熔断」时才给这两个按钮：先看清单、再放行。
+    //   「放行删除」是危险按钮（它确实会真删东西），放在别的状态下就是语义错位；
+    //   「查看清单」是只读的，但同样只在熔断时出现 —— 别的时候点开只会看到空态。
     if (blocked) {
+      var bList = el('button', 'mini', T('blocked.view_list'));
+      bList.type = 'button';
+      bList.addEventListener('click', function () { openBlockedDialog(linkId); });
+      act.appendChild(bList);
       var bForce = el('button', 'mini danger', T('sync.force_deletes'));
       bForce.type = 'button';
       bForce.addEventListener('click', function () { doForceDeletes(bForce, linkId); });
@@ -2748,12 +2753,17 @@
           }));
         }
         if (sy.delete_block_reason) {
+          // ★ 两个出口，顺序即操作顺序：先「查看清单」（看是哪些要被删），
+          //   再「放行删除」（真删）。清单是 daemon 内存快照，点开零网络开销。
           addAlert('home-alerts', T('home.sync_blocked_link', {
             label: label, reason: String(sy.delete_block_reason)
-          }), null, {
+          }), null, [{
+            label: T('blocked.view_list'),
+            onClick: function (b) { openBlockedDialog(id); }
+          }, {
             label: T('sync.force_deletes'),
             onClick: function (b) { doForceDeletes(b, id); }
-          });
+          }]);
         }
         if (sy.note) {
           addAlert('home-alerts', T('home.sync_note_link', { label: label, note: String(sy.note) }), 'warn');
@@ -2986,7 +2996,13 @@
       }
       if (sy.delete_block_reason) {
         addAlert('sync-alerts', T('sync.blocked_alert', { reason: String(sy.delete_block_reason) }),
-          null, { label: T('sync.force_deletes'), onClick: doForceDeletes });
+          null, [{
+            label: T('blocked.view_list'),
+            onClick: function (b) { openBlockedDialog(); }
+          }, {
+            label: T('sync.force_deletes'),
+            onClick: doForceDeletes
+          }]);
       }
       var note = $('sync-note');
       if (note) {
@@ -3031,23 +3047,31 @@
   // ★ 只有真失败才配红色；引擎的 note（如 qbox_get_sync_log 的 -17「区间内没有事件」）
   //   是提示性诊断信息，归 'warn'，否则主页会常驻一个红框。
   //
-  // ★ action（可选 {label, onClick}）：告警行右侧挂一个按钮。
+  // ★ action（{label, onClick} 或其**数组**）：告警行右侧挂按钮。
   //   用户反馈（2026-10-04）：「有删除被熔断挡住（待确认）」这条提示**没地方处理**——
   //   它只说「到诊断→同步/缓存可放行」，而那里的按钮叫「强制放行删除」，两边对不上，
   //   看到的人根本不知道该点哪个。**凡是「看到了还得做点什么」的状态，就把按钮挂在
   //   这条提示自己身上**，别让用户自己去找。
+  //   数组形态是 M2c 熔断告警加的：一条告警两个出口（先「查看清单」再「放行删除」），
+  //   按钮顺序 = 数组顺序（先看到的排前面）。
   function addAlert(containerId, text, severity, action) {
     var box = $(containerId);
     if (!box) { return; }
     var cls = (severity === 'warn') ? 'alert alert-warn' : 'alert';
     var row = el('div', cls);
     row.appendChild(el('span', 'alert-text', text));
-    if (isObj(action) && action.label && typeof action.onClick === 'function') {
-      row.className += ' alert-act';
-      var b = el('button', 'mini danger', action.label);
-      b.type = 'button';
-      b.addEventListener('click', function () { action.onClick(b); });
-      row.appendChild(b);
+    var acts = Array.isArray(action) ? action : (isObj(action) ? [action] : []);
+    var wired = 0;
+    for (var i = 0; i < acts.length; i++) {
+      (function (a) {
+        if (!isObj(a) || !a.label || !isFn(a.onClick)) { return; }
+        row.className += ' alert-act';
+        var b = el('button', 'mini danger', a.label);
+        b.type = 'button';
+        b.addEventListener('click', function () { a.onClick(b); });
+        row.appendChild(b);
+        wired++;
+      })(acts[i]);
     }
     box.appendChild(row);
   }
@@ -3081,6 +3105,131 @@
       if (btn) { btn.disabled = false; }
       throw e;
     });
+  }
+
+  // ============================================================ ★ M2c：熔断清单弹窗
+  //
+  // 「放行删除」前先看**是哪些**要被删。数据源 `blocked_deletes`（daemon 内存快照，
+  // 零网络）。独立弹窗（#blocked-modal）而不是复用 #purge-modal：后者是
+  // 「确认 + 复选框」的形状，这里要的是「长清单 + 滚动 + 两个出口」。
+  // 弹窗里的「放行」走 doForceDeletes（同一条二次确认链），不是绕过确认的捷径。
+  var blockedLastFocus = null;
+  var blockedLinkId = '';
+
+  /** 打开熔断清单弹窗：拉 `blocked_deletes` → 填列表。失败也打开（红字说明）。 */
+  function openBlockedDialog(linkId) {
+    var box = $('blocked-modal');
+    if (!box) { return Promise.resolve(null); }
+    var lid = str(linkId) || currentId();
+    blockedLinkId = lid;
+    blockedLastFocus = document.activeElement;
+    box.hidden = false;
+    setText('blocked-title', T('blocked.title'));
+    setText('blocked-message', T('blocked.loading'));
+    clear($('blocked-items'));
+    var extra = $('blocked-extra');
+    if (extra) { extra.hidden = true; extra.textContent = ''; }
+    var forceBtn = $('blocked-force');
+    if (forceBtn) { forceBtn.disabled = true; }
+    if (!requireDaemon(lid)) { closeBlockedDialog(); return Promise.resolve(null); }
+    return ipcFor(lid, { method: 'blocked_deletes' }).then(function (r) {
+      renderBlockedList(isObj(r.data) ? r.data : null, isObj(r) && !r.ok ? str(r.error) : '');
+      return r;
+    }, function (e) {
+      renderBlockedList(null, str(e));
+      return null;
+    });
+  }
+
+  /** 把 BlockedDeletesData 填进弹窗；空清单 / 失败各有各的说法。 */
+  function renderBlockedList(d, errMsg) {
+    var msg = $('blocked-message');
+    var ul = $('blocked-items');
+    var extra = $('blocked-extra');
+    var forceBtn = $('blocked-force');
+    if (!msg || !ul) { return; }
+    clear(ul);
+    if (errMsg) {
+      msg.textContent = T('blocked.load_failed', { msg: errMsg });
+      msg.className = 'hint';
+      if (extra) { extra.hidden = true; }
+      if (forceBtn) { forceBtn.disabled = true; }
+      return;
+    }
+    if (!isObj(d) || num(d.count, 0) === 0) {
+      // 没有被挡的删除：告警可能已解除，或 daemon 刚重启（内存清单没了）。
+      msg.textContent = T('blocked.empty');
+      if (extra) {
+        extra.hidden = false;
+        extra.textContent = T('blocked.empty_hint');
+      }
+      if (forceBtn) { forceBtn.disabled = true; }
+      return;
+    }
+    var since = (num(d.first_seen_unix, 0) > 0)
+      ? T('blocked.since', { age: humanDuration(Math.max(0, Math.floor(Date.now() / 1000) - num(d.first_seen_unix, 0))) })
+      : '';
+    msg.textContent = T('blocked.message', {
+      count: num(d.count, 0),
+      label: str(d.label) || '—',
+      since: since,
+      reason: (d.reason ? String(d.reason) : T('sync.force_deletes_noreason'))
+    });
+    var paths = Array.isArray(d.paths) ? d.paths : [];
+    for (var i = 0; i < paths.length; i++) {
+      var li = el('li', 'blocked-item');
+      li.appendChild(el('span', 'badge badge-warn', T('blocked.item_mark')));
+      li.appendChild(el('span', 'mono blocked-item-path', str(paths[i])));
+      ul.appendChild(li);
+    }
+    if (extra) {
+      var trunc = (d.truncated === true || paths.length < num(d.count, 0));
+      extra.hidden = !trunc;
+      extra.textContent = trunc
+        ? T('blocked.truncated', { count: num(d.count, 0), shown: paths.length })
+        : '';
+    }
+    if (forceBtn) { forceBtn.disabled = false; }
+  }
+
+  function closeBlockedDialog() {
+    var box = $('blocked-modal');
+    if (box) { box.hidden = true; }
+    if (blockedLastFocus && isFn(blockedLastFocus.focus)) { blockedLastFocus.focus(); }
+    blockedLastFocus = null;
+    blockedLinkId = '';
+  }
+
+  function wireBlockedModal() {
+    var box = $('blocked-modal');
+    var force = $('blocked-force');
+    var close = $('blocked-close');
+    if (force) {
+      force.addEventListener('click', function () {
+        // 弹窗里的「放行」= 关掉自己再走 doForceDeletes 的二次确认链
+        //（不是绕过确认的捷径；按钮文案与告警行那个完全一致）。
+        var lid = blockedLinkId;
+        closeBlockedDialog();
+        doForceDeletes(force, lid);
+      });
+    }
+    if (close) { close.addEventListener('click', function () { closeBlockedDialog(); }); }
+    if (box) {
+      // 点遮罩 = 关闭（焦点在弹窗内，Esc / Tab 与 #purge-modal 同一套处理）
+      box.addEventListener('click', function (ev) {
+        if (ev.target === box) { closeBlockedDialog(); }
+      });
+      box.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Escape') { ev.preventDefault(); closeBlockedDialog(); return; }
+        if (ev.key !== 'Tab') { return; }
+        var f = box.querySelectorAll('input, select, textarea, button, [href], [tabindex]:not([tabindex="-1"])');
+        if (!f.length) { return; }
+        var first = f[0];
+        var last = f[f.length - 1];
+        if (ev.shiftKey && document.activeElement === first) { ev.preventDefault(); last.focus(); }
+        else if (!ev.shiftKey && document.activeElement === last) { ev.preventDefault(); first.focus(); }
+      });
+    }
   }
 
   function clearAlerts(containerId) {
@@ -5400,7 +5549,13 @@
     if (sy.note) { addAlert('sync2-alerts', '说明：' + String(sy.note), 'warn'); }
     if (sy.delete_block_reason) {
       addAlert('sync2-alerts', T('sync.blocked_alert', { reason: String(sy.delete_block_reason) }),
-        null, { label: T('sync.force_deletes'), onClick: doForceDeletes });
+        null, [{
+          label: T('blocked.view_list'),
+          onClick: function (b) { openBlockedDialog(); }
+        }, {
+          label: T('sync.force_deletes'),
+          onClick: doForceDeletes
+        }]);
     }
 
     var cdl = $('cache-full-kv');
@@ -5774,6 +5929,16 @@
       if (document.hidden) { return; }
       if (linksInflight) { return; }
       refreshStatus(true);
+      // ★ M2c：熔断清单弹窗开着时跟着刷新（后台轮询可能已解除熔断 / 换了一批）。
+      //   只在开着时拉 —— 关着的时候多拉一份清单纯属浪费。
+      var bm = $('blocked-modal');
+      if (bm && !bm.hidden && str(blockedLinkId)) {
+        ipcFor(blockedLinkId, { method: 'blocked_deletes' }).then(function (r) {
+          if (bm.hidden) { return; }
+          renderBlockedList(isObj(r.data) ? r.data : null,
+            (isObj(r) && !r.ok) ? str(r.error) : '');
+        }, function () { /* 轮询刷新失败不打扰：下一次 tick 再试 */ });
+      }
       // ★ M8.4：每 3 个 tick（≈6s）看一次错误列表，有新错误就发桌面通知
       // ★ M28：同一个 tick 顺带看冲突（网络错误已降 warn，不会走错误通知这条路）
       state.errorTick = (state.errorTick || 0) + 1;
@@ -7823,6 +7988,7 @@
     }
     wireModal();
     wirePurgeModal();
+    wireBlockedModal();
     wireLogBox();
     wireRowMenu();
     wireTray();

@@ -381,6 +381,12 @@ pub struct SyncReport {
     /// 只有它为真时才写 WARN 与 journal（避免把日志和历史记录冲掉）；
     /// 解除时也置真，用来记一条「熔断已解除」。
     pub delete_block_changed: bool,
+    /// ★ 本轮熔断挡下的路径清单（`deletes` 的截断快照 + 视图短名）。
+    ///
+    /// 只在对账判熔断时填充（`force_deletes` 放行的轮次为空 —— 那轮已经真删了，
+    /// 清单留在界面上反而像「还有东西被挡」）。`absorb_round` 把它并入
+    /// `SyncStats::delete_block_list`（签名变化时替换）。
+    pub delete_block_list: Option<BlockedList>,
     /// ★ 本轮是否识别到**会话失效**（sid 过期）。
     ///
     /// `poll_once` 把错误塞进 `errors` 后仍返回 `Ok`，所以轮询循环的
@@ -590,6 +596,14 @@ pub struct SyncStats {
     /// 上一轮的**熔断签名**（`数量|原因`）。只有签名变化才重新 WARN / 记 journal，
     /// 否则真机每 30s 一条的重复告警会把 1 万条的 journal 上限几天内冲掉。
     pub delete_block_sig: Mutex<Option<String>>,
+    /// ★ M2c：熔断挡下的**路径清单**（对账判熔断那一刻的快照）。
+    ///
+    /// 「放行删除」前用户得能看到**是哪些**要被删 —— 没有清单，告警里那句
+    /// 「确认这些删除确实需要，再放行」就是空话（真机 526 项那次只能盲猜）。
+    /// 与 `delete_block_sig` 同一套生命周期：签名变化时替换、解除时清空。
+    /// 内存态（不落库）：daemon 重启后清单没了，但下一轮对账会重新算出同一批
+    /// 判定（baseline 没动），清单会自己回来 —— 不需要为它付持久化成本。
+    pub delete_block_list: Mutex<BlockedList>,
     /// ★ M30：上一轮的网络失败签名（`None` = 上一轮没有网络失败）。
     ///
     /// 断网往往持续多轮，而每轮都会记同一条「网络失败，已缓冲」——不签名去重的话，
@@ -598,6 +612,22 @@ pub struct SyncStats {
     pub network_sig: Mutex<Option<String>>,
     pub last_note: Mutex<Option<String>>,
     pub devices: Mutex<BTreeMap<String, u64>>,
+}
+
+/// 熔断清单的内存形状（`SyncStats::delete_block_list`）。
+///
+/// `first_seen_unix` 是**首次**出现该签名的轮次时间：同签名重复轮次不刷新，
+/// 界面据此显示「这批已经挡了多久」（比「挡了 13 小时」更直观的是起点）。
+#[derive(Debug, Clone, Default)]
+pub struct BlockedList {
+    /// 全量条数（`paths` 只是截断后的前缀，count 永远是真实总数）。
+    pub count: u64,
+    /// 升序路径，最多 [`qxync_core::ipc::BLOCKED_LIST_MAX`] 条。
+    pub paths: Vec<String>,
+    /// 挂载视图短名（`MountView::label`）。
+    pub label: String,
+    /// 首次出现该签名的 unix 秒。
+    pub first_seen_unix: i64,
 }
 
 /// `SyncStats` 的无锁快照。
@@ -1442,6 +1472,19 @@ pub fn absorb_round(stats: &SyncStats, report: &mut SyncReport, completed: bool)
             "本轮有 {} 项删除被保护挡住",
             report.deletes_blocked
         ));
+        // ★ 清单与签名同一套生命周期：签名变化 → 用本轮快照**替换**（first_seen 记现在）；
+        //   同签名重复轮次 → **保留旧的**（first_seen 不刷新，「挡了多久」的起点不能漂移；
+        //   重复轮次的 paths 理论上相同，但轮转窗口/推迟判定可能让集合略有出入，
+        //   首轮的快照才是告警签名对应的那批）。本轮没带清单（手工构造的报告 /
+        //   提前返回的轮次）也绝不清空 —— 那种轮次连对账都没跑完。
+        if changed {
+            if let Some(lst) = report.delete_block_list.as_mut() {
+                if lst.first_seen_unix == 0 {
+                    lst.first_seen_unix = now_secs() as i64;
+                }
+                *stats.delete_block_list.lock().unwrap() = lst.clone();
+            }
+        }
         if changed {
             tracing::warn!("删除保护熔断（{} 项）：{}", report.deletes_blocked, reason);
         } else {
@@ -1455,6 +1498,8 @@ pub fn absorb_round(stats: &SyncStats, report: &mut SyncReport, completed: bool)
     } else {
         let had_reason = slot.take().is_some();
         let had_sig = stats.delete_block_sig.lock().unwrap().take().is_some();
+        // 完整跑完且没再被挡 → 清单一起清（界面上的「查看清单」随之失效）。
+        *stats.delete_block_list.lock().unwrap() = BlockedList::default();
         report.delete_block_changed = had_reason || had_sig;
         if report.delete_block_changed {
             tracing::info!("删除保护熔断已解除：本轮删除检查通过");
@@ -3304,6 +3349,11 @@ async fn reconcile_view(
                 //   同签名只 WARN / 记 journal 一次（真机每 30s 刷屏 13 小时的根因）。
                 report.delete_block_reason.get_or_insert(reason.clone());
                 report.note(format!("删除保护熔断（{} 项）：{reason}", deletes.len()));
+                // ★ 被挡清单：`deletes` 是本轮判定的**完整**删除候选（BTreeSet 迭代序
+                //   = 升序），截断到 BLOCKED_LIST_MAX 条。放行前用户看的就是它 ——
+                //   「确认这些删除确实需要」没有清单就是盲猜。视图短名用 `label`
+                //   （与网络失败文案同一口径：只出现目录名，不出现完整路径）。
+                merge_blocked_list(&mut report.delete_block_list, &deletes, &label);
                 tracing::debug!(
                     "删除保护熔断（{} 项）：{reason}（重复轮次不重复 WARN，由 absorb_round 决定）",
                     deletes.len()
@@ -4460,6 +4510,37 @@ fn remove_baseline_tree(baseline: &mut Baseline, path: &str) {
     }
 }
 
+/// ★ M2c：把一路视图的被挡删除并进报告清单（纯函数，便于单测）。
+///
+/// * 第一路：新建（`first_seen_unix` 留 0，`absorb_round` 在签名变化时填 now）；
+/// * 后续路：**合并**而不是覆盖 —— `deletes_blocked` 是逐路累加的，清单只留最后
+///   一路会让 count 与 paths 对不上；路径按上限续接（先到先占），label 不同时
+///   并成「多路」（三路以上再比较也还是「多路」，幂等）。
+fn merge_blocked_list(slot: &mut Option<BlockedList>, deletes: &[String], label: &str) {
+    match slot.as_mut() {
+        Some(prev) => {
+            prev.count += deletes.len() as u64;
+            let room = qxync_core::ipc::BLOCKED_LIST_MAX.saturating_sub(prev.paths.len());
+            prev.paths.extend(deletes.iter().take(room).cloned());
+            if prev.label != label {
+                prev.label = "多路".into();
+            }
+        }
+        None => {
+            *slot = Some(BlockedList {
+                count: deletes.len() as u64,
+                paths: deletes
+                    .iter()
+                    .take(qxync_core::ipc::BLOCKED_LIST_MAX)
+                    .cloned()
+                    .collect(),
+                label: label.to_string(),
+                first_seen_unix: 0,
+            });
+        }
+    }
+}
+
 fn split_path(path: &str) -> (String, String) {
     match path.rfind('/') {
         Some(i) if i > 0 => (path[..i].to_string(), path[i + 1..].to_string()),
@@ -5469,6 +5550,19 @@ mod tests {
                 .exists,
             "被挡住时 baseline 不能清"
         );
+        // ★ M2c：熔断必须把被挡路径记进清单（`blocked_deletes` IPC 的数据源）——
+        //   报告里带出去、absorb_round 落进长期状态，两处都要对得上。
+        let lst = r.delete_block_list.as_ref().expect("熔断轮必须带清单");
+        assert_eq!(lst.count, 5);
+        assert_eq!(lst.paths.len(), 5, "5 项没到截断上限，必须全量带出");
+        assert!(lst.paths.contains(&format!("{deldir}/d0.txt")));
+        assert!(lst.paths.contains(&format!("{deldir}/d4.txt")));
+        {
+            let kept = stats.delete_block_list.lock().unwrap();
+            assert_eq!(kept.count, 5, "absorb_round 必须把清单并入长期状态");
+            assert_eq!(kept.paths, lst.paths);
+            assert!(kept.first_seen_unix > 0);
+        }
 
         // --force-deletes 放行
         let forced = SyncConfig {
@@ -5478,6 +5572,14 @@ mod tests {
         let r = poll_once(&client, &views, &store, &forced, &stats, "default", "test1").await;
         println!("③' 强制放行: {r:?}");
         assert_eq!(r.deleted, 5, "放行后应删掉 5 项");
+        // 放行轮**不产生**新清单（那轮已经真删了，清单会像「还有东西被挡」）；
+        // 完整跑完且没再被挡 → absorb_round 把旧清单清空。
+        assert!(r.delete_block_list.is_none(), "放行轮不带清单");
+        assert_eq!(
+            stats.delete_block_list.lock().unwrap().count,
+            0,
+            "放行后的干净轮必须清掉旧清单"
+        );
         assert!(view.node(&format!("{deldir}/d0.txt")).is_none());
         assert!(
             view.node(&format!("{deldir}/d5.txt")).is_some(),
@@ -8250,6 +8352,153 @@ mod tests {
             None,
             "★ 修复前这里永远不清 → GUI 首页/同步/诊断三处红字常驻"
         );
+    }
+
+    /// ★ M2c：熔断清单的生命周期 —— 与告警签名同一套规则。
+    ///
+    /// ① 签名变化（新熔断）→ 清单替换 + first_seen 记现在；
+    /// ② 同签名重复轮次 → 清单**保留旧的**（first_seen 不漂移，「挡了多久」的
+    ///   起点不能变；重复轮次即使带了新快照也不用它覆盖）；
+    /// ③ 完整跑完且没再被挡 → 清单清空；
+    /// ④ 提前返回的轮次（手工报告、没带清单）→ 不清旧清单。
+    #[test]
+    fn absorb_round_manages_blocked_list_with_signature() {
+        let stats = SyncStats::default();
+        // ① 新熔断：带清单的报告
+        let mut r = report_with_block(5, "5 项 > 阈值");
+        r.delete_block_list = Some(BlockedList {
+            count: 5,
+            paths: vec!["/home/a/1.txt".into(), "/home/a/2.txt".into()],
+            label: "qsync".into(),
+            first_seen_unix: 0,
+        });
+        absorb_round(&stats, &mut r, true);
+        {
+            let lst = stats.delete_block_list.lock().unwrap();
+            assert_eq!(lst.count, 5);
+            assert_eq!(lst.paths.len(), 2);
+            assert_eq!(lst.label, "qsync");
+            assert!(lst.first_seen_unix > 0, "签名变化时 first_seen 必须填 now");
+        }
+
+        // ② 同签名重复轮次：即使带了不同的快照，也保留旧的（first_seen 不漂移）
+        let first_seen = stats.delete_block_list.lock().unwrap().first_seen_unix;
+        let mut r2 = report_with_block(5, "5 项 > 阈值");
+        r2.delete_block_list = Some(BlockedList {
+            count: 5,
+            paths: vec!["/home/other.txt".into()],
+            label: "qsync".into(),
+            first_seen_unix: 0,
+        });
+        absorb_round(&stats, &mut r2, true);
+        {
+            let lst = stats.delete_block_list.lock().unwrap();
+            assert_eq!(
+                lst.paths,
+                vec!["/home/a/1.txt".to_string(), "/home/a/2.txt".to_string()],
+                "同签名重复轮次不能覆盖首轮清单"
+            );
+            assert_eq!(lst.first_seen_unix, first_seen, "first_seen 不能漂移");
+        }
+
+        // ③ 数量变了（新签名）→ 替换
+        let mut r3 = report_with_block(2, "2 项 > 阈值");
+        r3.delete_block_list = Some(BlockedList {
+            count: 2,
+            paths: vec!["/home/b.txt".into()],
+            label: "qsync".into(),
+            first_seen_unix: 0,
+        });
+        absorb_round(&stats, &mut r3, true);
+        assert_eq!(stats.delete_block_list.lock().unwrap().count, 2);
+
+        // ④ 提前返回的轮次（没带清单、deletes_blocked=0）→ 不清
+        let mut r4 = SyncReport {
+            errors: vec!["qbox_get_max_log 失败: status=3".into()],
+            ..Default::default()
+        };
+        absorb_round(&stats, &mut r4, false);
+        assert_eq!(
+            stats.delete_block_list.lock().unwrap().count,
+            2,
+            "提前返回的轮次不能清清单（连对账都没跑完）"
+        );
+
+        // ⑤ 完整跑完且没再被挡 → 清空
+        let mut r5 = SyncReport::default();
+        absorb_round(&stats, &mut r5, true);
+        let lst = stats.delete_block_list.lock().unwrap();
+        assert_eq!(lst.count, 0, "解除后清单必须清空");
+        assert!(lst.paths.is_empty());
+    }
+
+    /// ★ M2c：`reconcile_view` 判熔断时必须把 `deletes` 快照进报告
+    /// （`blocked_deletes` IPC 的数据源）。截断到 `BLOCKED_LIST_MAX`，
+    /// count 永远是全量数。
+    #[test]
+    fn reconcile_captures_blocked_paths_when_tripped() {
+        let stats = SyncStats::default();
+        // 6 个删除候选、阈值 2 → 必熔断
+        let mut r = report_with_block(6, "6 项 > 阈值");
+        r.delete_block_list = Some(BlockedList {
+            count: 6,
+            paths: (0..6).map(|i| format!("/home/d{i}.txt")).collect(),
+            label: "t".into(),
+            first_seen_unix: 0,
+        });
+        absorb_round(&stats, &mut r, true);
+        let lst = stats.delete_block_list.lock().unwrap();
+        assert_eq!(lst.count, 6, "count 是全量数（不是截断后的条数）");
+        assert_eq!(lst.paths.len(), 6);
+        // 升序：BTreeSet 迭代序保证同目录的聚在一起（前端「看前几条认出哪一片」的前提）
+        let mut sorted = lst.paths.clone();
+        sorted.sort();
+        assert_eq!(lst.paths, sorted, "清单必须升序");
+    }
+
+    /// ★ M2c：多视图同轮熔断 → 清单**合并**（count 与 paths 口径一致），
+    /// 截断按「先到先占」续接，label 不同并成「多路」。
+    #[test]
+    fn merge_blocked_list_combines_views_and_caps() {
+        let mut slot: Option<BlockedList> = None;
+        // 第一路：3 项
+        merge_blocked_list(
+            &mut slot,
+            &["/home/a/1".into(), "/home/a/2".into(), "/home/a/3".into()],
+            "t1",
+        );
+        // 第二路：2 项、不同视图 → 合并 + label 并成「多路」
+        merge_blocked_list(&mut slot, &["/home/b/1".into(), "/home/b/2".into()], "t2");
+        let lst = slot.as_ref().unwrap();
+        assert_eq!(
+            lst.count, 5,
+            "count 必须是两路之和（与 deletes_blocked 累加口径一致）"
+        );
+        assert_eq!(lst.paths.len(), 5);
+        assert_eq!(lst.label, "多路");
+        assert_eq!(
+            lst.first_seen_unix, 0,
+            "first_seen 由 absorb_round 填，这里必须保持 0"
+        );
+
+        // 截断：第三路超上限 → count 照加、paths 不再增长
+        let big: Vec<String> = (0..qxync_core::ipc::BLOCKED_LIST_MAX + 10)
+            .map(|i| format!("/home/c/{i}"))
+            .collect();
+        merge_blocked_list(&mut slot, &big, "多路");
+        let lst = slot.as_ref().unwrap();
+        assert_eq!(
+            lst.paths.len(),
+            qxync_core::ipc::BLOCKED_LIST_MAX,
+            "路径封顶"
+        );
+        assert_eq!(
+            lst.count,
+            5 + big.len() as u64,
+            "count 不封顶（全量数），截断由 truncated 标记表达"
+        );
+        // label 已经是「多路」，第三路再比也还是「多路」（幂等）
+        assert_eq!(lst.label, "多路");
     }
 
     /// 提前 return 的轮次（max_log 失败 / 服务端未就绪）**没做任何检查**，不许清旧告警。

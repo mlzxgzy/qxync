@@ -1199,6 +1199,26 @@
   </div>
 </div>
 
+<!-- ===================== ★ M2c：删除熔断清单弹窗 =====================
+     「放行删除」前先看**是哪些**要被删 —— 告警行只说「本轮有 N 项删除被保护挡住」，
+     没有清单，那句「确认这些删除确实需要，再放行」就是盲猜（真机 526 项那次）。
+     数据源：`ipc({method:'blocked_deletes'})`（daemon 内存快照，零网络）。
+     独立弹窗（#blocked-modal）而不是复用 #purge-modal：后者是「确认 + 复选框」
+     的形状，这里要的是「长清单 + 滚动 + 两个出口（放行 / 关闭）」。
+     条目全部由 app.js 用 createElement/textContent 构造，不碰 innerHTML。 -->
+<div id="blocked-modal" class="modal" hidden>
+  <div class="modal-card modal-wide" role="dialog" aria-modal="true" aria-labelledby="blocked-title">
+    <h3 id="blocked-title" data-i18n="blocked.title">删除被熔断挡住 —— 以下文件尚未删除</h3>
+    <p id="blocked-message" class="hint"></p>
+    <ul class="plain-list blocked-list" id="blocked-items"></ul>
+    <p id="blocked-extra" class="hint" hidden></p>
+    <div class="btn-row">
+      <button type="button" id="blocked-force" class="primary danger" data-i18n="blocked.force">放行这一轮的删除</button>
+      <button type="button" id="blocked-close" data-i18n="modal.cancel">取消</button>
+    </div>
+  </div>
+</div>
+
 <!-- ===================== ★ M33：右下角下载进度卡片 =====================
      「下载到本地」超过 3 秒（静默期）后，每笔下载在这里浮一张卡片：
      文件名 + 进度条 + 百分比/已下载/速度/剩余时间。fixed 定位在窗口右下角，
