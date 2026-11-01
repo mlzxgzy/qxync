@@ -7,6 +7,25 @@
 
 ## [未发布]
 
+### 修复
+
+- **`status=3` 不再显示「未知状态码」**：用户反馈 `qbox_get_max_log 失败:
+  qbox_get_max_log: status=3 (未知状态码（按失败处理）)`。这个码其实早有真机定论
+  （[M10](docs/M10-会话热更新.md) §3：sid 过期后每 30s 一条 `status=3`，重登即恢复）
+  —— M10 时只在 daemon 轮询入口做了**行为**识别（`max_log_failure_is_session_loss`），
+  但**显示层**码表（`ServerStatus::meaning`）没跟上，用户看到的还是「未知状态码」。
+  现在：① 码表补 `3 = 会话失效 / sid 过期（实测仅 qbox_get_max_log；其它端点语义
+  未验证）`；② 判据从 daemon 私有函数收进 `Error::is_auth()`（端点限定
+  `context == "qbox_get_max_log"`，不凭码值推广到其它端点）—— client 保活
+  （`alive_from_max_log`）、daemon 轮询、FUSE `with_session_retry` 三层自动统一，
+  daemon 侧简化为纯委托；③ 顺带修正 `alive_from_max_log` 兜底分支的注释与代码矛盾
+  （注释写「不触发重登」，实际 `Ok(false)` 在 `keeper_step` 里就是 `Relogin` ——
+  而这正是 M10 真机日志里保活救回 sid 的那条路径）。行为不变的部分：status=8
+  （服务端未就绪）依旧不进重登路径；其它端点回 3 依旧不判会话失效。
+  验收：`cargo test --workspace` 23 套件全绿（core 新增 2 例：码表显示带端点限定、
+  `is_auth` 端点限定判定；client 补 1 断言：max_log 3 → `Ok(false)` 走保活重登；
+  daemon 委托测试原样通过）；`cargo fmt --all -- --check` 0 diff。
+
 ## [0.8.2] - 2026-10-31
 
 ### 新增

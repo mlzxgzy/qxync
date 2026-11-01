@@ -79,10 +79,20 @@ impl Error {
     ///
     /// 调用方据此决定要不要**重登一次再重试**。判据原先是 daemon 里的一个私有函数，
     /// 现在收到 core：client、daemon、FUSE 三层用的是同一套判定。
+    ///
+    /// ★ status=3（**端点限定** `qbox_get_max_log`）：真机证据（`docs/M10-会话热更新.md`
+    /// §3，sid 过期后每 30s 一条 `qbox_get_max_log: status=3`，重登即恢复）表明它是
+    /// sid 过期码。**只在 `qbox_get_max_log` 上观测到**，其它端点语义未验证 —— 所以
+    /// 这里同时限定 `context == "qbox_get_max_log"`，不凭码值推广到其它端点。
     pub fn is_auth(&self) -> bool {
         match self {
             Error::Auth(_) => true,
-            Error::Status { status, .. } => matches!(status.0, 4 | 5),
+            Error::Status {
+                status, context, ..
+            } => {
+                matches!(status.0, 4 | 5)
+                    || (status.is_session_expired() && context == "qbox_get_max_log")
+            }
             _ => false,
         }
     }
@@ -164,6 +174,21 @@ mod tests {
         assert!(!Error::status(-17, "qbox_get_sync_log").is_auth());
         assert!(!Error::Transport("连接超时".into()).is_auth());
         assert!(!Error::Parse("坏 JSON".into()).is_auth());
+    }
+
+    /// ★ status=3 只在 `qbox_get_max_log` 上认作会话失效（M10 真机证据），
+    /// 其它端点回 3 一律不推广。
+    #[test]
+    fn status_3_is_auth_only_on_max_log() {
+        assert!(Error::status(3, "qbox_get_max_log").is_auth());
+        // 其它端点语义未验证 → 不判会话失效
+        assert!(!Error::status(3, "qbox_get_sync_log").is_auth());
+        assert!(!Error::status(3, "get_list").is_auth());
+        // 带 msg 的错误构造也走同一判据
+        assert!(Error::status_msg(3, "qbox_get_max_log", "会话过期").is_auth());
+        // 相邻码值不受影响
+        assert!(!Error::status(2, "qbox_get_max_log").is_auth());
+        assert!(!Error::status(8, "qbox_get_max_log").is_auth());
     }
 
     /// ★ 服务端未就绪（status=8）既不是登录失败、也不该按普通错误重试。

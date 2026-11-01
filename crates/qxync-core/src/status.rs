@@ -2,6 +2,9 @@
 //!
 //! 报告里没有码表，以下语义是 2026-09-30 对真机（QTS 5.2.9 / Qsync QPKG 20260723）
 //! 逐个端点实测得到的；未知值一律按「失败」处理但保留原值，方便边跑边补。
+//!
+//! ⚠️ `3` 是**端点限定**的会话失效码：只在 `qbox_get_max_log` 上观测到
+//! （`docs/M10-会话热更新.md` §3 真机日志），其它端点语义未验证，不要推广。
 
 use serde::{Deserialize, Serialize};
 
@@ -42,12 +45,28 @@ impl ServerStatus {
         self.0 == Self::SERVER_BUSY
     }
 
+    /// ★ 会话失效码（**端点限定**：`qbox_get_max_log`）。
+    ///
+    /// 真机证据（`docs/M10-会话热更新.md` §3，`qxyncd.log.2026-10-18`，sid 过期后）：
+    /// 变更轮询每 30s 报一次 `qbox_get_max_log: status=3`，重登后即恢复。
+    /// **只在 `qbox_get_max_log` 上观测到**，其它端点语义未验证 —— 判定会话失效时
+    /// 必须同时限定端点（见 [`crate::error::Error::is_auth`]），不要只凭码值推广。
+    pub const SESSION_EXPIRED: i64 = 3;
+
+    /// 是否是会话失效码（配合端点限定使用，见 [`Self::SESSION_EXPIRED`]）。
+    pub fn is_session_expired(self) -> bool {
+        self.0 == Self::SESSION_EXPIRED
+    }
+
     /// 人类可读的语义（未知值给中性描述）。
     pub fn meaning(self) -> &'static str {
         match self.0 {
             0 => "成功",
             1 => "成功（该端点的成功变体）",
             2 => "源不存在 / 参数不适用（实测：rename 源缺失、FileStation rename 拒绝）",
+            Self::SESSION_EXPIRED => {
+                "会话失效 / sid 过期（实测仅 qbox_get_max_log；其它端点语义未验证）"
+            }
             4 => "路径不存在 / 无权限",
             5 => "路径不存在 / 无权限",
             6 => "路径不存在",
@@ -91,5 +110,23 @@ mod tests {
         assert!(ServerStatus(8).is_server_busy());
         assert!(!ServerStatus(8).is_success());
         assert!(!ServerStatus(5).is_server_busy());
+    }
+
+    /// ★ status=3 的显示语义：不再「未知状态码」，并带端点限定警告。
+    #[test]
+    fn session_expired_meaning_is_not_unknown() {
+        let s = ServerStatus(3);
+        assert!(s.is_session_expired());
+        assert!(!s.is_success());
+        let shown = s.to_string();
+        assert!(shown.contains("会话失效"), "显示要能认出 sid 过期：{shown}");
+        assert!(!shown.contains("未知状态码"), "不能再显示未知：{shown}");
+        assert!(
+            shown.contains("qbox_get_max_log"),
+            "要带端点限定（其它端点未验证）：{shown}"
+        );
+        // 其它码值不受影响
+        assert!(!ServerStatus(2).is_session_expired());
+        assert!(!ServerStatus(8).is_session_expired());
     }
 }

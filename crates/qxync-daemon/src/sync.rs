@@ -1722,33 +1722,19 @@ pub(crate) fn replay_interrupt_reset() {
 
 /// ★ 判「`qbox_get_max_log` 这次失败 = 会话没了」。
 ///
-/// `Error::is_auth()` 只认 `Auth` 与 status 4/5；但**真机证据**（`docs/M10-会话热更新.md`
-/// §1 现场日志）显示 sid 过期后 `qbox_get_max_log` 会回 `status=3`：
-///
-/// ```text
-/// 变更轮询每一轮都报错（`qbox_get_max_log 失败: status=3`），也不会重登。
-/// ```
-///
-/// status=3 没有码表、也**只在这一个端点上**观测到，所以这里做两件保守的事：
-/// 1. 判据只给 `qbox_get_max_log` 用（其他端点不推广 status=3）；
-/// 2. 误判的代价只是「多登一次」，漏判的代价是真机实测过的「每 30s 报错，
-///    直到 120s 保活才恢复」。
+/// 判据已收进 [`CoreError::is_auth`]（qxync-core）：`Auth` / status 4、5，以及
+/// **端点限定**的 `qbox_get_max_log + status=3`（真机证据见
+/// `docs/M10-会话热更新.md` §3：sid 过期后每 30s 一条 `status=3`，重登即恢复；
+/// 其它端点语义未验证，不推广）。这里保留一个具名函数，让轮询入口的调用点
+/// 读起来还是「这次 max_log 失败是不是会话没了」。
 ///
 /// ⚠️ 关于「多登一次」到底多贵：`login_internal` 自己**不做去重**；唯一的 3s
 /// 去重在 `spawn_session_broker` 里（`SESSION_REFRESH_DEDUP`），而那把去重**只服务
 /// FUSE 挂载点的重登请求**。轮询循环看到 `auth_failed` 后是直接调 `login_internal`
 /// （见 `spawn_poller`）—— 频率上限是「每轮一次」，轮询默认 30s 一轮，量级可接受；
 /// 但如果凭据本身失效，就会每轮一次失败登录（长期可能撞上 NAS 的暴力破解封锁）。
-/// 所以这里**不要**再把「有 3s 去重」当成放宽判据的理由。
 fn max_log_failure_is_session_loss(e: &CoreError) -> bool {
-    if e.is_auth() {
-        return true;
-    }
-    matches!(
-        e,
-        CoreError::Status { status, context, .. }
-            if status.0 == 3 && context == "qbox_get_max_log"
-    )
+    e.is_auth()
 }
 
 /// 把内存状态写回 store（**游标 + baseline 同一个事务**；失败只记录不 panic）。
@@ -8554,8 +8540,8 @@ mod tests {
 
     // ------------------------------------------------- ★ 会话失效自愈判据
 
-    /// ★ 真机证据（docs/M10 §1）：sid 过期后 `qbox_get_max_log` 回 `status=3`。
-    /// status=3 没有码表、也只在 max_log 上观测到 → 判据只给这个端点，不推广。
+    /// ★ 真机证据（docs/M10 §3）：sid 过期后 `qbox_get_max_log` 回 `status=3`。
+    /// 判据在 core 的 `is_auth()`（端点限定 `qbox_get_max_log`），这里验证委托没走样。
     #[test]
     fn status_3_on_max_log_is_session_loss_but_not_elsewhere() {
         let e = CoreError::status_msg(3, "qbox_get_max_log", "会话过期");

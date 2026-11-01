@@ -1685,7 +1685,8 @@ impl Client {
 /// 把 `qbox_get_max_log` 的探测结果分成三类（[`Client::check_alive`] 的判定核心）：
 ///
 /// * `Ok(true)`  —— 探测成功，sid 有效；
-/// * `Ok(false)` —— **会话确定失效**（[`Error::is_auth`]：登录失败 / status 4 / 5），该重登；
+/// * `Ok(false)` —— **会话确定失效**（[`Error::is_auth`]：登录失败 / status 4、5 /
+///   **端点限定的 max_log status=3**），该重登；
 /// * `Err(e)`    —— 探测本身失败（断网 / 解析失败 / 服务端未就绪），调用方应稍后再试，
 ///   **不要**重登。
 ///
@@ -1703,7 +1704,8 @@ fn alive_from_max_log(probe: Result<MaxLog>) -> Result<bool> {
             status.0,
             "qbox_get_max_log（服务端未就绪：Qsync Central is initializing）",
         )),
-        // 其它业务 status：无法确认存活，但也不是「确定失效」→ 不触发重登。
+        // 其它业务 status（2/6/20/33/-17/-50…）：无法确认存活，但也不是「确定失效」
+        // → 交给会话保活的下一轮（默认 120s）再探，不在探测层盲目重登。
         Err(Error::Status { .. }) => Ok(false),
         Err(e) => Err(e),
     }
@@ -2748,6 +2750,12 @@ mod tests {
         ));
         assert!(matches!(
             alive_from_max_log(Err(Error::status(4, "qbox_get_max_log"))),
+            Ok(false)
+        ));
+        // ★ M10 真机证据：sid 过期后 max_log 回 status=3 → 确定失效，走重登
+        //（保活日志「sid 已失效（Ok(false)），重登并推给挂载点」就是这条分支救回来的）
+        assert!(matches!(
+            alive_from_max_log(Err(Error::status(3, "qbox_get_max_log"))),
             Ok(false)
         ));
 

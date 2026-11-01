@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`status=3` no longer renders as "unknown status code"**: user feedback (translated):
+  `qbox_get_max_log 失败: qbox_get_max_log: status=3 (未知状态码（按失败处理）)`. This
+  code has had a real-machine verdict for a while ([M10](docs/M10-会话热更新.md) §3:
+  after sid expiry, `qbox_get_max_log` returns `status=3` every 30 s poll; re-login
+  fixes it) — M10 added the *behavioural* recognition in the daemon poller
+  (`max_log_failure_is_session_loss`), but the *display* code table
+  (`ServerStatus::meaning`) never caught up, so users still saw "unknown status code".
+  Now: ① the table gains `3 = session lost / sid expired (observed only on
+  qbox_get_max_log; other endpoints unverified)`; ② the predicate moved from the
+  daemon-private function into `Error::is_auth()` — gated on
+  `context == "qbox_get_max_log"` so the code value is **not** promoted to other
+  endpoints — which unifies all three layers (client keep-alive `alive_from_max_log`,
+  daemon poller, FUSE `with_session_retry`); the daemon function becomes a pure
+  delegation; ③ fixed a comment/code contradiction in `alive_from_max_log`'s
+  fallback arm (the comment claimed "no re-login" while `Ok(false)` maps to
+  `KeeperStep::Relogin` — exactly the path that rescued the session in M10's
+  real-machine log). Unchanged: status=8 (server not ready) still never enters the
+  re-login path; status=3 from any other endpoint is still not treated as session
+  loss. Acceptance: `cargo test --workspace` — all 23 suites green (core +2 tests:
+  display carries the endpoint caveat, `is_auth` endpoint gating; client +1 assertion:
+  max_log 3 → `Ok(false)` keep-alive re-login; daemon delegation test unchanged);
+  `cargo fmt --all -- --check` clean.
+
 ## [0.8.2] - 2026-10-31
 
 ### Added
