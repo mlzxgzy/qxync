@@ -962,7 +962,10 @@ pub fn ui_spec() -> Value {
         .iter()
         .all(|id| index.contains(&format!("id=\"{id}\"")));
     // ★ P2-09：日志不再是独立 tab，收进「高级」里的折叠块（保留 id，深链仍可开）。
-    let log_nested_under_advanced = match (index.find("id=\"sec-advanced\""), index.find("id=\"sec-log\"")) {
+    let log_nested_under_advanced = match (
+        index.find("id=\"sec-advanced\""),
+        index.find("id=\"sec-log\""),
+    ) {
         (Some(a), Some(b)) => a < b,
         _ => false,
     };
