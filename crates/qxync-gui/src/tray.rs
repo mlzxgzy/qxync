@@ -35,6 +35,8 @@ const TRAY_ID: &str = "qxync-tray";
 const MENU_OPEN: &str = "tray-open";
 const MENU_SYNC: &str = "tray-sync";
 const MENU_PAUSE: &str = "tray-pause";
+const MENU_SETTINGS: &str = "tray-settings";
+const MENU_ABOUT: &str = "tray-about";
 const MENU_QUIT: &str = "tray-quit";
 
 /// ★ M28：托盘默认 tooltip（状态图标会在此基础上追加一行状态说明）。
@@ -327,10 +329,12 @@ fn build(app: &AppHandle) -> tauri::Result<()> {
     let open = MenuItemBuilder::with_id(MENU_OPEN, "打开主窗口").build(app)?;
     let sync = MenuItemBuilder::with_id(MENU_SYNC, "立即与 NAS 同步").build(app)?;
     let pause = MenuItemBuilder::with_id(MENU_PAUSE, "暂停").build(app)?;
+    let settings = MenuItemBuilder::with_id(MENU_SETTINGS, "设置").build(app)?;
+    let about = MenuItemBuilder::with_id(MENU_ABOUT, "关于").build(app)?;
     let quit = MenuItemBuilder::with_id(MENU_QUIT, "退出").build(app)?;
-    // 顺序照 Qsync：三项动作 + 分隔线 + 退出（退出隔开，避免误点）
+    // ★ P3-04：对齐官方托盘菜单 —— 打开 / 立即同步 / 暂停 / 设置 / 关于，退出单独隔开。
     let menu = MenuBuilder::new(app)
-        .items(&[&open, &sync, &pause])
+        .items(&[&open, &sync, &pause, &settings, &about])
         .separator()
         .item(&quit)
         .build()?;
@@ -343,6 +347,8 @@ fn build(app: &AppHandle) -> tauri::Result<()> {
             MENU_OPEN => emit_action(app, "open"),
             MENU_SYNC => emit_action(app, "sync"),
             MENU_PAUSE => emit_action(app, "pause"),
+            MENU_SETTINGS => emit_action(app, "settings"),
+            MENU_ABOUT => emit_action(app, "about"),
             // 退出是这里唯一自己动手的动作：前端可能已经卡住/窗口已隐藏，
             // 再走一遍 IPC 反而可能退不掉。
             MENU_QUIT => {

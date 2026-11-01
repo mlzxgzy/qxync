@@ -1991,3 +1991,11 @@ tr.row-bad:hover td { background: var(--err-soft); }
 .state-warn { color: var(--err); background: var(--err-soft); }
 .state-unknown { color: var(--fg-faint); background: var(--bg-sunken); }
 .state-dir { color: var(--fg-faint); background: none; }
+
+/* ---- ★ P3-01/03：分享占位页与首次引导 ---- */
+.firstrun-card { width: min(560px, 92vw); }
+.firstrun-steps { margin: 14px 0 18px; padding-left: 22px; display: grid; gap: 10px; }
+.firstrun-steps li strong { display: block; margin-bottom: 2px; }
+.firstrun-steps li span { color: var(--fg-dim); font-size: 12.5px; }
+.help-menu { flex-wrap: wrap; }
+.empty-state .btn-row { justify-content: center; }

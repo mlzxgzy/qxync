@@ -63,6 +63,12 @@
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
         <span data-i18n="nav.files">文件</span>
       </button>
+      <!-- ★ P3-01：官方第 4 个内容图标位「分享」—— qxync 没有分享后端，做成诚实占位 -->
+      <button type="button" class="rail-item" data-page="share"
+              title="分享（qxync 暂不支持 Qsync Central 分享链接）" data-i18n-title="nav.share_title">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="18" cy="5" r="2.6"/><circle cx="6" cy="12" r="2.6"/><circle cx="18" cy="19" r="2.6"/><path d="M8.4 10.8l7.2-4.2M8.4 13.2l7.2 4.2"/></svg>
+        <span data-i18n="nav.share">分享</span>
+      </button>
     </nav>
 
     <div class="rail-spacer"></div>
@@ -365,6 +371,32 @@
             行尾<strong>⋯</strong>或<strong>右键</strong>任意一行都能打开操作菜单
             （查询 / 设置 pin、释放空间、下载、删除、复制路径）。
           </p>
+        </div>
+      </section>
+
+      <!-- ======================= 页面 3.5：分享（P3-01 占位） ======================= -->
+      <section class="page" id="page-share">
+        <div class="card">
+          <div class="card-head">
+            <h2>分享中心</h2>
+          </div>
+          <div class="empty-state" data-keep>
+            <svg class="empty-art" viewBox="0 0 96 72" fill="none" stroke="currentColor"
+                 stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="68" cy="16" r="9"/><circle cx="24" cy="36" r="9"/><circle cx="68" cy="56" r="9"/>
+              <path d="M32 31.5l27-11M32 40.5l27 11"/>
+            </svg>
+            <p class="empty-title">这个版本没有分享中心</p>
+            <p class="empty-desc">
+              Qsync 6 的「分享」依赖 Qsync Central 的分享链接服务；qxync 目前只做本机按需同步，
+              没有账号体系与分享 API，所以不做一个点进去空白的页面。
+            </p>
+            <div class="btn-row">
+              <button type="button" class="primary" id="btn-share-station">在 File Station 打开</button>
+            </div>
+            <p class="hint">需要从浏览器把 NAS 文件分享给别人时，用 File Station 的「分享链接」；本机同步状态在「任务」页。</p>
+          </div>
+          <div id="share-result" class="result" hidden></div>
         </div>
       </section>
 
@@ -846,7 +878,11 @@
           <div class="card">
             <h2>本机路径 / 运行环境</h2>
             <dl class="kv mono" id="paths-kv"></dl>
-            <button type="button" class="mini" id="btn-app-info-refresh">刷新</button>
+            <div class="btn-row">
+              <button type="button" class="mini" id="btn-app-info-refresh">刷新</button>
+              <button type="button" class="mini" id="btn-env-logdir">打开日志目录</button>
+              <button type="button" class="mini" id="btn-env-config">打开配置目录</button>
+            </div>
             <p class="hint" id="link-path-hint">—</p>
           </div>
 
@@ -1318,19 +1354,20 @@
           <div class="help-menu">
             <button type="button" class="help-item" id="btn-help-about">关于 qxync</button>
             <button type="button" class="help-item" id="btn-help-quickstart">快速入门</button>
+            <button type="button" class="help-item" id="btn-help-whatsnew">新增功能</button>
+            <button type="button" class="help-item" id="btn-help-license">开源声明</button>
+            <button type="button" class="help-item" id="btn-help-online">在线文档</button>
           </div>
           <div id="help-about-panel">
-        <!-- ---------------- 设置 9：关于 ---------------- -->
+        <!-- ---------------- P3-10：关于只留版本/许可/运行概览，路径类信息进诊断 ---------------- -->
         <div class="settings-sec active help-modal-body" id="sec-about">
           <div class="card">
-            <h2>关于 / 快捷出口</h2>
+            <h2>关于 qxync</h2>
             <dl class="kv" id="about-kv"></dl>
             <p class="hint" id="about-m84">—</p>
             <div class="btn-row">
               <button type="button" id="btn-about-refresh">刷新</button>
-              <button type="button" id="btn-open-logdir">打开日志目录</button>
-              <button type="button" id="btn-open-config">打开配置目录</button>
-              <button type="button" id="btn-open-station">在 File Station 打开</button>
+              <button type="button" id="btn-open-homepage">打开项目主页</button>
             </div>
             <div id="about-result" class="result" hidden></div>
             <h3 class="sub">本客户端明确不做的事（避免用户以为「界面没找到」）</h3>
@@ -1350,6 +1387,45 @@
               <li>在「任务列表」点「＋ 添加任务」，选一个 NAS 文件夹配成本地文件夹对。</li>
               <li>首次同步完成后，文件会按需出现在本地挂载点里。</li>
             </ol>
+          </div>
+          <div id="help-whatsnew-panel" hidden>
+            <h3 class="sub">2026-11 界面全面贴合 Qsync Client 6</h3>
+            <ul class="plain-list">
+              <li>主页/任务改成官方式平铺任务卡；新增任务详情二级页（本地/NAS 双卡 + 一对一文件夹对）。</li>
+              <li>左栏纯图标 +「显示导航文字」开关；顶栏只留页面标题与安静的连接状态。</li>
+              <li>设置收成 4 个分区；连接管理进右上角 NAS 菜单；关于进左栏帮助。</li>
+              <li>文件更新中心四列对齐；错误列表独立成页并按任务分组，支持定位/复制/看日志。</li>
+              <li>文件目录表列顺序对齐；状态压成单图标，悬停看细节。</li>
+            </ul>
+          </div>
+          <div id="help-license-panel" hidden>
+            <h3 class="sub">qxync</h3>
+            <p class="hint">以 MIT 或 Apache-2.0 双许可发布（任选其一）。完整文本在仓库根目录
+              <code>LICENSE-MIT</code> / <code>LICENSE-APACHE</code>。</p>
+            <h3 class="sub">主要开源组件</h3>
+            <ul class="plain-list">
+              <li>Rust 生态：tokio / fuser / serde / tracing 等（各自许可，见 Cargo.lock）。</li>
+              <li>Tauri 2（窗口壳）、WebKitGTK（渲染）、GTK 3（原生控件）。</li>
+              <li>界面为自绘 HTML/CSS/JS，不包含 QNAP 的图标或插图资源。</li>
+            </ul>
+            <p class="hint">「Qsync」「QNAP」是其权利人的商标；本项目与 QNAP 无隶属关系。</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- ★ P3-03：首次运行引导（无连接时出现一次，可跳过；帮助里可重开） -->
+      <div class="modal" id="firstrun" hidden>
+        <div class="modal-card firstrun-card" role="dialog" aria-modal="true" aria-labelledby="firstrun-title">
+          <h2 id="firstrun-title">欢迎使用 qxync</h2>
+          <p class="hint">三步开始：连接 NAS → 建同步任务 → 文件按需出现在本地。</p>
+          <ol class="firstrun-steps">
+            <li><strong>连接 NAS</strong><span>右上角 NAS 菜单 →「添加 NAS…」，填地址、用户、口令。</span></li>
+            <li><strong>建同步任务</strong><span>「任务」页 →「＋ 添加任务」，选一个 NAS 文件夹配一个本地文件夹。</span></li>
+            <li><strong>开始使用</strong><span>任务卡上点「立即同步」；之后文件按需出现在挂载点里。</span></li>
+          </ol>
+          <div class="btn-row">
+            <button type="button" class="primary" id="btn-firstrun-start">连接 NAS</button>
+            <button type="button" class="ghost" id="btn-firstrun-skip">跳过</button>
           </div>
         </div>
       </div>

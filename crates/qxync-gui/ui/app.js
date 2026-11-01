@@ -33,11 +33,12 @@
   var NEW_LINK_OPTION = '__new__';
 
   // ★ M8.1：一级目的地（左侧图标栏）。顺序 = 界面顺序。
-  var PAGES = ['home', 'tasks', 'files', 'journal', 'errors', 'settings', 'diag'];
+  var PAGES = ['home', 'tasks', 'journal', 'errors', 'files', 'share', 'settings', 'diag'];
   var PAGE_TITLE = {
     home: T('page.home'),
     tasks: T('page.tasks'),
     files: T('page.files'),
+    share: T('page.share'),
     journal: T('page.journal'),
     errors: T('page.errors'),
     settings: T('page.settings'),
@@ -4188,6 +4189,7 @@
     return refreshStatus(true).then(function () {
       state.linksLoading = false;
       renderConnList();
+      maybeShowFirstRun();
       return { ok: true };
     }, function (e) {
       state.linksLoading = false;
@@ -6312,6 +6314,8 @@
     state.links = ls;
     state.linksError = '';
     state.linksLoaded = true;
+    // ★ P3-03：links_status 是启动第一条到齐的数据，在这里判断首次引导。
+    if (isFn(maybeShowFirstRun)) { maybeShowFirstRun(); }
     state.statuses = {};
     for (var i = 0; i < ls.length; i++) {
       state.statuses[str(ls[i].id)] = isObj(ls[i].daemon) ? ls[i].daemon : null;
@@ -6334,6 +6338,7 @@
     state.currentLink = id;
     state.linksError = '';
     state.linksLoaded = true;
+    if (isFn(maybeShowFirstRun)) { maybeShowFirstRun(); }
   }
 
   function fetchLinksStatus() {
@@ -7788,12 +7793,10 @@
     if (!dl) { return; }
     clear(dl);
     var info = state.appInfo;
-    kvText(dl, 'qxync', info ? str(info.version) : '—');
-    kvText(dl, '说明', 'FUSE 按需同步 + qxyncd 常驻守护；对齐 Qsync Client 6.1 的界面与术语');
-    kvText(dl, 'socket', info ? str(info.socket) : '—');
-    kvText(dl, '配置目录', info ? str(info.config_dir) : '—');
-    kvText(dl, '数据目录', info ? str(info.data_dir) : '—');
-    kvText(dl, '状态目录', info ? str(info.state_dir) : '—');
+    kvText(dl, '版本', info ? str(info.version) : '—');
+    kvText(dl, '说明', 'FUSE 按需同步 + 常驻守护；界面与术语对齐 Qsync Client 6.1');
+    kvText(dl, '许可', 'MIT OR Apache-2.0');
+    kvText(dl, '路径与日志', '在「诊断 → 状态」的「本机路径 / 运行环境」里');
     // ★ M16：关于页显示「当前连接」；daemon 运行数按全部连接聚合。
     var cur = currentLinkEntry();
     if (cur) {
@@ -7820,10 +7823,7 @@
         else if (m.tray_created === true) { tray = '不可见（名字注册了但没有面板宿主）'; }
         else { tray = '不可用（没有 StatusNotifierWatcher）'; }
         note.textContent = '托盘：' + tray +
-          (m.tray_reason ? '　' + str(m.tray_reason) : '') +
-          '　| 插件：' + ((m.plugins || []).join(' / ') || '—') +
-          '　| 关窗：' + (m.close_to_tray ? '收进托盘' : '直接关闭') +
-          '　| 托盘事件：' + (state.trayAction ? state.trayAction : '（还没触发过）');
+          '　| 关窗：' + (m.close_to_tray ? '收进托盘' : '直接关闭');
       }
     }
   }
@@ -8059,8 +8059,7 @@
     if (!m) { return; }
     m.hidden = false;
     renderAbout();
-    show('help-about-panel', true);
-    show('help-quickstart-panel', false);
+    showHelpPanel('about');
     var c = $('btn-help-modal-close');
     if (c) { c.focus(); }
   }
@@ -8068,6 +8067,43 @@
   function closeHelpModal() {
     var m = $('help-modal');
     if (m) { m.hidden = true; }
+  }
+
+  /** ★ P3-02：帮助弹窗里的面板一次只显示一个。 */
+  function showHelpPanel(name) {
+    var ids = { about: 'help-about-panel', quickstart: 'help-quickstart-panel', whatsnew: 'help-whatsnew-panel', license: 'help-license-panel' };
+    var keys = Object.keys(ids);
+    for (var i = 0; i < keys.length; i++) {
+      show(ids[keys[i]], keys[i] === name);
+    }
+  }
+
+  var FIRSTRUN_KEY = 'qxync.firstrun.done';
+
+  function firstRunDone() {
+    try { return window.localStorage.getItem(FIRSTRUN_KEY) === '1'; } catch (e) { return true; }
+  }
+
+  function markFirstRunDone() {
+    try { window.localStorage.setItem(FIRSTRUN_KEY, '1'); } catch (e) { /* 无 localStorage 就每次启动问一次，不致命 */ }
+    var m = $('firstrun');
+    if (m) { m.hidden = true; }
+  }
+
+  /** ★ P3-03：还没有任何连接、且没标记过「跳过」→ 出首次引导。 */
+  function maybeShowFirstRun() {
+    var m = $('firstrun');
+    if (!m || !m.hidden) { return; }
+    if (firstRunDone()) { return; }
+    if (state.linksLoaded !== true) { return; }
+    // 「有连接」= 配置过 link 文件，而不是 daemon 上报的未配置占位行。
+    var ls = linksList();
+    var configured = 0;
+    for (var i = 0; i < ls.length; i++) { if (ls[i].link_exists !== false) { configured++; } }
+    if (configured) { markFirstRunDone(); return; }
+    m.hidden = false;
+    var b = $('btn-firstrun-start');
+    if (b && isFn(b.focus)) { b.focus(); }
   }
 
   // ---- 右上角 NAS 菜单（P2-10）
@@ -8421,8 +8457,28 @@
     on('btn-conn-modal-close', 'click', closeConnModal);
     on('btn-help-modal-close', 'click', closeHelpModal);
     on('btn-help', 'click', openHelpModal);
-    on('btn-help-about', 'click', function () { show('help-about-panel', true); show('help-quickstart-panel', false); });
-    on('btn-help-quickstart', 'click', function () { show('help-about-panel', false); show('help-quickstart-panel', true); });
+    on('btn-help-about', 'click', function () { showHelpPanel('about'); });
+    on('btn-help-quickstart', 'click', function () { showHelpPanel('quickstart'); });
+    on('btn-help-whatsnew', 'click', function () { showHelpPanel('whatsnew'); });
+    on('btn-help-license', 'click', function () { showHelpPanel('license'); });
+    on('btn-help-online', 'click', function () { doOpen('url', 'https://github.com/mlzxgzy/qxync'); });
+    on('btn-open-homepage', 'click', function () { doOpen('url', 'https://github.com/mlzxgzy/qxync'); });
+    on('btn-share-station', 'click', function () {
+      var u = fileStationUrl();
+      if (!u) { renderError('share-result', '打不开', '还没有连接配置（先在右上角 NAS 菜单里添加）'); return; }
+      doOpen('url', u);
+      renderResult('share-result', true, '已请求打开 File Station', [['URL', u]]);
+    });
+    on('btn-env-logdir', 'click', function () {
+      var info = state.appInfo;
+      doOpen('path', info ? (str(info.state_dir) + '/log') : '');
+    });
+    on('btn-env-config', 'click', function () {
+      var info = state.appInfo;
+      doOpen('path', info ? str(info.config_dir) : '');
+    });
+    on('btn-firstrun-start', 'click', function () { markFirstRunDone(); openConnModal(); });
+    on('btn-firstrun-skip', 'click', function () { markFirstRunDone(); });
     if ($('conn-modal')) {
       $('conn-modal').addEventListener('click', function (ev) {
         if (ev.target === $('conn-modal')) { closeConnModal(); }
@@ -8728,6 +8784,12 @@
         trayFanout({ once: true }, '托盘：立即与 NAS 同步');
       } else if (action === 'pause') {
         trayFanout({ interval_secs: 0 }, '托盘：暂停轮询');
+      } else if (action === 'settings') {
+        call('window_show', {});
+        switchPage('settings', null, 'proxy');
+      } else if (action === 'about') {
+        call('window_show', {});
+        openHelpModal();
       }
       renderAbout();
     });
