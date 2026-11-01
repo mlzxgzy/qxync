@@ -20,7 +20,7 @@ fuser = { path = "vendor/fuser" }
 
 
 [workspace.package]
-version = "0.8.3"
+version = "0.9.0"
 edition = "2021"
 rust-version = "1.90"
 

@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-01
+
+### Added
+
+- **Desktop GUI overhauled to align with Qsync Client 6 (package B: P0–P3).** The user asked
+  for a product-level (not pixel-perfect) fit to Qsync Client 6. We first produced an
+  evidence-backed study (official tutorial 1× screenshots with pixel/typography measurements,
+  [report](docs/调研-Qsync-Client-6界面全面贴合报告.md), [67 work items](docs/贴合Qsync6-工作项清单.md))
+  and then landed it in four batches:
+  ① **P0 visual foundation / shell cleanup**: 61px icon-only rail with groups and a selected
+  pill (labels can be enabled in settings), topbar reduced to a 24px page title plus one quiet
+  connection line — pid/uptime/socket/start-stop/login moved into *Diagnostics → Runtime*;
+  operation log hidden by default; Qsync 6 spacing/radius/weight/density tokens;
+  ② **P1 task model**: flat task cards on Home/Tasks (status circle, name, `Sync` badge,
+  absolute last-sync time, pause/⋮/›); new **task detail page** with local/NAS cards, a 1:1
+  folder-pair table and sync settings; create-task flow split into type picker then form
+  (backup disabled with an explanation); engineering fields folded into "Advanced";
+  ③ **P2 information architecture**: file-update center with four aligned columns, sorting,
+  search and activity filter (raw kinds only in tooltips); errors became their own page grouped
+  by task with locate/copy-path/open-log actions; settings condensed to four tabs with
+  connection management in the top-right NAS menu and About in the rail help; files table
+  columns reordered and state collapsed into a single icon plus tooltip;
+  ④ **P3 polish**: honest placeholder Sharing page (no Qsync Central sharing API — deep link
+  to File Station), complete Help menu (About/Quick start/What's new/Licenses/Online docs),
+  three-step first-run guide for users with no connection (skippable), tray menu gained
+  Settings/About, About page de-teched (paths live in Diagnostics).
+  Acceptance: [side-by-side](docs/验收-Qsync6-96dpi/并排对比.md), [change notes](docs/贴合Qsync6-变更说明.md),
+  [screenshots](docs/验收-Qsync6-96dpi/README.md); GUI matrix 165/165, purge 37/37, `ui_spec` green.
+  Behavior unchanged: no sync/delete/dehydrate semantics changed, no IPC or config format change,
+  no fake progress or fake toggles (Always-available stays a pin marker, Sync now still triggers
+  one polling round, auto-update stays disabled with a reason).
+
+### Not done (per package B, stated honestly)
+
+- English UI (P3-08): 100+ new keys needed; language dropdown lists Simplified Chinese only;
+- Error retry (P2-07, needs backend IPC BE-06) and per-task filters (P2-18, needs BE-07);
+- Notification click-through (P3-05): the Linux notification plugin exposes no click callback;
+- Client-side decorations (P3-11): Linux CSD risk; the official client also uses native titlebars;
+- Backup/restore/versions/thumbnails/USB import: flagship Qsync 6 features outside qxync's scope.
+
 ## [0.8.3] - 2026-11-01
 
 ### Added
