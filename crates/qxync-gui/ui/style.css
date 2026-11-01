@@ -13,37 +13,43 @@
  * 约定：**颜色先在这里起名**，规则区不写裸色值（阴影里的 rgba 除外）；
  *       深色模式只覆写这一块 —— 新增 token 必须同时补深色值，否则会在深色下露白。 */
 :root {
-  --bg: #f4f5f7;
-  --bg-elev: #ffffff;
-  --bg-sunken: #eceef2;
-  --bg-head: #f7f8fa;
-  --fg: #1c1f24;
-  --fg-dim: #5b6470;
-  --fg-faint: #8a929e;
-  --border: #d8dce3;
-  --border-soft: #e6e9ee;
-  --accent: #2f6fd0;
+  --bg: #ffffff;
+  --bg-elev: #fafafa;
+  --bg-sunken: #f1f2f4;
+  --bg-head: #ffffff;
+  --fg: #1a1a1a;
+  --fg-dim: #5a5a5a;
+  --fg-faint: #838383;
+  --border: #dfdfe8;
+  --border-soft: #ececf0;
+  --accent: #0c75ff;
   --accent-fg: #ffffff;
-  --accent-soft: #e8f0fc;
-  --ok: #1f8a4c;
-  --ok-soft: #e6f5ec;
+  --accent-soft: #e1eeff;
+  --ok: #269514;
+  --ok-soft: #e1ffde;
   --warn: #a86a00;
   --warn-soft: #fdf3e0;
-  --err: #c0392b;
+  --err: #d93025;
   --err-soft: #fdecea;
-  --info: #2f6fd0;
+  --info: #0c75ff;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
   --sans: system-ui, -apple-system, "Segoe UI", "Noto Sans CJK SC", "Source Han Sans SC", "Microsoft YaHei", sans-serif;
-  --radius: 6px;
+  --radius: 4px;
   --radius-lg: 8px;
   --radius-pill: 999px;
-  --gap: 10px;
-  --shadow: 0 1px 2px rgba(16, 22, 32, .07);
+  --gap: 16px;
+  --shadow: none;
   --shadow-lg: 0 10px 26px rgba(0, 0, 0, .28);
   --overlay: rgba(16, 22, 32, .45);
-  --focus: #2f6fd0;                 /* 键盘焦点环（与 --accent 同色） */
-  --focus-halo: rgba(47, 111, 208, .35);
+  --focus: #0c75ff;                 /* 键盘焦点环（与 --accent 同色） */
+  --focus-halo: rgba(12, 117, 255, .35);
   --code-bg: rgba(128, 128, 128, .18);
+  --rail-bg: #f8f9fb;
+  --rail-selected: #e1eeff;
+  --rail-icon: #036de1;
+  --rail-icon-active: #0444a7;
+  --border-strong: #cacaca;
+  --link: #0b5fd0;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -73,6 +79,12 @@
     --focus: #5c9bf0;
     --focus-halo: rgba(92, 155, 240, .45);
     --code-bg: rgba(200, 200, 200, .16);
+    --rail-bg: #14161a;
+    --rail-selected: #1f2d3d;
+    --rail-icon: #6aa9ff;
+    --rail-icon-active: #9cc6ff;
+    --border-strong: #3f444c;
+    --link: #7db3ff;
   }
 }
 
@@ -1624,3 +1636,101 @@ button.primary.danger:hover:not(:disabled) {
 .dl-card.done .dl-line { color: var(--ok); }
 .dl-card.err .dl-fill { background: var(--err); animation: none; }
 .dl-card.err .dl-line { color: var(--err); }
+
+/* ============================================================================
+ * ★ P0 贴合层（2026-11，对齐 Qsync Client 6）—— 组件级覆盖
+ * 官方 1× 实测：左栏 61px / 图标 24 / 选中胶囊 55×47 #E1EEFF；页标题 24/600；
+ * 卡片 #FAFAFA + #DFDFE8 + 圆角 8；主按钮 #0C75FF 高 30 圆角 4；
+ * 表格行 34 / 表头 13 #5A5A5A / 线 #CACACA；正文 14。
+ * 约定：新组件只依赖 :root token 与本层尺寸，不再写裸色值。
+ * ==========================================================================*/
+
+body { font-size: 14px; line-height: 1.5; }
+
+h2 {
+  font-size: 16px; font-weight: 700; letter-spacing: 0;
+  border-bottom: 0; padding-bottom: 0; margin-bottom: 12px;
+}
+h3.sub { font-size: 13.5px; margin: 14px 0 6px; }
+
+/* ---- 左栏：61px、#F8F9FB、纯图标、选中胶囊 ---- */
+.rail { width: 61px; padding: 12px 0 10px; background: var(--rail-bg); border-right: 0; }
+.rail-logo { width: 40px; height: 40px; margin: 0 auto 16px; border-radius: 10px; background: var(--rail-icon); font-size: 20px; }
+.rail-nav { gap: 0; }
+.rail-item {
+  width: 55px; height: 47px; margin: 0 auto 13px; padding: 0; gap: 0;
+  border: 0; border-left: 0; border-radius: 12px;
+  background: transparent; color: var(--rail-icon);
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+}
+.rail-item svg { width: 24px; height: 24px; stroke-width: 1.8; }
+.rail-item:hover:not(.active) { background: rgba(225, 238, 255, .55); color: var(--rail-icon); }
+.rail-item.active { background: var(--rail-selected); color: var(--rail-icon-active); font-weight: 600; }
+.rail-item.rail-expert { border-top: 0; margin-top: 8px; }
+/* 默认纯图标：文字视觉隐藏、读屏保留（P0-05 会给「显示导航文字」开关） */
+.rail-item span {
+  position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+body.rail-labels .rail-item { height: 58px; gap: 3px; margin-bottom: 8px; }
+body.rail-labels .rail-item span { position: static; width: auto; height: auto; margin: 0; overflow: visible; clip: auto; font-size: 10.5px; }
+
+/* ---- 顶栏 / 页面头 ---- */
+.topbar { background: var(--bg); border-bottom: 0; box-shadow: none; padding: 18px 26px 4px 40px; }
+.topbar-row { align-items: center; gap: 16px; }
+.pagetitle { font-size: 24px; font-weight: 600; letter-spacing: 0; }
+.topbar-meta { font-size: 12px; color: var(--fg-faint); margin-top: 2px; }
+
+#main { padding: 8px 26px 24px 40px; }
+
+/* ---- 卡片 ---- */
+.card {
+  background: var(--bg-elev); border: 1px solid var(--border);
+  border-radius: var(--radius-lg); padding: 16px 20px;
+  margin-bottom: var(--gap); box-shadow: none;
+}
+
+/* ---- 任务卡 ---- */
+.task-card { background: var(--bg-elev); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 14px 18px; gap: 12px; }
+.task-state { font-size: 16px; font-weight: 700; }
+.task-meta { font-size: 13px; font-family: var(--sans); color: var(--fg-dim); }
+
+/* ---- 按钮三档 ---- */
+button {
+  font-size: 14px; height: 30px; padding: 0 14px; border-radius: var(--radius);
+  border: 1px solid var(--border-strong); background: var(--bg-elev); color: var(--fg);
+}
+button:hover:not(:disabled) { background: var(--bg-sunken); border-color: var(--fg-faint); }
+button:disabled { opacity: 1; background: #d6d6d6; border-color: #d6d6d6; color: #7a7a7a; }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); font-weight: 500; }
+button.primary:hover:not(:disabled) { filter: brightness(.94); background: var(--accent); }
+button.mini { height: 26px; padding: 0 10px; font-size: 13px; }
+button.link-btn { height: auto; padding: 0 4px; border: 0; background: none; color: var(--accent); }
+
+/* ---- 表单 ---- */
+input[type="text"], input[type="password"], input[type="number"], input[type="search"],
+select, textarea {
+  font-family: inherit; font-size: 14px; height: 30px;
+  border: 1px solid #aaa; border-radius: 3px; background: var(--bg-elev); color: var(--fg);
+  padding: 0 8px;
+}
+textarea { height: auto; padding: 6px 8px; }
+input:focus, select:focus, textarea:focus { border-color: var(--accent); outline: 2px solid var(--focus-halo); outline-offset: 0; }
+
+/* ---- 表格 ---- */
+table.tbl { font-size: 13.5px; }
+table.tbl th { font-weight: 400; font-size: 13px; color: #5a5a5a; background: var(--bg-elev); border-bottom: 1px solid var(--border-strong); padding: 7px 8px; }
+table.tbl td { font-size: 13.5px; padding: 7px 8px; border-bottom: 1px solid var(--border-soft); }
+table.tbl tbody tr:hover { background: var(--bg-sunken); }
+table.tbl tr.selected, table.tbl tbody tr:focus-within { background: var(--rail-selected); }
+
+/* ---- tab ---- */
+.tabs { gap: 20px; padding: 0 26px; background: transparent; border-bottom: 1px solid var(--border-soft); }
+.tab { height: 36px; padding: 0; border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: transparent; color: var(--fg-dim); font-size: 14px; }
+.tab:hover { color: var(--fg); background: transparent; }
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); background: transparent; }
+
+/* ---- 徽章 / 日志 ---- */
+.badge { font-size: 12px; border-radius: 4px; padding: 1px 7px; }
+.chip { font-size: 12px; padding: 2px 8px; }
+.logbox { background: var(--bg-head); }

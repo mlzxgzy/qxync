@@ -607,7 +607,7 @@
             <h2>筛选器设置（Filter settings）</h2>
             <p class="hint">
               通配符规则，每行一条（<code>thumbs.db</code> / <code>*.crdownload</code> / <code>.*</code> / <code>/cache/</code>）。
-              以 <code>/</code> 结尾的规则会**剪掉整棵子树**（这一点 qxync 比 Qsync 6.x 强，不要退化）。
+              以 <code>/</code> 结尾的规则会<strong>剪掉整棵子树</strong>（这一点 qxync 比 Qsync 6.x 强，不要退化）。
               规则改完要重启 daemon 才对挂载点生效（同步引擎与 FUSE 在启动时注入规则）。
             </p>
             <label>排除规则（exclude）
@@ -631,13 +631,13 @@
           <div class="card">
             <h2>冲突策略（Conflict policies）</h2>
             <p class="hint">
-              策略挂在**任务**上（不是全局）。没配过的任务默认 <code>rename_local</code>，也就是 M2c 一直以来的行为
+              策略挂在<strong>任务</strong>上（不是全局）。没配过的任务默认 <code>rename_local</code>，也就是 M2c 一直以来的行为
               「NAS 上的文件占原名、本地内容另存 <code>xxx (conflicted copy from …)</code>」。
-              <code>replace_*</code> 两个选项会**丢一边的改动**，界面上有显式警告。
+              <code>replace_*</code> 两个选项会<strong>丢一边的改动</strong>，界面上有显式警告。
             </p>
             <dl class="kv kv-inline" id="conflict-kv"></dl>
             <p class="hint">
-              每个任务的策略在「任务」页的**文件夹对设置**里改；
+              每个任务的策略在「任务」页的<strong>文件夹对设置</strong>里改；
               「每个文件都问我」的待裁决项也在任务页顶部处理。
             </p>
           </div>
@@ -660,10 +660,10 @@
               </div>
               <label class="check"><input type="checkbox" id="s-close-tray"> 关闭主窗口时最小化到托盘</label>
               <p class="hint">
-                ⚠ **托盘不可见时这个开关不会生效**：如果系统里没有
+                ⚠ <strong>托盘不可见时这个开关不会生效</strong>：如果系统里没有
                 <code>org.kde.StatusNotifierWatcher</code>（纯 XEmbed 桌面如 IceWM/Fluxbox，
                 或装了 GNOME 但没启用 AppIndicator 扩展），图标根本不会被画出来 ——
-                此时关闭窗口会**真的关闭**，免得窗口藏起来之后找不回。
+                此时关闭窗口会<strong>真的关闭</strong>，免得窗口藏起来之后找不回。
                 这种桌面可以装 <code>snixembed</code> 把 SNI 图标桥进老式托盘。
               </p>
               <div class="btn-row">
@@ -682,7 +682,7 @@
               <label class="check"><input type="checkbox" id="s-debug-log"> 启用调试日志（Enable debug log，⚠ 影响同步性能）</label>
               <p class="hint">
                 真正的日志级别仍由 <code>RUST_LOG</code> 控制（qxync 的日志落在状态目录 <code>log/</code>，
-                ★ M39 起按天**且按大小**切段，占用与保留策略在「日志」分区里调）；
+                ★ M39 起按天<strong>且按大小</strong>切段，占用与保留策略在「日志」分区里调）；
                 这个开关是给界面/后续里程碑用的记录位。
               </p>
               <label class="check"><input type="checkbox" id="s-notifications"> 显示桌面通知（Show desktop notifications）</label>
@@ -755,7 +755,7 @@
               </div>
               <p class="hint">
                 三个数字的 <b>0</b> 含义各不相同：单文件上限 0 = 不按大小切段；保留天数 0 = 不按天数删；
-                总占用 0 = 不限总量。保存后 daemon **立即**应用新策略并顺手清一次。
+                总占用 0 = 不限总量。保存后 daemon <strong>立即</strong>应用新策略并顺手清一次。
                 每个「前缀族」（daemon / GUI 各一族）里最新的那个文件永远保留 —— 它就是正在写的那个。
               </p>
               <div class="btn-row">
@@ -812,7 +812,7 @@
               <div id="space-blocked" class="alert-stack"></div>
               <p class="note">
                 脱水永远走 M3 的安全检查链：有未上传改动 / 待上传 / <code>pin=pinned</code> / <code>excluded</code> /
-                打开中 / 被 mmap / 正在传输 —— 任一命中就**跳过并计入「被挡下」**，与手动脱水完全同一条路。
+                打开中 / 被 mmap / 正在传输 —— 任一命中就<strong>跳过并计入「被挡下」</strong>，与手动脱水完全同一条路。
               </p>
               <div id="free-result" class="result" hidden></div>
             </div>
@@ -824,9 +824,9 @@
           <div class="card">
             <h2>LAN 加速（LAN sync）</h2>
             <p class="hint">
-              qxync 的 LAN 通道是**自研协议**（与官方 Windows 客户端的 LAN 二进制通道不互通，已决策不做）。
+              qxync 的 LAN 通道是<strong>自研协议</strong>（与官方 Windows 客户端的 LAN 二进制通道不互通，已决策不做）。
               它的作用是：同一账号的另一台 qxync 设备上已有内容时，水合优先走局域网直传，失败自动回落 NAS。
-              默认**不监听**（要显式打开）；配对用的是明文 TCP + 共享令牌，只在可信局域网里用。
+              默认<strong>不监听</strong>（要显式打开）；配对用的是明文 TCP + 共享令牌，只在可信局域网里用。
             </p>
             <div class="form">
               <div class="row-2">
@@ -841,7 +841,7 @@
                 <button type="button" id="btn-lan-save" class="primary">保存 LAN 设置</button>
                 <button type="button" id="btn-lan-status">刷新对等状态</button>
               </div>
-              <p class="hint">监听地址改动要**重启 daemon** 才生效（保存后可以在「诊断 → 挂载」里停止再启动）。</p>
+              <p class="hint">监听地址改动要<strong>重启 daemon</strong> 才生效（保存后可以在「诊断 → 挂载」里停止再启动）。</p>
               <dl class="kv" id="lan-status-kv"></dl>
               <h3 class="sub">配对一台设备</h3>
               <div class="toolbar">
