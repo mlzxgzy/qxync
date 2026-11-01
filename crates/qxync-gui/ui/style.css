@@ -1909,3 +1909,85 @@ details.decisions-card > .btn-row { padding: 0 20px 16px; }
 .sync-modal-card { position: relative; width: min(520px, 92vw); max-height: 88vh; overflow: auto; }
 /* 类型卡是 <button>：全局按钮高度/行高会裁掉两行内容，这里还原成卡片 */
 .type-grid .type-card { height: auto; min-height: 104px; line-height: 1.35; white-space: normal; }
+
+/* ---- ★ P2 更新中心 / 错误列表表格 ---- */
+.journal-toolbar { flex-wrap: wrap; }
+.th-sort {
+  border: 0; background: none; padding: 0; height: auto;
+  font: inherit; color: inherit; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 2px;
+}
+.th-sort:hover { color: var(--fg); }
+.sort-mark { color: var(--fg-faint); font-size: 10.5px; }
+.tbl-journal .col-file { width: 26%; }
+.tbl-journal .col-kind { width: 110px; }
+.tbl-journal .col-time { width: 156px; }
+.tbl-journal .col-desc { width: auto; }
+.tbl-errors .col-file { width: 26%; }
+.tbl-errors .col-task { width: 16%; }
+.tbl-errors .col-reason { width: auto; }
+.tbl-errors .col-time { width: 150px; }
+.tbl-errors .col-act { width: 176px; white-space: nowrap; }
+.tbl-errors .col-act .mini { margin-right: 4px; }
+.tbl-journal td, .tbl-errors td { height: 34px; }
+.file-name { color: var(--fg); }
+tr.row-bad td { background: var(--err-soft); }
+tr.row-bad:hover td { background: var(--err-soft); }
+.tbl-group td {
+  background: var(--bg-sunken); color: var(--fg-dim);
+  font-size: 12px; font-weight: 600; height: 30px;
+}
+
+/* 更新中心工具栏：搜索框吃剩余宽度、下拉/条数固定宽，别各占一行 */
+.journal-toolbar { display: flex; align-items: center; gap: 8px; }
+.journal-toolbar input[type="search"] { flex: 1 1 260px; min-width: 200px; width: auto; }
+.journal-toolbar select { flex: 0 0 180px; width: 180px; }
+.journal-toolbar .inline-num { flex: 0 0 auto; }
+.journal-toolbar .inline-num input { width: 76px; }
+.col-reason { max-width: 420px; }
+
+/* ---- ★ P2-09/10/11：设置 4 tab、连接模态、帮助模态 ---- */
+.topbar-actions { margin-left: auto; display: flex; align-items: center; gap: 6px; }
+.topbar-actions .icon-btn { width: 34px; height: 34px; }
+.topbar-actions .icon-btn svg { width: 20px; height: 20px; }
+.conn-modal-card { position: relative; width: min(880px, 94vw); max-height: 90vh; overflow: auto; }
+.conn-modal-body { display: block; }
+.conn-modal-card .settings-sec { display: none; }
+.conn-modal-card .settings-sec.active { display: block; }
+.help-modal-card { position: relative; width: min(720px, 92vw); max-height: 90vh; overflow: auto; }
+.help-menu { display: flex; gap: 8px; margin: 10px 0 14px; }
+.help-item {
+  height: auto; padding: 6px 12px; border: 1px solid var(--border);
+  border-radius: var(--radius); background: var(--bg-elev); color: var(--fg);
+}
+.help-item:hover { border-color: var(--accent); }
+.help-modal-body { display: block; }
+.settings-sub {
+  border: 1px solid var(--border); border-radius: var(--radius-lg);
+  background: var(--bg-elev); padding: 0; margin-bottom: 16px;
+}
+.settings-sub > summary {
+  cursor: pointer; padding: 14px 20px; font-weight: 600; list-style: none;
+  display: flex; align-items: center; gap: 8px;
+}
+.settings-sub > summary::-webkit-details-marker { display: none; }
+.settings-sub > summary::before { content: "›"; color: var(--fg-faint); font-size: 18px; transition: transform .12s ease; }
+.settings-sub[open] > summary::before { transform: rotate(90deg); }
+.settings-sub > .card { border: 0; box-shadow: none; margin: 0; padding: 0 20px 16px; }
+.settings-sub .grid-2 > .card { padding: 0; }
+
+/* ---- ★ P2-17 高级四项 / P2-20 文件状态图标 ---- */
+.adv-lan-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.adv-lan-row .hint { margin: 0; }
+.state-icon {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 20px; height: 20px; border-radius: 50%;
+  font-size: 12px; line-height: 1;
+}
+.state-online { color: var(--accent); background: var(--accent-soft); }
+.state-local { color: var(--ok); background: var(--ok-soft); }
+.state-always { color: var(--warn-fg); background: var(--warn-soft); }
+.state-progress { color: var(--accent); background: var(--accent-soft); }
+.state-warn { color: var(--err); background: var(--err-soft); }
+.state-unknown { color: var(--fg-faint); background: var(--bg-sunken); }
+.state-dir { color: var(--fg-faint); background: none; }

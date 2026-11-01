@@ -365,8 +365,13 @@ else
     slug=$(echo "$t" | tr ':' '-')
     SHOT="$SHOTS/tab-$slug.png"
     shot_page "$t" "$SHOT" "$slug" || continue
-    AE=$(ae_of "$SHOTS/tab-settings.png" "$SHOT")
-    check "$([ "${AE:-0}" -gt 4000 ] && echo 0 || echo 1)" "sec=$t：与「连接」分区画面不同（AE $AE px）"
+    # ★ P2-09：默认设置页就是「代理」，它自己就是 tab-settings.png 的基准 → 首个分区不比。
+    if [ "$t" != "settings:proxy" ]; then
+      AE=$(ae_of "$SHOTS/tab-settings.png" "$SHOT")
+      check "$([ "${AE:-0}" -gt 4000 ] && echo 0 || echo 1)" "sec=$t：与「代理」分区画面不同（AE $AE px）"
+    else
+      check 0 "sec=$t：默认分区（基准画面）"
+    fi
     if [ -n "$prev_sec" ]; then
       AE2=$(ae_of "$prev_sec" "$SHOT")
       check "$([ "${AE2:-0}" -gt 4000 ] && echo 0 || echo 1)" "sec=$t：与上一个分区也不同（AE $AE2 px）"

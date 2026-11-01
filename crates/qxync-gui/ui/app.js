@@ -82,6 +82,7 @@
   // --------------------------------------------------------------- ★ M16 多连接状态
   var state = {
     page: 'home',      // 一级目的地（PAGES）
+    journalSort: 'time-desc',   // ★ P2-02：更新中心排序（time-desc / time-asc / kind-asc）
     wantDetail: '',    // ★ P1-10：`task:<id>` 深链等任务列表到齐后再进详情
     wantSyncModal: false,
     detail: null,
@@ -117,7 +118,7 @@
     pollTimer: null,
     logCount: 0,
     // ★ M8.4
-    sec: 'connect',       // 设置页内的分区
+    sec: 'proxy',       // 设置页内的分区
     settings: null,       // settings 请求的最近一次结果（全局，所有连接共享一份文件）
     link: null,           // link_read 的最近一次结果（**当前连接**的 LAN / 筛选器）
     space: null,          // space 请求的最近一次结果（当前连接）
@@ -1883,8 +1884,11 @@
 
   function kindLabel(k) {
     var s = str(k);
-    return KIND_LABEL[s] ? (KIND_LABEL[s] + '（' + s + '）') : s;
+    // ★ P2-04：界面上只显示人话；原始 kind 放 title（排障时还能看到）
+    return KIND_LABEL[s] || s || '—';
   }
+
+  function kindRaw(k) { return str(k); }
 
   function statusMark(st) {
     if (st === 'error') { return '❌'; }
@@ -1908,6 +1912,22 @@
       }
     }
     return req;
+  }
+
+  /** ★ P2-02：时间 / 活动排序（默认时间倒序，点击表头切换）。 */
+  function sortJournalEntries(list) {
+    var mode = str(state.journalSort) || 'time-desc';
+    var out = list.slice();
+    if (mode === 'time-asc') {
+      out.reverse();
+    } else if (mode === 'kind-asc') {
+      out.sort(function (a, b) {
+        var ka = kindLabel(a.e.kind), kb = kindLabel(b.e.kind);
+        if (ka !== kb) { return ka.localeCompare(kb, 'zh'); }
+        return num(b.e.ts, 0) - num(a.e.ts, 0);
+      });
+    }
+    return out;
   }
 
   /** 合并各连接的 journal 条目：[{e, linkId}]，按时间倒序。 */
@@ -2020,24 +2040,47 @@
       setListState('journal-empty', 'ready');
     }
 
-    for (var i = 0; i < list.length; i++) {
+    var ordered = sortJournalEntries(list);
+    // 表头状态（排序箭头）
+    setText('j-sort-time-mark', (str(state.journalSort) === 'time-asc') ? '↑' : '↓');
+    setText('j-sort-kind-mark', (str(state.journalSort) === 'kind-asc') ? '↑' : '');
+    var multi = linksList().length > 1;
+    for (var i = 0; i < ordered.length; i++) {
       (function (item) {
         var e = item.e;
+        var full = str(e.path);
         var tr = el('tr');
-        tr.appendChild(el('td', 'col-time mono', humanTimeFromEpoch(e.ts)));
-        // ★ M16：来源连接（同一日志表里合并了多个 daemon 的记录）
-        var tdLink = el('td', 'col-link');
-        tdLink.appendChild(el('span', 'badge badge-link', linkLabelById(item.linkId)));
-        tr.appendChild(tdLink);
+        if (str(e.status) === 'error' || str(e.status) === 'blocked') { tr.className = 'row-bad'; }
+
+        // 文件：只显示文件名，完整路径放 title；多连接时行内带来源徽标
+        var tdFile = el('td', 'col-file');
+        var name = pathBase(full) || '—';
+        var fn = el('span', 'file-name mono' + (pathBase(full) ? '' : ' val-dim'), name);
+        fn.title = full;
+        tdFile.appendChild(fn);
+        if (multi) {
+          tdFile.appendChild(document.createTextNode(' '));
+          var lb = el('span', 'badge badge-link', linkLabelById(item.linkId));
+          lb.title = full;
+          tdFile.appendChild(lb);
+        }
+        tr.appendChild(tdFile);
+
         var tdKind = el('td', 'col-kind');
-        tdKind.appendChild(el('span', null, statusMark(str(e.status)) + ' '));
-        tdKind.appendChild(el('span', 'badge', kindLabel(e.kind)));
+        var badge = el('span', 'badge', kindLabel(e.kind));
+        badge.title = kindRaw(e.kind);
+        tdKind.appendChild(badge);
         tr.appendChild(tdKind);
-        tr.appendChild(el('td', 'mono', str(e.path) || '—'));
-        tr.appendChild(el('td', null, str(e.detail) || '—'));
-        tr.appendChild(el('td', 'col-size mono', num(e.bytes, 0) > 0 ? humanSize(e.bytes) : ''));
+
+        var tEl = el('td', 'col-time mono', humanTimeFromEpoch(e.ts) || '—');
+        tr.appendChild(tEl);
+
+        var detail = friendlyError(e.detail);
+        var tdDesc = el('td', 'col-desc', detail || '—');
+        if (!detail && num(e.bytes, 0) > 0) { tdDesc.textContent = humanSize(e.bytes); }
+        tr.appendChild(tdDesc);
         tb.appendChild(tr);
-      })(list[i]);
+      })(ordered[i]);
     }
 
     var notes = fanoutNotes(state.journalByLink);
@@ -2101,6 +2144,70 @@
     return out;
   }
 
+  /** 错误 → 所属任务视图（按 NAS 根前缀匹配；找不到返回 null）。 */
+  function entryTaskView(e) {
+    var p = str(e && e.path);
+    if (!p) { return null; }
+    var groups = taskGroups();
+    var best = null, bestLen = -1;
+    for (var i = 0; i < groups.length; i++) {
+      for (var j = 0; j < groups[i].views.length; j++) {
+        var v = groups[i].views[j];
+        var root = str(taskRoot(v)).replace(/\/+$/, '');
+        if (!root) { continue; }
+        if (p === root || p.indexOf(root + '/') === 0) {
+          if (root.length > bestLen) { best = v; bestLen = root.length; }
+        }
+      }
+    }
+    return best;
+  }
+
+  function entryTaskLabel(e) {
+    var v = entryTaskView(e);
+    if (v) { return taskDisplayName(v); }
+    var p = str(e && e.path);
+    return p ? pathBase(pathParent(p)) : T('errors.conn_level');
+  }
+
+  /** ★ P2-04：把 daemon 的技术前缀换成用户能读的动作名（不改变事实）。 */
+  function friendlyError(detail) {
+    var d = str(detail);
+    if (!d) { return d; }
+    return d
+      .replace(/qbox_get_max_log\s*失败/g, '读取 NAS 日志游标失败')
+      .replace(/qbox_get_max_log:/g, '读取日志游标：')
+      .replace(/get_list:status=3/g, '列目录失败：NAS 返回未知状态')
+      .replace(/get_list:/g, '列目录：')
+      .replace(/stat:status=5/g, '文件信息：路径不存在或无权限')
+      .replace(/stat:/g, '文件信息：');
+  }
+
+  /** 错误行「定位文件」：换算成本地挂载点路径，切到文件页浏览其父目录。 */
+  function gotoEntryLocal(e) {
+    var p = str(e && e.path);
+    var v = entryTaskView(e);
+    if (!v || !p) { copyText(p); return; }
+    var root = str(taskRoot(v)).replace(/\/+$/, '');
+    var rel = p.slice(root.length);
+    var local = str(v.task.mountpoint).replace(/\/+$/, '') + rel;
+    var dir = pathParent(local);
+    if (!dir) { dir = local; }
+    state.files.path = dir;
+    var fp = $('fp-path');
+    if (fp) { fp.value = dir; }
+    switchPage('files');
+  }
+
+  /** 错误行「打开日志」：切到更新中心并按文件名过滤。 */
+  function openEntryInJournal(e) {
+    var q = str(e && e.path) ? pathBase(str(e.path)) : '';
+    var jq = $('j-query');
+    if (jq) { jq.value = q; }
+    switchPage('journal');
+    refreshJournal();
+  }
+
   function renderErrorsPage() {
     var box = $('errors-list');
     if (!box) { return; }
@@ -2120,27 +2227,63 @@
     setText('errors-count', list.length ? '（' + list.length + '）' : '');
     setListState('errors-empty', list.length ? 'ready' : 'empty', T('errors.empty'));
 
+    // ★ P2-05：按任务分组（同一任务的失败挨在一起，先能回答「哪个任务坏了」）
+    var groups = [];
+    var index = {};
     for (var i = 0; i < list.length; i++) {
-      (function (item) {
-        var e = item.e;
-        var row = el('div', 'alert alert-err');
-        row.appendChild(el('span', 'mono', humanTimeFromEpoch(e.ts) + '  '));
-        // ★ M16：来源连接 —— 同一份列表里 A 的失败不能被当成 B 的
-        row.appendChild(el('span', 'badge badge-link', linkLabelById(item.linkId)));
-        row.appendChild(document.createTextNode(' '));
-        row.appendChild(el('span', 'badge badge-err', kindLabel(e.kind)));
-        row.appendChild(document.createTextNode('  ' + (str(e.detail) || T('errors.no_detail'))));
-        if (str(e.path)) {
-          row.appendChild(document.createTextNode('  '));
-          row.appendChild(el('span', 'mono', str(e.path)));
-          var b = el('button', 'mini', T('errors.copy_path'));
-          b.type = 'button';
-          b.addEventListener('click', function () { copyText(str(e.path)); });
-          row.appendChild(document.createTextNode(' '));
-          row.appendChild(b);
-        }
-        box.appendChild(row);
-      })(list[i]);
+      var e = list[i].e;
+      var label = entryTaskLabel(e);
+      if (!index[label]) { index[label] = { label: label, rows: [] }; groups.push(index[label]); }
+      index[label].rows.push(list[i]);
+    }
+    for (var g = 0; g < groups.length; g++) {
+      var head = el('tr', 'tbl-group');
+      var headTd = el('td', null, groups[g].label);
+      headTd.colSpan = 5;
+      head.appendChild(headTd);
+      box.appendChild(head);
+      for (var k = 0; k < groups[g].rows.length; k++) {
+        (function (item) {
+          var en = item.e;
+          var full = str(en.path);
+          var tr = el('tr');
+          tr.className = 'row-bad';
+
+          var tdFile = el('td', 'col-file');
+          var fn = el('span', 'file-name mono' + (pathBase(full) ? '' : ' val-dim'), pathBase(full) || '—');
+          fn.title = full;
+          tdFile.appendChild(fn);
+          tr.appendChild(tdFile);
+
+          var tdTask = el('td', 'col-task');
+          tdTask.appendChild(el('span', null, entryTaskLabel(en)));
+          if (linksList().length > 1) {
+            tdTask.appendChild(document.createTextNode(' '));
+            tdTask.appendChild(el('span', 'badge badge-link', linkLabelById(item.linkId)));
+          }
+          tr.appendChild(tdTask);
+
+          tr.appendChild(el('td', 'col-reason', friendlyError(en.detail) || T('errors.no_detail')));
+          tr.appendChild(el('td', 'col-time mono', humanTimeFromEpoch(en.ts) || '—'));
+
+          var tdAct = el('td', 'col-act');
+          var bLoc = el('button', 'mini', T('errors.act_locate'));
+          bLoc.type = 'button';
+          bLoc.title = full;
+          bLoc.addEventListener('click', function () { gotoEntryLocal(en); });
+          tdAct.appendChild(bLoc);
+          var bCopy = el('button', 'mini', T('errors.copy_path'));
+          bCopy.type = 'button';
+          bCopy.addEventListener('click', function () { copyText(full); });
+          tdAct.appendChild(bCopy);
+          var bLog = el('button', 'mini', T('errors.act_log'));
+          bLog.type = 'button';
+          bLog.addEventListener('click', function () { openEntryInJournal(en); });
+          tdAct.appendChild(bLog);
+          tr.appendChild(tdAct);
+          box.appendChild(tr);
+        })(groups[g].rows[k]);
+      }
     }
 
     var notes = fanoutNotes(state.errorsByLink);
@@ -5349,6 +5492,53 @@
     else { setListState('files-empty', 'empty', T('files.empty')); }
   }
 
+  /** ★ P2-20：一个图标表达文件状态（三态 + 同步进度/冲突/脏），细节放 title。 */
+  function fileStateIcon(fs, isDir) {
+    var wrap = el('span', 'state-icon');
+    var parts = [];
+    var kind = 'unknown', glyph = '—', cls = 'state-unknown';
+    var titleBits = [];
+    if (isDir) {
+      kind = 'dir'; glyph = '—'; cls = 'state-dir'; titleBits.push(T('state.dir'));
+    } else if (fs) {
+      var prog = fs.progress;
+      if (isObj(prog) && num(prog[1], 0) > 0 && num(prog[0], 0) < num(prog[1], 0)) {
+        var pct = Math.floor(num(prog[0], 0) * 100 / num(prog[1], 0));
+        kind = 'progress'; glyph = '↑'; cls = 'state-progress';
+        titleBits.push(T('state.progress', { pct: pct }));
+      } else if (fs.in_sync === false) {
+        titleBits.push(num(fs.conflicts, 0) > 0
+          ? T('state.conflicts', { n: num(fs.conflicts, 0) })
+          : T('state.outOfSync'));
+        kind = 'warn'; glyph = '⚠'; cls = 'state-warn';
+      } else if (fs.dirty === true) {
+        kind = 'warn'; glyph = '⚠'; cls = 'state-warn'; titleBits.push(T('state.dirty'));
+      } else if (fs.in_sync === null || fs.in_sync === undefined) {
+        titleBits.push(T('state.syncUnknown'));
+        kind = 'unknown'; glyph = '☁'; cls = 'state-unknown';
+      }
+      var base = str(fs.state);
+      if (!titleBits.length || base) {
+        var baseText = base === 'always' ? T('state.always')
+          : (base === 'local' ? T('state.local')
+            : (base === 'online' ? T('state.online') : T('state.syncUnknown')));
+        titleBits.push(baseText);
+        if (!titleBits.length || kind === 'unknown') {
+          if (base === 'always') { glyph = '📌'; cls = 'state-always'; kind = 'always'; }
+          else if (base === 'local') { glyph = '●'; cls = 'state-local'; kind = 'local'; }
+          else if (base === 'online') { glyph = '☁'; cls = 'state-online'; kind = 'online'; }
+        }
+      }
+      if (num(fs.hydrated_bytes, 0) > 0) { titleBits.push(humanSize(num(fs.hydrated_bytes, 0)) + ' 已缓存'); }
+    } else if (!isDir) {
+      titleBits.push(T('state.syncUnknown'));
+    }
+    wrap.textContent = glyph;
+    wrap.className = 'state-icon ' + cls;
+    wrap.title = titleBits.join(' · ');
+    return wrap;
+  }
+
   function buildFileRow(e, hideExcluded) {
     var tr = el('tr');
     var full = pathJoin(state.files.dir, e.filename);
@@ -5365,18 +5555,9 @@
     tdSel.appendChild(cb);
     tr.appendChild(tdSel);
 
-    // 类型（have_child 合并在这里：目录名后加 ▾ 表示有子目录）
     var isDir = e.isfolder === true;
-    var tdType = el('td', 'col-type');
-    tdType.appendChild(document.createTextNode(isDir ? '📁' : '📄'));
-    if (isDir && e.have_child === true) {
-      var sub = el('span', 'has-child', '▾');
-      sub.title = '有子目录';
-      tdType.appendChild(sub);
-    }
-    tr.appendChild(tdType);
 
-    // 文件名
+    // ★ P2-19：名称列在前（官方表格语言）
     var tdName = el('td', 'name');
     var dispName = str(e.filename);
     tdName.title = dispName;          // ★ 省略号显示时靠title 给全名
@@ -5395,11 +5576,17 @@
       tdName.appendChild(document.createTextNode(' '));
       tdName.appendChild(el('span', 'badge badge-warn', '占位'));
     }
-    if (e.privilege) {
-      tdName.appendChild(document.createTextNode(' '));
-      tdName.appendChild(el('span', 'badge', str(e.privilege)));
-    }
     tr.appendChild(tdName);
+
+    // 类型（have_child 合并在这里：目录名后加 ▾ 表示有子目录）
+    var tdType = el('td', 'col-type');
+    tdType.appendChild(document.createTextNode(isDir ? '📁' : '📄'));
+    if (isDir && e.have_child === true) {
+      var sub = el('span', 'has-child', '▾');
+      sub.title = '有子目录';
+      tdType.appendChild(sub);
+    }
+    tr.appendChild(tdType);
 
     // 大小
     tr.appendChild(el('td', 'col-size', isDir ? '—' : humanSize(e.filesize)));
@@ -5407,98 +5594,39 @@
     // 时间
     tr.appendChild(el('td', 'col-time mono', entryTime(e)));
 
-    // ★ M8.4：状态列（节省空间模式三态）
+    // ★ P2-20：三态 + 同步维度压成**一个**状态图标，全部细节进 tooltip。
     var fs = state.fileStates[str(e.filename)];
     var tdState = el('td', 'col-state');
-    if (isDir) {
-      tdState.appendChild(el('span', 'badge', T('state.dir')));
-    } else if (fs && str(fs.state) === 'always') {
-      tdState.appendChild(el('span', 'badge badge-always', T('state.always')));
-    } else if (fs && str(fs.state) === 'local') {
-      tdState.appendChild(el('span', 'badge badge-local', T('state.local')));
-    } else if (fs && str(fs.state) === 'online') {
-      tdState.appendChild(el('span', 'badge badge-online', T('state.online')));
-    } else {
-      tdState.appendChild(el('span', 'badge', '—'));
-    }
-    if (fs && !isDir && num(fs.hydrated_bytes, 0) > 0) {
-      tdState.appendChild(document.createTextNode(' '));
-      tdState.appendChild(el('span', 'task-meta', humanSize(num(fs.hydrated_bytes, 0))));
-    }
-    // ★ M15/T8：同步维度（与上面的空间三态**正交** ——「仅在线 + 已同步」很正常）。
-    //   progress 有值 → 正在传（百分比）；in_sync === false/null → 未同步/未知。
-    if (fs && !isDir) {
-      var prog = fs.progress;
-      if (isObj(prog) && num(prog[1], 0) > 0 && num(prog[0], 0) < num(prog[1], 0)) {
-        var pct = Math.floor(num(prog[0], 0) * 100 / num(prog[1], 0));
-        tdState.appendChild(document.createTextNode(' '));
-        tdState.appendChild(el('span', 'badge badge-syncing', T('state.progress', { pct: pct })));
-      } else if (fs.in_sync === false) {
-        tdState.appendChild(document.createTextNode(' '));
-        tdState.appendChild(el(
-          'span',
-          'badge badge-warn',
-          num(fs.conflicts, 0) > 0
-            ? T('state.conflicts', { n: num(fs.conflicts, 0) })
-            : T('state.outOfSync')));
-      } else if (fs.in_sync === null || fs.in_sync === undefined) {
-        tdState.appendChild(document.createTextNode(' '));
-        tdState.appendChild(el('span', 'badge', T('state.syncUnknown')));
-      }
-    }
-    if (fs && fs.dirty === true) {
-      tdState.appendChild(document.createTextNode(' '));
-      tdState.appendChild(el('span', 'badge badge-warn', T('state.dirty')));
-    }
+    var stIcon = fileStateIcon(fs, isDir);
+    tdState.appendChild(stIcon);
     tr.appendChild(tdState);
 
-    // ★ pin 下拉先建出来：右键菜单 / 键盘菜单 /⋯ 按钮都要用它回填 pin 状态
-    var sel = el('select', PIN_SELECT_CLASS);
+    // ★ P2-19：pin 的英文 key 不再占可见表格列，全部收进行操作菜单（⋯ / 右键）。
 
     // 右键菜单（对齐 Qsync 的「节省空间模式 ▸ …」）
     tr.addEventListener('contextmenu', function (ev) {
       ev.preventDefault();
-      openRowMenu(ev, e, full, sel);
+      openRowMenu(ev, e, full, null);
     });
     // ★ M8.6：键盘打开同一份菜单（Shift+F10 或菜单键）—— 事件从行内的 checkbox/按钮冒泡上来
     tr.addEventListener('keydown', function (ev) {
       if (ev.key === 'ContextMenu' || (ev.shiftKey && ev.key === 'F10')) {
         ev.preventDefault();
-        openRowMenu(ev, e, full, sel);
+        openRowMenu(ev, e, full, null);
       }
     });
 
-    // ★ pin 操作列 —— 从「下拉 + 4 个按钮」收成「下拉 + ⋯ 菜单」。
-    //   原因：那 4 个按钮（查 pin / 设 pin / 下载 / 脱水）每一个都在行右键菜单里有
-    //   等价项（查 pin 原本缺，已补），而它们把这一列撑到 ~370px —— 整张表因此
-    //   溢出容器，最右列被**静默裁掉**，用户得横向拖才能看到。查询/设置/下载/
-    //   脱水的文案与说明在菜单里反而更完整，所以收编过去不丢功能。
-    var tdPin = el('td', 'col-pin');
-    var opt0 = el('option', null, '（未知）');
-    opt0.value = '';
-    sel.appendChild(opt0);
-    for (var i = 0; i < PIN_STATES.length; i++) {
-      // 选项文字只留英文 key —— 中文说明挪到菜单项里，下拉框窄一点才放得下
-      var o = el('option', null, PIN_STATES[i]);
-      o.value = PIN_STATES[i];
-      o.title = PIN_LABEL[PIN_STATES[i]];
-      sel.appendChild(o);
-    }
-    sel.value = '';
-    sel.title = '选中后从⋯ 菜单里设 pin';
-    tdPin.appendChild(sel);
-
+    // 操作列：只剩 ⋯（右键 / Shift+F10 等价）；pin 的增删改在菜单里。
+    var tdPin = el('td', 'col-act');
     var btnMore = el('button', 'mini row-more', '⋯');
     btnMore.type = 'button';
     btnMore.title = '这一行的操作（也可用右键 / Shift+F10）';
     btnMore.addEventListener('click', function (ev) {
       ev.preventDefault();
-      ev.stopPropagation();          // 别让行自己再开一次
-      openRowMenu(ev, e, full, sel);
+      ev.stopPropagation();
+      openRowMenu(ev, e, full, null);
     });
-    tdPin.appendChild(document.createTextNode(' '));
     tdPin.appendChild(btnMore);
-
     tr.appendChild(tdPin);
     return tr;
   }
@@ -6321,8 +6449,7 @@
     else if (state.page === 'tasks') { renderTasksPage(); }
     else if (state.page === 'task') { renderTaskDetail(); }
     else if (state.page === 'settings') {
-      if (state.sec === 'connect') { renderConnList(); renderConnSelect(); }
-      else if (state.sec === 'free') { renderSpace(); }
+      if (state.sec === 'free') { renderSpace(); }
     } else if (state.page === 'diag') {
       if (state.diag === 'status' || state.diag === 'sync') { renderStatusPanel(currentStatus()); }
       else if (state.diag === 'mounts') {
@@ -7899,15 +8026,110 @@
   }
 
   /** ★ M8.4：切设置页内的分区。 */
+  /** 旧分区 → 新 4 tab 的落点（P2-09；P2-21 深链兼容）。 */
+  var SETTINGS_ALIAS = { sync: 'advanced', log: 'advanced', lan: 'advanced' };
+
+  /** 打开「高级」里的折叠子块（同步筛选 / 日志 / LAN）。 */
+  function openSettingsSub(id) {
+    var d = $(id);
+    if (!d) { return; }
+    d.open = true;
+    if (isFn(d.scrollIntoView)) { d.scrollIntoView({ block: 'nearest' }); }
+  }
+
+  // ---- 连接管理模态（P2-10）
+  function openConnModal() {
+    var m = $('conn-modal');
+    if (!m) { return; }
+    m.hidden = false;
+    loadConnect();
+    renderConnList();
+    var c = $('btn-conn-modal-close');
+    if (c) { c.focus(); }
+  }
+
+  function closeConnModal() {
+    var m = $('conn-modal');
+    if (m) { m.hidden = true; }
+  }
+
+  // ---- 帮助 / 关于模态（P2-11）
+  function openHelpModal() {
+    var m = $('help-modal');
+    if (!m) { return; }
+    m.hidden = false;
+    renderAbout();
+    show('help-about-panel', true);
+    show('help-quickstart-panel', false);
+    var c = $('btn-help-modal-close');
+    if (c) { c.focus(); }
+  }
+
+  function closeHelpModal() {
+    var m = $('help-modal');
+    if (m) { m.hidden = true; }
+  }
+
+  // ---- 右上角 NAS 菜单（P2-10）
+  function closeConnMenu() {
+    var m = $('conn-menu');
+    if (m) { m.hidden = true; }
+  }
+
+  function openConnMenu() {
+    var menu = $('conn-menu');
+    var btn = $('btn-conn-menu');
+    if (!menu || !btn) { return; }
+    menu.hidden = false;
+    var r = btn.getBoundingClientRect();
+    var w = menu.offsetWidth || 200;
+    menu.style.left = Math.max(4, Math.min(r.right - w, window.innerWidth - w - 8)) + 'px';
+    menu.style.top = (r.bottom + 6) + 'px';
+    var first = menu.querySelector('.ctx-item');
+    if (first && isFn(first.focus)) { first.focus(); }
+  }
+
+  function doConnMenu(act) {
+    closeConnMenu();
+    if (act === 'add') { openConnModal(); newLink(); }
+    else if (act === 'manage') { openConnModal(); }
+    else if (act === 'test') { refreshLinks().then(function () { logInfo('连接测试完成：见「诊断 → 状态」或连接列表'); }); }
+  }
+
+  function wireConnMenu() {
+    var menu = $('conn-menu');
+    var btn = $('btn-conn-menu');
+    if (!menu || !btn) { return; }
+    btn.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      if (menu.hidden) { openConnMenu(); } else { closeConnMenu(); }
+    });
+    var items = menu.querySelectorAll('.ctx-item');
+    for (var i = 0; i < items.length; i++) {
+      (function (b) {
+        b.addEventListener('click', function () { doConnMenu(str(b.getAttribute('data-act'))); });
+      })(items[i]);
+    }
+    document.addEventListener('click', function (ev) {
+      if (!menu.hidden && !menu.contains(ev.target) && ev.target !== btn) { closeConnMenu(); }
+    });
+  }
+
+  /** ★ M8.4：切设置页内的分区（P2-09 起只有 4 个 tab）。 */
   function switchSettingsSec(name) {
-    if (SETTINGS_SECS.indexOf(name) < 0) { name = 'connect'; }
-    state.sec = name;
+    name = str(name) || 'proxy';
+    if (name === 'connect') { openConnModal(); return; }
+    if (name === 'about') { openHelpModal(); return; }
+    var leaf = name;
+    var target = SETTINGS_ALIAS[name] || name;
+    if (['proxy', 'personal', 'advanced', 'free'].indexOf(target) < 0) { target = 'proxy'; }
+    state.sec = target;
     var tabs = document.querySelectorAll('#settings-tabs .tab');
     for (var i = 0; i < tabs.length; i++) {
       var t = tabs[i];
-      if (t.getAttribute('data-sec') === name) {
+      if (t.getAttribute('data-sec') === target) {
         t.classList.add('active');
-        t.setAttribute('aria-selected', 'true');     // ★ M8.6
+        t.setAttribute('aria-selected', 'true');
       } else {
         t.classList.remove('active');
         t.setAttribute('aria-selected', 'false');
@@ -7915,18 +8137,16 @@
     }
     var secs = document.querySelectorAll('#page-settings .settings-sec');
     for (var j = 0; j < secs.length; j++) {
-      var s = secs[j];
-      if (s.id === 'sec-' + name) { s.classList.add('active'); }
-      else { s.classList.remove('active'); }
+      var sec = secs[j];
+      if (sec.id === 'sec-' + target) { sec.classList.add('active'); }
+      else { sec.classList.remove('active'); }
     }
-    setText('page-title', T('page.settings_sec', { sec: SEC_TITLE[name] || name }));
-    if (name === 'free') { refreshSpace(); }
-    if (name === 'lan') { refreshLan(); }
-    // ★ M39：日志分区的占用/文件表每次都重读（它随时在变；缓存反而会误导）
-    if (name === 'log') { refreshLogs(); }
-    if (name === 'connect') { loadConnect(); renderConnList(); }
-    if (name === 'about') { renderAbout(); }
-    if (name === 'sync') { refreshFilters(); }
+    setText('page-title', T('page.settings_sec', { sec: SEC_TITLE[target] || target }));
+    if (leaf === 'free') { refreshSpace(); }
+    if (leaf === 'lan') { refreshLan(); }
+    if (leaf === 'log') { refreshLogs(); }
+    if (leaf === 'sync') { refreshFilters(); }
+    if (leaf === 'log' || leaf === 'lan' || leaf === 'sync') { openSettingsSub('sec-' + leaf); }
   }
 
   /** 切诊断页内的子 tab（状态 / 挂载 / 同步缓存）。 */
@@ -8081,6 +8301,21 @@
     // ★ M8.3 更新中心 / 错误列表
     on('btn-journal-refresh', 'click', function () { refreshJournal(); });
     on('btn-journal-clear', 'click', function () { doJournalClear(); });
+    on('j-sort-time', 'click', function () {
+      state.journalSort = (state.journalSort === 'time-asc') ? 'time-desc' : 'time-asc';
+      renderJournalPage();
+    });
+    on('j-sort-kind', 'click', function () {
+      state.journalSort = (state.journalSort === 'kind-asc') ? 'time-desc' : 'kind-asc';
+      renderJournalPage();
+    });
+    on('btn-journal-clear-filters', 'click', function () {
+      var q = $('j-query'); if (q) { q.value = ''; }
+      var lv = $('j-level'); if (lv) { lv.value = 'all'; }
+      var lm = $('j-limit'); if (lm) { lm.value = '200'; }
+      state.journalSort = 'time-desc';
+      refreshJournal();
+    });
     on('btn-errors-refresh', 'click', function () { refreshErrors(); });
     var jq = $('j-query');
     if (jq) {
@@ -8183,6 +8418,21 @@
     });
     on('btn-sync-cancel', 'click', closeSyncModal);
     on('btn-sync-modal-close', 'click', closeSyncModal);
+    on('btn-conn-modal-close', 'click', closeConnModal);
+    on('btn-help-modal-close', 'click', closeHelpModal);
+    on('btn-help', 'click', openHelpModal);
+    on('btn-help-about', 'click', function () { show('help-about-panel', true); show('help-quickstart-panel', false); });
+    on('btn-help-quickstart', 'click', function () { show('help-about-panel', false); show('help-quickstart-panel', true); });
+    if ($('conn-modal')) {
+      $('conn-modal').addEventListener('click', function (ev) {
+        if (ev.target === $('conn-modal')) { closeConnModal(); }
+      });
+    }
+    if ($('help-modal')) {
+      $('help-modal').addEventListener('click', function (ev) {
+        if (ev.target === $('help-modal')) { closeHelpModal(); }
+      });
+    }
     if ($('type-modal')) {
       $('type-modal').addEventListener('click', function (ev) {
         if (ev.target === $('type-modal')) { closeTypeChooser(); }
@@ -8201,7 +8451,11 @@
     document.addEventListener('keydown', function (ev) {
       if (ev.key !== 'Escape') { return; }
       var tm = $('task-modal'), ym = $('type-modal'), sm = $('sync-modal');
-      if (sm && !sm.hidden) { ev.preventDefault(); closeSyncModal(); }
+      var cm = $('conn-modal'), hm = $('help-modal'), nm = $('conn-menu');
+      if (nm && !nm.hidden) { ev.preventDefault(); closeConnMenu(); }
+      else if (sm && !sm.hidden) { ev.preventDefault(); closeSyncModal(); }
+      else if (cm && !cm.hidden) { ev.preventDefault(); closeConnModal(); }
+      else if (hm && !hm.hidden) { ev.preventDefault(); closeHelpModal(); }
       else if (tm && !tm.hidden) { ev.preventDefault(); closeTaskForm(); }
       else if (ym && !ym.hidden) { ev.preventDefault(); closeTypeChooser(); }
     });
@@ -8406,6 +8660,9 @@
         }
       });
     });
+    on('btn-adv-log-clear', 'click', function () { var b = $('btn-log-prune'); if (b) { b.click(); } });
+    on('btn-adv-log-open', 'click', function () { var b = $('btn-open-logdir'); if (b) { b.click(); } });
+    on('btn-adv-lan', 'click', function () { openSettingsSub('sec-lan'); });
     on('btn-open-logdir', 'click', function () {
       var info = state.appInfo;
       // daemon/GUI 的日志在状态目录的 log/ 下
@@ -8546,6 +8803,7 @@
     initRailLabels();
     wireRowMenu();
     wireTaskMenu();
+    wireConnMenu();
     wireTray();
     bindEvents();
 

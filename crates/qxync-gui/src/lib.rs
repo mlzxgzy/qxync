@@ -961,9 +961,14 @@ pub fn ui_spec() -> Value {
     let log_buttons = ["btn-log-save", "btn-log-prune", "btn-log-refresh"]
         .iter()
         .all(|id| index.contains(&format!("id=\"{id}\"")));
+    // ★ P2-09：日志不再是独立 tab，收进「高级」里的折叠块（保留 id，深链仍可开）。
+    let log_nested_under_advanced = match (index.find("id=\"sec-advanced\""), index.find("id=\"sec-log\"")) {
+        (Some(a), Some(b)) => a < b,
+        _ => false,
+    };
     let logs_ok = index.contains("id=\"sec-log\"")
-        && index.contains("id=\"sec-tab-log\"")
-        && index.contains("data-sec=\"log\"")
+        && log_nested_under_advanced
+        && index.contains("class=\"settings-sub\"")
         && log_policy_inputs
         && log_buttons
         && index.contains("id=\"log-prune-result\"")
@@ -976,7 +981,7 @@ pub fn ui_spec() -> Value {
         && app.contains("'log',"); // SETTINGS_SECS 里必须有 log，否则深链/切页不认它
     let logs = json!({
         "ok": logs_ok,
-        "tab": index.contains("id=\"sec-tab-log\""),
+        "tab": log_nested_under_advanced,
         "panel": index.contains("id=\"sec-log\""),
         "policy_inputs": log_policy_inputs,
         "buttons": log_buttons,
@@ -1428,8 +1433,8 @@ mod tests {
             "设置页缺少日志分区 #sec-log"
         );
         assert!(
-            index.contains("id=\"sec-tab-log\""),
-            "设置页缺少日志分区的 tab #sec-tab-log"
+            index.contains("class=\"settings-sub\""),
+            "设置页缺少「高级」折叠子块（日志分区应嵌在里面）"
         );
         assert!(
             index.contains("id=\"btn-log-prune\""),

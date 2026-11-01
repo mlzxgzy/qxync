@@ -369,8 +369,12 @@ cat >"$WORK/driver.js" <<'DRIVER'
 
       // ---- 6) 连接行「移除」→ 弹窗；勾选确认 → link_delete ----
       q('.rail-item[data-page="settings"]').click();
-      q('#sec-tab-connect').click();
+      // ★ P2-10：连接管理已从设置 tab 移到右上角 NAS 菜单 → 「管理连接…」
+      q('#btn-conn-menu').click();
       await wait(60);
+      q('#conn-menu .ctx-item[data-act="manage"]').click();
+      await waitFor(modalOpen, 3000);
+      await wait(120);
       var removeBtn = q('#conn-list [data-act="link-remove"]');
       ok('连接行有「移除」按钮', !!removeBtn);
       if (removeBtn) { removeBtn.click(); }
