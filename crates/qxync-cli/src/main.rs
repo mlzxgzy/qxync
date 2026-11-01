@@ -916,6 +916,18 @@ async fn main() -> Result<()> {
                     // ★ M40：登录失败时把每条路径的现场直接摆出来 —— 用户最想知道
                     //   的正是「到底是内网那条不通、还是 DDNS 没更新」。
                     eprintln!("❌ 登录 {}@{} 失败: {e}", link.user, link.host);
+                    // ★ M47：缺第二因素（2SV）→ 给 CLI 参数指引（GUI 那头是弹
+                    //   验证码小窗，见 GUI 的 login_flow；这里只能靠参数）。
+                    if let qxync_core::Error::Auth(msg) = &e {
+                        if let Some(body) = qxync_core::error::strip_need_2sv(msg) {
+                            eprintln!("💡 {body}");
+                            eprintln!(
+                                "   本次登录：加 --otp-code <6位验证码>；\
+                                 想以后自动完成：--otp-secret <Base32密钥>\
+                                 （随凭据保存，daemon 重登时自动现算验证码）"
+                            );
+                        }
+                    }
                     if client.router().endpoint_count() > 1 {
                         eprintln!("正在检测全部访问路径（DNS + HTTP）…");
                         let _ = client.probe_all_routes(qxync_client::PROBE_TIMEOUT).await;
@@ -2059,6 +2071,16 @@ async fn route_via_daemon(
                         "❌ 经 daemon 登录失败：{}\n   提示：`qxync routes --probe` 可逐条检查 DNS / 内网-公网 / 可达性",
                         e.message
                     );
+                    // ★ M47：缺第二因素（2SV）→ daemon 已把 `need_2sv:` 前缀归一到
+                    //   message 最前（见 daemon 的 map_err），这里补 CLI 参数指引。
+                    if let Some(body) = qxync_core::error::strip_need_2sv(&e.message) {
+                        eprintln!("💡 {body}");
+                        eprintln!(
+                            "   本次登录：加 --otp-code <6位验证码>；\
+                             想以后自动完成：--otp-secret <Base32密钥>\
+                             （随凭据保存，daemon 重登时自动现算验证码）"
+                        );
+                    }
                     return Err(e);
                 }
             };

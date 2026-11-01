@@ -13,6 +13,7 @@
 //! 因此数据面一律走 FileStation；这也意味着**只读 M0 不依赖 `q_token`**。
 
 use futures_util::StreamExt;
+use qxync_core::error::NEED_2SV_PREFIX;
 use qxync_core::{
     build_query, encode_query_value, model::parse_listing, parse_max_log, parse_nas_uid,
     parse_sync_log, DirEntry, Endpoint, Error, LinkConfig, Listing, MaxLog, NasUid, ProxySettings,
@@ -403,6 +404,12 @@ impl Client {
     /// 字段的处理将来变了，两步流程对两种账号都成立，而 Web UI 走的就是这条路径。
     /// 传密钥时**每次调用现算**验证码 —— daemon 定时重登也走这里，绝不会拿到
     /// 30 秒前的旧码。
+    ///
+    /// ★ M47：账号要 2SV 而本次没带验证码/密钥时，错误 message 以
+    ///   [`qxync_core::error::NEED_2SV_PREFIX`] 开头（稳定机器契约）。GUI 据此弹
+    ///   「只输验证码」的小窗（口令用已保存凭据，对齐官方登录流程），CLI 据此
+    ///   打印 `--otp-code` / `--otp-secret` 指引 —— 所以这条 message 里**不写
+    ///   CLI 参数**，两个前端各自补自己的话。
     pub async fn login_with_otp(
         &mut self,
         user: &str,
@@ -476,13 +483,10 @@ impl Client {
                 Some(qxync_core::Otp::Code(code)) => code.to_string(),
                 Some(qxync_core::Otp::Secret(secret)) => qxync_core::totp::code_now(secret)?,
                 None => {
-                    return Err(Error::Auth(format!(
-                        "该账号已开启两步验证（2SV），但这次没有提供验证码或 TOTP 密钥\
-                         （need_2sv=1 / authPassed=0）：用 `--otp-secret <Base32密钥>` \
-                         保存密钥，或 `--otp-code <6位验证码>` 只用于本次登录。\
-                         NAS 响应：{}",
-                        self.auth_failure_summary(&first)
-                    )))
+                    // ★ M47：带稳定机器前缀（见 `qxync_core::error::NEED_2SV_PREFIX`）。
+                    //   注意**不写 CLI 参数**：GUI 弹验证码框、CLI 补 --otp-code 指引，
+                    //   各自的提示归各自层。
+                    return Err(need_2sv_error(&self.auth_failure_summary(&first)));
                 }
             };
             let second = self.auth_login(user, password, Some(&code)).await?;
@@ -2598,6 +2602,18 @@ fn parse_uid_stub() -> NasUid {
     serde_json::from_str("{}").expect("空对象可解析")
 }
 
+/// ★ M47：构造「NAS 要求两步验证、本次没带第二因素」的错误。
+///
+/// message 以 [`qxync_core::error::NEED_2SV_PREFIX`] 开头（跨层机器契约：daemon
+/// 归一位置、GUI 弹验证码框、CLI 补参数指引）。正文**不写 CLI 参数** —— 两个
+/// 前端各自补自己的话；这里只说事实 + NAS 原始响应摘要。
+fn need_2sv_error(nas_summary: &str) -> Error {
+    Error::Auth(format!(
+        "{NEED_2SV_PREFIX} 该账号已开启两步验证（2SV），本次登录还需要 6 位验证码\
+         （或保存 TOTP 密钥后自动生成）。NAS 响应：{nas_summary}"
+    ))
+}
+
 /// 供 CLI 打印用：把相对路径拼成 NAS 绝对路径。
 pub fn join_nas_path(dir: &str, name: &str) -> String {
     format!("{}/{}", dir.trim_end_matches('/'), name)
@@ -2665,6 +2681,30 @@ mod tests {
         assert!(checked_range(0, 1023).is_ok());
         let e = checked_range(50, 10).expect_err("start > end 必须报错");
         assert!(e.to_string().contains("非法区间"), "{e}");
+    }
+
+    /// ★ M47：缺第二因素的 2SV 错误必须带机器前缀（GUI/CLI 靠它转交互），
+    /// 且正文**不写 CLI 参数**（提示归各自前端层补）。
+    ///
+    /// 注意断言的是**内层 message**：`Error::Auth` 的 Display 会加「鉴权失败: 」
+    /// 壳，把前缀顶到中间 —— daemon 的 `map_err` / CLI 的直连检测都取内层，
+    /// 这里与它们对齐。
+    #[test]
+    fn need_2sv_error_carries_machine_prefix_and_no_cli_args() {
+        let e = need_2sv_error("authPassed=0 errorValue=0 need_2sv=1");
+        let qxync_core::Error::Auth(msg) = &e else {
+            panic!("必须是 Auth 错误，实际：{e:?}");
+        };
+        assert!(qxync_core::error::is_need_2sv_message(msg), "{msg}");
+        assert!(msg.contains("两步验证"), "{msg}");
+        assert!(msg.contains("need_2sv=1"), "NAS 摘要必须保留：{msg}");
+        assert!(!msg.contains("--otp"), "CLI 参数指引归 CLI 层：{msg}");
+        // 前缀在 message 最前面（daemon 的 map_err 依赖这个位置归一）
+        assert!(
+            msg.trim_start()
+                .starts_with(qxync_core::error::NEED_2SV_PREFIX),
+            "{msg}"
+        );
     }
 
     /// 服务端忽略 Range 的判定：只拦「200 + 从中间取 + 长度不对」这一种确定的整文件回包。

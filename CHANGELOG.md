@@ -7,6 +7,41 @@
 
 ## [未发布]
 
+### 新增
+
+- **两步验证（2SV）登录对齐官方流程：先账密、后弹框只要验证码，不重输口令**
+  （[M47](docs/M47-两步验证登录体验.md)）。用户反馈：官方 QTS 登录是「先输账号密码，
+  需要二次验证时再单独问验证码」；我们的 GUI 却是「表单里口令 + 验证码一次性交，
+  缺码时回一句带 `--otp-secret`/`--otp-code` 的 CLI 报错」，重新登录还得重输口令，
+  已保存的 TOTP 密钥也看不出有没有用上。现在：
+  ① **稳定机器前缀** `need_2sv:`（[error.rs](crates/qxync-core/src/error.rs)）——
+  client 在 `need_2sv=1` 且本次没带第二因素时生成，daemon 的 `map_err` 把它归一到
+  IPC 错误 message 最前（thiserror 的 Display 会把前缀顶到「鉴权失败: 」后面），
+  CLI/GUI 据此转各自的交互。选 message 前缀而不是新 `ErrorKind` 变体，是因为
+  老客户端解未知枚举值会让整个响应解析失败，未知前缀则只是当正文显示 —— 符合
+  「只加字段不 bump」的 IPC 策略；
+  ② **GUI 表单路径**：`login_flow` 返回结构化 `need_2sv: true`（并顺手剥掉给用户
+  看的 message 里的机器前缀），前端弹「只输验证码」小窗（复用既有 modal，数字
+  键盘 + `one-time-code` 自动填充语义），拿到码后**用同一份表单入参**重走
+  `login_flow` —— 口令已在第一步写进凭据，续登不再要求重输；
+  ③ **「立即登录」**：直接发 IPC `Login`（不重写 link/凭据文件），失败 message 带
+  `need_2sv:` 前缀时同样弹码续登；
+  ④ **口令不再强制重输**：`login_flow` 的口令缺省时回退到该连接已保存的凭据
+  （与 daemon `login_internal` 同一套回退顺序），表单口令框留空 + 已有凭据即放行，
+  placeholder 改为「留空则用已保存的口令」；
+  ⑤ **CLI**：两条登录路径（直连 / 经 daemon）识别前缀后补 `--otp-code`（本次）/
+  `--otp-secret`（保存后自动）指引 —— 该指引从 client 错误文案里挪出来归 CLI 层，
+  GUI 用户不再看到 CLI 参数。
+  行为不变的部分：已保存 TOTP 密钥的账号照旧全自动现算验证码（无感重登）；
+  验证码本身仍绝不落盘；码错/过期按普通登录失败显示（NAS 的拒绝理由原样透传），
+  再点一次登录会重新弹码，不会陷入无限弹窗。验收：`cargo test --workspace`
+  23 套件全绿（core +1：前缀契约钉死字面量；client +1：错误带前缀且不含 CLI
+  参数、断言内层 message（Display 有「鉴权失败: 」壳）；daemon +1：map_err 归一
+  位置、非 2SV 错误一字不动；GUI +2：口令回退凭据的边界、`need_2sv` 双条件判定
+  （口令错误绝不能触发弹码））；`cargo fmt --all -- --check` 0 diff；
+  `ui_spec` 绿（新增 `otp.prompt_*` 三键 zh/en，DOM 挂载的 `connect.otp_hint`
+  同步更新）。
+
 ### 修复
 
 - **`status=3` 不再显示「未知状态码」**：用户反馈 `qbox_get_max_log 失败:

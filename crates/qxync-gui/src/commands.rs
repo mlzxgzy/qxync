@@ -819,18 +819,55 @@ pub async fn daemon_stop_all(force: Option<bool>) -> Result<Value, String> {
     Ok(json!({"ok": ok, "links": ids}))
 }
 
+/// ★ M47：登录要用的口令 —— 表单填了用表单的（写新凭据），没填回退到该连接
+/// 已保存凭据里的口令；两边都没有 → `None`（调用方报「缺少口令」）。
+///
+/// 与 daemon `login_internal` 的回退顺序一致：参数 > 凭据文件。
+fn login_password_or_saved(
+    paths: &ConfigPaths,
+    link: &LinkConfig,
+    typed: Option<&str>,
+) -> Option<String> {
+    if let Some(pw) = typed.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(pw.to_string());
+    }
+    Credentials::load_for(paths, link)
+        .ok()
+        .map(|c| c.password)
+        .filter(|pw| !pw.is_empty())
+}
+
+/// ★ M47：daemon 的 Login 响应是不是「NAS 要求两步验证、本次没带第二因素」。
+///
+/// 判据 = `ok:false` + `error.kind == "auth"` + message 以
+/// [`qxync_core::error::NEED_2SV_PREFIX`] 开头（daemon 的 `map_err` 已把前缀
+/// 归一到最前）。kind 和前缀**双条件**：普通口令错误也是 auth，绝不能弹验证码框。
+fn login_needs_2sv(login: &Value) -> bool {
+    if login["ok"].as_bool().unwrap_or(false) {
+        return false;
+    }
+    login["error"]
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .is_some_and(|k| k == "auth")
+        && login["error"]
+            .get("message")
+            .and_then(|v| v.as_str())
+            .is_some_and(qxync_core::error::is_need_2sv_message)
+}
+
 /// 「保存连接 + 登录」一条龙：
 /// 写 link → 写凭据 → 连接参数变了就重启 daemon（daemon 只在启动时读 link）→ IPC 登录。
+///
+/// ★ M47：`password` **可选** —— 省略时用该连接已保存凭据里的口令（「立即登录」
+/// 和 2SV 续登弹窗都靠这个：口令已经在 0600 凭据文件里，不该逼用户重输一遍）。
+/// 表单里填了口令则照旧写入凭据（「保存并登录」不变）。
 #[tauri::command]
 pub async fn login_flow(input: Value) -> Result<Value, String> {
     let li: LinkInput = serde_json::from_value(input).map_err(|e| format!("参数错误: {e}"))?;
     if li.host.trim().is_empty() || li.user.trim().is_empty() {
         return Err("host / user 不能为空".into());
     }
-    let password = li
-        .password
-        .clone()
-        .ok_or_else(|| "缺少 password".to_string())?;
     let p = paths()?;
     p.ensure_dirs().map_err(|e| e.to_string())?;
     let id = resolve_link_id(&p, li.id.as_deref(), true)?;
@@ -842,6 +879,17 @@ pub async fn login_flow(input: Value) -> Result<Value, String> {
                 link.user, link.host, link.port),
         }));
     }
+    // ★ M47：口令缺省 = 沿用已保存凭据（没有凭据才报错 —— 与 daemon 的
+    //   `login_internal` 同一套回退顺序）。填了则照旧：写凭据 + 本次登录都用它。
+    let password = match login_password_or_saved(&p, &link, li.password.as_deref()) {
+        Some(pw) => pw,
+        None => {
+            return Ok(json!({
+                "ok": false,
+                "error": "缺少口令：表单里填一次（会保存进凭据），或先跑 `qxync login --password`",
+            }))
+        }
+    };
     // ★ M17：两步验证输入。点「保存并登录」时 **空输入 = 保留已有密钥**；
     //   填密钥 → 归一化后写进凭据（daemon 之后每次重登自己现算验证码）；
     //   填 6 位验证码 → 不落盘，只随下面这条 Login 请求发过去。
@@ -899,7 +947,7 @@ pub async fn login_flow(input: Value) -> Result<Value, String> {
         }
     }
 
-    let login = ipc::call(
+    let mut login = ipc::call(
         &socket,
         Request::Login {
             user: Some(link.user.clone()),
@@ -911,6 +959,25 @@ pub async fn login_flow(input: Value) -> Result<Value, String> {
     )
     .await;
     let ok = login["ok"].as_bool().unwrap_or(false);
+    // ★ M47：NAS 要 2SV 而本次没带第二因素 → daemon 的错误 message 已带
+    //   `need_2sv:` 前缀（归一在最前，见 daemon 的 map_err）。前端靠这个
+    //   布尔转成「只输验证码」的小窗（口令用刚写好的凭据，不再重输）。
+    //   检测到时顺手把 message 里的机器前缀剥掉 —— 用户只该看到正文。
+    let need_2sv = login_needs_2sv(&login);
+    if need_2sv {
+        // 先取 owned 副本再写回，避免「读着 message 改 message」的借用冲突。
+        let stripped = login
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+            .and_then(qxync_core::error::strip_need_2sv)
+            .map(str::to_string);
+        if let Some(body) = stripped {
+            if let Some(m) = login.get_mut("error").and_then(|e| e.get_mut("message")) {
+                *m = serde_json::Value::String(body);
+            }
+        }
+    }
     Ok(json!({
         "ok": ok,
         "link_path": link_path.display().to_string(),
@@ -919,6 +986,8 @@ pub async fn login_flow(input: Value) -> Result<Value, String> {
         // 本次是否存了密钥（密钥**本身**绝不进返回值/日志）。
         "otp_saved": otp.saved,
         "otp_note": if otp.code_input { Some("一次性验证码不会保存") } else { None },
+        // ★ M47：true = 下一步该弹「输验证码」小窗（不是普通登录失败）。
+        "need_2sv": need_2sv,
         "login": login,
     }))
 }
@@ -2328,6 +2397,83 @@ mod tests {
         assert!(err.contains("两步验证密钥格式不对"), "{err}");
 
         std::fs::remove_dir_all(p.config_dir.parent().unwrap()).ok();
+    }
+
+    /// ★ M47：口令缺省 = 沿用已保存凭据；凭据也没有才报错。
+    /// 「立即登录」/ 2SV 续登弹窗都靠这条回退 —— 口令已在 0600 凭据文件里，
+    /// 不该逼用户重输一遍。
+    #[test]
+    fn m47_login_password_falls_back_to_saved_credentials() {
+        let p = m17_paths("pw-fallback");
+        let link = LinkConfig {
+            id: "default".into(),
+            host: "nas.local".into(),
+            port: 9834,
+            https: true,
+            insecure: false,
+            user: "test2".into(),
+            ipv4_only: false,
+            exclude: vec![],
+            filter_temp: true,
+            peer_listen: None,
+            peer_name: None,
+            endpoints: Vec::new(),
+            local_namespace: None,
+        };
+        // 没有凭据 → None（login_flow 据此报「缺少口令」）
+        assert_eq!(login_password_or_saved(&p, &link, None), None);
+        assert_eq!(
+            login_password_or_saved(&p, &link, Some("")),
+            None,
+            "空串=没填"
+        );
+        // 有凭据 → 回退到已保存的口令
+        Credentials::new(link.host.clone(), link.user.clone(), "saved-pw")
+            .save_for(&p, &link)
+            .unwrap();
+        assert_eq!(
+            login_password_or_saved(&p, &link, None).as_deref(),
+            Some("saved-pw")
+        );
+        assert_eq!(
+            login_password_or_saved(&p, &link, Some("  ")).as_deref(),
+            Some("saved-pw"),
+            "纯空白也算没填"
+        );
+        // 表单里填了 → 表单优先（写新凭据 + 本次登录都用它）
+        assert_eq!(
+            login_password_or_saved(&p, &link, Some("typed")).as_deref(),
+            Some("typed")
+        );
+        std::fs::remove_dir_all(p.config_dir.parent().unwrap()).ok();
+    }
+
+    /// ★ M47：`need_2sv` 检测只认「auth + message 以 need_2sv: 开头」，
+    /// 普通口令错误绝不能触发验证码弹窗（否则用户输一百次码也登不进去）。
+    #[test]
+    fn m47_need_2sv_flag_requires_auth_kind_and_prefix() {
+        let resp = |kind: &str, msg: &str| {
+            serde_json::from_str::<serde_json::Value>(&format!(
+                r#"{{"v":1,"ok":false,"error":{{"kind":"{kind}","message":{}}}}}"#,
+                serde_json::to_string(msg).unwrap()
+            ))
+            .unwrap()
+        };
+        // 正例：auth + 前缀
+        assert!(login_needs_2sv(&resp(
+            "auth",
+            "need_2sv: 该账号已开启两步验证（2SV），本次登录还需要 6 位验证码"
+        )));
+        // 反例 1：口令错误（auth 但无前缀）→ 绝不弹验证码框
+        assert!(!login_needs_2sv(&resp(
+            "auth",
+            "鉴权失败: authPassed=0 errorValue=1"
+        )));
+        // 反例 2：前缀对但 kind 不是 auth（防御：前缀只是 message 约定）
+        assert!(!login_needs_2sv(&resp("transport", "need_2sv: 不该出现")));
+        // 反例 3：成功响应 / 缺 error
+        assert!(!login_needs_2sv(&serde_json::json!({"v":1,"ok":true})));
+        assert!(!login_needs_2sv(&serde_json::json!({"v":1,"ok":false})));
     }
 
     #[test]

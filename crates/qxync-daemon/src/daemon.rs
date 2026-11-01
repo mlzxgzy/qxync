@@ -1765,7 +1765,23 @@ fn map_err(e: CoreError) -> IpcError {
             CoreError::Unsupported(_) => ErrorKind::Unsupported,
         }
     };
-    IpcError::new(kind, e.to_string())
+    // ★ M47：`need_2sv:` 前缀归一到 message **最前面**。client 的 `Error::Auth`
+    //   Display 是「鉴权失败: need_2sv: …」，前缀在中间 —— CLI/GUI 的检测约定
+    //   是「以 need_2sv: 开头」（见 `qxync_core::error::NEED_2SV_PREFIX`），
+    //   这里把「鉴权失败: 」这层壳剥掉再放前缀，跨层契约就稳定了。
+    //   非 2SV 错误原样透传，一个字符不动。
+    let message = match &e {
+        CoreError::Auth(msg) if qxync_core::error::is_need_2sv_message(msg) => {
+            let body = msg
+                .trim_start()
+                .strip_prefix(qxync_core::error::NEED_2SV_PREFIX)
+                .unwrap_or(msg)
+                .trim_start();
+            format!("{}{body}", qxync_core::error::NEED_2SV_PREFIX)
+        }
+        _ => e.to_string(),
+    };
+    IpcError::new(kind, message)
 }
 
 /// 会话失效的两种表现：`Auth`，或 `get_list`/`stat` 回 status 4/5（判定在 core，三层共用）。
@@ -7705,5 +7721,39 @@ mod tests {
             endpoints: Vec::new(),
             local_namespace: None,
         }
+    }
+
+    /// ★ M47：`need_2sv:` 前缀必须出现在 IPC 错误 message 的**最前面** ——
+    /// CLI / GUI 的检测约定是「以 need_2sv: 开头」，而 client 的 `Error::Auth`
+    /// Display 会把前缀顶到「鉴权失败: 」后面，`map_err` 负责归一。
+    #[test]
+    fn m47_map_err_normalizes_need_2sv_prefix_to_front() {
+        use qxync_core::error::{is_need_2sv_message, NEED_2SV_PREFIX};
+        let core_err = qxync_core::Error::Auth(format!(
+            "{NEED_2SV_PREFIX} 该账号已开启两步验证（2SV），本次登录还需要 6 位验证码。NAS 响应：authPassed=0 errorValue=0 need_2sv=1"
+        ));
+        let ipc = map_err(core_err);
+        assert_eq!(ipc.kind, ErrorKind::Auth);
+        assert!(
+            is_need_2sv_message(&ipc.message),
+            "IPC message 必须以 {NEED_2SV_PREFIX} 开头，实际：{}",
+            ipc.message
+        );
+        assert!(
+            !ipc.message.contains("鉴权失败"),
+            "前缀已归一到最前，「鉴权失败: 」壳不应重复出现：{}",
+            ipc.message
+        );
+        assert!(ipc.message.contains("两步验证"), "{}", ipc.message);
+
+        // 非 2SV 的鉴权错误原样透传（壳保留、不误判）
+        let plain = map_err(qxync_core::Error::Auth("口令不对".into()));
+        assert_eq!(plain.message, "鉴权失败: 口令不对");
+        assert!(!is_need_2sv_message(&plain.message));
+
+        // 其它类型错误一个字符不动
+        let transport = map_err(qxync_core::Error::Transport("连接超时".into()));
+        assert_eq!(transport.message, "网络错误: 连接超时");
+        assert_eq!(transport.kind, ErrorKind::Transport);
     }
 }

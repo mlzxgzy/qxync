@@ -156,6 +156,7 @@
     currentLink: '',      // 当前连接 id（持久化到 localStorage 的 qxync.currentLink）
     editingLinkId: '',    // 连接表单：'' = 新建
     creatingLink: false,  // ★ M16.1：'' 有两种含义（「展示当前连接」/「正在新建」），用它区分
+    credPresent: false,   // ★ M47：当前表单目标连接有没有已保存凭据（口令留空放行用）
     taskFormLink: '',     // 任务表单：这条任务属于哪个连接
     taskFormEditing: false,
     // ★ M18：新任务表单里哪些字段还是「自动派生」的。
@@ -3434,7 +3435,7 @@
     setFormChecked('f-ipv4-only', link ? link.ipv4_only === true : false);
     var pw = $('f-password');
     if (pw) { pw.value = ''; }
-    // ★ M17：两步验证密钥**绝不回显**（和口令一样：只写不读）。但只在「表单换到了
+    // ★ M47：两步验证密钥**绝不回显**（和口令一样：只写不读）。但只在「表单换到了
     //   另一条连接 / 进入新建态」时清空 —— 不能每次填表都清：切页/保存后/当前连接被
     //   外部改掉时都会重新 fillConnectForm，无脑清空会在用户正输入密钥时把它抹掉。
     var formTarget = (link
@@ -3445,6 +3446,10 @@
       var otpEl = $('f-otp-secret');
       if (otpEl) { otpEl.value = ''; }
     }
+
+    // ★ M47：当前表单目标连接有没有已保存凭据 —— 「保存并登录」的口令框
+    //   留空时靠它放行（后端回退到已保存口令；没有凭据才拦）。
+    state.credPresent = !!(present && present.present);
 
     // 表单标题 / 编辑提示 / 编辑态按钮
     setText('conn-form-title', editing
@@ -3951,6 +3956,63 @@
     });
   }
 
+  /** ★ M47：NAS 要 2SV 而本次没带验证码时弹的「只输验证码」小窗。
+   *  对齐官方登录流程：账号密码已经验过（凭据已保存），这里只差第二因素 ——
+   *  绝不让用户重输口令。返回 Promise<string|null>：6 位码 / 取消。
+   *  输入框按验证码场景设置（数字键盘、maxlength 6、one-time-code 自动填充）。 */
+  function promptOtpCode(userLabel) {
+    var input = $('modal-input');
+    if (input) {
+      input.setAttribute('inputmode', 'numeric');
+      input.setAttribute('autocomplete', 'one-time-code');
+      input.setAttribute('maxlength', '6');
+      input.setAttribute('placeholder', T('otp.prompt_placeholder'));
+    }
+    var p = openModal(
+      T('otp.prompt_title'),
+      T('otp.prompt_message', { user: userLabel || '' }),
+      ''
+    );
+    return p.then(function (v) {
+      // closeModal 负责还原可见性/文案；验证码专属属性在这里清掉
+      if (input) {
+        input.removeAttribute('inputmode');
+        input.removeAttribute('autocomplete');
+        input.removeAttribute('maxlength');
+        input.removeAttribute('placeholder');
+      }
+      var code = str(v).replace(/\s+/g, '');
+      return /^\d{6}$/.test(code) ? code : null;
+    });
+  }
+
+  /** ★ M47：带 2SV 续登的登录执行器。
+   *  `input` 是完整的 login_flow 入参（口令可以缺省 —— 后端回退到已保存凭据）。
+   *  NAS 要 2SV 而没带码时：弹「只输验证码」小窗 → 用户输码 → 用**同一份入参**
+   *  （口令/密钥状态原样）+ `otp_secret=<码>` 再走一次 login_flow。
+   *  验证码是 6 位数字 → 后端 `resolve_otp_for_save` 判成一次性码：不落盘、
+   *  已保存的 TOTP 密钥原样保留。最多问一次：码错了就按普通登录失败显示
+   *  （错误信息里 NAS 会说明是验证码被拒）。 */
+  function loginFlowWithOtp(input, buttons) {
+    return withBusy({ buttons: buttons || [] }, function () {
+      return call('login_flow', { input: input });
+    }).then(function (r) {
+      if (!r.ok) { return r; }
+      var d = isObj(r.data) ? r.data : {};
+      if (d.ok === false || d.need_2sv !== true) { return r; }
+      // NAS 要 2SV：弹码 → 续登。取消 = 保持失败结果（用户可以稍后再点登录）。
+      var label = str(input.user) + '@' + str(input.host);
+      return promptOtpCode(label).then(function (code) {
+        if (!code) { return r; }
+        var retry = Object.assign({}, input, { otp_secret: code });
+        delete retry.password;   // ★ 口令已在凭据里，续登不要求重输
+        return withBusy({ buttons: buttons || [] }, function () {
+          return call('login_flow', { input: retry });
+        });
+      });
+    });
+  }
+
   /** 保存 + 写凭据 + （必要时）重启该连接的 daemon + 登录。**只动这一条连接**。 */
   function doLogin() {
     var built = buildLinkInput(true);
@@ -3958,19 +4020,16 @@
       renderError('login-result', '参数错误', built.error);
       return Promise.resolve({ ok: false, error: built.error });
     }
-    if (!built.input.password) {
+    // ★ M47：口令留空 + 该连接已有凭据 → 放行（后端回退到已保存的口令）。
+    //   「重新登录」不再强制重输口令；没有凭据的连接才必须填。
+    if (!built.input.password && !state.credPresent) {
       renderError('login-result', '缺少口令', '请输入口令后再「保存并登录」（口令只用于写入凭据，不会回传）。');
       var pw = $('f-password');
       if (pw) { pw.focus(); }
       return Promise.resolve({ ok: false, error: '缺少口令' });
     }
     var wantId = str(built.input.id || '');
-    return withBusy({
-      spinners: [],
-      buttons: ['btn-login', 'btn-link-save']
-    }, function () {
-      return call('login_flow', { input: built.input });
-    }).then(function (r) {
+    return loginFlowWithOtp(built.input, ['btn-login', 'btn-link-save']).then(function (r) {
       if (!r.ok) {
         renderError('login-result', '登录流程失败（invoke 被拒）', str(r.error));
         return r;
@@ -3987,7 +4046,7 @@
         rows.push(['user', str(login.data.user)]);
         rows.push(['uid', optText(login.data.uid)]);
         // ★ M17：这次登录是否走了两步验证。`two_step=true` = NAS 要求 2SV 且
-        //   验证码通过了；false = 账号没开 2SV（或本次没用上）。
+        //   验证码通过了；false = 账号没开 2SV（或本次未用上）。
         rows.push(['两步验证', login.data.two_step === true
           ? '已通过（TOTP）'
           : '未启用 / 本次未使用']);
@@ -4312,21 +4371,45 @@
         return null;
       }
       return call('daemon_start', { linkId: id }).then(function () {
+        // ★ M47：直接发 Login（daemon 自己读该连接的 credentials 文件，不重写
+        //   link/凭据 —— login_flow 会重写文件，这里没必要也不该动它们）。
+        //   NAS 要 2SV 而凭据里没存密钥时，daemon 的错误 message 带
+        //   `need_2sv:` 前缀 → 弹「只输验证码」小窗 → 拿码再发一次 Login
+        //   （口令仍走凭据，用户全程只输 6 位码，对齐官方登录流程）。
         return withBusy({ buttons: ['btn-quick-login'] }, function () {
-          // 不带 user/password：daemon 自己读该连接的 credentials 文件
           return ipcFor(id, { method: 'login' });
         });
       }).then(function (lr) {
-        if (lr && lr.ok) {
-          logOk('登录成功（' + linkLabelById(id) + '）：' + str(lr.data && lr.data.sid_masked) +
-            ' user=' + str(lr.data && lr.data.user));
-        } else {
-          logErr('登录失败（' + linkLabelById(id) + '）：' + str(lr && lr.error));
+        if (lr && lr.ok) { return finishQuickLogin(id, lr); }
+        var msg = str(lr && lr.error);
+        if (msg.indexOf('need_2sv:') === 0) {
+          // ★ M47：剥掉机器前缀，正文给用户看；弹码续登。
+          var body = msg.replace(/^need_2sv:\s*/, '');
+          logInfo(body);
+          return promptOtpCode(linkLabelById(id)).then(function (code) {
+            if (!code) { return lr; }
+            return withBusy({ buttons: ['btn-quick-login'] }, function () {
+              return ipcFor(id, { method: 'login', otp: code });
+            }).then(function (r2) { return finishQuickLogin(id, r2); });
+          });
         }
+        logErr('登录失败（' + linkLabelById(id) + '）：' + msg);
         refreshStatus(true);
         return lr;
       });
     });
+  }
+
+  /** ★ M47：立即登录的收尾（成功/失败各记一条日志）。 */
+  function finishQuickLogin(id, lr) {
+    if (lr && lr.ok) {
+      logOk('登录成功（' + linkLabelById(id) + '）：' + str(lr.data && lr.data.sid_masked) +
+        ' user=' + str(lr.data && lr.data.user));
+    } else {
+      logErr('登录失败（' + linkLabelById(id) + '）：' + str(lr && lr.error));
+    }
+    refreshStatus(true);
+    return lr;
   }
 
   // ============================================================ Tab 3 挂载

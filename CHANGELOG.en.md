@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **2-step-verification login now follows the official flow: account+password
+  first, then a code-only prompt — never re-asking the password**
+  ([M47](docs/M47-两步验证登录体验.md), user feedback translated: the official QTS
+  login asks for the 2SV code *after* accepting account+password, while our GUI
+  demanded everything up front, answered a missing code with a CLI-oriented error
+  (`--otp-secret`/`--otp-code`), forced password re-typing on every re-login, and
+  gave no visibility into whether the saved TOTP secret was being used). Now:
+  ① a **stable machine prefix** `need_2sv:` ([error.rs](crates/qxync-core/src/error.rs))
+  — produced by the client when the NAS replies `need_2sv=1` and no second factor
+  was supplied; the daemon's `map_err` normalizes it to the *front* of the IPC
+  error message (thiserror's Display would bury it behind `鉴权失败: `), and
+  CLI/GUI branch on it for their own UX. A message prefix instead of a new
+  `ErrorKind` variant because old clients fail to parse unknown enum values
+  (losing the whole response) while an unknown prefix just displays as text —
+  per the "add fields only, no version bump" IPC policy;
+  ② **GUI form path**: `login_flow` returns a structured `need_2sv: true` (and
+  strips the machine prefix from the human-facing message), the frontend pops a
+  code-only dialog (reusing the existing modal, numeric inputmode +
+  `one-time-code` autocomplete), then retries `login_flow` with the *same* form
+  input plus the code — the password was already saved to credentials in step 1,
+  so it is never re-asked;
+  ③ **"Log in now"**: sends the IPC `Login` directly (no rewriting of link/
+  credentials files) and pops the same code dialog when the failure message
+  carries the prefix;
+  ④ **no more forced password re-typing**: `login_flow` falls back to the
+  connection's saved credentials when the password field is left empty (same
+  fallback order as the daemon's `login_internal`); the form allows an empty
+  password when credentials exist, and the placeholder now reads "leave empty to
+  use the saved password";
+  ⑤ **CLI**: both login paths (direct / via daemon) detect the prefix and print
+  `--otp-code` (this time) / `--otp-secret` (saved, auto thereafter) hints — the
+  hint moved out of the client error message into the CLI layer, so GUI users no
+  longer see CLI flags.
+  Unchanged: accounts with a saved TOTP secret still log in fully automatically
+  (fresh code computed per attempt); one-time codes are still never persisted;
+  a wrong/expired code surfaces as a normal login failure with the NAS's
+  rejection reason, and clicking login again re-prompts — no infinite dialog
+  loop. Acceptance: `cargo test --workspace` — all 23 suites green (core +1:
+  prefix contract pinned; client +1: error carries the prefix, no CLI args,
+  asserted on the inner message (Display adds the `鉴权失败: ` wrapper);
+  daemon +1: `map_err` normalization, non-2SV errors byte-identical; GUI +2:
+  password fallback boundaries, `need_2sv` double-condition (a wrong password
+  must never trigger the code dialog)); `cargo fmt --all -- --check` 0 diff;
+  `ui_spec` green (new `otp.prompt_*` keys in zh/en, DOM-mounted
+  `connect.otp_hint` updated in both locales).
+
 ### Fixed
 
 - **`status=3` no longer renders as "unknown status code"**: user feedback (translated):

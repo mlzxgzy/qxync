@@ -161,6 +161,36 @@ fn render_msg(msg: &Option<String>) -> String {
     }
 }
 
+// ---------------------------------------------------------------- ★ M47：2SV 前缀契约
+
+/// ★ M47：「NAS 要求两步验证（2SV）」错误的稳定机器前缀。
+///
+/// **这是一条跨层契约**：client 生成（`login_once` 发现 `need_2sv=1` 且本次没有
+/// 验证码/密钥）→ daemon 的 `map_err` 把它归一到 IPC 错误 message 的**最前面** →
+/// CLI / GUI 检测前缀转成各自的交互：
+///
+/// * GUI：弹一个**只输验证码**的小窗（口令用已保存的凭据，不再重输 —— 对齐
+///   QTS 官方登录流程），拿到码后发 `Login { otp: <码> }` 续登；
+/// * CLI：打印 `--otp-code` / `--otp-secret` 的参数指引。
+///
+/// 为什么是 message 前缀而不是新 `ErrorKind` 变体：IPC 的版本策略是「只加字段
+/// 不 bump」（老客户端解未知**字段**会被 serde 静默忽略，解未知**枚举值**则整个
+/// 响应解析失败、连 message 都丢）。前缀对老版本完全无害 —— 最多把前缀当正文显示。
+pub const NEED_2SV_PREFIX: &str = "need_2sv:";
+
+/// message 是不是「需要两步验证」这一类（client 生成 / daemon 归一后以
+/// [`NEED_2SV_PREFIX`] 开头；容忍前导空白）。
+pub fn is_need_2sv_message(msg: &str) -> bool {
+    msg.trim_start().starts_with(NEED_2SV_PREFIX)
+}
+
+/// 剥掉机器前缀，返回给人看的正文；不是这一类错误则 `None`。
+pub fn strip_need_2sv(msg: &str) -> Option<&str> {
+    msg.trim_start()
+        .strip_prefix(NEED_2SV_PREFIX)
+        .map(|rest| rest.trim_start())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,5 +256,30 @@ mod tests {
         let blank = Error::status_msg(5, "get_list", "   ");
         assert_eq!(blank.server_msg(), None);
         assert_eq!(blank.to_string(), e.to_string());
+    }
+
+    /// ★ M47：`need_2sv:` 前缀是跨层契约（client 生成 → daemon 归一 → CLI/GUI 识别），
+    /// 字面量在这里钉死：任何一层改写法都会被这条测试拦下。
+    #[test]
+    fn need_2sv_prefix_contract() {
+        assert_eq!(NEED_2SV_PREFIX, "need_2sv:");
+        let msg =
+            format!("{NEED_2SV_PREFIX} 该账号已开启两步验证（2SV）：请提供 6 位验证码或 TOTP 密钥");
+        assert!(is_need_2sv_message(&msg));
+        let stripped = strip_need_2sv(&msg).expect("必须能剥出正文");
+        assert!(
+            stripped.starts_with("该账号"),
+            "正文不能再带前缀：{stripped}"
+        );
+        assert!(stripped.contains("两步验证"));
+
+        // 普通鉴权错误不受影响（不能把口令错也当成「要验证码」）
+        assert!(!is_need_2sv_message("authPassed=0 errorValue=1"));
+        assert!(!is_need_2sv_message("鉴权失败: 口令不对"));
+        assert!(strip_need_2sv("口令不对").is_none());
+
+        // 前导空白容忍（透传链路上不该出现，但契约上稳一点）
+        assert!(is_need_2sv_message(&format!("  {NEED_2SV_PREFIX} x")));
+        assert_eq!(strip_need_2sv(&format!(" {NEED_2SV_PREFIX}  x")), Some("x"));
     }
 }

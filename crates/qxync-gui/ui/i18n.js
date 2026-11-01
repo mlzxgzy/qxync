@@ -309,6 +309,11 @@
     'modal.ok': '确定',
     'modal.cancel': '取消',
 
+    // ---- ★ M47 两步验证（2SV）：登录时 NAS 要验证码 → 只弹码，不重输口令
+    'otp.prompt_title': '两步验证',
+    'otp.prompt_message': '账号口令已通过，NAS 还需要一步验证。{user}：请输入认证器上当前的 6 位验证码（30 秒一换，输完点「确定」）。',
+    'otp.prompt_placeholder': '6 位验证码',
+
     // ---- ★ M23 Dolphin 集成（user.xdg.tags / Baloo 门禁）
     'adv.dolphin_hint': '两个开关相互独立，可只开一个，默认都关。Tags 列：把图标字符（✓ 已水合 / ☁ 仅在线 / ◐ 部分本地）写进 user.xdg.tags，Dolphin 内置列直接显示，不需要装任何插件。文件角标：需要装 qxync-dolphin-overlay 插件包（KOverlayIconPlugin，只支持 KDE Dolphin），Dolphin 才会在文件图标上画彩色角标（绿对钩 / 蓝云），读的是 user.qxync.overlay —— 装没装、会不会加载，看下面检测表里的「角标插件」一行。两者前置条件相同：挂载点必须已排除出 Baloo 索引（否则索引器会把整个 NAS 拉到本地）。状态都不实时刷新（F5 / 重进目录后更新）。',
     'baloo.title': '需要先排除 Baloo 索引',
@@ -420,7 +425,7 @@
     'connect.cred_present': '已保存凭据：{user}@{host}（{path}）',
     'connect.cred_missing': '无凭据（{path}）；保存并登录时需要输入口令。',
     // ★ M17：两步验证（2SV / TOTP）—— 输入框提示与凭据状态后缀
-    'connect.otp_hint': '开了两步验证才需要：填 TOTP 密钥会保存下来，之后自动生成验证码；填 6 位验证码只用于本次登录。密钥与口令一样保存在 0600 凭据文件里。',
+    'connect.otp_hint': '开了两步验证才需要：填 TOTP 密钥会保存下来，之后登录/重登自动生成验证码；填 6 位验证码只用于本次登录。没填时若 NAS 要求验证码，登录中会单独弹框询问，无需重新输入口令。密钥与口令一样保存在 0600 凭据文件里。',
     'connect.otp_configured': '两步验证：已配置',
     'connect.otp_missing': '两步验证：未配置',
     'home.conn_no_daemon': '连接 {label} 的 daemon 未运行 —— 点顶部「启动 daemon」',
@@ -580,10 +585,14 @@
   // ★ M17：这里只补了两步验证（2SV）的 4 条 —— 其余键继续回落 zh-CN。
   // ★ M39：补「日志」分区的 8 条（分区名 + 四态/清理结果文案）。
   var EN = {
-    'connect.otp_hint': 'Only needed when 2-step verification is enabled: a TOTP secret is saved and used to generate codes later; a 6-digit code is used for this login only. The secret is stored in the 0600 credentials file, same as the password.',
+    'connect.otp_hint': 'Only needed when 2-step verification is enabled: a TOTP secret is saved and used to generate codes later; a 6-digit code is used for this login only. If left empty and the NAS asks for a code, a prompt appears during login — no need to re-enter the password. The secret is stored in the 0600 credentials file, same as the password.',
     'connect.otp_configured': '2-step verification: configured',
     'connect.otp_missing': '2-step verification: not configured',
     'links.otp_badge': '2-step',
+    // ★ M47：2SV 弹码小窗（只输验证码，不重输口令）
+    'otp.prompt_title': 'Two-step verification',
+    'otp.prompt_message': 'The password has been accepted; the NAS needs one more step. {user}: enter the current 6-digit code from your authenticator (it rotates every 30 seconds), then press OK.',
+    'otp.prompt_placeholder': '6-digit code',
     'sec.log': 'Logs',
     'logs.loading': 'Reading the log directory…',
     'logs.empty': 'No log files yet (neither the daemon nor the GUI has written one).',
