@@ -1014,6 +1014,36 @@ pub fn ui_spec() -> Value {
         "wired_in_boot": app.contains("wireBlockedModal();"),
     });
 
+    // 9) ★ P0（2026-11）：Qsync 6 贴合 —— 静态可判的尺寸/结构。
+    //    截图级验收在 `xtask/tests/gui-matrix.sh`（96dpi：GDK_DPI_SCALE=96/Xft.dpi）；
+    //    这里只钉「改了会悄悄退回旧壳」的硬事实：61px 图标栏、选中胶囊、页面标题 24、
+    //    安静连接行、顶栏工程信息搬进诊断、日志默认收起、品牌标自绘。
+    let qs6_fit = json!({
+        "rail_width_61": css.contains("width: 61px"),
+        "rail_selected_pill": css.contains("--rail-selected: #e1eeff")
+            && css.contains("border-radius: 12px"),
+        "brand_mark_svg": index.contains("class=\"rail-logo\"")
+            && index.contains("viewBox=\"0 0 24 24\""),
+        "rail_groups": index.contains("class=\"rail-bottom\"") && css.contains(".rail-bottom"),
+        "rail_labels_hidden_by_default": css.contains(".rail-item span")
+            && css.contains("clip: rect(0 0 0 0)")
+            && app.contains("rail-labels"),
+        "rail_labels_toggle": index.contains("id=\"s-rail-labels\"")
+            && app.contains("RAIL_LABELS_KEY"),
+        "page_title_24": css.contains(".pagetitle") && css.contains("font-size: 24px"),
+        "quiet_conn_line": index.contains("id=\"conn-line\"") && css.contains(".conn-line"),
+        "topbar_teardown": !index.contains("id=\"chip-conn\"")
+            && index.contains("id=\"diag-runtime\"")
+            && !css.contains(".brand-sub"),
+        "log_hidden_default": index.contains("id=\"logbox\"")
+            && index.contains("data-i18n-aria-label=\"log.title\" hidden")
+            && index.contains("id=\"btn-diag-log\""),
+    });
+    let qs6_fit_ok = qs6_fit
+        .as_object()
+        .map(|m| m.values().all(|v| v.as_bool() == Some(true)))
+        .unwrap_or(false);
+
     json!({
         "ok": sinks.is_empty()
             && i18n_ok
@@ -1022,7 +1052,8 @@ pub fn ui_spec() -> Value {
             && task_defaults_ok
             && purge_ok
             && logs_ok
-            && blocked_list_ok,
+            && blocked_list_ok
+            && qs6_fit_ok,
         "html_sinks": sinks,
         "i18n": {
             "ok": i18n_ok,
@@ -1040,6 +1071,7 @@ pub fn ui_spec() -> Value {
         "purge": purge,
         "logs": logs,
         "blocked_list": blocked_list,
+        "qs6_fit": qs6_fit,
     })
 }
 

@@ -192,30 +192,6 @@ code {
   z-index: 5;
 }
 
-.topbar-row {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  flex-wrap: wrap;
-}
-
-.brand {
-  font-size: 15px;
-  font-weight: 700;
-  letter-spacing: .04em;
-  white-space: nowrap;
-}
-
-.brand-sub {
-  font-size: 11px;
-  font-weight: 400;
-  color: var(--fg-faint);
-  margin-left: 6px;
-  letter-spacing: 0;
-}
-
-.status-chips { display: flex; gap: 6px; flex-wrap: wrap; }
-
 .chip {
   font-size: 12px;
   padding: 2px 8px;
@@ -230,8 +206,6 @@ code {
 .chip-warn { background: var(--warn-soft); color: var(--warn); border-color: currentColor; }
 .chip-err { background: var(--err-soft); color: var(--err); border-color: currentColor; }
 .chip-unknown { background: var(--bg-sunken); color: var(--fg-faint); }
-
-.topbar-actions { margin-left: auto; display: flex; gap: 6px; }
 
 .topbar-meta {
   margin-top: 5px;
@@ -1677,7 +1651,6 @@ body.rail-labels .rail-item span { position: static; width: auto; height: auto; 
 
 /* ---- 顶栏 / 页面头 ---- */
 .topbar { background: var(--bg); border-bottom: 0; box-shadow: none; padding: 18px 26px 4px 40px; }
-.topbar-row { align-items: center; gap: 16px; }
 .pagetitle { font-size: 24px; font-weight: 600; letter-spacing: 0; }
 .topbar-meta { font-size: 12px; color: var(--fg-faint); margin-top: 2px; }
 
@@ -1734,3 +1707,51 @@ table.tbl tr.selected, table.tbl tbody tr:focus-within { background: var(--rail-
 .badge { font-size: 12px; border-radius: 4px; padding: 1px 7px; }
 .chip { font-size: 12px; padding: 2px 8px; }
 .logbox { background: var(--bg-head); }
+
+/* ============================================================================
+ * ★ P0-B 外壳层（2026-11）—— 顶栏拆解 / 安静连接行 / 左栏分组 / 日志收进诊断
+ * 顶栏只剩 24px 页面标题 + 一行连接状态（官方 Task List 形态）；
+ * 工程信息（pid/uptime/socket/session/启停）全部搬进「诊断 → 状态」的运行控制卡。
+ * ==========================================================================*/
+
+/* ---- 左侧图标栏：分组（上 5 内容 / 下 2 工具）+ 40×40 品牌标 ---- */
+.rail { padding: 14px 0 12px; }
+.rail-logo {
+  width: 40px; height: 40px; margin: 0 auto 22px; border-radius: 10px;
+  background: var(--rail-icon); color: #ffffff; font-size: 0;
+}
+.rail-logo svg { width: 26px; height: 26px; display: block; }
+.rail-nav { width: 100%; align-items: center; }
+.rail-bottom { display: flex; flex-direction: column; align-items: center; width: 100%; }
+.rail-bottom .rail-expert { margin-top: 10px; }
+.rail-item { margin-bottom: 6px; }
+.rail-item.active { font-weight: 400; }
+body.rail-labels .rail { width: 96px; }
+body.rail-labels .rail-item { width: 84px; }
+body.rail-labels .rail-logo { margin-bottom: 16px; }
+
+/* ---- 页面头：24px 标题 + 安静连接行 ---- */
+.page-head { display: flex; align-items: flex-start; gap: 16px; }
+.page-head-text { min-width: 0; }
+.conn-line {
+  display: flex; align-items: center; gap: 7px;
+  margin: 6px 0 0; font-size: 13px; color: var(--fg-dim);
+}
+.conn-line .conn-dot { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto; }
+.conn-line .linklike {
+  height: auto; padding: 0; border: 0; background: none;
+  color: var(--accent); font-size: 13px; cursor: pointer;
+}
+.conn-line .linklike:hover { background: none; text-decoration: underline; }
+
+/* ---- 诊断「运行控制」卡：启动/停止/登录 + 连接切换 + 工程 meta ---- */
+.runtime-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 10px 0; }
+.runtime-row .grow { flex: 1 1 auto; }
+#diag-runtime .topbar-meta {
+  display: flex; gap: 18px; flex-wrap: wrap; margin: 2px 0 10px;
+  font-size: 12px; color: var(--fg-faint);
+}
+#diag-log-card .count { font-weight: 400; color: var(--fg-faint); font-size: 12px; margin-left: 6px; }
+
+/* 日志抽屉打开时从底部浮起（默认 hidden，唯一入口在诊断页） */
+.logbox { box-shadow: 0 -1px 0 var(--border-soft); }

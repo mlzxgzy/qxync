@@ -20,15 +20,23 @@
 
 <div class="shell">
 
-  <!-- ======================= 左侧图标栏（对齐 Qsync Client 6） =======================
-       6.x 的左栏只有图标、没有文字标签；这里保留小号文字是为了可发现性
-       （7 个目的地靠 tooltip 认不全），属**有意的偏离**，见 docs/M8-向Qsync-Client-6靠拢.md §1.1。 -->
+  <!-- ======================= 左侧图标栏（对齐 Qsync Client 6，★ P0-02/03/04） =======================
+       官方 6.x 是 61px 纯图标栏（上 4 下 2，选中 55×47 #E1EEFF 胶囊）。qxync 多了
+       「主页」「文件」两个 qxync 自有目的地，所以内容组是 5 个；设置/诊断压底部。
+       文字标签默认视觉隐藏（读屏与 tooltip 保留），设置→个人可开「显示导航文字」（P0-05）。 -->
   <aside class="rail">
-    <div class="rail-logo" title="qxync — QNAP 按需同步">Q</div>
+    <!-- ★ P0-04：自绘品牌标（40×40，不抄 QNAP 图形）。QSync 6 左栏顶部就是 40×40 的 App 标。 -->
+    <div class="rail-logo" title="qxync — QNAP 按需同步" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round">
+        <path d="M4 12a8 8 0 0 1 13.7-5.6"/><path d="M20 12a8 8 0 0 1-13.7 5.6"/>
+        <path d="M17 3v4h-4"/><path d="M7 21v-4h4"/>
+      </svg>
+    </div>
 
-    <!-- ★ M8.6：图标栏是一组按钮（键盘可达）—— 方向键在条目间移动、Home/End 到首尾，
-         aria-current="page" 标出当前页；图标本身 aria-hidden，可读名来自 span 文本。
-         这里用「导航按钮 + aria-current」而不是 tab/tablist：它换的是整页，不是页内面板。 -->
+    <!-- ★ P0-02/P0-05：上 4 + 内容页（home 是 qxync 的「任务概览」，官方对应 Task List）。
+         官方左栏只有图标；文字标签默认视觉隐藏（读屏 + tooltip 保留），
+         设置→个人里的「显示导航文字」可打开（P0-05）。 -->
     <nav class="rail-nav" id="rail-nav" aria-label="主导航" data-i18n-aria-label="nav.aria">
       <button type="button" class="rail-item active" data-page="home" aria-current="page"
               title="主页（任务状态）" data-i18n-title="nav.home_title">
@@ -40,11 +48,6 @@
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16"/><path d="M4 12h16"/><path d="M4 18h10"/></svg>
         <span data-i18n="nav.tasks">任务</span>
       </button>
-      <button type="button" class="rail-item" data-page="files"
-              title="文件（浏览 NAS / 节省空间模式）" data-i18n-title="nav.files_title">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
-        <span data-i18n="nav.files">文件</span>
-      </button>
       <button type="button" class="rail-item" data-page="journal"
               title="文件更新中心（同步日志）" data-i18n-title="nav.journal_title">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 8v4l3 2"/></svg>
@@ -55,58 +58,47 @@
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4 2.5 20h19z"/><path d="M12 10v4"/><path d="M12 17.2v.1"/></svg>
         <span data-i18n="nav.errors">错误</span>
       </button>
-      <button type="button" class="rail-item" data-page="settings"
-              title="设置（连接 / 同步 / 缓存 / 网络 / 通知）" data-i18n-title="nav.settings_title">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M19 5l-2 2M7 17l-2 2"/></svg>
-        <span data-i18n="nav.settings">设置</span>
+      <button type="button" class="rail-item" data-page="files"
+              title="文件（浏览 NAS / 节省空间模式）" data-i18n-title="nav.files_title">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+        <span data-i18n="nav.files">文件</span>
       </button>
     </nav>
 
     <div class="rail-spacer"></div>
 
-    <!-- 专家模式：现有排障页（状态/挂载/同步缓存）收纳在这里，字段与 id 全部保留 -->
-    <button type="button" class="rail-item rail-expert" data-page="diag"
-            title="诊断（专家模式：游标 / baseline / 水合 / 脱水）" data-i18n-title="nav.diag_title">
-      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 4.5a4 4 0 0 0 5 5L21 8v3l-8 8-1.5-1.5"/><path d="M3 21l6-6"/><path d="M10.5 6.5 6 11l3 3 4.5-4.5z"/></svg>
-      <span data-i18n="nav.diag">诊断</span>
-    </button>
+    <!-- 下 2：工具（设置）+ 专家模式（诊断）。官方也把设置/帮助放在左栏底部。 -->
+    <div class="rail-bottom">
+      <button type="button" class="rail-item" data-page="settings"
+              title="设置（连接 / 同步 / 缓存 / 网络 / 通知）" data-i18n-title="nav.settings_title">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        <span data-i18n="nav.settings">设置</span>
+      </button>
+      <button type="button" class="rail-item rail-expert" data-page="diag"
+              title="诊断（专家模式：游标 / baseline / 水合 / 脱水）" data-i18n-title="nav.diag_title">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 4.5a4 4 0 0 0 5 5L21 8v3l-8 8-1.5-1.5"/><path d="M3 21l6-6"/><path d="M10.5 6.5 6 11l3 3 4.5-4.5z"/></svg>
+        <span data-i18n="nav.diag">诊断</span>
+      </button>
+    </div>
   </aside>
 
   <div class="main-col">
 
-    <!-- ============================= 顶部常驻状态条 ============================= -->
+    <!-- ============================= 页面头（★ P0-06/07/08） =============================
+         对齐 Qsync Client 6：内容区左上角是 24px 页面标题，下面一行安静连接状态。
+         原来的 daemon 药丸 / pid·uptime·socket / session / 启停 / 当前连接下拉已全部
+         收进「诊断 → 状态」的「运行控制」卡（元素 id 不变，排障与验收仍可用）。 -->
     <header id="topbar" class="topbar">
-      <div class="topbar-row">
-        <h1 class="pagetitle" id="page-title">主页</h1>
-
-        <div class="status-chips">
-          <span id="chip-daemon" class="chip chip-unknown" role="status" data-i18n="top.daemon_checking">qxyncd：检测中…</span>
-          <span id="chip-conn" class="chip chip-unknown">连接：—</span>
-          <span id="chip-login" class="chip chip-unknown">登录：—</span>
+      <div class="page-head">
+        <div class="page-head-text">
+          <h1 class="pagetitle" id="page-title">主页</h1>
+          <!-- ★ P0-08：安静连接行 —— 替代三个工程药丸（官方也是「主机名 + 绿点 + Connected」） -->
+          <p class="conn-line" id="conn-line" hidden>
+            <span class="conn-dot" id="conn-line-dot"></span>
+            <span id="conn-line-text">—</span>
+            <button type="button" class="linklike" id="btn-conn-line-action" hidden></button>
+          </p>
         </div>
-
-        <!-- ★ M16：当前连接选择器（决定「文件 / 诊断」页和顶栏 meta 显示哪个 daemon） -->
-        <label class="conn-picker">
-          <span data-i18n="top.switch">当前连接</span>
-          <select id="conn-select" aria-label="当前连接" data-i18n-aria-label="top.switch_aria"></select>
-        </label>
-        <!-- ★ M16.1：「加连接」必须有显眼入口 —— 老用户会盯着「当前连接」找新建，
-             可原来这里没有任何按钮，只能自己摸到「设置 → 连接」卡片右上角。 -->
-        <button type="button" id="btn-top-add-link" class="conn-add"
-                title="添加新的 NAS 连接" aria-label="添加新的 NAS 连接"
-                data-i18n-title="top.add_link_title" data-i18n-aria-label="top.add_link_aria">＋</button>
-
-        <div class="topbar-actions">
-          <button id="btn-daemon-start" type="button">启动 daemon</button>
-          <button id="btn-daemon-stop" type="button">停止 daemon</button>
-          <button id="btn-quick-login" type="button" class="primary">立即登录</button>
-        </div>
-      </div>
-
-      <div class="topbar-meta mono">
-        <span id="meta-daemon">daemon：—</span>
-        <span id="meta-conn">连接：—</span>
-        <span id="meta-session">session：—</span>
       </div>
     </header>
 
@@ -658,6 +650,7 @@
                   <input type="text" id="s-region" class="mono" placeholder="cn / us / auto" spellcheck="false">
                 </label>
               </div>
+              <label class="check"><input type="checkbox" id="s-rail-labels" data-i18n="personal.rail_labels"> 显示导航文字（默认关闭，贴近 Qsync 6 的纯图标栏）</label>
               <label class="check"><input type="checkbox" id="s-close-tray"> 关闭主窗口时最小化到托盘</label>
               <p class="hint">
                 ⚠ <strong>托盘不可见时这个开关不会生效</strong>：如果系统里没有
@@ -898,6 +891,45 @@
 
         <!-- ---------------- 诊断子页 1：状态 / 进度（id 与字段全部保留） ---------------- -->
         <section class="panel active" id="panel-status" role="tabpanel" aria-labelledby="diag-tab-status">
+          <!-- ★ P0-06：原顶栏的工程信息收在这里（id 全部保留，renderTop/验收不受影响）。
+               普通页面不再出现 pid / uptime / socket / session / 启停 daemon。 -->
+          <div class="card" id="diag-runtime">
+            <h2>运行控制 <span class="count">诊断用</span></h2>
+            <p class="hint">日常不需要这些按钮：连接 NAS 时主窗口会自动拉起 daemon。这里保留启动/停止/登录、当前连接切换，以及 pid / uptime / socket / session 等排障信息。</p>
+            <div class="runtime-row">
+              <span id="chip-daemon" class="chip chip-unknown" role="status" data-i18n="top.daemon_checking">qxyncd：检测中…</span>
+              <span id="chip-login" class="chip chip-unknown">登录：—</span>
+              <span class="grow"></span>
+              <button type="button" id="btn-daemon-start">启动 daemon</button>
+              <button type="button" id="btn-daemon-stop">停止 daemon</button>
+              <button type="button" id="btn-quick-login" class="primary">立即登录</button>
+            </div>
+            <div class="topbar-meta mono">
+              <span id="meta-daemon">daemon：—</span>
+              <span id="meta-conn">连接：—</span>
+              <span id="meta-session">session：—</span>
+            </div>
+            <div class="runtime-row">
+              <label class="conn-picker">
+                <span data-i18n="top.switch">当前连接</span>
+                <select id="conn-select" aria-label="当前连接" data-i18n-aria-label="top.switch_aria"></select>
+              </label>
+              <button type="button" id="btn-top-add-link" class="conn-add"
+                      title="添加新的 NAS 连接" aria-label="添加新的 NAS 连接"
+                      data-i18n-title="top.add_link_title" data-i18n-aria-label="top.add_link_aria">＋</button>
+            </div>
+          </div>
+
+          <!-- ★ P0-09：操作日志默认不显示；诊断页给出唯一入口。 -->
+          <div class="card" id="diag-log-card">
+            <h2 data-i18n="log.title">操作日志</h2>
+            <p class="hint" data-i18n="log.diag_hint">界面的每次命令在这里记一行（保留 200 条）。默认不显示，排障时可以打开。</p>
+            <div class="runtime-row">
+              <button type="button" id="btn-diag-log" data-i18n="log.open">打开操作日志</button>
+              <span class="count" id="diag-log-count">0 条</span>
+            </div>
+          </div>
+
           <div class="grid-2">
             <div class="card">
               <h2>服务端信息</h2>
@@ -1113,7 +1145,7 @@
 </div>
 
 <!-- ============================= 底部操作日志 ============================= -->
-<footer id="logbox" class="logbox" aria-label="操作日志" data-i18n-aria-label="log.title">
+<footer id="logbox" class="logbox" aria-label="操作日志" data-i18n-aria-label="log.title" hidden>
   <!-- ★ M8.6：可折叠区域的头是 div（视觉上是整条），因此显式补上键盘语义：
        role=button + tabindex=0 + aria-expanded + Enter/Space（见 app.js wireLogBox） -->
   <div class="logbox-head" id="logbox-head" role="button" tabindex="0"
@@ -1122,6 +1154,7 @@
     <span class="logbox-count" id="log-count">0</span>
     <span class="logbox-toggle" id="log-toggle" data-i18n="log.collapse">收起</span>
     <button type="button" class="mini" id="btn-log-clear" data-i18n="log.clear">清空</button>
+    <button type="button" class="mini" id="btn-log-close" data-i18n="log.close">关闭</button>
   </div>
   <div class="logbox-body" id="log-body" role="log" aria-live="polite" aria-relevant="additions"></div>
 </footer>

@@ -421,6 +421,7 @@
       body.removeChild(body.lastChild);
     }
     setText('log-count', T('log.count', { n: state.logCount }));
+    setText('diag-log-count', T('log.count', { n: state.logCount }));
   }
 
   function logOk(text) { logLine('ok', text); }
@@ -1196,68 +1197,87 @@
   }
 
   // ============================================================ 顶部状态条（多连接聚合）
+  /**
+   * ★ P0-06/08：顶栏只剩「页面标题 + 安静连接行」。
+   * 原来的 daemon/连接/登录三个药丸与 pid·uptime·socket·session 已搬进「诊断 → 状态」，
+   * 这里继续更新它们（id 都在诊断页里），主界面不再显示工程信息。
+   * 连接行只有三种日常状态：已连接 / 已连接但未登录 / 未连接；动作按钮就地给「登录」或「启动」。
+   */
   function renderTop() {
     var chipD = $('chip-daemon');
-    var chipC = $('chip-conn');
     var chipL = $('chip-login');
-    if (!chipD) { return; }
-
-    if (!state.linksLoaded) {
-      // 首轮状态还没回来：别把「检测中」显示成「未运行」
-      chipD.textContent = state.linksError ? T('top.daemon_error') : T('top.daemon_checking');
-      chipD.className = 'chip ' + (state.linksError ? 'chip-err' : 'chip-unknown');
-      chipC.textContent = T('top.conn_dash');
-      chipC.className = 'chip chip-unknown';
-      chipL.textContent = T('top.login_dash');
-      chipL.className = 'chip chip-unknown';
-      setText('meta-daemon', state.linksError
-        ? T('top.meta_error', { msg: state.linksError })
-        : T('top.daemon_meta_down', { socket: '—' }));
-      setText('meta-conn', T('top.meta_dash'));
-      setText('meta-session', T('top.session_dash'));
-      return;
+    if (chipD) {
+      if (!state.linksLoaded) {
+        // 首轮状态还没回来：别把「检测中」显示成「未运行」
+        chipD.textContent = state.linksError ? T('top.daemon_error') : T('top.daemon_checking');
+        chipD.className = 'chip ' + (state.linksError ? 'chip-err' : 'chip-unknown');
+      } else {
+        var ls0 = linksList();
+        var total0 = ls0.length;
+        var up0 = 0;
+        for (var i0 = 0; i0 < ls0.length; i0++) {
+          var d0 = (ls0[i0] && isObj(ls0[i0].daemon)) ? ls0[i0].daemon : null;
+          if (d0 && d0.running) { up0++; }
+        }
+        chipD.textContent = total0 ? T('top.daemon_count', { up: up0, total: total0 }) : T('top.daemon_down');
+        chipD.className = 'chip ' + (total0 === 0 ? 'chip-err' : (up0 === 0 ? 'chip-err' : (up0 === total0 ? 'chip-ok' : 'chip-warn')));
+      }
     }
-
-    var ls = linksList();
-    var total = ls.length;
-    var up = 0;
-    var logged = 0;
-    for (var i = 0; i < ls.length; i++) {
-      var d = (ls[i] && isObj(ls[i].daemon)) ? ls[i].daemon : null;
-      if (d && d.running) {
-        up++;
-        if (isObj(d.status) && d.status.logged_in === true) { logged++; }
+    if (chipL) {
+      if (!state.linksLoaded) {
+        chipL.textContent = T('top.login_dash');
+        chipL.className = 'chip chip-unknown';
+      } else {
+        var ls1 = linksList();
+        var total1 = ls1.length;
+        var logged1 = 0;
+        for (var i1 = 0; i1 < ls1.length; i1++) {
+          var d1 = (ls1[i1] && isObj(ls1[i1].daemon)) ? ls1[i1].daemon : null;
+          if (d1 && d1.running && isObj(d1.status) && d1.status.logged_in === true) { logged1++; }
+        }
+        chipL.textContent = total1 ? T('top.login_count', { up: logged1, total: total1 }) : T('top.login_dash');
+        chipL.className = 'chip ' + (!total1 ? 'chip-unknown' : (logged1 === total1 ? 'chip-ok' : 'chip-warn'));
       }
     }
 
-    // daemon chip：N/M 运行
-    chipD.textContent = total ? T('top.daemon_count', { up: up, total: total }) : T('top.daemon_down');
-    chipD.className = 'chip ' + (total === 0 ? 'chip-err' : (up === 0 ? 'chip-err' : (up === total ? 'chip-ok' : 'chip-warn')));
-
-    // 连接 chip：当前连接
-    var cur = currentLinkEntry();
-    if (!total) {
-      chipC.textContent = T('top.conn_dash');
-      chipC.className = 'chip chip-unknown';
-    } else if (!cur || (cur.link_exists === false && !str(cur.host))) {
-      chipC.textContent = T('top.conn_unconfigured');
-      chipC.className = 'chip chip-warn';
-    } else {
-      chipC.textContent = T('top.conn', { value: linkLabel(cur) });
-      chipC.className = 'chip chip-ok';
+    // ---- 安静连接行（主页/任务页）
+    var line = $('conn-line');
+    if (line) {
+      var total2 = linksList().length;
+      var cur2 = currentLinkEntry();
+      var st2 = currentStatus();
+      var running2 = !!(st2 && st2.running);
+      var s2 = (st2 && isObj(st2.status)) ? st2.status : null;
+      var logged2 = !!(running2 && s2 && s2.logged_in === true);
+      var onContentPage = (state.page === 'home' || state.page === 'tasks');
+      line.hidden = !total2 || !onContentPage;
+      if (!line.hidden) {
+        var dot2 = $('conn-line-dot');
+        var txt2 = $('conn-line-text');
+        var act2 = $('btn-conn-line-action');
+        if (!cur2) {
+          if (dot2) { dot2.className = 'conn-dot warn'; }
+          if (txt2) { txt2.textContent = T('top.conn_unconfigured'); }
+          if (act2) { act2.hidden = true; }
+        } else if (!running2) {
+          if (dot2) { dot2.className = 'conn-dot err'; }
+          if (txt2) { txt2.textContent = T('top.conn_line_down', { value: linkLabel(cur2) }); }
+          if (act2) { act2.hidden = false; act2.textContent = T('top.action_start'); act2.setAttribute('data-act', 'start'); }
+        } else if (!logged2) {
+          if (dot2) { dot2.className = 'conn-dot warn'; }
+          if (txt2) { txt2.textContent = T('top.conn_line_login', { value: linkLabel(cur2) }); }
+          if (act2) { act2.hidden = false; act2.textContent = T('top.action_login'); act2.setAttribute('data-act', 'login'); }
+        } else {
+          if (dot2) { dot2.className = 'conn-dot ok'; }
+          if (txt2) { txt2.textContent = T('top.conn_line_ok', { value: linkLabel(cur2) }); }
+          if (act2) { act2.hidden = true; }
+        }
+      }
     }
 
-    // login chip：已登录 N/M
-    if (!total) {
-      chipL.textContent = T('top.login_dash');
-      chipL.className = 'chip chip-unknown';
-    } else {
-      chipL.textContent = T('top.login_count', { up: logged, total: total });
-      chipL.className = 'chip ' + (logged === total ? 'chip-ok' : 'chip-warn');
-    }
-
-    // meta：**当前连接**的 daemon / socket / session（按连接分开显示，不混算）
+    // ---- 诊断「运行控制」里的 meta（普通页面不显示）
     var st = currentStatus();
+    var cur = currentLinkEntry();
     var ping = (st && isObj(st.ping)) ? st.ping : null;
     if (!st || !st.running) {
       setText('meta-daemon', T('top.daemon_meta_down', { socket: str(st ? st.socket : (cur ? cur.socket : '')) }));
@@ -7521,6 +7541,8 @@
       else { p.classList.remove('active'); }
     }
     setText('page-title', PAGE_TITLE[name] || name);
+    // ★ P0-08：连接行只在内容页（主页/任务）出现；设置/诊断不显示。
+    renderTop();
 
     // ★ M16：切页只决定「去哪」，取数统一走 refreshCurrentPage（它知道每页要拉什么）。
     if (name === 'settings') {
@@ -7605,6 +7627,23 @@
     var head = $('logbox-head');
     var box = $('logbox');
     var toggle = $('log-toggle');
+    // ★ P0-09：日志默认不显示（markup 里 hidden）；唯一入口在「诊断 → 状态」。
+    function setLogVisible(v) {
+      if (!box) { return; }
+      box.hidden = !v;
+      if (!v) { return; }
+      box.classList.remove('collapsed');
+      if (toggle) { toggle.textContent = T('log.collapse'); }
+      if (head) {
+        head.setAttribute('aria-expanded', 'true');
+        if (isFn(head.focus)) { head.focus(); }
+      }
+    }
+    on('btn-diag-log', 'click', function () { setLogVisible(true); });
+    on('btn-log-close', 'click', function (ev) {
+      ev.stopPropagation();
+      setLogVisible(false);
+    });
     if (head && box) {
       var flip = function () {
         box.classList.toggle('collapsed');
@@ -7614,7 +7653,7 @@
         head.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
       };
       head.addEventListener('click', function (ev) {
-        if (ev.target && ev.target.id === 'btn-log-clear') { return; }
+        if (ev.target && (ev.target.id === 'btn-log-clear' || ev.target.id === 'btn-log-close')) { return; }
         flip();
       });
       // ★ M8.6：Enter / Space 也能折叠（鼠标之外的第二条路）
@@ -7635,6 +7674,25 @@
         setText('log-count', '0 条');
       });
     }
+  }
+
+  // ============================================================ 左栏文字开关（★ P0-05）
+  /**
+   * 默认纯图标（官方 Qsync 6）；用户可在「设置 → 个人」打开文字。
+   * 这是**纯前端偏好**（localStorage），不进 daemon settings —— 换台机器不该带过去。
+   */
+  var RAIL_LABELS_KEY = 'qxync.ui.railLabels';
+  function initRailLabels() {
+    var on = false;
+    try { on = window.localStorage.getItem(RAIL_LABELS_KEY) === '1'; } catch (e) { /* 隐私模式忽略 */ }
+    document.body.classList.toggle('rail-labels', on);
+    var cb = $('s-rail-labels');
+    if (!cb) { return; }
+    cb.checked = on;
+    cb.addEventListener('change', function () {
+      document.body.classList.toggle('rail-labels', cb.checked);
+      try { window.localStorage.setItem(RAIL_LABELS_KEY, cb.checked ? '1' : '0'); } catch (e) { /* 忽略 */ }
+    });
   }
 
   // ============================================================ 事件绑定
@@ -7769,6 +7827,13 @@
     on('btn-daemon-start', 'click', function () { doDaemonStart(); });
     on('btn-daemon-stop', 'click', function () { doDaemonStop(); });
     on('btn-quick-login', 'click', function () { doQuickLogin(); });
+    // ★ P0-08：连接行就地动作（未连接→启动；未登录→登录）
+    on('btn-conn-line-action', 'click', function () {
+      var act = $('btn-conn-line-action');
+      var kind = act ? str(act.getAttribute('data-act')) : '';
+      if (kind === 'start') { doDaemonStart(currentId(), act); }
+      else if (kind === 'login') { doQuickLogin(); }
+    });
 
     // ★ M16：顶部「当前连接」选择器（键盘/读屏都能用；select 自带 label）
     on('conn-select', 'change', function (ev) {
@@ -8073,6 +8138,7 @@
     wirePurgeModal();
     wireBlockedModal();
     wireLogBox();
+    initRailLabels();
     wireRowMenu();
     wireTray();
     bindEvents();

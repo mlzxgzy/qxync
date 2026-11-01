@@ -141,6 +141,20 @@ fi
 # 只影响本脚本；用户正常启动仍走 Wayland。
 [ "$NO_WINDOW" = "0" ] && export GDK_BACKEND="${GDK_BACKEND:-x11}"
 
+# ★ P0-17（2026-11）：截图基线统一 96dpi。
+#   GTK/WebKit 的页面缩放跟 X 资源 `Xft.dpi` 走（本机 158 → 实际 DPR 1.65，CSS 视口只剩
+#   729×486，量出来的 61px 左栏会变成 100px，不能当基线）；GDK_SCALE 只能整数倍，
+#   所以用 GDK_DPI_SCALE=96/dpi 把有效 DPR 拉回 1.0。用户显式设了 GDK_DPI_SCALE 就不覆盖。
+if [ "$NO_WINDOW" = "0" ] && [ -z "${GDK_DPI_SCALE:-}" ]; then
+  XDPI=$(xrdb -query 2>/dev/null | awk '/^Xft\.dpi:/{print $2; exit}')
+  if [ -n "${XDPI:-}" ] && [ "$XDPI" != "96" ]; then
+    GDK_DPI_SCALE=$(awk -v d="$XDPI" 'BEGIN{printf "%.6f", 96/d}')
+    export GDK_DPI_SCALE
+    echo "  ℹ️  Xft.dpi=$XDPI → GDK_DPI_SCALE=$GDK_DPI_SCALE（截图按 96dpi 基线）"
+  fi
+fi
+export GDK_SCALE="${GDK_SCALE:-1}"
+
 # ---------------------------------------------------------------- 起 daemon + 登录
 echo "== 1. daemon + 登录 =="
 "$QS" --socket "$SOCK" daemon stop --force >/dev/null 2>&1 || true; rm -f "$SOCK"; sleep 0.5
