@@ -105,51 +105,66 @@
     <main id="main" tabindex="-1">
 
       <!-- ======================= 页面 1：主页 ======================= -->
+      <!-- ★ P1-05/06：官方 Task List 形态 —— 连接状态一行、任务卡列表、Add；累计计数移诊断。 -->
       <section class="page active" id="page-home">
-        <div class="card">
-          <h2>连接</h2>
-          <div class="home-conn">
-            <span class="conn-dot" id="home-dot"></span>
-            <span class="mono" id="home-conn-text">—</span>
-            <span class="home-conn-actions">
-              <button type="button" class="mini" id="btn-home-add-link"
-                      data-i18n="home.add_link" data-i18n-title="home.add_link_title"
-                      title="添加新的 NAS 连接">＋ 添加连接</button>
-              <button type="button" class="mini" id="btn-home-settings">连接设置</button>
-              <button type="button" class="mini" id="btn-home-sync-now">立即同步</button>
+        <div id="home-alerts" class="alert-stack"></div>
+
+        <div class="card" id="home-tasks-card">
+          <div class="card-head">
+            <h2>同步任务 <span class="count" id="home-task-count"></span></h2>
+            <div class="card-actions">
+              <button type="button" class="mini" id="btn-home-refresh">刷新</button>
               <button type="button" class="mini primary" id="btn-home-add-task" data-i18n="task.act_add">＋ 添加任务</button>
-            </span>
+            </div>
           </div>
-        </div>
-
-        <div class="card">
-          <h2>任务 <span class="count" id="home-task-count"></span>
-            <button type="button" class="mini" id="btn-home-refresh">刷新</button>
-          </h2>
           <div id="home-tasks" class="task-list"></div>
-          <p class="empty-hint" id="home-tasks-empty" hidden data-state="ready" data-i18n="home.tasks_empty">
-            还没有同步任务。点右上「＋ 添加任务」把本地文件夹与 NAS 文件夹配成一对。
-          </p>
-        </div>
-
-        <div class="card">
-          <h2>最近一次同步</h2>
-          <dl class="kv kv-inline" id="home-sync-kv"></dl>
-          <div id="home-alerts" class="alert-stack"></div>
+          <div class="empty-state" id="home-tasks-empty" hidden data-state="ready" data-keep>
+            <svg class="empty-art" viewBox="0 0 96 72" fill="none" aria-hidden="true">
+              <rect x="10" y="16" width="48" height="34" rx="4" stroke="currentColor" stroke-width="2"/>
+              <path d="M10 26h48" stroke="currentColor" stroke-width="2"/>
+              <rect x="40" y="28" width="46" height="32" rx="4" fill="var(--bg)" stroke="currentColor" stroke-width="2"/>
+              <path d="M50 40h26M50 48h18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+              <path d="M20 16V9h18v7" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            </svg>
+            <p class="empty-title" data-i18n="home.tasks_empty_title">还没有同步任务</p>
+            <p class="empty-desc" data-i18n="home.tasks_empty">
+              把本地文件夹与 NAS 文件夹配成一对，qxync 会按需同步它们。
+            </p>
+            <button type="button" class="primary" id="btn-home-add-task-empty" data-i18n="task.act_add">＋ 添加任务</button>
+          </div>
         </div>
       </section>
 
       <!-- ======================= 页面 2：任务（M8.2，M8.4 补冲突策略） ======================= -->
       <section class="page" id="page-tasks">
         <p class="hint" id="tasks-links-hint"></p>
+        <div class="card">
+          <div class="card-head">
+            <h2>同步任务 <span class="count" id="tasks-count"></span></h2>
+            <div class="card-actions">
+              <button type="button" class="mini" id="btn-tasks-refresh">刷新</button>
+              <button type="button" class="mini primary" id="btn-tasks-add" data-i18n="task.act_add_pair">＋ 添加同步任务</button>
+            </div>
+          </div>
+          <div id="tasks-list" class="task-list"></div>
+          <p class="empty-hint" id="tasks-empty" hidden data-state="ready" data-i18n="tasks.empty">
+            还没有同步任务。点右上「＋ 添加配对文件夹」把本地文件夹与 NAS 文件夹配成一对。
+          </p>
+          <p class="note" id="tasks-note" hidden></p>
+          <ul class="plain-list mono" id="tasks-bad"></ul>
+        </div>
+
         <!-- ★ M8.4：冲突策略 =「每个文件都问我」时攒下的待裁决队列 -->
-        <div class="card" id="decisions-card">
-          <h2>冲突待裁决 <span class="count" id="decisions-count"></span>
+        <details class="card decisions-card" id="decisions-card">
+          <summary>
+            <h2>冲突待裁决 <span class="count" id="decisions-count"></span></h2>
+          </summary>
+          <div class="card-actions">
             <button type="button" class="mini" id="btn-decisions-refresh"
               data-i18n="decisions.act_refresh">刷新</button>
             <button type="button" class="mini" id="btn-decisions-clear"
               data-i18n="decisions.act_clear">清空全部</button>
-          </h2>
+          </div>
           <!-- 注意：这里**不要**加 data-i18n —— 本段含内联 <code>ask</code>，
                apply() 用 textContent 覆盖会吃掉标记（i18n.js 文件头已把「含内联标记的
                混合段落」划出 i18n 范围）；静态中文文案与 i18n.js 的 decisions.hint 保持一致。 -->
@@ -160,119 +175,60 @@
           <div id="decisions-list" class="task-list"></div>
           <p class="empty-hint" id="decisions-empty" hidden data-state="ready" data-i18n="decisions.empty">没有待裁决的冲突。</p>
           <p class="note" id="decisions-note" hidden></p>
+        </details>
+
+      </section>
+
+      <!-- ======================= 二级页：任务详情（★ P1-10，不进左栏） ======================= -->
+      <section class="page" id="page-task">
+        <div class="detail-head">
+          <button type="button" class="icon-btn" id="btn-task-back"
+                  title="返回任务列表" aria-label="返回任务列表" data-i18n-title="detail.back" data-i18n-aria-label="detail.back">↩</button>
+          <div class="detail-title-wrap">
+            <p class="crumb" id="detail-crumb">任务</p>
+            <h1 class="pagetitle" id="detail-title">同步任务</h1>
+          </div>
+          <div class="detail-actions">
+            <button type="button" class="mini" id="btn-detail-sync" data-i18n="detail.sync_now">立即同步一轮</button>
+            <button type="button" class="icon-btn" id="btn-detail-gear"
+                    title="同步设置" aria-label="同步设置" data-i18n-title="detail.settings" data-i18n-aria-label="detail.settings">⚙</button>
+            <button type="button" class="icon-btn" id="btn-detail-more"
+                    title="更多" aria-label="更多" aria-haspopup="menu"
+                    data-i18n-title="detail.more" data-i18n-aria-label="detail.more">⋮</button>
+          </div>
+        </div>
+
+        <div class="pair-grid">
+          <div class="card">
+            <h2 data-i18n="detail.local">本地文件夹</h2>
+            <p class="mono detail-path" id="detail-local">—</p>
+          </div>
+          <div class="card">
+            <h2 data-i18n="detail.remote">NAS 文件夹</h2>
+            <p class="mono detail-path" id="detail-remote">—</p>
+          </div>
         </div>
 
         <div class="card">
-          <h2>同步任务 <span class="count" id="tasks-count"></span>
-            <button type="button" class="mini" id="btn-tasks-refresh">刷新</button>
-            <button type="button" class="mini primary" id="btn-tasks-add" data-i18n="task.act_add_pair">＋ 添加配对文件夹</button>
-          </h2>
-          <div id="tasks-list" class="task-list"></div>
-          <p class="empty-hint" id="tasks-empty" hidden data-state="ready" data-i18n="tasks.empty">
-            还没有同步任务。点右上「＋ 添加配对文件夹」把本地文件夹与 NAS 文件夹配成一对。
-          </p>
-          <p class="note" id="tasks-note" hidden></p>
-          <ul class="plain-list mono" id="tasks-bad"></ul>
+          <h2 data-i18n="detail.pairs">配对文件夹</h2>
+          <table class="tbl">
+            <thead><tr>
+              <th data-i18n="detail.col_local">本地</th>
+              <th data-i18n="detail.col_remote">NAS</th>
+              <th data-i18n="detail.col_state">状态</th>
+            </tr></thead>
+            <tbody id="detail-pair-body"></tbody>
+          </table>
+          <p class="hint" data-i18n="detail.pairs_hint">qxync 是一对一配对：一个任务 = 一组本地 ⇄ NAS 文件夹。要同步更多文件夹，请新建任务。</p>
         </div>
 
-        <div class="card" id="task-form-card" hidden>
-          <h2 id="task-form-title">文件夹对设置</h2>
-          <form id="form-task" class="form" autocomplete="off">
-            <!-- ★ M16：这条任务登记在哪个连接上（新建默认当前连接；编辑时只读） -->
-            <label>NAS 连接
-              <select id="t-link" class="mono"></select>
-            </label>
-            <p class="hint" id="t-link-hint" hidden></p>
-            <!-- ★ M18：先选 NAS 文件夹 —— 任务 id 与两条本地路径都由它派生 -->
-            <label>NAS 文件夹（一对一映射）
-              <span class="select-row">
-                <select id="t-nas-folder" class="mono"></select>
-                <button type="button" class="mini" id="btn-nas-browse">浏览…</button>
-              </span>
-            </label>
-            <label id="t-nas-manual-wrap" hidden>手动输入 NAS 路径
-              <input type="text" id="t-nas-manual" class="mono" spellcheck="false"
-                     placeholder="/home/.Qsync">
-            </label>
-            <p class="hint">
-              ★ <strong>一对一</strong>：本地文件夹 ⇄ 这<strong>一个</strong> NAS 文件夹；挂载点里
-              <strong>直接</strong>就是它的内容，不会再套一层目录名（NAS 选 <code>/home</code>，
-              挂载点里就是家目录，不是 <code>挂载点/home</code>）。候选来自「NAS 上登记的 Qsync
-              同步文件夹」与家目录；选不到就点「浏览…」逐层挑，或选「手动输入」。要同步多个
-              NAS 文件夹 → 建多个任务（提交时会检查本地文件夹重复/嵌套、NAS 文件夹重复）。
-              <strong>能不能写由 NAS 决定</strong>：Qsync 里登记成同步文件夹的目录可以写，
-              没登记过的共享文件夹会被服务端拒绝（<code>status:20</code>）—— 勾了「读写」仍失败的话，
-              错误会进「更新 / 错误」页，客户端不会替你改只读。
-            </p>
-            <div class="row-2 row-wide">
-              <label>任务 id（也是文件名）
-                <input type="text" id="t-id" class="mono" spellcheck="false"
-                       placeholder="home">
-              </label>
-              <label>缓存模式
-                <select id="t-cache-mode">
-                  <option value="pagecache">pagecache（默认）</option>
-                  <option value="direct">direct（绕过 page cache，不可 mmap）</option>
-                </select>
-              </label>
-            </div>
-            <label>本地文件夹（挂载点，绝对路径）
-              <input type="text" id="t-mountpoint" class="mono" spellcheck="false"
-                     placeholder="默认 ~/qxync/&lt;连接 id&gt;/&lt;任务 id&gt;">
-            </label>
-            <p class="hint" id="t-defaults-hint">
-              ★ 默认值按「<strong>连接 + NAS 文件夹</strong>」自动生成，不会再出现两条任务
-              id / 路径一模一样的情况：任务 id 取文件夹名（<code>/home</code> →
-              <code>home</code>，重名自动加 <code>-2</code>）；本地文件夹 =
-              <code>~/qxync/&lt;连接 id&gt;/&lt;任务 id&gt;</code>；水合缓存 =
-              <code>&lt;data_dir&gt;/cache/tasks/&lt;连接 id&gt;/&lt;任务 id&gt;</code>。
-              手动改过的字段不再被自动覆盖，想恢复点
-              <button type="button" class="mini" id="btn-task-defaults">重置为默认路径</button>。
-            </p>
-            <label>水合缓存目录（留空 = 按连接共享；默认按任务隔离）
-              <input type="text" id="t-cache-dir" class="mono" spellcheck="false"
-                     placeholder="留空 = 按连接共享；实际缓存会再拼一层连接的命名空间">
-            </label>
-            <div class="row-2">
-              <label>冲突策略（Conflict policies）
-                <select id="t-conflict">
-                  <option value="rename_local">重命名本地文件（默认；NAS 上的文件占原名，本地另存冲突副本）</option>
-                  <option value="ask">每个文件都问我（进待裁决队列）</option>
-                  <option value="rename_remote">重命名 NAS 上的文件（本地内容占原名）</option>
-                  <option value="replace_remote">用本地文件替换 NAS 上的文件（⚠ NAS 上那份会丢）</option>
-                  <option value="replace_local">用 NAS 上的文件替换本地文件（⚠ 本地那份会丢）</option>
-                </select>
-              </label>
-              <label>同步方向（记录；1-way 的实际执行在 M9）
-                <select id="t-direction">
-                  <option value="2way">双向（2-way）</option>
-                  <option value="1way-up">仅上传（1-way up）</option>
-                  <option value="1way-down">仅下载（1-way down）</option>
-                </select>
-              </label>
-            </div>
-            <div class="row-checks">
-              <label class="check"><input type="checkbox" id="t-space-saving"> 节省空间模式（按需同步 / 可脱水）</label>
-              <label class="check"><input type="checkbox" id="t-smart-delete"> 智能删除（≈ 待确认删除；与节省空间模式互斥）</label>
-            </div>
-            <div class="row-checks">
-              <label class="check"><input type="checkbox" id="t-read-write"> 读写（默认只读）</label>
-              <label class="check"><input type="checkbox" id="t-do-mount" checked> 保存后立即挂载</label>
-            </div>
-            <p class="hint">
-              保存位置 <code>~/.config/qxync/tasks/&lt;id&gt;.json</code>；
-              <strong>只登记参数，不动 NAS 上的任何数据</strong>。
-              冲突策略与节省空间模式已经接到后端；选择性同步（勾选子文件夹）仍是 M9 的事，
-              现在用「多任务」近似 —— <strong>一个任务 = 一个配对文件夹（一对一）</strong>。
-            </p>
-            <div class="btn-row">
-              <button type="submit" id="btn-task-save" class="primary">保存任务</button>
-              <button type="button" id="btn-task-cancel">取消</button>
-              <span class="busy" id="task-busy" hidden data-i18n="busy.text">进行中…</span>
-            </div>
-          </form>
-          <div id="task-result" class="result" hidden></div>
+        <div class="card">
+          <h2 data-i18n="detail.settings">同步设置</h2>
+          <dl class="kv" id="detail-kv"></dl>
+          <div id="detail-flags" class="flag-row"></div>
         </div>
+
+        <div id="detail-alerts" class="alert-stack"></div>
       </section>
 
       <!-- ======================= 页面 3：文件 ======================= -->
@@ -920,6 +876,13 @@
             </div>
           </div>
 
+          <!-- ★ P1-06：累计同步计数从主页搬到这里（官方主页不展示累计数）。 -->
+          <div class="card" id="diag-sync-summary">
+            <h2>累计同步（按连接）</h2>
+            <p class="hint">自 daemon 启动只增不清：轮询 / 上传 / 删除 / 冲突。主页只保留任务与状态。</p>
+            <dl class="kv kv-inline" id="home-sync-kv"></dl>
+          </div>
+
           <!-- ★ P0-09：操作日志默认不显示；诊断页给出唯一入口。 -->
           <div class="card" id="diag-log-card">
             <h2 data-i18n="log.title">操作日志</h2>
@@ -1140,6 +1103,168 @@
         </section>
       </section>
 
+      <!-- ★ P1-11：同步设置（快速改冲突策略 / 节省空间 / 智能删除 + 立即同步） -->
+      <div class="modal" id="sync-modal" hidden>
+        <div class="modal-card sync-modal-card" role="dialog" aria-modal="true" aria-labelledby="sync-modal-title">
+          <button type="button" class="modal-x" id="btn-sync-modal-close" aria-label="关闭">×</button>
+          <h2 id="sync-modal-title">同步设置 · <span id="sync-modal-name">—</span></h2>
+          <label>冲突策略
+            <select id="s-conflict">
+              <option value="rename_local">重命名本地文件（默认；NAS 占原名，本地另存副本）</option>
+              <option value="ask">每个文件都问我（进待裁决队列）</option>
+              <option value="rename_remote">重命名 NAS 上的文件（本地占原名）</option>
+              <option value="replace_remote">用本地替换 NAS（⚠ NAS 上那份会丢）</option>
+              <option value="replace_local">用 NAS 替换本地（⚠ 本地那份会丢）</option>
+            </select>
+          </label>
+          <div class="row-checks">
+            <label class="check"><input type="checkbox" id="s-space-saving"> 节省空间模式（按需同步）</label>
+            <label class="check"><input type="checkbox" id="s-smart-delete"> 智能删除（待确认删除）</label>
+          </div>
+          <p class="hint">节省空间模式与智能删除互斥：开启节省空间时，智能删除会被关闭（后端语义）。</p>
+          <div class="btn-row">
+            <button type="button" id="btn-sync-save" class="primary">保存</button>
+            <button type="button" id="btn-sync-now">立即同步一轮</button>
+            <button type="button" id="btn-sync-cancel">取消</button>
+          </div>
+          <div id="sync-result" class="result" hidden></div>
+        </div>
+      </div>
+
+      <!-- ★ P1-08：添加任务先选类型；官方备份任务列表在 qxync 这里没有对应能力，明确置灰。 -->
+      <div class="modal" id="type-modal" hidden>
+        <div class="modal-card type-modal-card" role="dialog" aria-modal="true" aria-labelledby="type-title">
+          <h2 id="type-title">选择任务类型</h2>
+          <p class="hint">同步任务让本地文件夹与 NAS 文件夹保持一致；备份任务需要单独的备份引擎，qxync 暂不支持。</p>
+          <div class="type-grid">
+            <button type="button" class="type-card" id="btn-type-sync">
+              <span class="type-ico" aria-hidden="true">⇄</span>
+              <strong>同步任务</strong>
+              <span class="type-desc">本地 ⇄ NAS；双向，或仅上传 / 仅下载</span>
+            </button>
+            <button type="button" class="type-card type-card-off" id="btn-type-backup" disabled aria-disabled="true">
+              <span class="type-ico" aria-hidden="true">⤒</span>
+              <strong>备份任务</strong>
+              <span class="type-desc">暂不支持（没有备份引擎）</span>
+            </button>
+          </div>
+          <div class="btn-row">
+            <button type="button" id="btn-type-cancel">取消</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ★ P1-09：创建同步任务 / P1-13：文件夹对设置，共用同一个模态表单 -->
+      <div class="modal" id="task-modal" hidden>
+        <div class="modal-card task-modal-card" role="dialog" aria-modal="true" aria-labelledby="task-form-title">
+          <button type="button" class="modal-x" id="btn-task-modal-close" aria-label="关闭">×</button>
+        <div class="card" id="task-form-card" hidden>
+          <h2 id="task-form-title">文件夹对设置</h2>
+          <form id="form-task" class="form" autocomplete="off">
+            <!-- ★ M16：这条任务登记在哪个连接上（新建默认当前连接；编辑时只读） -->
+            <label>NAS 连接
+              <select id="t-link" class="mono"></select>
+            </label>
+            <p class="hint" id="t-link-hint" hidden></p>
+            <div class="pair-summary">
+              <div class="pair-sum-item">
+                <span class="pair-sum-k">本地文件夹</span>
+                <code class="pair-sum-v" id="t-pair-local">—</code>
+              </div>
+              <div class="pair-sum-item">
+                <span class="pair-sum-k">NAS 文件夹</span>
+                <code class="pair-sum-v" id="t-pair-remote">—</code>
+              </div>
+            </div>
+            <!-- ★ M18：先选 NAS 文件夹 —— 任务 id 与两条本地路径都由它派生 -->
+            <label>NAS 文件夹（一对一映射）
+              <span class="select-row">
+                <select id="t-nas-folder" class="mono"></select>
+                <button type="button" class="mini" id="btn-nas-browse">浏览…</button>
+              </span>
+            </label>
+            <label id="t-nas-manual-wrap" hidden>手动输入 NAS 路径
+              <input type="text" id="t-nas-manual" class="mono" spellcheck="false"
+                     placeholder="/home/.Qsync">
+            </label>
+            <p class="hint">
+              一个任务 = 一个本地文件夹 ⇄ 一个 NAS 文件夹。要同步更多文件夹，请新建任务。
+              能不能写入由 NAS 决定：没在 Qsync 里登记为同步文件夹的共享目录可能被服务端拒绝。
+            </p>
+            <details class="form-adv" id="task-adv">
+              <summary>高级：任务 ID / 本地路径 / 缓存 / 方向</summary>
+            <div class="row-2 row-wide">
+              <label>任务 id（也是文件名）
+                <input type="text" id="t-id" class="mono" spellcheck="false"
+                       placeholder="home">
+              </label>
+              <label>缓存模式
+                <select id="t-cache-mode">
+                  <option value="pagecache">pagecache（默认）</option>
+                  <option value="direct">direct（绕过 page cache，不可 mmap）</option>
+                </select>
+              </label>
+            </div>
+            <label>本地文件夹（挂载点，绝对路径）
+              <input type="text" id="t-mountpoint" class="mono" spellcheck="false"
+                     placeholder="默认 ~/qxync/&lt;连接 id&gt;/&lt;任务 id&gt;">
+            </label>
+            <p class="hint" id="t-defaults-hint">
+              ★ 默认值按「<strong>连接 + NAS 文件夹</strong>」自动生成，不会再出现两条任务
+              id / 路径一模一样的情况：任务 id 取文件夹名（<code>/home</code> →
+              <code>home</code>，重名自动加 <code>-2</code>）；本地文件夹 =
+              <code>~/qxync/&lt;连接 id&gt;/&lt;任务 id&gt;</code>；水合缓存 =
+              <code>&lt;data_dir&gt;/cache/tasks/&lt;连接 id&gt;/&lt;任务 id&gt;</code>。
+              手动改过的字段不再被自动覆盖，想恢复点
+              <button type="button" class="mini" id="btn-task-defaults">重置为默认路径</button>。
+            </p>
+            <label>水合缓存目录（留空 = 按连接共享；默认按任务隔离）
+              <input type="text" id="t-cache-dir" class="mono" spellcheck="false"
+                     placeholder="留空 = 按连接共享；实际缓存会再拼一层连接的命名空间">
+            </label>
+              <label>同步方向（记录；1-way 的实际执行在 M9）
+                <select id="t-direction">
+                  <option value="2way">双向（2-way）</option>
+                  <option value="1way-up">仅上传（1-way up）</option>
+                  <option value="1way-down">仅下载（1-way down）</option>
+                </select>
+              </label>
+            </details>
+
+            <div class="row-wide">
+              <label>冲突策略（Conflict policies）
+                <select id="t-conflict">
+                  <option value="rename_local">重命名本地文件（默认；NAS 上的文件占原名，本地另存冲突副本）</option>
+                  <option value="ask">每个文件都问我（进待裁决队列）</option>
+                  <option value="rename_remote">重命名 NAS 上的文件（本地内容占原名）</option>
+                  <option value="replace_remote">用本地文件替换 NAS 上的文件（⚠ NAS 上那份会丢）</option>
+                  <option value="replace_local">用 NAS 上的文件替换本地文件（⚠ 本地那份会丢）</option>
+                </select>
+              </label>
+            </div>
+            <div class="row-checks">
+              <label class="check"><input type="checkbox" id="t-space-saving"> 节省空间模式（按需同步 / 可脱水）</label>
+              <label class="check"><input type="checkbox" id="t-smart-delete"> 智能删除（≈ 待确认删除；与节省空间模式互斥）</label>
+            </div>
+            <div class="row-checks">
+              <label class="check"><input type="checkbox" id="t-read-write"> 读写（默认只读）</label>
+              <label class="check"><input type="checkbox" id="t-do-mount" checked> 保存后立即挂载</label>
+            </div>
+            <p class="hint">
+              保存只登记参数，不动 NAS 上的任何数据。选择性同步（只同步部分子文件夹）暂不支持，
+              可以拆成多个任务近似。
+            </p>
+            <div class="btn-row">
+              <button type="submit" id="btn-task-save" class="primary">保存任务</button>
+              <button type="button" id="btn-task-cancel">取消</button>
+              <span class="busy" id="task-busy" hidden data-i18n="busy.text">进行中…</span>
+            </div>
+          </form>
+          <div id="task-result" class="result" hidden></div>
+        </div>
+        </div>
+      </div>
+
     </main>
   </div>
 </div>
@@ -1162,6 +1287,14 @@
 <!-- ============================= 文件页行右键菜单（M8.4） =============================
      对齐 Qsync 的「节省空间模式 ▸ 始终保留在此设备 / 释放空间」。用自绘菜单而不是
      系统菜单：前端零依赖、验收矩阵能直接断言条目；所有字符串来自 daemon，绝不拼 innerHTML。 -->
+<div id="task-menu" class="ctx-menu" role="menu" aria-label="任务操作" hidden>
+  <div class="ctx-title" id="task-menu-title">—</div>
+  <button type="button" class="ctx-item" data-act="sync" role="menuitem" data-i18n="detail.sync_once">立即同步一轮</button>
+  <button type="button" class="ctx-item" data-act="open" role="menuitem" data-i18n="task.act_open_dir">打开本地目录</button>
+  <button type="button" class="ctx-item" data-act="pause" role="menuitem" data-i18n="detail.pause_resume">暂停 / 继续</button>
+  <button type="button" class="ctx-item" data-act="settings" role="menuitem" data-i18n="task.act_settings">同步设置…</button>
+  <button type="button" class="ctx-item danger" data-act="delete" role="menuitem" data-i18n="detail.delete">删除任务…</button>
+</div>
 <div id="row-menu" class="ctx-menu" role="menu" aria-label="文件操作" hidden>
   <div class="ctx-title" id="row-menu-title">—</div>
   <button type="button" class="ctx-item" role="menuitem" data-act="pinquery" data-i18n="menu.pinquery">🔍 查询 pin 状态</button>
@@ -1227,6 +1360,7 @@
     <p id="purge-opt-hint" class="hint" hidden></p>
     <div class="btn-row">
       <button type="button" id="purge-ok" class="primary danger" data-i18n="purge.confirm_delete">删除</button>
+      <button type="button" id="purge-registration" hidden>仅删除任务登记（保留两侧文件）</button>
       <button type="button" id="purge-cancel" data-i18n="modal.cancel">取消</button>
     </div>
   </div>

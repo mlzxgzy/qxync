@@ -1755,3 +1755,157 @@ body.rail-labels .rail-logo { margin-bottom: 16px; }
 
 /* 日志抽屉打开时从底部浮起（默认 hidden，唯一入口在诊断页） */
 .logbox { box-shadow: 0 -1px 0 var(--border-soft); }
+
+/* ============================================================================
+ * ★ P1-A 任务模型（2026-11）—— 官方形态任务卡 / 主页空态 / 二级详情页 / ⋮ 菜单
+ * 官方实测：卡片 #FAFAFA、圆角 8、标题 16/700、次行 13 灰、右上是 Sync 角标，
+ * 行尾只有「暂停」与「›」；管理/删除在详情页。
+ * ==========================================================================*/
+
+/* ---- 卡片头（标题 + 右侧动作） ---- */
+.card-head { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+.card-head h2 { margin: 0; }
+.card-actions { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+
+/* ---- 主页连接行（不再用整张卡） ---- */
+.home-conn-line {
+  display: flex; align-items: center; gap: 8px;
+  margin: 2px 0 14px; font-size: 13px; color: var(--fg-dim);
+}
+.home-conn-line .linklike { font-size: 13px; border: 0; background: none; height: auto; padding: 0; color: var(--accent); }
+.home-conn-line .linklike:hover { background: none; text-decoration: underline; }
+
+/* ---- 主页空态（插画 + 说明 + Add） ---- */
+.empty-state {
+  text-align: center; padding: 30px 16px 34px; color: var(--fg-dim);
+}
+.empty-art { width: 120px; height: 90px; color: var(--border-strong); margin-bottom: 10px; }
+.empty-title { font-size: 16px; font-weight: 700; color: var(--fg); margin: 0 0 4px; }
+.empty-desc { font-size: 13px; margin: 0 auto 14px; max-width: 460px; color: var(--fg-dim); }
+
+/* ---- 任务卡（P1-01） ---- */
+.task-list { display: flex; flex-direction: column; gap: 8px; }
+.task-card {
+  display: flex; align-items: center; gap: 14px;
+  background: var(--bg-elev); border: 1px solid var(--border);
+  border-radius: var(--radius-lg); padding: 13px 16px;
+  margin: 0;
+}
+.task-card:hover { border-color: var(--border-strong); }
+.task-card-main { display: flex; align-items: center; gap: 12px; flex: 1 1 auto; min-width: 0; }
+.task-icon {
+  flex: 0 0 36px; width: 36px; height: 36px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--bg-sunken); color: var(--fg-dim);
+}
+.task-card[data-state="ok"] .task-icon { background: var(--ok-soft); color: var(--ok); }
+.task-card[data-state="warn"] .task-icon { background: var(--warn-soft); color: var(--warn); }
+.task-card[data-state="error"] .task-icon { background: var(--err-soft); color: var(--err); }
+.task-card[data-state="paused"] .task-icon { background: var(--bg-sunken); color: var(--fg-faint); }
+.task-card[data-state="clock"] .task-icon { background: var(--accent-soft); color: var(--accent); }
+.state-icon { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.task-card-text { flex: 1 1 auto; min-width: 0; }
+.task-title-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.task-title {
+  font-size: 16px; font-weight: 700; line-height: 1.3;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.task-state-line { font-size: 13px; color: var(--fg); margin-top: 2px; }
+.task-sub {
+  font-size: 13px; color: var(--fg-dim); margin-top: 1px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.task-card-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 2px; }
+.icon-btn {
+  width: 30px; height: 30px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 1px solid transparent; border-radius: 6px; background: transparent;
+  color: var(--fg-dim); font-size: 15px; line-height: 1;
+}
+.icon-btn:hover:not(:disabled) { background: var(--bg-sunken); border-color: transparent; color: var(--fg); }
+.icon-btn .state-icon { width: 16px; height: 16px; }
+.task-more-btn { font-size: 22px; font-weight: 400; }
+
+/* 冲突卡沿用 .task-card 外壳（.dec-card 自己负责换行） */
+.task-card.dec-card { align-items: flex-start; flex-wrap: wrap; }
+.task-card.dec-card .task-state { font-size: 15px; font-weight: 700; }
+
+/* ---- 冲突待裁决折叠区（P1-15：不占首屏） ---- */
+details.decisions-card { padding: 0; }
+details.decisions-card > summary {
+  list-style: none; cursor: pointer; padding: 14px 20px;
+  display: flex; align-items: center; gap: 8px;
+}
+details.decisions-card > summary::-webkit-details-marker { display: none; }
+details.decisions-card > summary h2 { margin: 0; }
+details.decisions-card > summary::before {
+  content: "›"; color: var(--fg-faint); font-size: 18px; transform: rotate(0deg);
+  transition: transform .12s ease;
+}
+details.decisions-card[open] > summary::before { transform: rotate(90deg); }
+details.decisions-card > .card-actions { padding: 0 20px 10px; }
+details.decisions-card > .hint,
+details.decisions-card > .task-list,
+details.decisions-card > .empty-hint,
+details.decisions-card > .note { padding-left: 20px; padding-right: 20px; }
+details.decisions-card > .btn-row { padding: 0 20px 16px; }
+
+/* ---- 二级页：任务详情（P1-10） ---- */
+#page-task .detail-head {
+  display: flex; align-items: flex-start; gap: 12px;
+  padding: 18px 0 6px;
+}
+#page-task .detail-title-wrap { flex: 1 1 auto; min-width: 0; }
+#page-task .crumb { margin: 0 0 2px; font-size: 12px; color: var(--fg-faint); }
+#page-task .detail-actions { display: flex; align-items: center; gap: 8px; padding-top: 14px; }
+.pair-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.pair-grid .card { margin-bottom: 16px; }
+.detail-path { margin: 0; word-break: break-all; font-size: 13px; }
+#detail-pair-body td .task-icon-inline { display: inline-flex; margin-right: 6px; vertical-align: -3px; }
+#detail-pair-body td .task-icon-inline .state-icon { width: 15px; height: 15px; }
+.flag-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+#detail-alerts { margin-bottom: 16px; }
+
+/* ---- ★ P1-08/09/11/13 模态：任务类型 / 创建表单 / 同步设置 ---- */
+.modal-x {
+  position: absolute; top: 8px; right: 10px;
+  width: 28px; height: 28px; padding: 0; line-height: 1;
+  border: 1px solid transparent; border-radius: 6px;
+  background: transparent; color: var(--fg-dim); font-size: 18px;
+}
+.modal-x:hover { background: var(--bg-sunken); color: var(--fg); }
+.task-modal-card {
+  position: relative; width: min(720px, 92vw); max-height: 88vh; overflow: auto;
+}
+.task-modal-card #task-form-card {
+  border: 0; padding: 0; background: transparent; box-shadow: none;
+}
+.pair-summary { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 6px 0 14px; }
+.pair-sum-item {
+  background: var(--bg-sunken); border: 1px solid var(--border-soft);
+  border-radius: var(--radius); padding: 10px 12px; min-width: 0;
+}
+.pair-sum-k { display: block; font-size: 12px; color: var(--fg-dim); margin-bottom: 2px; }
+.pair-sum-v { font-size: 13px; word-break: break-all; }
+.form-adv {
+  border: 1px solid var(--border-soft); border-radius: var(--radius);
+  padding: 8px 12px; margin: 10px 0 12px;
+}
+.form-adv > summary { cursor: pointer; font-size: 13px; color: var(--fg-dim); }
+.form-adv > summary:hover { color: var(--fg); }
+.type-modal-card { width: min(560px, 92vw); }
+.type-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 14px 0; }
+.type-card {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 6px;
+  padding: 16px; border: 1px solid var(--border); border-radius: var(--radius-lg);
+  background: var(--bg-elev); text-align: left;
+}
+.type-card:hover:not(:disabled) { border-color: var(--accent); }
+.type-ico { font-size: 22px; color: var(--accent); }
+.type-card strong { font-size: 15px; }
+.type-desc { font-size: 12px; color: var(--fg-dim); }
+.type-card-off { opacity: .55; cursor: not-allowed; }
+.type-card-off .type-ico { color: var(--fg-faint); }
+.sync-modal-card { position: relative; width: min(520px, 92vw); max-height: 88vh; overflow: auto; }
+/* 类型卡是 <button>：全局按钮高度/行高会裁掉两行内容，这里还原成卡片 */
+.type-grid .type-card { height: auto; min-height: 104px; line-height: 1.35; white-space: normal; }

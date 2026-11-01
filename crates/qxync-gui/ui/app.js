@@ -82,6 +82,9 @@
   // --------------------------------------------------------------- ★ M16 多连接状态
   var state = {
     page: 'home',      // 一级目的地（PAGES）
+    wantDetail: '',    // ★ P1-10：`task:<id>` 深链等任务列表到齐后再进详情
+    wantSyncModal: false,
+    detail: null,
     diag: 'status',    // 诊断页内的子 tab（DIAG_PANELS）
     files: {
       path: '/home',
@@ -179,7 +182,9 @@
   function el(tag, cls, text) {
     var n = document.createElement(tag);
     if (cls) { n.className = cls; }
-    if (text !== undefined && text !== null) { n.textContent = String(text); }
+    if (text !== undefined && text !== null && !n.hasAttribute('data-keep')) {
+      n.textContent = String(text);
+    }
     return n;
   }
 
@@ -812,6 +817,7 @@
   // 弹出的是独立弹窗（#purge-modal），**不复用** #modal：后者是「一个输入框」的形状，
   // 而且 focus/Enter 的语义是「返回输入值」，与这里的「确认 + 一个复选框」完全不同。
   var purgeResolve = null;
+  var purgeRegistrationLabel = '';
   var purgeLastFocus = null;
   var purgeOptRequired = false;
 
@@ -956,6 +962,13 @@
       ok.textContent = str(o.confirmText) || T('purge.confirm_delete');
       ok.disabled = purgeOptRequired;
     }
+    // ★ P1-16：删除任务时的第二出口 —— 只删登记、保留两侧文件（默认焦点不落在危险按钮上）
+    purgeRegistrationLabel = str(o.registrationLabel);
+    var regBtn = $('purge-registration');
+    if (regBtn) {
+      regBtn.hidden = !purgeRegistrationLabel;
+      regBtn.textContent = purgeRegistrationLabel || '仅删除任务登记（保留两侧文件）';
+    }
 
     purgeLastFocus = document.activeElement;
     box.hidden = false;
@@ -969,18 +982,19 @@
     });
   }
 
-  function closePurgeDialog(confirmed) {
+  function closePurgeDialog(confirmed, registrationOnly) {
     var box = $('purge-modal');
     var opt = $('purge-opt');
     var optOn = !!(opt && opt.checked === true);
+    var regOnly = registrationOnly === true;
     // 必须勾选却没勾：把「确认」当取消处理（按钮本来 disabled，这里再兜一层）
-    var yes = (confirmed === true) && (!purgeOptRequired || optOn);
+    var yes = regOnly || ((confirmed === true) && (!purgeOptRequired || optOn));
     if (box) { box.hidden = true; }
     if (purgeLastFocus && isFn(purgeLastFocus.focus)) { purgeLastFocus.focus(); }
     purgeLastFocus = null;
     var r = purgeResolve;
     purgeResolve = null;
-    if (isFn(r)) { r({ confirmed: yes, purge: yes && optOn }); }
+    if (isFn(r)) { r({ confirmed: yes, purge: regOnly ? false : (yes && optOn), registrationOnly: regOnly }); }
   }
 
   function wirePurgeModal() {
@@ -990,6 +1004,8 @@
     var opt = $('purge-opt');
     if (ok) { ok.addEventListener('click', function () { closePurgeDialog(true); }); }
     if (cancel) { cancel.addEventListener('click', function () { closePurgeDialog(false); }); }
+    var regBtn = $('purge-registration');
+    if (regBtn) { regBtn.addEventListener('click', function () { closePurgeDialog(true, true); }); }
     if (opt) {
       opt.addEventListener('change', function () {
         var b = $('purge-ok');
@@ -1305,48 +1321,43 @@
   }
   // ============================================================ 主页 / 任务卡片（★ M16 按连接聚合）
   /**
-   * 把一个「同步任务」的状态压成一句话 + 一个状态标记（对齐 Qsync 的任务卡片语言）。
-   * ⚠️ 只做**诚实**的归纳：拿不到证据就不说「已同步」。
-   *
-   * ★ M16：`st` / `sy` 必须是**该任务所属连接**的状态，不能拿当前连接的去套。
+   * 任务状态 → 图标语义（★ P1-02：不再用 emoji）。
+   * 只做**诚实**归纳：拿不到证据就不说「已同步」。
    */
   function taskState(st, sy, hasMounts) {
     if (!st || !st.running) {
-      return { mark: '⏸', tone: 'warn', text: T('task.state_no_daemon') };
+      return { kind: 'paused', tone: 'warn', text: T('task.state_no_daemon') };
     }
     var s = isObj(st.status) ? st.status : null;
     if (!s || !s.logged_in) {
-      return { mark: '⚠️', tone: 'warn', text: T('task.state_not_logged_in') };
+      return { kind: 'warn', tone: 'warn', text: T('task.state_not_logged_in') };
     }
     if (!hasMounts) {
-      return { mark: '⏸', tone: 'warn', text: T('task.state_no_task') };
+      return { kind: 'paused', tone: 'warn', text: T('task.state_no_task') };
     }
     if (sy) {
-      // ★ M28：离线时 `last_error` 多半就是那条「网络不可用」—— 托盘红点和首页
-      //   离线横幅已经表达了，卡片不再叠一条「同步出错」。
       var conn = (s && isObj(s.connectivity)) ? s.connectivity : null;
       var offline = !!(conn && conn.known === true && conn.online === false);
       if (sy.last_error && !offline) {
-        return { mark: '⚠️', tone: 'err', text: T('task.state_sync_error', { msg: String(sy.last_error) }) };
+        return { kind: 'error', tone: 'err', text: T('task.state_sync_error', { msg: String(sy.last_error) }) };
       }
-      // 离线但本地还有攒着的改动：如实说「等联网」，比「已同步」诚实。
       if (offline) {
-        return { mark: '⚠️', tone: 'warn', text: T('task.state_offline') };
+        return { kind: 'warn', tone: 'warn', text: T('task.state_offline') };
       }
       if (sy.delete_block_reason) {
-        return { mark: '⚠️', tone: 'warn', text: T('task.state_delete_blocked'), blocked: true };
+        return { kind: 'warn', tone: 'warn', text: T('task.state_delete_blocked'), blocked: true };
       }
       if (!sy.enabled) {
-        return { mark: '⏸', tone: 'warn', text: T('task.state_paused') };
+        return { kind: 'paused', tone: 'warn', text: T('task.state_paused') };
       }
       if (!num(sy.polls, 0)) {
-        return { mark: '⏳', tone: 'warn', text: T('task.state_no_poll') };
+        return { kind: 'clock', tone: 'warn', text: T('task.state_no_poll') };
       }
       if (num(sy.conflicts, 0) > 0) {
-        return { mark: '⚠️', tone: 'warn', text: T('task.state_conflicts', { n: num(sy.conflicts, 0) }) };
+        return { kind: 'warn', tone: 'warn', text: T('task.state_conflicts', { n: num(sy.conflicts, 0) }) };
       }
     }
-    return { mark: '✅', tone: 'ok', text: T('task.state_all_synced') };
+    return { kind: 'ok', tone: 'ok', text: T('task.state_all_synced') };
   }
 
   /** 某个连接上的挂载点（优先用该连接 status 里的 mounts；当前连接再看 state.mounts）。 */
@@ -1461,10 +1472,11 @@
     var stoppedNote = stoppedLinksNote();
     if (stoppedNote) { box.appendChild(el('p', 'note', stoppedNote)); }
 
+    var multiLink = groups.length > 1;
     for (var g = 0; g < groups.length; g++) {
       var group = groups[g];
       if (!group.views.length && !group.error) { continue; }   // 没任务也没挂载的连接不占版面
-      box.appendChild(buildTaskGroupHead(group));
+      if (multiLink) { box.appendChild(buildTaskGroupHead(group)); }
       if (group.error) {
         box.appendChild(el('div', 'task-group-empty', T('task.group_error', {
           label: linkLabel(group.link), msg: group.error
@@ -1477,9 +1489,75 @@
     }
   }
 
+  /** 自绘状态图标（SVG，跟随 currentColor；kind: ok/warn/error/paused/clock）。 */
+  function stateIcon(kind) {
+    var ns = 'http://www.w3.org/2000/svg';
+    var svg = document.createElementNS(ns, 'svg');
+    svg.setAttribute('viewBox', '0 0 24 24');
+    svg.setAttribute('aria-hidden', 'true');
+    svg.setAttribute('class', 'state-icon state-icon-' + kind);
+    var p = function (d) {
+      var n = document.createElementNS(ns, 'path');
+      n.setAttribute('d', d);
+      svg.appendChild(n);
+    };
+    if (kind === 'ok') {
+      p('M5 12.5l4.5 4.5L19 7.5');
+    } else if (kind === 'warn') {
+      p('M12 4 2.5 20h19z'); p('M12 10v4'); p('M12 17.4v.1');
+    } else if (kind === 'error') {
+      p('M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z'); p('M12 7.5v5.5'); p('M12 16.4v.1');
+    } else if (kind === 'paused') {
+      p('M9 5v14'); p('M15 5v14');
+    } else {
+      p('M12 4a8 8 0 1 0 0 16 8 8 0 0 0 0-16z'); p('M12 8v4.2l3 2');
+    }
+    return svg;
+  }
+
+  function pathBase(p) {
+    var x = str(p).replace(/\/+$/, '');
+    var i = x.lastIndexOf('/');
+    return i >= 0 ? x.slice(i + 1) : x;
+  }
+
+  /** 卡片标题：官方用「文件夹名」，这里取 NAS 根的最后一段，退回落 task id。 */
+  function taskDisplayName(v) {
+    var t = v.task, m = v.mount || {};
+    // 官方显示的是「文件夹名」；本地挂载点最后一段最稳定（NAS 根可能是 .Qsync 这种隐藏名）
+    var name = pathBase(t ? str(t.mountpoint) : str(m.mountpoint));
+    if (!name) { name = pathBase(taskRoot(v)); }
+    if (!name || name === '.' || name === '..') { name = t ? str(t.id) : ''; }
+    if (!name) { name = t ? str(t.id) : T('task.not_set'); }
+    return name;
+  }
+
+  /** 「上次同步」绝对时间（★ P1-03：官方给的是 yyyy-MM-dd HH:mm:ss，不是「20 秒前」）。 */
+  function taskLastSyncText(sy) {
+    var age = sy ? num(sy.last_sync_ok_age_secs, 0) : 0;
+    if (!age) { return ''; }
+    var ts = Math.floor(Date.now() / 1000) - age;
+    return humanTimeFromEpoch(ts);
+  }
+
+  /** 某张任务卡的次行摘要：上次同步 + 读写/缓存/方向/节省空间。 */
+  function taskSubLine(v, sy, t) {
+    var bits = [];
+    var last = taskLastSyncText(sy);
+    bits.push(last ? T('task.last_sync_at', { time: last }) : T('task.never_synced'));
+    if (t) {
+      bits.push(t.read_write ? T('task.meta_read_write') : T('task.meta_read_only'));
+      if (t.space_saving) { bits.push(T('task.meta_space_saving')); }
+      if (t.smart_delete) { bits.push(T('task.meta_smart_delete')); }
+      if (t.direction && t.direction !== '2way') { bits.push(T('task.meta_direction', { dir: str(t.direction) })); }
+    }
+    return bits.join(' · ');
+  }
+
   /**
-   * 一张任务卡。`full=true` 时带完整操作（任务页用），否则只给「管理 + 立即同步」（主页用）。
-   * ★ M16：卡片右上带**来源连接**徽标；所有操作按 `v.linkId` 发到对应 daemon。
+   * 一张任务卡（★ P1-01/04：官方形态 —— 左状态图标、标题 16/700、次行时间、Sync 角标、
+   * 右侧只有「暂停/继续 + ›」；管理/删除/挂载全在详情页）。
+   * ★ M16：所有操作按 v.linkId 发到对应 daemon。
    */
   function buildTaskCard(v, full) {
     var t = v.task, m = v.mount || {};
@@ -1489,150 +1567,304 @@
     var s = (st && isObj(st.status)) ? st.status : null;
     var sy = (s && isObj(s.sync)) ? s.sync : null;
     var ts = taskState(st, sy, v.mounted === true || !!(t || m.mountpoint));
+    var kind = ts.kind;
+    if (t) {
+      if (!t.enabled) { kind = 'paused'; }
+      else if (!v.mounted) { kind = 'warn'; }
+    }
+
     var card = el('div', 'task-card');
-    var mark = ts.mark;
-    if (t) {
-      if (!t.enabled) { mark = '⏸'; }
-      else if (!v.mounted) { mark = '⚠️'; }
-    }
-    card.appendChild(el('div', 'task-mark', mark));
+    card.setAttribute('data-state', kind);
 
-    var body = el('div', 'task-body');
+    var main = el('div', 'task-card-main');
+    var ico = el('span', 'task-icon');
+    ico.appendChild(stateIcon(kind));
+    main.appendChild(ico);
+
+    var text = el('div', 'task-card-text');
+    var titleRow = el('div', 'task-title-row');
+    titleRow.appendChild(el('span', 'task-title', taskDisplayName(v)));
+    titleRow.appendChild(el('span', 'badge badge-sync', T('task.badge_sync')));
+    if (linksList().length > 1) {
+      titleRow.appendChild(el('span', 'badge badge-link', linkBadge(link)));
+    }
+    text.appendChild(titleRow);
+
     var stateText = ts.text;
-    // 卡片自己的登记状态会盖掉全局同步状态（暂停 / 未挂载更"紧急"）——
-    // 覆盖生效时下面的「放行删除」也要一起让位，否则会出现「状态说已暂停、
-    // 却挂着个放行删除按钮」的矛盾画面。
-    var blocked = ts.blocked === true;
     if (t) {
-      if (!t.enabled) { stateText = T('task.state_paused_task'); blocked = false; }
-      else if (!v.mounted) { stateText = T('task.state_not_mounted'); blocked = false; }
+      if (!t.enabled) { stateText = T('task.state_paused_task'); }
+      else if (!v.mounted) { stateText = T('task.state_not_mounted'); }
     }
-    body.appendChild(el('div', 'task-state', stateText));
-
-    // ★ M16：来源连接（徽标 + 人话名）。同一 NAS 多账号时 id 是唯一能区分的。
-    var linkRow = el('div', 'task-link-row');
-    linkRow.appendChild(el('span', 'badge badge-link', T('task.link_badge', { label: linkBadge(link) })));
-    if (!linkDaemonRunning(link)) {
-      linkRow.appendChild(document.createTextNode(' '));
-      linkRow.appendChild(el('span', 'badge badge-off', T('task.link_daemon_down')));
+    text.appendChild(el('div', 'task-state-line', stateText));
+    text.appendChild(el('div', 'task-sub', taskSubLine(v, sy, t)));
+    if (ts.blocked === true && full) {
+      var bList = el('button', 'linklike', T('blocked.view_list'));
+      bList.type = 'button';
+      bList.addEventListener('click', function (ev) { ev.stopPropagation(); openBlockedDialog(linkId); });
+      text.appendChild(bList);
     }
-    body.appendChild(linkRow);
+    main.appendChild(text);
+    card.appendChild(main);
 
-    var root = taskRoot(v);
-    var mp = t ? str(t.mountpoint) : str(m.mountpoint);
-    body.appendChild(el('div', 'task-meta', T('task.pair', {
-      local: mp || T('task.not_set'),
-      remote: root || T('task.roots_by_link')
-    })));
-
-    var sub = [];
+    var act = el('div', 'task-card-actions');
     if (t) {
-      sub.push(t.read_write ? T('task.meta_read_write') : T('task.meta_read_only'));
-      sub.push(T('task.meta_cache', { mode: str(t.cache_mode) }));
-      if (t.direction && t.direction !== '2way') { sub.push(T('task.meta_direction', { dir: str(t.direction) })); }
-      if (t.space_saving) { sub.push(T('task.meta_space_saving')); }
-      if (t.smart_delete) { sub.push(T('task.meta_smart_delete')); }
-      if ((t.exclude || []).length) { sub.push(T('task.meta_exclude', { n: t.exclude.length })); }
-      // ★ M8.4：冲突策略一眼可见（ask 的要显眼 —— 会攒待裁决队列）
-      sub.push(T('task.meta_conflict', { policy: conflictLabel(str(t.conflict) || 'rename_local') }));
-    } else {
-      sub.push(m.readonly ? T('task.meta_read_only') : T('task.meta_read_write'));
+      var enabled = t.enabled !== false;
+      var pb = el('button', 'icon-btn task-pause-btn');
+      pb.type = 'button';
+      pb.title = enabled ? T('task.act_pause') : T('task.act_resume');
+      pb.setAttribute('aria-label', pb.title);
+      pb.appendChild(stateIcon(enabled ? 'paused' : 'ok'));
+      pb.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        doTaskAction(enabled ? 'pause' : 'resume', t.id, enabled ? '暂停' : '继续', pb, linkId);
+      });
+      act.appendChild(pb);
     }
-    if (sy && num(sy.last_poll_age_secs, 0) > 0) {
-      sub.push(T('task.meta_last_poll', { dur: humanDuration(sy.last_poll_age_secs) }));
-    }
-    body.appendChild(el('div', 'task-meta', sub.join(' · ')));
+    // ⋮ 快速菜单：删除 / 同步设置等低频操作不挤在卡片上，但也不用先进详情
+    var menuBtn = el('button', 'icon-btn task-more-menu-btn', '⋮');
+    menuBtn.type = 'button';
+    menuBtn.setAttribute('data-act', 'task-more');
+    menuBtn.title = T('detail.more');
+    menuBtn.setAttribute('aria-label', T('detail.more'));
+    menuBtn.setAttribute('aria-haspopup', 'menu');
+    menuBtn.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      openTaskMenu(ev, v, menuBtn);
+    });
+    act.appendChild(menuBtn);
 
-    var badgeRow = el('div', 'task-meta');
-    badgeRow.appendChild(el('span', 'badge badge-sync', T('task.badge_sync')));
-    badgeRow.appendChild(document.createTextNode(' '));
-    if (t && !t.enabled) {
-      badgeRow.appendChild(el('span', 'badge badge-off', T('task.badge_paused')));
-    } else if (t && !v.mounted) {
-      badgeRow.appendChild(el('span', 'badge badge-warn', T('task.badge_unmounted')));
-    } else {
-      badgeRow.appendChild(el('span', 'badge badge-on', T('task.badge_mounted')));
-    }
-    body.appendChild(badgeRow);
-    card.appendChild(body);
+    var more = el('button', 'icon-btn task-more-btn', '›');
+    more.type = 'button';
+    more.title = T('task.act_detail');
+    more.setAttribute('aria-label', T('task.act_detail'));
+    more.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      openTaskDetail(v);
+    });
+    act.appendChild(more);
+    card.appendChild(act);
 
-    var act = el('div', 'task-actions');
+    card.addEventListener('dblclick', function () { openTaskDetail(v); });
+    return card;
+  }
 
-    if (full && t) {
-      if (!t.enabled) {
-        var bResume = el('button', 'mini primary', T('task.act_resume'));
-        bResume.type = 'button';
-        bResume.addEventListener('click', function () { doTaskAction('resume', t.id, '继续', bResume, linkId); });
-        act.appendChild(bResume);
-      } else if (v.mounted) {
-        var bPause = el('button', 'mini', T('task.act_pause'));
-        bPause.type = 'button';
-        bPause.addEventListener('click', function () { doTaskAction('pause', t.id, '暂停', bPause, linkId); });
-        act.appendChild(bPause);
-      } else {
-        var bMount = el('button', 'mini primary', T('task.act_mount'));
-        bMount.type = 'button';
-        bMount.addEventListener('click', function () { doTaskAction('mount', t.id, '挂载', bMount, linkId); });
-        act.appendChild(bMount);
+  // ============================================================ 任务详情（★ P1-10）
+  /** 任务列表到齐后处理 `task:<id>` 深链（找不到就留在当前页，不报错）。 */
+  function tryOpenWantedDetail() {
+    var want = str(state.wantDetail);
+    if (!want) { return; }
+    var groups = taskGroups();
+    for (var i = 0; i < groups.length; i++) {
+      for (var j = 0; j < groups[i].views.length; j++) {
+        var v = groups[i].views[j];
+        if (v.task && (str(v.task.id) === want || taskDisplayName(v) === want)) {
+          state.wantDetail = '';
+          openTaskDetail(v);
+          if (state.wantSyncModal === true) {
+            state.wantSyncModal = false;
+            openSyncModal(v.task, str(v.linkId));
+          }
+          return;
+        }
       }
     }
+  }
 
-    if (full && t) {
-      var bEdit = el('button', 'mini', T('task.act_settings'));
-      bEdit.type = 'button';
-      bEdit.addEventListener('click', function () { editTask(t, linkId); });
-      act.appendChild(bEdit);
+  function openTaskDetail(v) {
+    if (!v || !v.task) { return; }
+    state.detail = {
+      linkId: str(v.linkId),
+      taskId: str(v.task.id),
+      from: (state.page && state.page !== 'task') ? state.page : 'tasks'
+    };
+    showTaskDetail();
+  }
+
+  function taskDetailView() {
+    if (!state.detail) { return null; }
+    var groups = taskGroups();
+    for (var i = 0; i < groups.length; i++) {
+      if (str(groups[i].id) !== str(state.detail.linkId)) { continue; }
+      for (var j = 0; j < groups[i].views.length; j++) {
+        var v = groups[i].views[j];
+        if (v.task && str(v.task.id) === str(state.detail.taskId)) { return v; }
+      }
+    }
+    return null;
+  }
+
+  function showTaskDetail() {
+    // 二级页自带「↩ + 面包屑 + 标题」，不再叠一条顶栏（官方详情页也是内容区自带头）
+    var tb = $('topbar');
+    if (tb) { tb.hidden = true; }
+    var pages = document.querySelectorAll('.page');
+    for (var i = 0; i < pages.length; i++) {
+      if (pages[i].id === 'page-task') { pages[i].classList.add('active'); }
+      else { pages[i].classList.remove('active'); }
+    }
+    var items = document.querySelectorAll('.rail-item');
+    for (var j = 0; j < items.length; j++) {
+      items[j].classList.remove('active');
+      items[j].removeAttribute('aria-current');
+    }
+    state.page = 'task';
+    renderTaskDetail();
+    var main = $('main');
+    if (main) { main.scrollTop = 0; }
+  }
+
+  function renderTaskDetail() {
+    var v = taskDetailView();
+    if (!v) {
+      setText('detail-title', T('detail.not_found'));
+      setText('detail-crumb', '任务');
+      setText('detail-local', '—');
+      setText('detail-remote', '—');
+      clear($('detail-pair-body'));
+      clearAlerts('detail-alerts');
+      return;
+    }
+    var t = v.task, linkId = str(v.linkId);
+    var st = statusOf(linkId);
+    var s = (st && isObj(st.status)) ? st.status : null;
+    var sy = (s && isObj(s.sync)) ? s.sync : null;
+    var ts = taskState(st, sy, v.mounted === true);
+    var local = str(t.mountpoint);
+    var remote = taskRoot(v);
+
+    setText('detail-title', taskDisplayName(v));
+    setText('detail-crumb', T('detail.crumb'));
+    setText('detail-local', local || T('task.not_set'));
+    setText('detail-remote', remote || T('task.roots_by_link'));
+
+    var body = $('detail-pair-body');
+    clear(body);
+    if (body) {
+      var tr = el('tr');
+      tr.appendChild(el('td', 'mono', local || T('task.not_set')));
+      tr.appendChild(el('td', 'mono', remote || T('task.roots_by_link')));
+      var tdState = el('td');
+      var ico = el('span', 'task-icon-inline');
+      ico.appendChild(stateIcon(t.enabled === false ? 'paused' : (v.mounted ? 'ok' : 'warn')));
+      tdState.appendChild(ico);
+      tdState.appendChild(document.createTextNode(
+        t.enabled === false ? T('task.state_paused_task')
+          : (v.mounted ? T('task.badge_mounted') : T('task.badge_unmounted'))));
+      tr.appendChild(tdState);
+      body.appendChild(tr);
     }
 
-    var bOpen = el('button', 'mini', T('task.act_manage'));
-    bOpen.type = 'button';
-    bOpen.addEventListener('click', function () { switchPage('diag', 'mounts'); });
-    act.appendChild(bOpen);
-
-    // ★ M10.7：「打开目录」—— 用系统里**用户自己配的默认目录工具**打开本地挂载点
-    // （走 `open_path` 命令，见 commands.rs：优先 `xdg-mime`/`gio` 查到的默认程序）。
-    // 开的是**本地**那一侧（NAS 侧在网络上，没有可交给本地目录工具的路径）。
-    var bDir = el('button', 'mini', T('task.act_open_dir'));
-    bDir.type = 'button';
-    bDir.setAttribute('title', mp || T('task.not_set'));
-    if (!mp) {
-      // 没有本地挂载点就没法开：禁用并说清原因，别让按钮点了没反应。
-      bDir.disabled = true;
-      bDir.setAttribute('aria-disabled', 'true');
-    } else {
-      bDir.addEventListener('click', function () { openTaskDir(mp, bDir); });
-    }
-    act.appendChild(bDir);
-
-    var bSync = el('button', 'mini primary', T('task.act_sync_now'));
-    bSync.type = 'button';
-    bSync.addEventListener('click', function () { doSync({ once: true }, [], '立即同步', linkId); });
-    act.appendChild(bSync);
-
-    if (full && t) {
-      var bDel = el('button', 'mini danger', T('task.act_delete'));
-      bDel.type = 'button';
-      bDel.setAttribute('data-act', 'task-delete');
-      bDel.addEventListener('click', function () { doTaskDelete(t, linkId, bDel); });
-      act.appendChild(bDel);
+    var dl = $('detail-kv');
+    clear(dl);
+    if (dl) {
+      kvText(dl, T('detail.state'), ts.text, ts.tone === 'err' ? 'val-warn' : null);
+      var last = taskLastSyncText(sy);
+      kvText(dl, T('detail.last_sync'), last || T('task.never_synced'), last ? null : 'val-dim');
+      kvText(dl, T('detail.conflict'), conflictLabel(str(t.conflict) || 'rename_local'));
+      kvText(dl, T('detail.mode'), str(t.cache_mode) || 'pagecache');
+      kvText(dl, T('detail.direction'), str(t.direction) || '2way');
+      kvText(dl, T('detail.permission'), t.read_write ? T('task.meta_read_write') : T('task.meta_read_only'));
+      kvText(dl, T('detail.link'), linkLabel(linkById(linkId)));
     }
 
-    // ★ 只有状态行真的在讲「删除被熔断」时才给这两个按钮：先看清单、再放行。
-    //   「放行删除」是危险按钮（它确实会真删东西），放在别的状态下就是语义错位；
-    //   「查看清单」是只读的，但同样只在熔断时出现 —— 别的时候点开只会看到空态。
-    if (blocked) {
-      var bList = el('button', 'mini', T('blocked.view_list'));
-      bList.type = 'button';
-      bList.addEventListener('click', function () { openBlockedDialog(linkId); });
-      act.appendChild(bList);
-      var bForce = el('button', 'mini danger', T('sync.force_deletes'));
-      bForce.type = 'button';
-      bForce.addEventListener('click', function () { doForceDeletes(bForce, linkId); });
-      act.appendChild(bForce);
+    var flags = $('detail-flags');
+    clear(flags);
+    if (flags) {
+      if (t.enabled === false) { flags.appendChild(el('span', 'badge badge-off', T('task.badge_paused'))); }
+      if (v.mounted) { flags.appendChild(el('span', 'badge badge-on', T('task.badge_mounted'))); }
+      else { flags.appendChild(el('span', 'badge badge-warn', T('task.badge_unmounted'))); }
+      if (t.space_saving) { flags.appendChild(el('span', 'badge', T('task.meta_space_saving'))); }
+      if (t.smart_delete) { flags.appendChild(el('span', 'badge', T('task.meta_smart_delete'))); }
+      if ((t.exclude || []).length) { flags.appendChild(el('span', 'badge', T('task.meta_exclude', { n: t.exclude.length }))); }
     }
 
-    card.appendChild(act);
-    return card;
+    clearAlerts('detail-alerts');
+    if (sy && sy.last_error) {
+      addAlert('detail-alerts', sy.last_error, 'warn');
+    }
+    if (ts.blocked === true) {
+      addAlert('detail-alerts', T('task.state_delete_blocked'), 'warn', [{
+        label: T('blocked.view_list'),
+        onClick: function () { openBlockedDialog(linkId); }
+      }]);
+    }
+  }
+
+  // ============================================================ 任务 ⋮ 菜单（★ P1-12）
+  function openTaskMenu(ev, v, trigger) {
+    var menu = $('task-menu');
+    if (!menu || !v || !v.task) { return; }
+    state.taskMenu = v;
+    state.taskMenuTrigger = trigger || document.activeElement;
+    setText('task-menu-title', taskDisplayName(v));
+    var acts = menu.querySelectorAll('.ctx-item');
+    var enabled = v.task.enabled !== false;
+    for (var i = 0; i < acts.length; i++) {
+      var a = acts[i];
+      if (a.getAttribute('data-act') === 'pause') {
+        a.textContent = enabled ? T('task.act_pause') : T('task.act_resume');
+      }
+    }
+    menu.hidden = false;
+    var w = menu.offsetWidth || 220;
+    var h = menu.offsetHeight || 220;
+    var rect = (trigger && trigger.getBoundingClientRect) ? trigger.getBoundingClientRect() : null;
+    var cx = rect ? rect.left : num(ev && ev.clientX, 0);
+    var cy = rect ? rect.bottom + 4 : num(ev && ev.clientY, 0);
+    menu.style.left = Math.max(4, Math.min(cx, window.innerWidth - w - 8)) + 'px';
+    menu.style.top = Math.max(4, Math.min(cy, window.innerHeight - h - 8)) + 'px';
+    var first = menu.querySelector('.ctx-item');
+    if (first && isFn(first.focus)) { first.focus(); }
+  }
+
+  function closeTaskMenu(restore) {
+    var menu = $('task-menu');
+    if (menu) { menu.hidden = true; }
+    state.taskMenu = null;
+    if (restore === true && state.taskMenuTrigger && isFn(state.taskMenuTrigger.focus)) {
+      state.taskMenuTrigger.focus();
+    }
+    state.taskMenuTrigger = null;
+  }
+
+  function doTaskMenuAction(act) {
+    var v = state.taskMenu;
+    if (!v || !v.task) { return; }
+    var t = v.task;
+    var linkId = str(v.linkId);
+    closeTaskMenu(true);
+    if (act === 'sync') { doSync({ once: true }, [], '立即同步', linkId); }
+    else if (act === 'open') { openTaskDir(str(t.mountpoint)); }
+    else if (act === 'pause') { doTaskAction(t.enabled === false ? 'resume' : 'pause', t.id, t.enabled === false ? '继续' : '暂停', null, linkId); }
+    else if (act === 'settings') { switchPage('tasks'); editTask(t, linkId); }
+    else if (act === 'delete') { doTaskDelete(t, linkId, null); }
+  }
+
+  function wireTaskMenu() {
+    var menu = $('task-menu');
+    if (!menu) { return; }
+    var items = menu.querySelectorAll('.ctx-item');
+    for (var i = 0; i < items.length; i++) {
+      (function (b) {
+        b.addEventListener('click', function () { doTaskMenuAction(str(b.getAttribute('data-act'))); });
+      })(items[i]);
+    }
+    menu.addEventListener('keydown', function (ev) {
+      var all = menu.querySelectorAll('.ctx-item');
+      var cur = -1;
+      for (var k = 0; k < all.length; k++) { if (all[k] === document.activeElement) { cur = k; } }
+      var next = -1;
+      if (ev.key === 'ArrowDown') { next = cur < 0 ? 0 : (cur + 1) % all.length; }
+      else if (ev.key === 'ArrowUp') { next = cur < 0 ? all.length - 1 : (cur - 1 + all.length) % all.length; }
+      else if (ev.key === 'Escape' || ev.key === 'Tab') { ev.preventDefault(); closeTaskMenu(true); return; }
+      if (next < 0) { return; }
+      ev.preventDefault();
+      all[next].focus();
+    });
+    document.addEventListener('click', function (ev) {
+      var m = $('task-menu');
+      if (m && !m.hidden && !m.contains(ev.target)) { closeTaskMenu(false); }
+    });
   }
 
   // ============================================================ 更新中心 / 错误列表（M8.3）
@@ -1992,6 +2224,8 @@
       window.setTimeout(function () { renderConflictKv(); }, 0);
       refreshDecisions();
       renderTasksPage();
+      // ★ P1-10：`QXNYC_GUI_TAB=task:<id>` 直达任务详情（截图验收 / 深链用）
+      tryOpenWantedDetail();
       return { ok: errors === 0, errors: errors };
     });
   }
@@ -2037,10 +2271,11 @@
     var stoppedNote = stoppedLinksNote();
     if (stoppedNote) { box.appendChild(el('p', 'note', stoppedNote)); }
 
+    var multiLink = groups.length > 1;
     for (var g = 0; g < groups.length; g++) {
       var group = groups[g];
       if (!group.views.length && !group.error) { continue; }
-      box.appendChild(buildTaskGroupHead(group));
+      if (multiLink) { box.appendChild(buildTaskGroupHead(group)); }
       if (group.error) {
         box.appendChild(el('div', 'task-group-empty', T('task.group_error', {
           label: linkLabel(group.link), msg: group.error
@@ -2075,8 +2310,14 @@
     if (badBox) { badBox.hidden = badCount === 0; }
     var note = $('tasks-note');
     if (note) {
-      note.hidden = !notes.length;
-      note.textContent = notes.length ? (T('tasks.note_prefix') + notes.join('；')) : '';
+      // ★ P1：官方任务页不摆运维说明；只把「可能影响同步」的 daemon 提示留在页面上，
+      //   纯信息类（任务登记路径 / 删除不动数据）进诊断页日志。
+      var important = [];
+      for (var ni = 0; ni < notes.length; ni++) {
+        if (/⚠|失败|冲突|错误|保护|拒绝|不可用/.test(str(notes[ni]))) { important.push(notes[ni]); }
+      }
+      note.hidden = !important.length;
+      note.textContent = important.length ? (T('tasks.note_prefix') + important.join('；')) : '';
     }
   }
 
@@ -2125,7 +2366,8 @@
         warnings: plan.warnings,
         optLabel: T('purge.opt_task', { size: humanSize(plan.optional_bytes) }),
         optHint: T('purge.opt_hint'),
-        confirmText: T('purge.confirm_delete')
+        confirmText: T('purge.confirm_delete'),
+        registrationLabel: T('purge.opt_registration')
       }).then(function (ans) {
         if (!ans.confirmed) {
           logInfo('已取消删除任务 ' + id);
@@ -2257,6 +2499,7 @@
     var info = isObj(state.appInfo) ? state.appInfo : {};
     if (auto.mountpoint && mpEl) { mpEl.value = TD.mountpoint(str(state.home), linkId, id); }
     if (auto.cache && cEl) { cEl.value = TD.cacheDir(str(info.data_dir), linkId, id); }
+    updatePairSummary();
   }
 
   /** 「重置为默认路径」：把三个字段都交回自动派生（用户手改后想恢复时用）。 */
@@ -2549,12 +2792,37 @@
     show('t-defaults-hint', true);
   }
 
+  /** ★ P1-08：添加任务 = 先选类型（备份任务明确置灰，不假装支持）。 */
+  function openTypeChooser() {
+    var m = $('type-modal');
+    if (!m) { openTaskForm(); return; }
+    m.hidden = false;
+    var first = $('btn-type-sync');
+    if (first) { first.focus(); }
+  }
+
+  function closeTypeChooser() {
+    var m = $('type-modal');
+    if (m) { m.hidden = true; }
+  }
+
+  function openTaskModal() {
+    var m = $('task-modal');
+    if (m) { m.hidden = false; }
+  }
+
+  function closeTaskModal() {
+    var m = $('task-modal');
+    if (m) { m.hidden = true; }
+  }
+
   function openTaskForm() {
     var card = $('task-form-card');
     if (!card) { return; }
     resetTaskForm();
+    setText('task-form-title', '创建同步任务');
     card.hidden = false;
-    card.scrollIntoView({ block: 'nearest' });
+    openTaskModal();
     loadNasCandidates();
     // ★ M18：焦点默认落在 NAS 文件夹（先选它，id/路径都会跟着变），而不是让用户
     //   先看见一个「看起来要手填」的 id 输入框。
@@ -2590,11 +2858,81 @@
     // ★ M18：编辑时字段都是磁盘上的既有值 —— 隐藏「默认值说明 + 重置按钮」
     show('t-defaults-hint', false);
     card.hidden = false;
-    card.scrollIntoView({ block: 'nearest' });
+    openTaskModal();
+    updatePairSummary();
     loadNasCandidates();
   }
 
+  /** ★ P1-09：表单顶部「本地 ⇄ NAS」只读摘要（官方向导的配对步骤）。 */
+  function updatePairSummary() {
+    var local = str($('t-mountpoint') ? $('t-mountpoint').value : '');
+    var remote = nasSelectedPath ? nasSelectedPath() : '';
+    setText('t-pair-local', local || '—');
+    setText('t-pair-remote', remote || '—');
+  }
+
+  // ============================================================ 同步设置（★ P1-11）
+  function openSyncModal(t, linkId) {
+    if (!t) { return; }
+    state.syncEdit = { task: t, linkId: str(linkId) || str(t.link_id) || currentId() };
+    setText('sync-modal-name', taskDisplayName({ task: t }));
+    var c = $('s-conflict');
+    if (c) { c.value = str(t.conflict) || 'rename_local'; }
+    var sp = $('s-space-saving');
+    if (sp) { sp.checked = t.space_saving === true; }
+    var sd = $('s-smart-delete');
+    if (sd) { sd.checked = t.smart_delete === true; }
+    show('sync-result', false);
+    var m = $('sync-modal');
+    if (m) { m.hidden = false; }
+    if (c) { c.focus(); }
+  }
+
+  function closeSyncModal() {
+    var m = $('sync-modal');
+    if (m) { m.hidden = true; }
+    state.syncEdit = null;
+  }
+
+  function saveSyncSettings() {
+    var e = state.syncEdit;
+    if (!e || !e.task) { return Promise.resolve(null); }
+    var t = e.task;
+    var space = isOn('s-space-saving', false);
+    var task = {
+      id: str(t.id),
+      name: str(t.name) || str(t.id),
+      enabled: t.enabled !== false,
+      mountpoint: str(t.mountpoint),
+      cache_dir: t.cache_dir ? str(t.cache_dir) : null,
+      root: str(t.root),
+      read_write: t.read_write === true,
+      cache_mode: str(t.cache_mode) || 'pagecache',
+      auto_unmount: t.auto_unmount !== false,
+      conflict: str($('s-conflict') ? $('s-conflict').value : 'rename_local') || 'rename_local',
+      direction: str(t.direction) || '2way',
+      space_saving: space,
+      // 后端语义：节省空间为真时强制关掉智能删除
+      smart_delete: space ? false : isOn('s-smart-delete', false)
+    };
+    var lid = str(e.linkId);
+    return withBusy({ buttons: ['btn-sync-save'] }, function () {
+      return ipcFor(lid, { method: 'tasks', action: 'save', task: task });
+    }).then(function (r) {
+      if (!r.ok) {
+        renderError('sync-result', '保存同步设置失败（' + linkLabelById(lid) + '）', str(r.error));
+        return r;
+      }
+      logOk('同步设置已更新：' + taskDisplayName({ task: task }) + '（' + linkLabelById(lid) + '）');
+      closeSyncModal();
+      refreshTasks();
+      if (state.page === 'task') { window.setTimeout(renderTaskDetail, 300); }
+      return r;
+    });
+  }
+
   function closeTaskForm() {
+    closeTaskModal();
     var card = $('task-form-card');
     if (card) { card.hidden = true; }
     state.taskFormEditing = false;
@@ -5981,6 +6319,7 @@
   function renderCurrentPage() {
     if (state.page === 'home') { renderHome(); }
     else if (state.page === 'tasks') { renderTasksPage(); }
+    else if (state.page === 'task') { renderTaskDetail(); }
     else if (state.page === 'settings') {
       if (state.sec === 'connect') { renderConnList(); renderConnSelect(); }
       else if (state.sec === 'free') { renderSpace(); }
@@ -6005,6 +6344,9 @@
     } else if (state.page === 'tasks') {
       refreshTasks();
       refreshDecisions();
+    } else if (state.page === 'task') {
+      renderTaskDetail();
+      refreshTasks();
     } else if (state.page === 'journal') {
       refreshJournal();
     } else if (state.page === 'errors') {
@@ -7514,6 +7856,8 @@
 
   /** 切一级目的地；`diagPanel` 只在 page=diag 时有意义，`sec` 只在 page=settings 时有意义。 */
   function switchPage(name, diagPanel, sec) {
+    var tb = $('topbar');
+    if (tb) { tb.hidden = false; }   // 从二级详情页返回时恢复页面头
     var r = resolvePage(name) || { page: 'home', diag: null };
     name = r.page;
     if (r.diag) { diagPanel = r.diag; }
@@ -7817,7 +8161,68 @@
     // ★ 主页「＋ 添加任务」= 任务页的「＋ 添加配对文件夹」：切到任务页并直接摊开文件夹对表单。
     //   （别再去诊断 → 挂载：那条路是「先挂载、再登记任务」的专家流程；
     //   任务页的表单提交走 tasks/save + tasks/resume，登记和挂载一步到位。）
-    on('btn-home-add-task', 'click', function () { switchPage('tasks'); openTaskForm(); });
+    on('btn-home-add-task', 'click', function () { openTypeChooser(); });
+    on('btn-home-add-task-empty', 'click', function () { openTypeChooser(); });
+    // ---- 任务类型向导 / 模态表单（★ P1-08/09/11/13）
+    on('btn-type-sync', 'click', function () {
+      closeTypeChooser();
+      switchPage('tasks');
+      openTaskForm();
+    });
+    on('btn-type-backup', 'click', function () {
+      alert('备份任务需要单独的备份引擎，qxync 暂不支持。可以用「同步任务」做单向（仅上传/仅下载）近似。');
+    });
+    on('btn-type-cancel', 'click', closeTypeChooser);
+    on('btn-task-modal-close', 'click', closeTaskForm);
+    on('btn-task-cancel', 'click', closeTaskForm);
+    on('btn-sync-save', 'click', saveSyncSettings);
+    on('btn-sync-now', 'click', function () {
+      var e = state.syncEdit;
+      closeSyncModal();
+      if (e) { doSync({ once: true }, [], '立即同步', str(e.linkId)); }
+    });
+    on('btn-sync-cancel', 'click', closeSyncModal);
+    on('btn-sync-modal-close', 'click', closeSyncModal);
+    if ($('type-modal')) {
+      $('type-modal').addEventListener('click', function (ev) {
+        if (ev.target === $('type-modal')) { closeTypeChooser(); }
+      });
+    }
+    if ($('task-modal')) {
+      $('task-modal').addEventListener('click', function (ev) {
+        if (ev.target === $('task-modal')) { closeTaskForm(); }
+      });
+    }
+    if ($('sync-modal')) {
+      $('sync-modal').addEventListener('click', function (ev) {
+        if (ev.target === $('sync-modal')) { closeSyncModal(); }
+      });
+    }
+    document.addEventListener('keydown', function (ev) {
+      if (ev.key !== 'Escape') { return; }
+      var tm = $('task-modal'), ym = $('type-modal'), sm = $('sync-modal');
+      if (sm && !sm.hidden) { ev.preventDefault(); closeSyncModal(); }
+      else if (tm && !tm.hidden) { ev.preventDefault(); closeTaskForm(); }
+      else if (ym && !ym.hidden) { ev.preventDefault(); closeTypeChooser(); }
+    });
+
+    // ---- 任务详情页（★ P1-10/P1-12）
+    on('btn-task-back', 'click', function () {
+      var from = (state.detail && state.detail.from) ? state.detail.from : 'tasks';
+      switchPage(from === 'task' ? 'tasks' : from);
+    });
+    on('btn-detail-sync', 'click', function () {
+      var v = taskDetailView();
+      if (v) { doSync({ once: true }, ['btn-detail-sync'], '立即同步', str(v.linkId)); }
+    });
+    on('btn-detail-gear', 'click', function () {
+      var v = taskDetailView();
+      if (v) { openSyncModal(v.task, str(v.linkId)); }
+    });
+    on('btn-detail-more', 'click', function (ev) {
+      var v = taskDetailView();
+      if (v) { openTaskMenu(ev, v, $('btn-detail-more')); }
+    });
     on('btn-home-refresh', 'click', function () { refreshStatus(true); refreshMounts(); });
     on('btn-home-sync-now', 'click', function () {
       doSync({ once: true }, ['btn-home-sync-now'], '立即同步');
@@ -8140,6 +8545,7 @@
     wireLogBox();
     initRailLabels();
     wireRowMenu();
+    wireTaskMenu();
     wireTray();
     bindEvents();
 
@@ -8170,7 +8576,17 @@
         //   旧值（M8.1 之前，必须继续可用）：status|mounts|sync→诊断；connect→设置；files
         // 后端 app_info 原样透传，截图矩阵靠它逐个目的地出图。
         var want = isObj(r.data) ? str(r.data.initial_tab) : '';
-        if (want && resolvePage(want)) { switchPage(want); }
+        if (want && want.indexOf('task:') === 0) {
+          var spec = want.slice(5).split(':');
+          state.wantDetail = spec[0];        // 任务列表回来后由 tryOpenWantedDetail 打开
+          state.wantSyncModal = spec[1] === 'sync';
+        } else if (want === 'type') {
+          switchPage('tasks');
+          openTypeChooser();                 // 截图验收：任务类型向导
+        } else if (want === 'add') {
+          switchPage('tasks');
+          openTaskForm();                    // 截图验收：创建同步任务表单
+        } else if (want && resolvePage(want)) { switchPage(want); }
       }
     });
 

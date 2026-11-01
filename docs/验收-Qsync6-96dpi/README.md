@@ -74,3 +74,25 @@ QXNYC_GUI_TAB=home target/debug/qxync-gui    # 窗口 1200×800
 - `qxync-gui --self-test`：`ok=true`；`ui_spec.ok=true`（含新增 `qs6_fit` 10/10）；i18n `zh_keys=496`、`en_keys=49`、无缺失 key。
 - `xtask/tests/gui-matrix.sh`（自动 96dpi）：**160/160 通过**，含 9 目的地 + 8 设置分区 + 5 个旧深链落点等价 + 键盘 Tab 焦点环。
 - 复核日期：2026-11-01；构建：`target/debug/qxync-gui`（v0.8.3 工作树）。
+
+## P1 任务模型（2026-11-01）
+
+复现命令同 P0（`GDK_DPI_SCALE=96/Xft.dpi`、1200×800）；详情页与模态可用深链：
+
+```bash
+QXNYC_GUI_TAB='task:qsync'       # 直接进任务详情（任务列表到齐后打开）
+QXNYC_GUI_TAB='task:qsync:sync'  # 详情 + 同步设置弹窗
+QXNYC_GUI_TAB='add'              # 创建同步任务表单（模态）
+QXNYC_GUI_TAB='type'             # 任务类型向导
+```
+
+| 图 | 页面 | 说明 |
+|---|---|---|
+| ![06](p1/06-task-list.png) | 主页（Task List） | 一张平铺任务卡：左状态图标、`qsync` 16/700、`Sync` 角标、上次同步绝对时间、右侧暂停/⋮/›；单连接不出分组标题 |
+| ![07](p1/07-tasks.png) | 任务 | 同形态平铺列表；冲突裁决折叠到列表下方（`details`，默认收起） |
+| ![08](p1/08-task-detail.png) | 任务详情（二级页） | `↩ 任务` 面包屑 + 标题；本地/NAS 双卡、配对文件夹表（一对一）、同步设置键值、状态徽标 |
+| ![09](p1/09-sync-settings.png) | 同步设置 | 冲突策略（5 种）/节省空间/智能删除 + 立即同步一轮；节省空间与智能删除互斥有说明 |
+| ![10](p1/10-create-task.png) | 创建同步任务 | 模态表单：本地⇄NAS 只读摘要、NAS 选择、冲突策略可见；ID/路径/缓存/方向收进「高级」折叠 |
+| ![11](p1/11-task-type.png) | 选择任务类型 | 同步任务可选；备份任务置灰并说明「没有备份引擎」，不假装支持 |
+
+验收：`gui-matrix.sh` 160/160；`qxync-gui --self-test` 的 `ui_spec` 全绿（i18n/空态/无障碍/purge 接线）。

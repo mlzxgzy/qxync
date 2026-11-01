@@ -271,10 +271,19 @@ cat >"$WORK/driver.js" <<'DRIVER'
     });
   }
   function modalOpen() { var m = $('purge-modal'); return !!m && m.hidden === false; }
-  function openTaskDialog() {
-    var b = q('#tasks-list [data-act="task-delete"]');
+  // ★ P1：任务卡不再直接摆「删除…」——先开卡片 ⋮ 菜单，再点「删除任务…」
+  async function openTaskDialog() {
+    var b = q('#tasks-list [data-act="task-more"]');
     if (!b) { return false; }
     b.click();
+    var opened = await waitFor(function () {
+      var m = $('task-menu');
+      return !!m && m.hidden === false;
+    }, 2000);
+    if (!opened) { return false; }
+    var del = q('#task-menu .ctx-item[data-act="delete"]');
+    if (!del) { return false; }
+    del.click();
     return true;
   }
 
@@ -287,7 +296,8 @@ cat >"$WORK/driver.js" <<'DRIVER'
         'cards=' + qa('#tasks-list .task-card').length);
 
       // ---- 1) 任务卡「删除…」→ 弹窗；条目非空、复选框默认未勾 ----
-      ok('任务卡有「删除…」按钮', openTaskDialog());
+      ok('任务卡有「更多」入口（⋮ 菜单）', !!q('#tasks-list [data-act="task-more"]'));
+      ok('任务菜单里能打开删除确认', await openTaskDialog());
       var shown = await waitFor(modalOpen, 3000);
       ok('任务卡「删除…」打开 #purge-modal', shown);
       ok('#purge-items 非空', $('purge-items').childElementCount > 0,
@@ -315,7 +325,7 @@ cat >"$WORK/driver.js" <<'DRIVER'
       // ---- 3) Esc 取消（同样什么都不删） ----
       var beforeTp = count('task_purge');
       var beforeDel = ipcTasksDeletes().length;
-      openTaskDialog();
+      await openTaskDialog();
       await waitFor(modalOpen, 2000);
       $('purge-modal').dispatchEvent(new KeyboardEvent('keydown', {
         key: 'Escape', bubbles: true, cancelable: true
@@ -328,7 +338,7 @@ cat >"$WORK/driver.js" <<'DRIVER'
         'tp=' + count('task_purge') + ' del=' + ipcTasksDeletes().length);
 
       // ---- 4) 不勾选 + 确认 → 旧路径（只删登记） ----
-      openTaskDialog();
+      await openTaskDialog();
       await waitFor(modalOpen, 2000);
       $('purge-ok').click();
       await waitFor(function () { return ipcTasksDeletes().length >= 1; }, 4000);
@@ -343,7 +353,7 @@ cat >"$WORK/driver.js" <<'DRIVER'
       ok('旧路径确认后弹窗关闭', !modalOpen());
 
       // ---- 5) 勾选 + 确认 → task_purge ----
-      openTaskDialog();
+      await openTaskDialog();
       await waitFor(modalOpen, 2000);
       $('purge-opt').click();
       ok('勾选后复选框为 true', $('purge-opt').checked === true);
