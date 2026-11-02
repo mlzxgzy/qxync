@@ -22,7 +22,7 @@ import sys
 from pathlib import Path
 
 try:
-    from PIL import Image, ImageDraw
+    from PIL import Image, ImageDraw, ImageFilter
 except ImportError:  # pragma: no cover
     sys.exit("缺少 Pillow：sudo pacman -S python-pillow / apt install python3-pil")
 
@@ -49,7 +49,8 @@ def ocr_hits(path: Path, pattern: re.Pattern[str]) -> list[tuple[int, int, int, 
     return hits
 
 
-def mask_lines(img: Image.Image, hits: list[tuple[int, int, int, int, str]]) -> int:
+def mask_lines(img: Image.Image, hits: list[tuple[int, int, int, int, str]],
+               blur: bool = False, pad: int = 28) -> int:
     """按 y 中线聚行，整行段涂掉；返回涂改的行数。"""
     draw = ImageDraw.Draw(img)
     hits = sorted(hits, key=lambda w: (w[1] + w[3] / 2, w[0]))
@@ -68,8 +69,12 @@ def mask_lines(img: Image.Image, hits: list[tuple[int, int, int, int, str]]) -> 
         xe = [w[0] + w[2] for w in ln["items"]]
         ys = [w[1] for w in ln["items"]]
         ye = [w[1] + w[3] for w in ln["items"]]
-        x1, x2 = max(0, min(xs) - 28), min(img.width, max(xe) + 28)
+        x1, x2 = max(0, min(xs) - pad), min(img.width, max(xe) + pad)
         y1, y2 = max(0, min(ys) - 4), min(img.height, max(ye) + 4)
+        if blur:
+            box = (x1, y1, max(x1 + 1, x2), max(y1 + 1, y2))
+            img.paste(img.crop(box).filter(ImageFilter.GaussianBlur(6)), box)
+            continue
         fill = (255, 255, 255)
         for sx in (x1 - 10, x2 + 10, (x1 + x2) // 2):
             if 0 <= sx < img.width:
@@ -87,6 +92,9 @@ def main() -> int:
     ap.add_argument("--pattern", action="append", required=True,
                     help="敏感子串（可多次）；请勿把真实值提交进仓库")
     ap.add_argument("--dry-run", action="store_true", help="只报告命中，不改图")
+    ap.add_argument("--blur", action="store_true",
+                    help="命中区域用高斯模糊代替纯色块（截图里更自然，不会留深色印子）")
+    ap.add_argument("--pad", type=int, default=28, help="命中框左右外扩像素（默认 28）")
     args = ap.parse_args()
     pat = re.compile("|".join(re.escape(p) for p in args.pattern if p), re.IGNORECASE)
     dirty = 0
@@ -102,7 +110,7 @@ def main() -> int:
             print(f"❌ {path}: {len(hits)} 处命中 —— {', '.join(h[4] for h in hits[:6])}")
             continue
         img = Image.open(path).convert("RGB")
-        n = mask_lines(img, hits)
+        n = mask_lines(img, hits, blur=args.blur, pad=args.pad)
         img.save(path)
         print(f"✅ 已涂改 {path}（{n} 行）")
     if args.dry_run and dirty:

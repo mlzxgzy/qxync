@@ -62,7 +62,7 @@ and `qxync-gui` (desktop GUI).
 
 ## Screenshots
 
-> The screenshots below show a **redacted** UI (real NAS addresses and local paths have been painted over).
+> In the screenshots below the NAS address and account are placeholders (`user@nas.example.com`); local paths are blurred.
 
 | Home | Files |
 |---|---|

@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-11-02
+
+### Fixed
+
+- **Real NAS address leaked through screenshots in the release page and repo**:
+  the v0.9.0 release notes embedded acceptance screenshots directly, and the
+  connection line at the top bar (`user@ddns-host:port`) plus local home paths
+  were plainly visible to anyone opening the Release page or browsing the repo.
+  This was a maintainer mistake, not a config error — the "screenshots are
+  redacted" line existed in the early release checklist but nothing enforced it
+  on later releases. Now:
+  (1) all 40 tracked screenshots are redacted by OCR-locating the sensitive
+  strings (`xtask/release/redact-shots.py`; patterns come from the command line
+  only and never land in the repo; `--dry-run` exits 1 on a hit, so it can gate
+  a release);
+  (2) real host names / user names / home paths in docs and test fixtures are
+  replaced with placeholders (`nas.example.com` / `user` / `/home/user`);
+  (3) embedded images in the release notes get `?v=2` to defeat GitHub's camo
+  cache, and screenshots are now taken with a placeholder config
+  (`user@nas.example.com`, local paths blurred) instead of painting over a real
+  one — the four README screenshots are re-shot against the current UI;
+  (4) **git history is scrubbed too** (`xtask/release/scrub-history.sh` +
+  `scrub-images.py`): 13 commits and 19 tags since v0.7.0 carried the real host
+  name, and text replacement alone is not enough — image pixels must be handled
+  as well, otherwise `git log` on an old commit still shows it. After the
+  rewrite the whole history has zero hits.
+  Verified: `git grep` over all history → 0 hits; OCR gate over every tracked
+  PNG → 0 hits; four README screenshots re-shot and checked by eye;
+  `cargo check --workspace` passes; `check-version.py v0.9.1` agrees.
+
+### Security note
+
+- What leaked: **host name, user name, home directory path**. No passwords,
+  credential files or TOTP secrets (verified: `credentials*.json` has always
+  been in `.gitignore`; no credential file appears anywhere in history).
+- Old commits may still be reachable on GitHub by raw SHA (force-push does not
+  delete server-side objects); a full purge needs GitHub Support. If that DDNS
+  host name is still in use, consider rotating it or removing public exposure.
+
 ## [0.9.0] - 2026-11-01
 
 ### Added

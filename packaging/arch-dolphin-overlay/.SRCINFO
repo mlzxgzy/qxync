@@ -1,6 +1,6 @@
 pkgbase = qxync-dolphin-overlay
 	pkgdesc = qxync 的水合状态角标插件：Dolphin 文件图标上的绿对钩 / 蓝云 / 半满圆（KOverlayIconPlugin）
-	pkgver = 0.9.0
+	pkgver = 0.9.1
 	pkgrel = 1
 	url = https://github.com/mlzxgzy/qxync
 	arch = x86_64
