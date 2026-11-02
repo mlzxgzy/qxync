@@ -4066,27 +4066,43 @@ async fn run_sync_once(state: &Arc<State>, manual: bool) -> Result<sync::SyncRep
         journal_record_sync(state, &r);
         return Ok(r);
     }
-    let views = build_views(state);
-    let mut cfg = state.sync_cfg.lock().unwrap().clone();
-    // ★ 时间预算每轮推导（间隔可运行时调；手动一轮给足预算想全量）。
-    cfg.scan_time_budget = scan_budget_for(state, manual);
-    // ★ 首次同步 / 太久没同步 / 上次没列完 → 全量列举（策略与阈值见 `sync::full_scan_plan`）。
-    //   `QXNYC_FULL_SYNC=0` 可整体关掉（退回纯轮转的旧行为，排障用）。
-    cfg.full_sync = full_sync_enabled();
-    cfg.full_sync_stale_after = full_sync_stale_after();
-    cfg.full_scan_budget = full_scan_budget();
     let user = state.link.user.clone();
     let link_id = state.link.id.clone();
-    let report = sync::poll_once(
-        &client,
-        &views,
-        &state.sync_store,
-        &cfg,
-        &state.sync_stats,
-        &link_id,
-        &user,
-    )
-    .await;
+    let mut report = poll_round(state, &client, manual, &link_id, &user).await;
+    // ★ 2026-11-02：会话失效**自愈** —— 重新取凭证（sid）+ **立即重跑本轮**。
+    //
+    // 以前这里把 `qbox_get_max_log 失败: status=3` 原样记进 `errors` 返回：用户看到
+    // 「⚠️ 同步错误（…）：… status=3 (会话失效 / sid 过期…)」红字 + 一条桌面通知，
+    // 而真正该做的（重新登录）daemon 自己就能做。真机反馈：「同步错误了还给我弹啥呀，
+    // 直接重试或者重新获取凭证啊」。
+    //
+    // 现在 `poll_once` 不再把会话失效写进 errors（见 `SyncReport::auth_failure`），
+    // 由这里重登 + 重跑；成功则用户无感，失败才升级成一条**可操作**的错误。
+    //
+    // ⚠️ 每轮最多重登一次：重登成功但重跑仍失效说明不是「sid 过期」这么简单，
+    //   在热路径里继续循环重登只会撞 NAS 的失败登录封锁（见
+    //   `sync::max_log_failure_is_session_loss` 的说明）。
+    if report.auth_failed {
+        match login_internal(state, None, None, None).await {
+            Ok(_) => {
+                tracing::info!("同步遇会话失效 → 已自动重新登录，立即重跑本轮");
+                let client = engine_client(state).await?;
+                report = poll_round(state, &client, manual, &link_id, &user).await;
+                if report.auth_failed {
+                    escalate_auth_failure(state, &report);
+                }
+            }
+            Err(e) => {
+                // 网络类失败要走离线判定（否则轮询器要等一个完整间隔才知道网回来了）。
+                note_login_failure_connectivity(state, &e);
+                escalate_relogin_failure(state, &e);
+            }
+        }
+    }
+    // 自愈成功（或本轮本来就没失效）→ 复位升级门闩：下次真失败要能立刻再报（不吞复发）。
+    if !report.auth_failed {
+        auth_escalation_reset();
+    }
     // ★ M20：用本轮结论刷新连通性。网络错误 → 离线（队列会停）；正常跑完 →
     // 在线，并唤醒可能还在闸门上等的上传/删除 worker。
     //
@@ -4117,6 +4133,100 @@ async fn run_sync_once(state: &Arc<State>, manual: bool) -> Result<sync::SyncRep
         }
     }
     Ok(report)
+}
+
+/// 跑一轮 `sync::poll_once`（`run_sync_once` 用；配置与视图每轮重新推导）。
+///
+/// 抽出来是因为会话失效自愈要「重登后**立即重跑一轮**」：重跑时预算/视图可能已经
+/// 变了（手动一轮 vs 后台轮询的预算不同，挂载点也可能刚变），不能复用上一轮的对象。
+async fn poll_round(
+    state: &Arc<State>,
+    client: &Client,
+    manual: bool,
+    link_id: &str,
+    user: &str,
+) -> sync::SyncReport {
+    let views = build_views(state);
+    let mut cfg = state.sync_cfg.lock().unwrap().clone();
+    // ★ 时间预算每轮推导（间隔可运行时调；手动一轮给足预算想全量）。
+    cfg.scan_time_budget = scan_budget_for(state, manual);
+    // ★ 首次同步 / 太久没同步 / 上次没列完 → 全量列举（策略与阈值见 `sync::full_scan_plan`）。
+    //   `QXNYC_FULL_SYNC=0` 可整体关掉（退回纯轮转的旧行为，排障用）。
+    cfg.full_sync = full_sync_enabled();
+    cfg.full_sync_stale_after = full_sync_stale_after();
+    cfg.full_scan_budget = full_scan_budget();
+    sync::poll_once(
+        client,
+        &views,
+        &state.sync_store,
+        &cfg,
+        &state.sync_stats,
+        link_id,
+        user,
+    )
+    .await
+}
+
+/// 「会话失效升级」的签名门闩（进程内单例）。
+///
+/// 会话失效**持续**期间，每一轮都会走到升级路径；`last_error` 每轮重写成同一句没关系
+/// （界面只显示当前值），但 journal 的 `error` 条目会触发桌面通知 —— 同一条只该报一次。
+/// 自愈成功 / 干净一轮时 [`auth_escalation_reset`] 复位，复发立刻再报。
+static AUTH_ESCALATION_LATCH: StdMutex<Option<String>> = StdMutex::new(None);
+
+/// ★ 会话失效升级成**可见错误**的文案（纯函数，便于单测）。
+///
+/// 会话失效本身是自愈事件，不该打扰用户；但「重登失败 / 重跑后仍失效」意味着
+/// 用户**有**可做的事（口令、两步验证、在设置里重新登录），这时必须说清楚 ——
+/// 只报状态码（`status=3 (会话失效 / sid 过期…)`）等于没说。
+fn auth_escalation_text(detail: &str) -> String {
+    format!(
+        "会话失效且未能自动恢复：{detail}。请确认 NAS 上的口令/两步验证没变，或在「设置 → 连接」里重新登录"
+    )
+}
+
+/// 把「自动恢复失败」升级成一条可见错误（`last_error` + 一条 journal `error`）。
+///
+/// 两处落点的分工：`last_error` 是首页/诊断/托盘的「⚠️ 最近错误」；journal 的 `error`
+/// 条目是「错误列表」与桌面通知的数据源。同一条升级只报一次（签名门闩），持续期间
+/// 只刷新 `last_error`。
+fn escalate_auth_message(state: &Arc<State>, detail: String) {
+    let msg = auth_escalation_text(&detail);
+    *state.sync_stats.last_error.lock().unwrap() = Some(msg.clone());
+    let mut last = AUTH_ESCALATION_LATCH
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if last.as_deref() == Some(msg.as_str()) {
+        tracing::debug!("{msg}（同一条升级已报过，降为 debug；last_error 保持）");
+        return;
+    }
+    tracing::warn!("{msg}");
+    journal_log(state, JournalEntry::error("sync", "", msg.clone()));
+    *last = Some(msg);
+}
+
+/// 自愈成功 / 干净一轮 → 复位升级门闩（下次真失败立刻再报，不吞复发）。
+fn auth_escalation_reset() {
+    let mut last = AUTH_ESCALATION_LATCH
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *last = None;
+}
+
+/// 重登成功但重跑后**仍然**会话失效 → 升级（这不是「sid 过期」这么简单）。
+fn escalate_auth_failure(state: &Arc<State>, report: &sync::SyncReport) {
+    escalate_auth_message(
+        state,
+        format!(
+            "自动重新登录后仍然无法同步：{}",
+            report.auth_error.as_deref().unwrap_or("会话失效")
+        ),
+    );
+}
+
+/// 重登本身失败（口令 / 两步验证 / 网络）→ 升级，并把网络类失败交给离线判定。
+fn escalate_relogin_failure(state: &Arc<State>, e: &IpcError) {
+    escalate_auth_message(state, format!("自动重新登录失败：{}", e.message));
 }
 
 /// `qxync sync`：查看/触发/调参同步引擎。
@@ -4401,27 +4511,19 @@ fn spawn_poller(state: Arc<State>, mut gen: EngineGen) -> tokio::task::JoinHandl
                     // ★ 全量同步没列完（预算用完、有进展）→ 下一圈 2 秒后继续。
                     //   有目录列举失败时不会置位（见 `SyncReport::full_scan_retry_now`）。
                     full_scan_next = r.full_scan_retry_now;
-                    // ★ 会话失效自愈：`poll_once` 把错误塞进 report.errors 后仍返回 Ok，
-                    //   所以下面 Err 分支的 `is_auth` 重登永远等不到。真机实测：
-                    //   sid 过期后每 30s 一条 `qbox_get_max_log 失败: status=3`，
-                    //   直到 120s 会话保活重登才恢复 —— 这里看到标志就立刻重登一次。
+                    // ★ 会话失效自愈已经在 `run_sync_once` 里做过（重登 + 立即重跑一轮）；
+                    //   走到这里仍为真 = 重登失败 / 重跑后仍失效，且已升级成可见错误
+                    //   （`last_error` + 一条 journal error）。这里只按状态迁移打日志。
                     if r.auth_failed {
                         // ★ M41：会话失效按**状态迁移**告警（「正常 → 失效」才一条 WARN，
                         //   持续失效的后续轮次降 debug）。以前每轮都把 `{:?}` 的 errors
                         //   数组整串抄一遍（真机 10-27 单行 1.8 KB × 33 行）。
                         match auth_latch.observe(&r) {
                             Some(msg) => tracing::warn!("{msg}"),
-                            // 未放行：逐条全文仍进 debug（RUST_LOG=debug 一条不少）。
                             None => tracing::debug!(
-                                "轮询仍会话失效（持续中，已在上次迁移时告警）: {:?}",
-                                r.errors
+                                "轮询仍会话失效（持续中，已在上次迁移时告警）: {}",
+                                r.auth_error.as_deref().unwrap_or("会话失效")
                             ),
-                        }
-                        if let Err(e2) = login_internal(&state, None, None, None).await {
-                            tracing::warn!("轮询重登失败: {}", e2.message);
-                        } else {
-                            // ★ M41：重登成功 → 清门闩：下次真失效必须立刻再报（不吞复发）。
-                            auth_latch.reset();
                         }
                     }
                     // ★ 熔断告警只在**签名变化**的那一轮打 WARN（重复轮次在
@@ -4444,14 +4546,19 @@ fn spawn_poller(state: Arc<State>, mut gen: EngineGen) -> tokio::task::JoinHandl
                 Err(e) => {
                     tracing::warn!("轮询失败: {}", e.message);
                     full_scan_next = false;
-                    *state.sync_stats.last_error.lock().unwrap() = Some(e.message.clone());
-                    // ★ M10：会话失效 → 重登（`login_internal` 会把新 sid 推给挂载点）。
-                    //   以前这里只是记一条错误，sid 死了就每一轮都失败。
                     if e.kind == ErrorKind::Auth {
-                        tracing::warn!("轮询遇会话失效，重登后下一轮继续");
+                        // ★ M10 / 2026-11-02：会话失效 → 自愈优先：立刻重登一次。
+                        //   **只有重登也失败**才升级成可操作错误（不再把底层 message
+                        //   原样挂成「最近错误」—— 那正是用户抱怨的「报什么」）。
+                        tracing::info!("轮询遇会话失效 → 自动重新登录");
                         if let Err(e2) = login_internal(&state, None, None, None).await {
-                            tracing::warn!("轮询重登失败: {}", e2.message);
+                            escalate_relogin_failure(&state, &e2);
+                        } else {
+                            // 重登成功 → 清门闩：下次真失效必须立刻再报（不吞复发）。
+                            auth_escalation_reset();
                         }
+                    } else {
+                        *state.sync_stats.last_error.lock().unwrap() = Some(e.message.clone());
                     }
                 }
             }
@@ -7081,6 +7188,30 @@ mod tests {
         assert_eq!(offline_probe_secs(300), 10);
         assert_eq!(offline_probe_secs(301), 30, "离线超过 5 分钟退到 30 秒");
         assert_eq!(offline_probe_secs(86_400), 30, "有上限，不会无限放大");
+    }
+
+    /// ★ 会话失效只该在「自动恢复失败」时打扰用户，而且文案必须**可操作**。
+    ///
+    /// 真机反馈（2026-11-02）：「同步错误了还给我弹啥呀，直接重试或者重新获取凭证啊，
+    /// 报什么」。所以：自愈成功时一个字都不报；升级时告诉用户**下一步做什么**
+    /// （去哪重新登录），而不是把内部状态码（`status=3 (会话失效 / sid 过期…)`）
+    /// 当结论复读一遍。
+    #[test]
+    fn auth_escalation_message_tells_user_what_to_do() {
+        let msg = auth_escalation_text("自动重新登录失败：口令错误");
+        assert!(msg.contains("自动重新登录失败"), "{msg}");
+        assert!(
+            msg.contains("设置 → 连接"),
+            "升级文案必须给出下一步动作: {msg}"
+        );
+        assert!(
+            msg.contains("口令") && msg.contains("两步验证"),
+            "要把用户能检查的东西说全: {msg}"
+        );
+        assert!(
+            !msg.contains("status=3") && !msg.contains("sid"),
+            "内部状态码不是给用户看的结论: {msg}"
+        );
     }
 
     /// ★ M3：连通性由**探活结论**决定，而不是「本轮是否遇到过网络错误」。

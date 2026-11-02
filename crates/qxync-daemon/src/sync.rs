@@ -393,7 +393,17 @@ pub struct SyncReport {
     /// `Err(e) if e.is_auth()` 分支永远不触发 —— 真机实测过：sid 过期后每 30s
     /// 报一次 `qbox_get_max_log 失败: status=3`，直到 120s 会话保活重登才恢复。
     /// 有了这个标志，轮询循环看到 `Ok(report)` 也能**立即重登一次**。
+    ///
+    /// ★ 2026-11-02：会话失效**不再进 `errors`**（见 [`SyncReport::auth_failure`]）——
+    /// 它是纯自愈事件：`run_sync_once` 看到这个标志就重登并**立即重跑本轮**；只有
+    /// 「重登失败 / 重跑后仍失效」才升级成可见错误（用户那时才有可做的事）。
     pub auth_failed: bool,
+    /// ★ 本轮会话失效的原因（`auth_failed` 时 `Some`）。
+    ///
+    /// 只供日志与「重登失败 / 重跑仍失效」时拼**可操作**的升级文案；**不进 `errors`**。
+    /// `qbox_get_max_log: status=3 (会话失效 / sid 过期…)` 这种诊断串留在这一行，
+    /// 不让它出现在「⚠️ 同步错误」和桌面通知里 —— 那时用户能做的只有等它自愈。
+    pub auth_error: Option<String>,
     /// ★ M15/T9：按 `file_id` 认出并迁移成功的远端改名次数。
     pub renamed: u64,
     /// ★ M20：本轮因为「离线缓冲区还没回放完」跳过了对账 —— 轮询器应尽快重试
@@ -502,6 +512,25 @@ impl SyncReport {
             self.transport_offline = true;
         }
     }
+    /// ★ 会话失效（sid 过期）是**自愈事件**，不是同步错误 —— 只置标志，不写 `errors`。
+    ///
+    /// 以前它和业务错误一样走 [`SyncReport::error`]，于是同一件事同时出现在三处：
+    /// GUI 的「⚠️ 同步错误」红字、`last_error`（首页/诊断/托盘）和 journal 的 `error`
+    /// 条目（**桌面通知**的数据源）。而用户对 sid 过期能做的只有等 —— 真机反馈
+    /// （2026-11-02）原话：「同步错误了还给我弹啥呀，直接重试或者重新获取凭证啊」。
+    ///
+    /// 现在的语义：
+    /// * 这里只 `debug!` 记原因，`run_sync_once` 看到 [`Self::auth_failed`] 立刻
+    ///   `login_internal`（重新取 sid）并**重跑本轮** —— 成功的话用户无感；
+    /// * 重登失败 / 重跑后仍失效 → 由 `run_sync_once` 升级成**一条**可操作的错误
+    ///   （「请到设置里重新登录」），那才是用户真能处理的信息。
+    pub fn auth_failure(&mut self, e: &CoreError, context: impl Into<String>) {
+        let msg = format!("{}: {e}", context.into());
+        self.auth_failed = true;
+        tracing::debug!("同步引擎: 会话失效（自愈：立即重登后重跑本轮，不报错）: {msg}");
+        self.auth_error = Some(msg);
+    }
+
     /// `error` / `network_error` 的共同落点：`errors` 与 `error_is_network` 同步增长。
     fn push_error(&mut self, s: impl Into<String>, is_network: bool) {
         let s = s.into();
@@ -1039,8 +1068,16 @@ pub async fn poll_once(
             }
             // ★ 会话失效：以前只记一条 error 就 Ok 返回，轮询循环收不到 Err，
             //   于是永远不重登 —— 真机实测每 30s 报一次，直到 120s 保活才恢复。
+            //
+            // ★ 2026-11-02：现在**不记 error**（见 [`SyncReport::auth_failure`]）——
+            //   这条错误会变成 GUI 红字 + journal error + 桌面通知，而 sid 过期
+            //   只需要重新登录一次。`run_sync_once` 看到 `auth_failed` 会立即重登并
+            //   重跑本轮；重登失败/重跑仍失效才升级成可操作的错误。
             if max_log_failure_is_session_loss(&e) {
-                report.auth_failed = true;
+                report.auth_failure(&e, "qbox_get_max_log 失败");
+                // 第一跳就失败：本轮没有任何对账，completed=false（不清陈旧告警）。
+                absorb_round(stats, &mut report, false);
+                return report;
             }
             record_net_error_or_abort(client, &mut net, &mut report, &e, "qbox_get_max_log 失败")
                 .await;
@@ -1166,8 +1203,12 @@ pub async fn poll_once(
                 break;
             }
             Err(e) => {
+                // ★ 会话失效 → 自愈（重登 + 重跑本轮），不记成同步错误。
+                //   游标没有越过任何未应用的批次，重跑会从同一 lower 再取一次。
                 if e.is_auth() {
-                    report.auth_failed = true;
+                    report.auth_failure(&e, format!("qbox_get_sync_log lower={lower} 失败"));
+                    finish_aborted_round(store, &cursors, &baseline, stats, &mut report);
+                    return report;
                 }
                 if record_net_error_or_abort(
                     client,
@@ -1202,8 +1243,11 @@ pub async fn poll_once(
             }
             Err(e) if is_log_missing(&e) => cursors.config = max.max_log as i64,
             Err(e) => {
+                // ★ 会话失效 → 自愈（重登 + 重跑本轮），不记成同步错误。
                 if e.is_auth() {
-                    report.auth_failed = true;
+                    report.auth_failure(&e, "qbox_get_device_config_list 失败");
+                    finish_aborted_round(store, &cursors, &baseline, stats, &mut report);
+                    return report;
                 }
                 if record_net_error_or_abort(
                     client,
@@ -1235,8 +1279,11 @@ pub async fn poll_once(
             }
             Err(e) if is_log_missing(&e) => cursors.global_notify = max.global_notify as i64,
             Err(e) => {
+                // ★ 会话失效 → 自愈（重登 + 重跑本轮），不记成同步错误。
                 if e.is_auth() {
-                    report.auth_failed = true;
+                    report.auth_failure(&e, "qbox_query_notify 失败");
+                    finish_aborted_round(store, &cursors, &baseline, stats, &mut report);
+                    return report;
                 }
                 if record_net_error_or_abort(
                     client,
@@ -1271,11 +1318,22 @@ pub async fn poll_once(
         if report.aborted_offline {
             break;
         }
+        // ★ 2026-11-02：会话已失效 → 其余视图列下去只会重复鉴权失败（重登由
+        //   `run_sync_once` 做），收尾本轮等重跑。
+        if report.auth_failed {
+            break;
+        }
     }
 
     // ★ 网络不可用 → 本轮到此为止：巡检要 stat（只会「查不到」+ 白等超时），
     //   计数器也不再把未完成的轮次当成完整轮次（吸收时 completed=false）。
     if report.aborted_offline {
+        finish_aborted_round(store, &cursors, &baseline, stats, &mut report);
+        return report;
+    }
+    // ★ 会话失效 → 同理收尾本轮：巡检/后续对账都要 stat，只会再失败一次。
+    //   `completed=false`：这轮没做完整对账，不许清任何陈旧告警。
+    if report.auth_failed {
         finish_aborted_round(store, &cursors, &baseline, stats, &mut report);
         return report;
     }
@@ -1638,6 +1696,10 @@ impl AnomalyLatch {
 /// 只需要一条 WARN。只有「正常 → 失效」这一次迁移放行；持续失效的后续轮次降
 /// `debug!`；重登成功 / 恢复在线后调用 [`AuthLatch::reset`]，下次真失效立刻再报
 /// （**不吞复发**：凭据真坏了的时候必须每轮都看得见）。
+///
+/// ★ 2026-11-02：这个门闩现在只管**日志**。会话失效本身已经不进 `errors`
+/// （见 [`SyncReport::auth_failure`]），自愈由 `run_sync_once` 做（重登 + 重跑）；
+/// 所以这里读 `auth_error` 而不是 `errors`（后者在失效轮次里是空的）。
 #[derive(Debug, Default)]
 pub struct AuthLatch {
     latched: bool,
@@ -1656,8 +1718,8 @@ impl AuthLatch {
         }
         self.latched = true;
         Some(format!(
-            "轮询遇会话失效（本轮已记录），立即重登后下一轮继续: {}",
-            qxync_core::noise::summarize_errors(&r.errors, 120)
+            "轮询遇会话失效（`run_sync_once` 已重登并重跑本轮；仍失效则已升级为可见错误）: {}",
+            r.auth_error.as_deref().unwrap_or("会话失效")
         ))
     }
 
@@ -1730,9 +1792,10 @@ pub(crate) fn replay_interrupt_reset() {
 ///
 /// ⚠️ 关于「多登一次」到底多贵：`login_internal` 自己**不做去重**；唯一的 3s
 /// 去重在 `spawn_session_broker` 里（`SESSION_REFRESH_DEDUP`），而那把去重**只服务
-/// FUSE 挂载点的重登请求**。轮询循环看到 `auth_failed` 后是直接调 `login_internal`
-/// （见 `spawn_poller`）—— 频率上限是「每轮一次」，轮询默认 30s 一轮，量级可接受；
-/// 但如果凭据本身失效，就会每轮一次失败登录（长期可能撞上 NAS 的暴力破解封锁）。
+/// FUSE 挂载点的重登请求**。`run_sync_once` 看到 `auth_failed` 后直接调 `login_internal`
+/// 并重跑一轮 —— 频率上限是「每轮最多一次」，轮询默认 30s 一轮，量级可接受；
+/// 但如果凭据本身失效，重登就会失败，`run_sync_once` 会**升级成可见错误**
+/// （提示去设置里重新登录）而不是无限静默重试；后续轮次由轮询循环的懒登录兜底。
 fn max_log_failure_is_session_loss(e: &CoreError) -> bool {
     e.is_auth()
 }
@@ -1843,10 +1906,11 @@ async fn apply_event(
                     //   的失败登录封锁。会话真失效时 `max_log` / 对账那条路会报出来。
                     tracing::debug!("事件 stat {path} 返回不存在/不可见（{e}）→ 跳过，等对账兜底");
                     report.skip("远端不可见(4/5/6)");
+                } else if e.is_auth() {
+                    // ★ 会话失效（HTTP 鉴权失败）→ 自愈：重登 + 重跑本轮。
+                    //   不记成同步错误（见 [`SyncReport::auth_failure`]）。
+                    report.auth_failure(&e, "事件 stat 失败");
                 } else {
-                    if e.is_auth() {
-                        report.auth_failed = true;
-                    }
                     // ★ 一批事件可以上千条：网络中途断了还逐条 stat，就是上千次
                     //   connect timeout + 一屏错误。确认整台不可达 → 置中止标志，
                     //   调用方看到后立刻收手（已在处理的事件由游标保证可重放）。
@@ -2820,15 +2884,23 @@ async fn reconcile_view(
                 //   远端根例外：**挂载根不可能凭空消失**，4/5/6 一律按权限/会话/卸载处理。
                 if dir == root {
                     list_failures += 1;
-                    if e.is_auth() {
-                        report.auth_failed = true;
-                    }
                     // ★ M30：文案里不留路径（`dir` 只进 debug 日志）。
                     tracing::debug!("对账：远端根 {dir} 列举返回不存在: {e}");
-                    report.error(
-                        "对账：远端根列举返回「不存在」→ 本轮不判定（按权限/会话/卸载处理）"
-                            .to_string(),
-                    );
+                    // ★ 2026-11-02：4/5 是「会话失效 / 权限拒绝」的码 —— 按会话失效自愈
+                    //   （重登 + 重跑一轮），**不记成同步错误**；重跑后仍列不出来，
+                    //   `run_sync_once` 会升级成一条可操作的错误。
+                    if e.is_auth() {
+                        report.auth_failure(&e, "对账：远端根列举返回「不存在」");
+                        // 数据安全要**说明**（本轮不判定 ≠ 删了），但说明行 ≠ 红字/通知。
+                        report.note(
+                            "对账：远端根列举返回「不存在」→ 本轮不判定（按权限/会话/卸载处理）",
+                        );
+                    } else {
+                        report.error(
+                            "对账：远端根列举返回「不存在」→ 本轮不判定（按权限/会话/卸载处理）"
+                                .to_string(),
+                        );
+                    }
                 } else {
                     match stat_path(client, &dir).await {
                         Ok(sig) if !sig.exists => {
@@ -2933,18 +3005,22 @@ async fn reconcile_view(
                 // ★ 这不是「远端不存在」，而是**我们没看到**。记错误；该目录下的候选
                 //   本轮不判定（由下面按目录的 `observed_dirs` 决定）。
                 list_failures += 1;
-                if e.is_auth() {
-                    report.auth_failed = true;
-                }
-                // ★ 先分清「整台连不上」和「这一条被丢了」（见 [`NetGuard`]）：
-                //   * 探活也失败 → 剩下 N 个目录挨个试只是把同一条错误刷 N 遍
-                //     （每次还要等 connect timeout），立刻中止本轮；
-                //   * 探活通过 → 闪断，继续列（错误受整轮配额限制，别刷屏）。
                 // ★ M30：路径只进 debug 日志；用户可见文案只说「哪一路同步、第几个目录」。
                 tracing::debug!("对账列举 {dir} 失败（第 {attempted}/{total_dirs} 个目录）: {e}");
                 let ctx = format!(
                     "同步「{label}」对账列举失败（第 {attempted}/{total_dirs} 个目录，已列 {scanned} 个）"
                 );
+                // ★ 2026-11-02：会话失效 → 自愈（重登 + 重跑本轮），**不记成同步错误**。
+                //   4/5/6 走上面的 `is_not_found` 分支（那条要 stat 正向确认、可能只是
+                //   权限）；能落到这里的 auth 类只有 HTTP 鉴权失败，基本等于会话没了。
+                if e.is_auth() {
+                    report.auth_failure(&e, &ctx);
+                    break;
+                }
+                // ★ 先分清「整台连不上」和「这一条被丢了」（见 [`NetGuard`]）：
+                //   * 探活也失败 → 剩下 N 个目录挨个试只是把同一条错误刷 N 遍
+                //     （每次还要等 connect timeout），立刻中止本轮；
+                //   * 探活通过 → 闪断，继续列（错误受整轮配额限制，别刷屏）。
                 if record_list_failure_or_abort(client, net, report, &e, &ctx).await {
                     offline_abort = true;
                     break;
@@ -3006,6 +3082,10 @@ async fn reconcile_view(
     //   都触发一次「立即重登」（真机 10-28：163 次，一天 163 次登录）。
     if notfound_auth_votes > 0 && scanned == 0 {
         report.auth_failed = true;
+        // 会话失效的自愈由 `run_sync_once` 做；这里只补一个给人看的原因（进日志/升级文案）。
+        report.auth_error.get_or_insert_with(|| {
+            format!("对账：{notfound_auth_votes} 个目录都列不出来（4/5/6），本轮一个目录都没列成")
+        });
     }
 
     if full {
@@ -4145,7 +4225,12 @@ async fn sweep_decision_queue(
                     Ok(s) => Some(s),
                     Err(e) => {
                         // 查不到 → 这行的事实不完整，**跳过它**（不删）。
-                        if e.is_auth() {
+                        //
+                        // ★ 2026-11-02：只认**非 4/5/6** 的鉴权失败（HTTP 鉴权 = 会话没了）。
+                        //   4/5 同时是「路径不存在 / 权限拒绝」的常规出口，一行 ACL 隐藏
+                        //   的路径不该让整轮重登 + 重跑（M44 在「无法核对目录」上踩过同一
+                        //   个坑：真机一天 163 次无意义重登）。会话真失效时 max_log 会报。
+                        if e.is_auth() && !is_not_found(&e) {
                             report.auth_failed = true;
                         }
                         tracing::debug!("巡检 stat {} 失败，跳过该行: {e}", r.path);
@@ -6108,6 +6193,9 @@ mod tests {
         /// 接口按真机形状应答）；`None`（默认）时这些 func 仍走原来的「未知 func →
         /// status 6」兜底，对账/事件单测行为一字不变。
         max_log: Option<u64>,
+        /// ★ 2026-11-02：`qbox_get_max_log` 强制回一个服务端 `status`（真机 sid 过期
+        /// 是 `status=3`，见 `docs/M10-会话热更新.md` §3）。`None` = 正常应答。
+        max_log_status: Option<i64>,
         /// ★ `poll_once` 模式：`qbox_get_sync_log` 返回的事件（按 `log_id` 升序）。
         events: Vec<qxync_core::sync::SyncEvent>,
     }
@@ -6156,6 +6244,7 @@ mod tests {
             drop_n_for_path,
             refuse_after,
             max_log,
+            max_log_status,
             events,
         } = spec;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -6171,6 +6260,7 @@ mod tests {
         let stat_status = Arc::new(stat_status);
         let mkdir_ok = Arc::new(mkdir_ok);
         let max_log = Arc::new(max_log);
+        let max_log_status = Arc::new(max_log_status);
         let events = Arc::new(events);
         let drop_budget = Arc::new(Mutex::new(drop_n_for_path));
         let handle = tokio::spawn(async move {
@@ -6197,6 +6287,7 @@ mod tests {
                 let stat_status = stat_status.clone();
                 let mkdir_ok = mkdir_ok.clone();
                 let max_log = max_log.clone();
+                let max_log_status = max_log_status.clone();
                 let events = events.clone();
                 let drop_budget = drop_budget.clone();
                 tokio::spawn(async move {
@@ -6262,7 +6353,19 @@ mod tests {
                             }
                         }
                     }
-                    let (code, body) = if func == "qbox_get_max_log" && max_log.is_some() {
+                    let (code, body) = if func == "qbox_get_max_log" && max_log_status.is_some() {
+                        // ★ 2026-11-02：模拟 sid 过期（真机形状：status=3，无 datas）
+                        (
+                            "200 OK",
+                            serde_json::json!({
+                                "max_log": 0,
+                                "notify": 0,
+                                "global_notify": 0,
+                                "status": max_log_status.unwrap_or(3),
+                            })
+                            .to_string(),
+                        )
+                    } else if func == "qbox_get_max_log" && max_log.is_some() {
                         // ★ poll_once 模式：max_log / sync_log / config log 按真机形状应答。
                         let n = max_log.unwrap_or(0);
                         (
@@ -7486,6 +7589,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&work);
     }
 
+    /// ★ 2026-11-02 真机回归：sid 过期 → `qbox_get_max_log` 回 `status=3` 时，
+    /// `poll_once` 必须只置 `auth_failed`、**不进 `errors`**。
+    ///
+    /// 修复前：这条会进 `errors` → `absorb_round` 写 `last_error`（首页红字）→
+    /// journal `error` 条目（桌面通知）。而真正该做的是重登 + 重跑一轮（`run_sync_once`
+    /// 现在会做）；用户能做的只有等，报给他没有信息量。
+    #[tokio::test]
+    async fn max_log_session_expiry_is_self_healing_not_a_sync_error() {
+        use qxync_core::DirEntry;
+        let home = HOME_ROOT;
+        let work = tmpdir("poll-auth-expired");
+        let view = FakeLocal::new(home, work.join("stash"));
+        let store = Mutex::new(SyncState::load(work.join("state")).unwrap());
+        let stats = SyncStats::default();
+        // 上一轮留一条真实错误：自愈中的失效轮次不许覆盖它。
+        *stats.last_error.lock().unwrap() = Some("真实的同步错误".into());
+        let cfg = SyncConfig::default();
+        let views = vec![mount_view(view.clone(), home, "/tmp/poll-auth-expired")];
+        let listings: BTreeMap<String, Vec<DirEntry>> =
+            BTreeMap::from([(home.to_string(), Vec::new())]);
+        let (host, port, _seen, srv) = spawn_nas_server(MockNasSpec {
+            listings,
+            max_log: Some(0),
+            max_log_status: Some(3),
+            ..Default::default()
+        })
+        .await;
+        let client = client_for(&host, port);
+        let r = poll_once(&client, &views, &store, &cfg, &stats, "default", "test1").await;
+        srv.abort();
+
+        assert!(r.auth_failed, "要置标志让 run_sync_once 重登 + 重跑: {r:?}");
+        assert!(
+            r.errors.is_empty(),
+            "会话失效不是同步错误（否则会变成 GUI 红字 + 桌面通知）: {r:?}"
+        );
+        assert!(
+            r.auth_error
+                .as_deref()
+                .is_some_and(|s| s.contains("status=3")),
+            "原因留给日志/升级文案: {r:?}"
+        );
+        assert_eq!(r.max_log, 0, "本轮在第一步就返回（什么都没做）");
+        assert_eq!(
+            stats.snapshot().last_error.as_deref(),
+            Some("真实的同步错误"),
+            "自愈中的失效轮次不许覆盖「最近错误」"
+        );
+        assert_eq!(
+            stats.snapshot().polls,
+            1,
+            "只跑了一轮（重跑由 run_sync_once 负责）"
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
     /// ★ O2：探活刷新判据（纯函数）—— TTL 过期或「自上次探活后又失败 3 次」都刷新。
     #[test]
     fn probe_should_refresh_on_ttl_or_repeated_failures() {
@@ -7714,8 +7873,14 @@ mod tests {
         assert!(view.node(&path).is_some());
         assert!(baseline.get(&path).exists);
         assert!(report.auth_failed, "4/5 要触发会话重登: {report:?}");
+        // ★ 2026-11-02：会话失效是自愈事件 → 只进说明行（告诉用户根为什么没判定），
+        //   不进 errors（那会变成 GUI 红字 + 桌面通知，见 `SyncReport::auth_failure`）。
         assert!(
-            report.errors.iter().any(|x| x.contains("远端根")),
+            report.errors.is_empty(),
+            "会话失效不该进 errors: {report:?}"
+        );
+        assert!(
+            report.notes.iter().any(|x| x.contains("远端根")),
             "要说明根为什么没判定: {report:?}"
         );
         srv.abort();
@@ -8400,7 +8565,7 @@ mod tests {
 
         // ④ 提前返回的轮次（没带清单、deletes_blocked=0）→ 不清
         let mut r4 = SyncReport {
-            errors: vec!["qbox_get_max_log 失败: status=3".into()],
+            errors: vec!["本地错误：清除对账轮转游标失败".into()],
             ..Default::default()
         };
         absorb_round(&stats, &mut r4, false);
@@ -8495,7 +8660,7 @@ mod tests {
         absorb_round(&stats, &mut r, true);
 
         let mut r = SyncReport {
-            errors: vec!["qbox_get_max_log 失败: status=3".into()],
+            errors: vec!["本地错误：清除对账轮转游标失败".into()],
             ..Default::default()
         };
         absorb_round(&stats, &mut r, false);
@@ -8511,7 +8676,42 @@ mod tests {
             .last_error
             .as_deref()
             .unwrap_or("")
-            .contains("status=3"));
+            .contains("清除对账轮转游标失败"));
+    }
+
+    /// ★ 2026-11-02 真机反馈：sid 过期时界面弹「同步错误（…）：qbox_get_max_log 失败:
+    /// status=3 (会话失效 / sid 过期…)」，桌面通知也弹。会话失效是**自愈事件**
+    /// （重登 + 重跑一轮就好），不该进 `errors` → 也就不会变成 GUI 红字、`last_error`
+    /// 和 journal 的 `error` 条目（桌面通知的数据源）。
+    #[test]
+    fn session_loss_is_a_self_healing_event_not_a_sync_error() {
+        let stats = SyncStats::default();
+        // 先放一条真实错误，验证「自愈中的失效轮次不覆盖、也不清掉它」
+        *stats.last_error.lock().unwrap() = Some("真实的同步错误".into());
+
+        let e = CoreError::status_msg(3, "qbox_get_max_log", "会话过期");
+        let mut r = SyncReport::default();
+        r.auth_failure(&e, "qbox_get_max_log 失败");
+
+        assert!(r.auth_failed, "要置标志让 run_sync_once 重登 + 重跑");
+        assert!(
+            r.errors.is_empty(),
+            "会话失效不能进 errors：那会变成 GUI 红字 + journal error（桌面通知）"
+        );
+        assert!(r.error_is_network.is_empty(), "它也不是网络错误");
+        assert!(
+            r.auth_error.as_deref().unwrap_or("").contains("status=3"),
+            "原因要留给日志/升级文案（不是给界面复读）: {:?}",
+            r.auth_error
+        );
+
+        absorb_round(&stats, &mut r, false);
+        assert_eq!(
+            stats.snapshot().last_error.as_deref(),
+            Some("真实的同步错误"),
+            "自愈中的失效轮次不该覆盖、也不该清掉真错误"
+        );
+        assert!(!r.delete_block_changed);
     }
 
     /// ★ 真机事故：`last_error` / `last_note` 同样只写不清 →
@@ -9552,10 +9752,18 @@ mod tests {
         let mut latch = AuthLatch::default();
         let mut bad = SyncReport::default();
         bad.auth_failed = true;
-        bad.errors.push("qbox_get_max_log 失败: status=3".into());
+        bad.auth_error = Some("qbox_get_max_log 失败: status=3".into());
 
         let first = latch.observe(&bad).expect("首次失效必须 WARN");
-        assert!(first.contains("共 1 条"), "要用摘要: {first}");
+        assert!(first.contains("status=3"), "日志里要带原因: {first}");
+        assert!(
+            first.contains("重跑"),
+            "日志要让读者知道 daemon 已自动重登并重跑本轮: {first}"
+        );
+        assert!(
+            !first.contains("已记录"),
+            "会话失效已经不进 errors 了，措辞不能再说「已记录」: {first}"
+        );
         assert!(latch.observe(&bad).is_none(), "持续失效必须压掉");
         assert!(latch.observe(&bad).is_none(), "同上");
 

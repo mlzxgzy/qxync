@@ -7,6 +7,29 @@
 
 ## [未发布]
 
+### 修复
+
+- **会话失效（sid 过期）不再报成「同步错误」**：`qbox_get_max_log` 回 `status=3`
+  （会话失效 / sid 过期）时，daemon 以前把它当普通错误写进 `errors` → GUI 的
+  「⚠️ 同步错误（…）」红字、`last_error`（首页 / 诊断 / 托盘）和 journal `error`
+  条目（**桌面通知**的数据源）三处同时出现，而它其实是一个自愈事件（重登一次就好）。
+  现在：
+  ① `poll_once` 的会话失效走 `SyncReport::auth_failure()`：只置 `auth_failed`
+  并记 debug 日志，**不进 `errors`**；`qbox_get_sync_log` / config log / notify
+  任一跳鉴权失败直接收尾本轮（游标不越过未应用的批次）；
+  ② `run_sync_once` 看到 `auth_failed` 立即 `login_internal` 重新取 sid，并用新会话
+  **重跑一轮**（不用等 30s 后的下一轮）——成功则用户完全无感；
+  ③ 只有「重登失败」或「重登成功但重跑仍失效」才升级成一条**可操作**的错误：
+  「会话失效且未能自动恢复：…。请确认 NAS 上的口令/两步验证没变，或在
+  「设置 → 连接」里重新登录」，`last_error` + 一条 journal `error`，同一条只报一次
+  （签名门闩，恢复后复位不吞复发）；
+  ④ 顺带收窄两处会误触发整轮重登的判据：远端根列举 4/5 走自愈（说明行保留、红字去掉），
+  单行巡检 `stat` 的 4/5 不再置 `auth_failed`（M44 同款理由：4/5 也是「路径不存在 /
+  权限拒绝」，一条 ACL 路径不该让登录次数涨上去）。
+  验收：daemon 单测 115 通过（新增 `max_log_session_expiry_is_self_healing_not_a_sync_error`
+  与 `session_loss_is_a_self_healing_event_not_a_sync_error` 两组回归，用 mock NAS
+  真实回 `status=3` 钉住「不进 errors / 不覆盖 last_error」）；`cargo test --workspace` 全绿。
+
 ## [0.9.1] - 2026-11-02
 
 ### 修复

@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Session expiry (stale sid) is no longer reported as a "sync error"**: when
+  `qbox_get_max_log` returns `status=3` (session lost / sid expired), the daemon
+  used to treat it like any other error and write it to `errors` — so the same
+  self-healing event showed up in three places at once: the GUI's "⚠️ sync error"
+  line, `last_error` (home / diagnostics / tray) and a journal `error` entry
+  (**the desktop notification source**). Re-logging in once is all it takes.
+  Now:
+  (1) session loss in `poll_once` goes through `SyncReport::auth_failure()`: it
+  only sets `auth_failed` and logs at debug level, **never enters `errors`**;
+  an auth failure on `qbox_get_sync_log` / config log / notify ends the round
+  immediately (the cursor never advances past a batch that was not applied);
+  (2) `run_sync_once` sees `auth_failed`, calls `login_internal` for a fresh sid
+  and **re-runs the round** with the new session (no 30 s wait) — the user sees
+  nothing when it works;
+  (3) only "re-login failed" or "re-login succeeded but the round still fails"
+  is escalated to one **actionable** error: "session lost and could not be
+  recovered automatically: … please check the NAS password / two-step code, or
+  sign in again under Settings → Connections". It lands in `last_error` plus one
+  journal `error`, once per distinct message (signature latch, reset on
+  recovery so a recurrence is never swallowed);
+  (4) two over-eager re-login triggers were narrowed: a 4/5 on the remote root
+  listing now self-heals (explanatory note kept, red line gone), and a 4/5 from
+  a single sweep `stat` no longer sets `auth_failed` (same M44 reasoning: 4/5
+  also means "not found / permission denied", and one ACL path must not inflate
+  the login count).
+  Verified: 115 daemon unit tests pass (new
+  `max_log_session_expiry_is_self_healing_not_a_sync_error` and
+  `session_loss_is_a_self_healing_event_not_a_sync_error` regressions, with a
+  mock NAS really answering `status=3`, pinning "not in errors / does not
+  overwrite last_error"); `cargo test --workspace` is green.
+
 ## [0.9.1] - 2026-11-02
 
 ### Fixed
