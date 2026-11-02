@@ -26,6 +26,7 @@ cd "$ROOT" || exit 1
 PATTERNS=()
 FILE=""
 APPLY=0
+IMAGES=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --pattern)      PATTERNS+=("$2"); shift 2 ;;
@@ -33,6 +34,7 @@ while [ "$#" -gt 0 ]; do
     --patterns-file) FILE="$2"; shift 2 ;;
     --patterns-file=*) FILE="${1#*=}"; shift ;;
     --apply)        APPLY=1; shift ;;
+    --images)       IMAGES=1; shift ;;
     -h|--help)      sed -n '2,26p' "$0" | sed 's/^#\{1,\} \{0,1\}//'; exit 0 ;;
     *) echo "未知参数：$1" >&2; exit 2 ;;
   esac
@@ -107,11 +109,19 @@ if [ -n "$(git status --porcelain)" ]; then
 fi
 
 FILTER="$ROOT/xtask/release/scrub-filter.py"
+IMG_FILTER="$ROOT/xtask/release/scrub-images.py"
 export SCRUB_PATTERNS_FILE="$TMPREPL"
+export SCRUB_IMG_CACHE="$ROOT/.local-run/img-cache"
+
+# --images：截图也一起清洗。文本替换改不了像素，历史里的截图会一直能被 git log 翻到。
+TREE_CMD="python3 '$FILTER' tree"
+if [ "$IMAGES" = 1 ]; then
+  TREE_CMD="$TREE_CMD && python3 '$IMG_FILTER'"
+fi
 
 echo "== 开始重写（filter-branch，可能需要几分钟） =="
 FILTER_BRANCH_SQUELCH_WARNING=1 git filter-branch -f --prune-empty \
-  --tree-filter "python3 '$FILTER' tree" \
+  --tree-filter "sh -c \"$TREE_CMD\"" \
   --msg-filter "python3 '$FILTER' msg" \
   --tag-name-filter cat -- --all
 
