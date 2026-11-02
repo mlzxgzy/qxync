@@ -148,7 +148,7 @@ mod tests {
         assert_eq!(scope("10.1.2.3"), IpScope::Private);
         assert_eq!(scope("172.16.0.1"), IpScope::Private);
         assert_eq!(scope("172.31.255.254"), IpScope::Private);
-        assert_eq!(scope("192.168.31.100"), IpScope::Private);
+        assert_eq!(scope("192.168.1.100"), IpScope::Private);
         assert_eq!(scope("169.254.1.1"), IpScope::LinkLocal);
         assert_eq!(scope("0.0.0.0"), IpScope::Unspecified);
         // 100.64/10 是 CGNAT；100.63/10 与 100.128/10 都不是

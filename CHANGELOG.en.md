@@ -5,7 +5,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [中文](CHANGELOG.md) · [README](README.en.md) · [Acceptance log](docs/验收记录.md)
 
-## [Unreleased]
+## [0.9.2] - 2026-11-02
 
 ### Fixed
 
@@ -39,6 +39,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `session_loss_is_a_self_healing_event_not_a_sync_error` regressions, with a
   mock NAS really answering `status=3`, pinning "not in errors / does not
   overwrite last_error"); `cargo test --workspace` is green.
+
+### Security
+
+- **Full leak gate re-run before this release**: a grep for sensitive strings
+  over the working tree and the whole history returns 0 hits; every tracked PNG
+  passes the OCR gate (`redact-shots.py --dry-run`) with 0 hits; and these
+  release notes **embed no screenshots** (text only, to shrink the
+  authentication-info surface).
+- **Real LAN address, account name, and machine hostname in test fixtures and
+  tracked screenshots replaced with placeholders**: the endpoint tests in
+  `crates/qxync-core` now use `192.168.1.100` (consistent with the rest of the
+  repo); the machine name in the `docs/M37` field evidence is now "test
+  machine"; and connection strings left over in three tracked screenshots are
+  painted over (the real LAN address in
+  `docs/验收-Qsync6-96dpi/p2/04-conn-modal.png`, the real test account name in
+  `docs/images/m33-dl-card.png`, and the real username in
+  `docs/验收-Qsync6-96dpi/p2/06-files.png`) — all caught by this release's
+  gate after adding a **2× upscale re-sweep** on top of the native-resolution
+  OCR pass (small-font strings the native pass could not read).
 
 ## [0.9.1] - 2026-11-02
 
@@ -2676,6 +2695,9 @@ Verified on **QNAP TS-464C / QTS 5.2.9 / Qsync QPKG 5.0.0.7 (build 20260723)**.
 - Acceptance results were split out of the README into [`docs/验收记录.md`](docs/验收记录.md).
 - Dual-licensed under **MIT OR Apache-2.0** (`LICENSE-MIT` / `LICENSE-APACHE`).
 
+[0.9.2]: https://github.com/mlzxgzy/qxync/compare/v0.9.1...v0.9.2
+[0.9.1]: https://github.com/mlzxgzy/qxync/compare/v0.9.0...v0.9.1
+[0.9.0]: https://github.com/mlzxgzy/qxync/compare/v0.8.3...v0.9.0
 [0.8.3]: https://github.com/mlzxgzy/qxync/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/mlzxgzy/qxync/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/mlzxgzy/qxync/compare/v0.8.0...v0.8.1

@@ -7,7 +7,7 @@
 
 ---
 
-## 1. 现场证据（2026-10-26，tb14 / CachyOS，systemd 262）
+## 1. 现场证据（2026-10-26，测试机 / CachyOS，systemd 262）
 
 ### 1.1 时间线（`journalctl -b`）
 

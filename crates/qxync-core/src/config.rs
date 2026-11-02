@@ -1545,29 +1545,29 @@ mod tests {
     #[test]
     fn m40_extra_endpoints_come_first_and_primary_is_appended() {
         let mut link = mk_link("default", "nas.example.com", "u");
-        link.endpoints = vec![ep("192.168.31.100", Some(9834), None)];
+        link.endpoints = vec![ep("192.168.1.100", Some(9834), None)];
         let list = link.endpoint_list();
         assert_eq!(list.len(), 2, "额外路径在前、主地址兜底");
-        assert_eq!(list[0].host, "192.168.31.100");
+        assert_eq!(list[0].host, "192.168.1.100");
         assert!(!list[0].primary);
         assert_eq!(list[1].host, "nas.example.com");
         assert!(list[1].primary);
 
         // 显式把主地址写进列表 → 尊重书写位置（LAN 主、DDNS 备）
         link.endpoints = vec![
-            ep("192.168.31.100", Some(9834), None),
+            ep("192.168.1.100", Some(9834), None),
             ep("nas.example.com", Some(9834), None),
         ];
         let list = link.endpoint_list();
         assert_eq!(list.len(), 2);
-        assert_eq!(list[0].host, "192.168.31.100");
+        assert_eq!(list[0].host, "192.168.1.100");
         assert_eq!(list[1].host, "nas.example.com");
         assert!(list[1].primary, "列表里显式写的主地址仍需标记 primary");
 
         // 重复项按 (scheme, host, port) 去重，保留第一次出现
         link.endpoints = vec![
-            ep("192.168.31.100", Some(9834), None),
-            ep("192.168.31.100", Some(9834), Some(true)),
+            ep("192.168.1.100", Some(9834), None),
+            ep("192.168.1.100", Some(9834), Some(true)),
         ];
         assert_eq!(link.endpoint_list().len(), 2);
     }
@@ -1582,21 +1582,21 @@ mod tests {
             primary: true,
         };
         // 端口/协议省略 → 继承
-        let inherited = ep("192.168.31.100", None, None).resolve(&primary).unwrap();
+        let inherited = ep("192.168.1.100", None, None).resolve(&primary).unwrap();
         assert_eq!(inherited.port, 9834);
         assert!(inherited.https);
         // 显式 http:// 但不写端口 → 端口仍继承（不猜 8080）
-        let http = ep("192.168.31.100", None, Some(false))
+        let http = ep("192.168.1.100", None, Some(false))
             .resolve(&primary)
             .unwrap();
         assert_eq!(http.port, 9834);
         assert!(!http.https);
-        assert_eq!(http.base_url(), "http://192.168.31.100:9834");
+        assert_eq!(http.base_url(), "http://192.168.1.100:9834");
         // 显式端口覆盖
-        let custom = ep("192.168.31.100", Some(8080), Some(false))
+        let custom = ep("192.168.1.100", Some(8080), Some(false))
             .resolve(&primary)
             .unwrap();
-        assert_eq!(custom.base_url(), "http://192.168.31.100:8080");
+        assert_eq!(custom.base_url(), "http://192.168.1.100:8080");
         // 坏配置 → 跳过而不是 panic
         assert!(ep("   ", None, None).resolve(&primary).is_none());
         assert!(ep("nas", Some(0), None).resolve(&primary).is_none());
@@ -1638,14 +1638,14 @@ mod tests {
     fn m40_parse_endpoint_lines_covers_grammar_and_comments() {
         let text = "\
 # 家里
-家里 LAN = 192.168.31.100:9834
+家里 LAN = 192.168.1.100:9834
 公网 DDNS = https://nas.example.com:9834/
 备用 = nas2.local
 ";
         let eps = LinkConfig::parse_endpoint_lines(text).unwrap();
         assert_eq!(eps.len(), 3);
         assert_eq!(eps[0].label.as_deref(), Some("家里 LAN"));
-        assert_eq!(eps[0].host, "192.168.31.100");
+        assert_eq!(eps[0].host, "192.168.1.100");
         assert_eq!(eps[0].port, Some(9834));
         assert_eq!(eps[1].https, Some(true));
         assert_eq!(eps[2].host, "nas2.local");
@@ -1681,7 +1681,7 @@ mod tests {
     fn m40_local_namespace_freezes_cache_and_state_dirs() {
         let paths = m16_paths("m40-ns");
         let mut link = mk_link("default", "nas.example.com", "u");
-        link.endpoints = vec![ep("192.168.31.100", Some(9834), None)];
+        link.endpoints = vec![ep("192.168.1.100", Some(9834), None)];
         let before = paths.sync_dir_for(&link);
         assert_eq!(before, paths.data_dir.join("sync/nas.example.com"));
 
@@ -1700,7 +1700,7 @@ mod tests {
 
         // 非 default 的命名空间含 #/@，校验必须放行（不能再被 sanitize 成下划线）
         let mut other = mk_link("nas2", "nas.example.com", "u");
-        other.endpoints = vec![ep("192.168.31.100", None, None)];
+        other.endpoints = vec![ep("192.168.1.100", None, None)];
         other.ensure_local_namespace(Some(&mk_link("nas2", "nas.example.com", "u")));
         assert_eq!(
             other.local_namespace.as_deref(),

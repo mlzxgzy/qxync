@@ -5,7 +5,7 @@
 
 [English](CHANGELOG.en.md) · [README](README.md) · [验收记录](docs/验收记录.md)
 
-## [未发布]
+## [0.9.2] - 2026-11-02
 
 ### 修复
 
@@ -29,6 +29,19 @@
   验收：daemon 单测 115 通过（新增 `max_log_session_expiry_is_self_healing_not_a_sync_error`
   与 `session_loss_is_a_self_healing_event_not_a_sync_error` 两组回归，用 mock NAS
   真实回 `status=3` 钉住「不进 errors / 不覆盖 last_error」）；`cargo test --workspace` 全绿。
+
+### 安全
+
+- **发版前泄漏闸门全量复跑**：工作区与全历史敏感串 grep 0 命中；全部入库 PNG 过
+  OCR 闸门（`redact-shots.py --dry-run`）0 命中；本版发布说明**不再嵌入截图**
+  （正文只留文字，减少鉴权信息面）。
+- **测试夹具与入库截图里的真实内网地址、账号名、本机计算机名换成占位值**：
+  `crates/qxync-core` 的 endpoint 测试用 `192.168.1.100`（与仓库其它测试一致）；
+  `docs/M37` 现场证据里的计算机名改为「测试机」；三张入库截图里残留的连接串涂抹
+  （`docs/验收-Qsync6-96dpi/p2/04-conn-modal.png` 的真实内网地址、
+  `docs/images/m33-dl-card.png` 的真实测试账号名、
+  `docs/验收-Qsync6-96dpi/p2/06-files.png` 的真实用户名）——都是本次发版闸门
+  在原生 OCR 之外加 **2× 放大复扫**后新抓到的（原生分辨率认不出的小字号）。
 
 ## [0.9.1] - 2026-11-02
 
@@ -2118,6 +2131,9 @@ NAS 设置名 `QSYNC_FOLDERPAIR_USE_SPACE_SAVING`、Windows 客户端注册表�
 - 验收结论从 README 抽出为 [`docs/验收记录.md`](docs/验收记录.md)。
 - 采用 **MIT OR Apache-2.0** 双许可（`LICENSE-MIT` / `LICENSE-APACHE`）。
 
+[0.9.2]: https://github.com/mlzxgzy/qxync/compare/v0.9.1...v0.9.2
+[0.9.1]: https://github.com/mlzxgzy/qxync/compare/v0.9.0...v0.9.1
+[0.9.0]: https://github.com/mlzxgzy/qxync/compare/v0.8.3...v0.9.0
 [0.8.3]: https://github.com/mlzxgzy/qxync/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/mlzxgzy/qxync/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/mlzxgzy/qxync/compare/v0.8.0...v0.8.1
