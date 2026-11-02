@@ -23,8 +23,9 @@ name: Release
 #   qxync / qxyncd / qxync-gui（三个裸二进制）
 #   SHA256SUMS
 # 手动重跑同一个 tag：Actions → Release → Run workflow，填 tag；同名资产会被覆盖，
-# 不会重复建 Release。Release 正文优先用 `docs/发布说明-<tag>.md`（存在时），
-# 否则用 GitHub 自动生成的 Release Notes。
+# 不会重复建 Release。Release 正文**英文优先**：先找 `docs/发布说明-<tag>.en.md`，
+# 再找中文 `docs/发布说明-<tag>.md`，都没有才用 GitHub 自动生成的 Release Notes
+# （规则说明见 docs/发布清单-v0.1.0.md §3.4）。
 on:
   push:
     tags: ["v*"]
@@ -396,17 +397,18 @@ jobs:
           retention-days: 14
           if-no-files-found: error
 
-      - name: 选 Release 正文（docs/发布说明-<tag>.md 存在就用它）
+      - name: 选 Release 正文（英文优先：docs/发布说明-<tag>.en.md → 中文 → 自动）
         id: notes
         run: |
-          body="docs/发布说明-${TAG}.md"
-          if [ -f "$body" ]; then
-            echo "body_path=$body" >> "$GITHUB_OUTPUT"
-            echo "用正文文件：$body"
-          else
-            echo "body_path=" >> "$GITHUB_OUTPUT"
-            echo "没有 $body，改用 GitHub 自动生成的 Release Notes"
-          fi
+          for body in "docs/发布说明-${TAG}.en.md" "docs/发布说明-${TAG}.md"; do
+            if [ -f "$body" ]; then
+              echo "body_path=$body" >> "$GITHUB_OUTPUT"
+              echo "用正文文件：$body"
+              exit 0
+            fi
+          done
+          echo "body_path=" >> "$GITHUB_OUTPUT"
+          echo "没有英文/中文正文文件，改用 GitHub 自动生成的 Release Notes"
 
       - name: 发布 / 更新 GitHub Release
         uses: softprops/action-gh-release@v2

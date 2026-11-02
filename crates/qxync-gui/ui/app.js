@@ -10,7 +10,7 @@
   'use strict';
 
   // --------------------------------------------------------------- i18n（★ M8.6）
-  // 文案表在 ui/i18n.js：zh-CN 是真值，en 预留、查不到就整条回落到 zh-CN。
+  // 文案表在 ui/i18n.js：zh-CN 是真值，en 是全量镜像（★ M50），查不到仍整条回落到 zh-CN。
   // 表没加载（旧包 / 被单测直接 eval）时退化成「返回 key」，界面不至于抛错。
   var I18N = (typeof window !== 'undefined' && window.QXNYC_I18N) ? window.QXNYC_I18N : null;
   function T(key, vars) {
@@ -18,19 +18,53 @@
     return String(key);
   }
 
+  /** ★ M50：排序用的 locale（英文界面按英文、中文界面按简体中文）。 */
+  function collLocale() {
+    return (I18N && isFn(I18N.locale) && I18N.locale() === 'en') ? 'en' : 'zh-Hans-CN';
+  }
+
+  /** ★ M50：全角标点按界面语言切换 —— 英文界面用 ASCII 的 `, ` / `; ` / `: ` 与圆括号。 */
+  function locEn() {
+    return !!(I18N && isFn(I18N.locale) && I18N.locale() === 'en');
+  }
+  function locSep(kind) {
+    if (locEn()) { return kind === 'semi' ? '; ' : ', '; }
+    return kind === 'semi' ? '；' : '、';
+  }
+  function locParen(inner) {
+    return locEn() ? ' (' + inner + ')' : '（' + inner + '）';
+  }
+  function locColon() {
+    return locEn() ? ': ' : '：';
+  }
+
+  /** ★ M50：语言定下来后重算两张模块级标题表（它们加载时已按默认语言算过一次）。
+   *  动态拼 key 时前缀放变量里：Rust `ui_spec()` 只扫 `T('...')` 字面量，别让它把
+   *  `'page.'` / `'sec.'` 当成键名（会把静态守卫弄红）。 */
+  function refreshLocaleTitles() {
+    var pagePrefix = 'page.';
+    for (var i = 0; i < PAGES.length; i++) { PAGE_TITLE[PAGES[i]] = T(pagePrefix + PAGES[i]); }
+    var secPrefix = 'sec.';
+    for (var j = 0; j < SETTINGS_SECS.length; j++) { SEC_TITLE[SETTINGS_SECS[j]] = T(secPrefix + SETTINGS_SECS[j]); }
+  }
+
   // --------------------------------------------------------------- 常量
   var LOG_MAX = 200;              // 操作日志最多保留条数
   var POLL_MS = 2000;             // daemon_status 轮询间隔
   var PIN_STATES = ['unspecified', 'pinned', 'unpinned', 'excluded'];
   var PIN_LABEL = {
-    unspecified: '未指定',
-    pinned: '已固定',
-    unpinned: '已取消固定',
-    excluded: '已排除'
+    unspecified: T('pin.unspecified'),
+    pinned: T('pin.pinned'),
+    unpinned: T('pin.unpinned'),
+    excluded: T('baloo.mount_excluded')
   };
 
   // ★ M16.1：任务表单「NAS 连接」下拉里的伪选项 —— 选中它 = 去新建连接（不是一条真连接）。
   var NEW_LINK_OPTION = '__new__';
+
+  // ★ M50：语言偏好（设置 → 个人 → 语言）。'' = 跟随系统；具体值 zh-CN / en。
+  //   存 localStorage 是为了**启动第一帧**就按上次的语言渲染；settings 回来后以 daemon 的值为准。
+  var LOCALE_PREF_KEY = 'qxync.locale';
 
   // ★ M8.1：一级目的地（左侧图标栏）。顺序 = 界面顺序。
   var PAGES = ['home', 'tasks', 'journal', 'errors', 'files', 'share', 'settings', 'diag'];
@@ -297,13 +331,13 @@
 
   function humanDuration(secs) {
     var s = Math.max(0, Math.round(num(secs, 0)));
-    if (s < 60) { return s + ' 秒'; }
+    if (s < 60) { return T('unit.dur_sec', { s: s }); }
     var m = Math.floor(s / 60);
-    if (m < 60) { return m + ' 分 ' + (s % 60) + ' 秒'; }
+    if (m < 60) { return T('unit.dur_min_sec', { m: m, s: s % 60 }); }
     var h = Math.floor(m / 60);
-    if (h < 24) { return h + ' 小时 ' + (m % 60) + ' 分'; }
+    if (h < 24) { return T('unit.dur_hour_min', { h: h, m: m % 60 }); }
     var d = Math.floor(h / 24);
-    return d + ' 天 ' + (h % 24) + ' 小时';
+    return T('unit.dur_day_hour', { d: d, h: h % 24 });
   }
 
   /** epoch 秒/毫秒 → 本地时间字符串。 */
@@ -457,11 +491,11 @@
     var label = cmd + (summary ? ' ' + summary : '');
     if (!invokeFn) {
       logErr(label + ' → 未在 Tauri 中运行，无法调用');
-      return Promise.resolve({ ok: false, error: '未在 Tauri 中运行（window.__TAURI__ 不存在）' });
+      return Promise.resolve({ ok: false, error: T('common.not_in_tauri') });
     }
     return invokeFn(cmd, args).then(function (res) {
       if (isObj(res) && res.ok === false) {
-        var m = (isObj(res.error) ? str(res.error.message) : str(res.error)) || '未知错误';
+        var m = (isObj(res.error) ? str(res.error.message) : str(res.error)) || T('common.unknown_error');
         var k = isObj(res.error) ? str(res.error.kind) : '';
         logErr(label + ' → error' + (k ? '[' + k + ']' : '') + ' ' + shortErr(m));
         return { ok: false, error: m, kind: k, data: res.data, raw: res };
@@ -471,7 +505,7 @@
     }, function (err) {
       var m = shortErr(err);
       logErr(label + ' → 调用失败 ' + m);
-      return { ok: false, error: m || '调用失败' };
+      return { ok: false, error: m || T('common.call_failed') };
     });
   }
 
@@ -485,7 +519,7 @@
       if (isObj(res) && res.ok === true) {
         return { ok: true, data: res.data, raw: res, linkId: id };
       }
-      var msg = (isObj(res) && isObj(res.error)) ? str(res.error.message) : '调用失败';
+      var msg = (isObj(res) && isObj(res.error)) ? str(res.error.message) : T('common.call_failed');
       return { ok: false, error: msg, raw: res, linkId: id };
     });
   }
@@ -526,7 +560,7 @@
       if (isObj(res) && res.ok === true) {
         return { ok: true, data: res.data, raw: res, linkId: id };
       }
-      var msg = (isObj(res) && isObj(res.error)) ? str(res.error.message) : '调用失败';
+      var msg = (isObj(res) && isObj(res.error)) ? str(res.error.message) : T('common.call_failed');
       return { ok: false, error: msg, raw: res, linkId: id };
     }, function (e) {
       settle();
@@ -597,14 +631,14 @@
       var v = speed(now);
       if (total > 0) {
         var pct = Math.min(100, written / total * 100);
-        var eta = (v > 0 && written < total) ? ' · 剩余 ' + fmtEta((total - written) / v) : '';
+        var eta = (v > 0 && written < total) ? T('dl.eta_left', { eta: fmtEta((total - written) / v) }) : '';
         ui.fill.classList.remove('indet');
         ui.fill.style.width = pct.toFixed(1) + '%';
         ui.line.textContent = '⬇ ' + pct.toFixed(1) + '% · ' + humanSize(written)
           + '/' + humanSize(total) + ' · ' + humanSize(v) + '/s' + eta;
       } else {
         ui.fill.classList.add('indet');
-        ui.line.textContent = '⬇ 已下载 ' + humanSize(written) + ' · ' + humanSize(v) + '/s';
+        ui.line.textContent = T('dl.downloaded', { size: humanSize(written), speed: humanSize(v) });
       }
     }
 
@@ -635,7 +669,7 @@
         h.fill.classList.remove('indet');
         h.line.textContent = ok
           ? '✅ ' + T('dl.done') + ' · ' + humanSize(lastWritten)
-          : '✗ ' + T('dl.fail') + (errText ? '：' + errText : '');
+          : '✗ ' + T('dl.fail') + (errText ? locColon() + errText : '');
         h.line.title = ok ? '' : str(errText || '');
         setTimeout(function () { removeDlCard(h); }, ok ? 2500 : 6000);
         h.card.onclick = function () { removeDlCard(h); };
@@ -969,7 +1003,7 @@
     var regBtn = $('purge-registration');
     if (regBtn) {
       regBtn.hidden = !purgeRegistrationLabel;
-      regBtn.textContent = purgeRegistrationLabel || '仅删除任务登记（保留两侧文件）';
+      regBtn.textContent = purgeRegistrationLabel || T('purge.opt_registration');
     }
 
     purgeLastFocus = document.activeElement;
@@ -1050,7 +1084,7 @@
   function kvText(dl, key, value, cls) { kvRow(dl, key, value, cls); }
 
   function kvBool(dl, key, on, onText, offText) {
-    kvRow(dl, key, on ? (onText || '是') : (offText || '否'), on ? 'val-ok' : 'val-dim');
+    kvRow(dl, key, on ? (onText || T('common.yes')) : (offText || T('common.no')), on ? 'val-ok' : 'val-dim');
   }
 
   function optText(v) {
@@ -1211,7 +1245,7 @@
     if (!stopped.length) { return ''; }
     var names = [];
     for (var i = 0; i < stopped.length; i++) { names.push(linkLabel(stopped[i])); }
-    return T('list.conn_no_daemon', { links: names.join('、') });
+    return T('list.conn_no_daemon', { links: names.join(locSep('comma')) });
   }
 
   // ============================================================ 顶部状态条（多连接聚合）
@@ -1618,7 +1652,7 @@
       pb.appendChild(stateIcon(enabled ? 'paused' : 'ok'));
       pb.addEventListener('click', function (ev) {
         ev.stopPropagation();
-        doTaskAction(enabled ? 'pause' : 'resume', t.id, enabled ? '暂停' : '继续', pb, linkId);
+        doTaskAction(enabled ? 'pause' : 'resume', t.id, enabled ? T('task.act_pause') : T('task.act_resume'), pb, linkId);
       });
       act.appendChild(pb);
     }
@@ -1719,7 +1753,7 @@
     var v = taskDetailView();
     if (!v) {
       setText('detail-title', T('detail.not_found'));
-      setText('detail-crumb', '任务');
+      setText('detail-crumb', T('detail.crumb'));
       setText('detail-local', '—');
       setText('detail-remote', '—');
       clear($('detail-pair-body'));
@@ -1835,9 +1869,9 @@
     var t = v.task;
     var linkId = str(v.linkId);
     closeTaskMenu(true);
-    if (act === 'sync') { doSync({ once: true }, [], '立即同步', linkId); }
+    if (act === 'sync') { doSync({ once: true }, [], T('task.act_sync_now'), linkId); }
     else if (act === 'open') { openTaskDir(str(t.mountpoint)); }
-    else if (act === 'pause') { doTaskAction(t.enabled === false ? 'resume' : 'pause', t.id, t.enabled === false ? '继续' : '暂停', null, linkId); }
+    else if (act === 'pause') { doTaskAction(t.enabled === false ? 'resume' : 'pause', t.id, t.enabled === false ? T('task.act_resume') : T('task.act_pause'), null, linkId); }
     else if (act === 'settings') { switchPage('tasks'); editTask(t, linkId); }
     else if (act === 'delete') { doTaskDelete(t, linkId, null); }
   }
@@ -1874,13 +1908,13 @@
   // ★ M16：这两页是**跨连接**的 —— 对每个运行中的 daemon 各发一次 journal 请求，
   //   合并后排序，并在每一行标出来源连接（同一个 ts 的两条不会再互相顶掉）。
   var KIND_LABEL = {
-    remote_change: 'NAS 上的改动',
-    upload: '上传',
-    download: '下载',
-    conflict: '冲突副本',
-    delete: '删除',
-    dehydrate: '释放空间',
-    scan: '对账'
+    remote_change: T('journal.kind_remote'),
+    upload: T('journal.kind_upload'),
+    download: T('journal.kind_download'),
+    conflict: T('journal.kind_conflict'),
+    delete: T('purge.confirm_delete'),
+    dehydrate: T('sec.free'),
+    scan: T('journal.kind_scan')
   };
 
   function kindLabel(k) {
@@ -1924,7 +1958,7 @@
     } else if (mode === 'kind-asc') {
       out.sort(function (a, b) {
         var ka = kindLabel(a.e.kind), kb = kindLabel(b.e.kind);
-        if (ka !== kb) { return ka.localeCompare(kb, 'zh'); }
+        if (ka !== kb) { return ka.localeCompare(kb, collLocale()); }
         return num(b.e.ts, 0) - num(a.e.ts, 0);
       });
     }
@@ -2096,7 +2130,7 @@
     var note = $('journal-note');
     if (note) {
       note.hidden = !all.length;
-      note.textContent = all.length ? (T('journal.note_prefix') + all.join('；')) : '';
+      note.textContent = all.length ? (T('journal.note_prefix') + all.join(locSep('semi'))) : '';
     }
   }
 
@@ -2176,12 +2210,12 @@
     var d = str(detail);
     if (!d) { return d; }
     return d
-      .replace(/qbox_get_max_log\s*失败/g, '读取 NAS 日志游标失败')
-      .replace(/qbox_get_max_log:/g, '读取日志游标：')
-      .replace(/get_list:status=3/g, '列目录失败：NAS 返回未知状态')
-      .replace(/get_list:/g, '列目录：')
-      .replace(/stat:status=5/g, '文件信息：路径不存在或无权限')
-      .replace(/stat:/g, '文件信息：');
+      .replace(/qbox_get_max_log\s*失败/g, T('errors.fmt_max_log'))
+      .replace(/qbox_get_max_log:/g, T('errors.fmt_max_log_prefix'))
+      .replace(/get_list:status=3/g, T('errors.fmt_list_unknown'))
+      .replace(/get_list:/g, T('errors.fmt_list_prefix'))
+      .replace(/stat:status=5/g, T('errors.fmt_stat_missing'))
+      .replace(/stat:/g, T('errors.fmt_stat_prefix'));
   }
 
   /** 错误行「定位文件」：换算成本地挂载点路径，切到文件页浏览其父目录。 */
@@ -2225,7 +2259,7 @@
       return;
     }
     var list = mergedErrorEntries();
-    setText('errors-count', list.length ? '（' + list.length + '）' : '');
+    setText('errors-count', list.length ? locParen(list.length) : '');
     setListState('errors-empty', list.length ? 'ready' : 'empty', T('errors.empty'));
 
     // ★ P2-05：按任务分组（同一任务的失败挨在一起，先能回答「哪个任务坏了」）
@@ -2291,13 +2325,13 @@
     var hint = $('errors-links-hint');
     if (hint) {
       hint.hidden = !notes.length;
-      hint.textContent = notes.join('；');
+      hint.textContent = notes.join(locSep('semi'));
     }
   }
 
   function copyText(t) {
     if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(t).then(function () { logOk('已复制：' + t); },
+      navigator.clipboard.writeText(t).then(function () { logOk(T('common.copied', { path: t })); },
                                             function () { logInfo('复制失败：' + t); });
     } else {
       logInfo('当前环境不支持剪贴板，路径在此：' + t);
@@ -2305,7 +2339,7 @@
   }
 
   function doJournalClear() {
-    if (!window.confirm('清空同步日志？\n\n只删日志本身，**不动同步状态**（游标 / baseline / pin / 上传队列都不受影响），也不动 NAS 上的数据。\n\n注意：所有连接的日志都会被清空。')) {
+    if (!window.confirm(T('journal.clear_confirm'))) {
       return Promise.resolve(null);
     }
     var targets = fanoutTargets();
@@ -2314,7 +2348,7 @@
     }).then(function (rs) {
       var ok = 0;
       for (var i = 0; i < rs.length; i++) { if (rs[i].r.ok) { ok++; } }
-      logOk('同步日志已清空（' + ok + '/' + rs.length + ' 个连接）');
+      logOk(T('journal.clear_done', { ok: ok, total: rs.length }));
       return refreshJournal();
     });
   }
@@ -2396,7 +2430,7 @@
     var ls = linksList();
     var total = 0;
     for (var gi = 0; gi < groups.length; gi++) { total += groups[gi].views.length; }
-    setText('tasks-count', total ? '（' + total + '）' : '');
+    setText('tasks-count', total ? locParen(total) : '');
     if (total === 0) {
       var anyData = false;
       for (var ai = 0; ai < ls.length; ai++) {
@@ -2446,7 +2480,7 @@
           var pair = bad[k];
           badBox.appendChild(el('li', null, T('tasks.bad_file', {
             file: str(pair[0]), err: str(pair[1])
-          }) + '（' + linkLabelById(str(ls[li].id)) + '）'));
+          }) + locParen(linkLabelById(str(ls[li].id)))));
           badCount++;
         }
       }
@@ -2461,7 +2495,7 @@
         if (/⚠|失败|冲突|错误|保护|拒绝|不可用/.test(str(notes[ni]))) { important.push(notes[ni]); }
       }
       note.hidden = !important.length;
-      note.textContent = important.length ? (T('tasks.note_prefix') + important.join('；')) : '';
+      note.textContent = important.length ? (T('tasks.note_prefix') + important.join(locSep('semi'))) : '';
     }
   }
 
@@ -2472,7 +2506,7 @@
       return ipcFor(lid, { method: 'tasks', action: action, id: id });
     }).then(function (r) {
       if (r.ok) {
-        logOk(label + ' ' + id + ' 完成（' + linkLabelById(lid) + '）');
+        logOk(T('log.task_done', { op: label, id: id, link: linkLabelById(lid) }));
       } else {
         logErr(label + ' ' + id + ' 失败（' + linkLabelById(lid) + '）：' + str(r.error));
       }
@@ -2519,7 +2553,7 @@
         }
         // 旧行为：只删任务登记（保持与以前完全一致，包括日志文案与刷新）
         if (!ans.purge) {
-          return doTaskAction('delete', id, '删除登记', btn, lid);
+          return doTaskAction('delete', id, T('task.act_delete_reg'), btn, lid);
         }
         return withBusy({ buttons: btn ? [btn] : [] }, function () {
           return call('task_purge', { linkId: lid, taskId: id });
@@ -2550,15 +2584,17 @@
    */
   function openTaskDir(mountpoint, btn) {
     // 连点两下会开两个目录窗口，这里直接挡掉第二次。
-    if (btn && btn.disabled) { return Promise.resolve({ ok: false, error: '已在打开中' }); }
+    if (btn && btn.disabled) { return Promise.resolve({ ok: false, error: T('task.opening') }); }
     if (btn) { btn.disabled = true; }
     return doOpen('path', mountpoint).then(function (r) {
       var d = (r && r.ok && isObj(r.data)) ? r.data : null;
       // `via` 如实反映走了哪条路：查到的默认目录程序（xdg-mime / gio）还是回落；
       // `program` 是**真正被执行的程序名**（不是桌面项 ID —— 那个往往不是可执行文件）。
       if (d && d.ok === true && d.via) {
-        logOk('已用 ' + str(d.via) + (d.program ? '（' + str(d.program) + '）' : '') +
-          ' 打开 ' + mountpoint);
+        logOk(T('task.opened_with', {
+          via: str(d.via) + (d.program ? T('task.via_program', { program: str(d.program) }) : ''),
+          path: mountpoint
+        }));
       }
       return r;
     }, function (e) {
@@ -2694,7 +2730,7 @@
       //   映射不出来就不当候选（宁可不给，也不猜一个挂载不了的 NAS 路径）。
       var cp = str(sf[i].client_path).trim();
       if (!cp) { continue; }
-      push(cp, T('task.nas_syncing_folder') + '：' + (str(sf[i].folder) || cp) + '（' + cp + '）');
+      push(cp, T('task.nas_syncing_folder') + locColon() + (str(sf[i].folder) || cp) + locParen(cp));
     }
     var nas = nasFor(id);
     nas.candidates = out;
@@ -2931,7 +2967,7 @@
     renderTaskLinkSelect();
     // setNasFolder → applyTaskDefaults：按当前 NAS 文件夹（默认 /home）填唯一默认值
     setNasFolder('/home');
-    setText('task-form-title', '文件夹对设置');
+    setText('task-form-title', T('task.form_title_pairs'));
     // ★ M18：编辑任务时不做派生，所以「默认值说明 + 重置按钮」只在新建时显示
     show('t-defaults-hint', true);
   }
@@ -2964,7 +3000,7 @@
     var card = $('task-form-card');
     if (!card) { return; }
     resetTaskForm();
-    setText('task-form-title', '创建同步任务');
+    setText('task-form-title', T('task.form_title_new'));
     card.hidden = false;
     openTaskModal();
     loadNasCandidates();
@@ -2998,7 +3034,7 @@
     renderTaskLinkSelect();
     // ★ 一对一：NAS 侧就一个文件夹（没写 = 用默认的家目录 /home）
     setNasFolder(str(t.root));
-    setText('task-form-title', '文件夹对设置 · ' + str(t.id));
+    setText('task-form-title', T('task.form_title_edit', { id: str(t.id) }));
     // ★ M18：编辑时字段都是磁盘上的既有值 —— 隐藏「默认值说明 + 重置按钮」
     show('t-defaults-hint', false);
     card.hidden = false;
@@ -3064,10 +3100,10 @@
       return ipcFor(lid, { method: 'tasks', action: 'save', task: task });
     }).then(function (r) {
       if (!r.ok) {
-        renderError('sync-result', '保存同步设置失败（' + linkLabelById(lid) + '）', str(r.error));
+        renderError('sync-result', T('sync.save_failed', { label: linkLabelById(lid) }), str(r.error));
         return r;
       }
-      logOk('同步设置已更新：' + taskDisplayName({ task: task }) + '（' + linkLabelById(lid) + '）');
+      logOk(T('sync.saved', { name: taskDisplayName({ task: task }), label: linkLabelById(lid) }));
       closeSyncModal();
       refreshTasks();
       if (state.page === 'task') { window.setTimeout(renderTaskDetail, 300); }
@@ -3081,7 +3117,7 @@
     if (card) { card.hidden = true; }
     state.taskFormEditing = false;
     state.taskFormLink = '';
-    setText('task-form-title', '文件夹对设置');
+    setText('task-form-title', T('task.form_title_pairs'));
     show('task-result', false);
   }
 
@@ -3090,41 +3126,40 @@
     //   id 是全局唯一文件名（tasks/<id>.json），空 / 非法字符 / 重名都在提交前说清楚。
     var id = str($('t-id') ? $('t-id').value : '').trim();
     if (!id) {
-      renderError('task-result', '参数错误',
-        '任务 id 不能为空：它是任务登记的文件名（如 home / public / home-2）');
+      renderError('task-result', T('common.bad_args'),
+        T('task.err_id_empty'));
       return Promise.resolve(null);
     }
     if (TD && !TD.isValidId(id)) {
-      renderError('task-result', '参数错误',
-        '任务 id 不合法：' + id + '（只允许 A-Za-z0-9 . _ -，最长 64 字符，且不能是 . 或 ..）');
+      renderError('task-result', T('common.bad_args'),
+        T('task.err_id_invalid', { id: id }));
       return Promise.resolve(null);
     }
     if (!state.taskFormEditing && takenTaskIds()[id]) {
-      renderError('task-result', '参数错误',
-        '任务 id「' + id + '」已经被另一条任务用了（同一份任务登记里 id 是唯一文件名）：'
-        + '换个 id，点「重置为默认路径」会自动加 -2 后缀');
+      renderError('task-result', T('common.bad_args'),
+        T('task.err_id_taken', { id: id }));
       return Promise.resolve(null);
     }
     var mp = str($('t-mountpoint') ? $('t-mountpoint').value : '').trim();
     if (!mp) {
-      renderError('task-result', '参数错误', '本地文件夹（挂载点）不能为空');
+      renderError('task-result', T('common.bad_args'), T('task.err_mp_empty'));
       return Promise.resolve(null);
     }
     if (mp.charAt(0) !== '/') {
-      renderError('task-result', '参数错误',
-        '本地文件夹必须是绝对路径（以 / 开头）：' + mp);
+      renderError('task-result', T('common.bad_args'),
+        T('task.err_mp_absolute', { path: mp }));
       return Promise.resolve(null);
     }
     // ★ 一对一：NAS 侧**一个**目录（下拉 / 浏览 / 手输，三选一）
     var nasPath = nasSelectedPath();
     if (!nasPath) {
-      renderError('task-result', '参数错误',
-        'NAS 文件夹不能为空：一个配对文件夹 = 一个本地文件夹 + 一个 NAS 文件夹');
+      renderError('task-result', T('common.bad_args'),
+        T('task.err_nas_empty'));
       return Promise.resolve(null);
     }
     var linkId = taskFormLinkId();
     if (!linkById(linkId)) {
-      renderError('task-result', '参数错误', '没有可用的 NAS 连接：先到「设置 → 连接」添加一台 NAS');
+      renderError('task-result', T('common.bad_args'), T('task.err_no_link'));
       return Promise.resolve(null);
     }
     var cdir = str($('t-cache-dir') ? $('t-cache-dir').value : '').trim();
@@ -3146,27 +3181,27 @@
       smart_delete: isOn('t-smart-delete', false)
     };
     var rows = [
-      ['id', id], ['本地', mp],
-      ['NAS 连接', linkBadge(linkById(linkId))],
-      ['NAS（一对一）', nasPath],
-      ['缓存目录', cdir || '（留空 = 按连接共享，实际在 <data_dir>/cache/<连接命名空间>）'],
-      ['冲突策略', conflictLabel(task.conflict)]
+      ['id', id], [T('detail.col_local'), mp],
+      [T('task.row_link'), linkBadge(linkById(linkId))],
+      [T('task.row_nas'), nasPath],
+      [T('task.row_cache_dir'), cdir || T('task.cache_dir_shared')],
+      [T('detail.conflict'), conflictLabel(task.conflict)]
     ];
     return withBusy({ spinners: ['task-busy'], buttons: ['btn-task-save'] }, function () {
       return ipcFor(linkId, { method: 'tasks', action: 'save', task: task });
     }).then(function (r) {
       if (!r.ok) {
         // daemon 的「目的地冲突 / 一对一 / 跨连接覆盖」错误原样展示（它已经是人话了）
-        renderError('task-result', '保存任务失败（' + linkLabelById(linkId) + '）', str(r.error));
+        renderError('task-result', T('task.save_failed', { label: linkLabelById(linkId) }), str(r.error));
         return r;
       }
       // ★ daemon 的 NAS 侧提示（同一 NAS 目录被别的任务用了）—— 只提示，不拦保存
       var warns = (isObj(r.data) && r.data.warnings) ? r.data.warnings : [];
       for (var wi = 0; wi < warns.length; wi++) {
-        if (str(warns[wi])) { rows.push(['⚠️ 提示', str(warns[wi])]); }
+        if (str(warns[wi])) { rows.push([T('task.row_warn'), str(warns[wi])]); }
       }
       if (!isOn('t-do-mount', true)) {
-        renderResult('task-result', true, '任务已保存（未挂载）', rows);
+        renderResult('task-result', true, T('task.saved_unmounted'), rows);
         refreshTasks();
         return r;
       }
@@ -3174,8 +3209,8 @@
         return ipcFor(linkId, { method: 'tasks', action: 'resume', id: id });
       }).then(function (r2) {
         var okMount = r2.ok;
-        renderResult('task-result', okMount, okMount ? '任务已保存并挂载' : '任务已保存，但挂载失败',
-          rows.concat([['挂载', okMount ? '成功' : str(r2.error)]]));
+        renderResult('task-result', okMount, okMount ? T('task.saved_mounted') : T('task.saved_mount_failed'),
+          rows.concat([[T('task.act_mount'), okMount ? T('common.success') : str(r2.error)]]));
         refreshTasks();
         refreshStatus(true);
         return r2;
@@ -3221,13 +3256,13 @@
               + num(off.pending_rename, 0) + num(off.pending_set_mtime, 0))
             : 0;
           var durSecs = conn.since_unix ? Math.max(0, Math.floor(Date.now() / 1000) - num(conn.since_unix, 0)) : 0;
-          var sinceTxt = durSecs > 0 ? '已离线 ' + humanDuration(durSecs) : '';
+          var sinceTxt = durSecs > 0 ? T('home.offline_since', { dur: humanDuration(durSecs) }) : '';
           addAlert('home-alerts', T('home.offline_link', {
             label: label,
             since: sinceTxt,
             state: pend > 0
-              ? '本地改动已先攒着（' + pend + ' 项），联网后自动同步'
-              : '已下载的内容仍可正常读写'
+              ? T('home.offline_queued', { n: pend })
+              : T('home.offline_readable')
           }), 'warn');
           if (off) {
             addAlert('home-alerts', T('home.offline_pending_link', {
@@ -3289,8 +3324,7 @@
 
     if (!st || !st.running) {
       show('sync-missing', true);
-      kvText(srv, '状态', '连接 ' + linkLabelById(currentId()) +
-        ' 的 qxyncd 未运行：请点顶部「启动 daemon」，或到「设置 → 连接」保存配置后启动。');
+      kvText(srv, T('detail.state'), T('diag.no_daemon', { label: linkLabelById(currentId()) }));
       ['sess-kv', 'cursors-kv', 'hydro-kv', 'transfers-kv', 'uploads-kv', 'cache-kv', 'cache-blocked-kv', 'sync-summary-kv', 'sync-note']
         .forEach(function (id) { clear($(id)); });
       show('uploads-active', false);
@@ -3304,44 +3338,44 @@
 
     var server = (s && isObj(s.server)) ? s.server : null;
     if (server) {
-      kvText(srv, 'Qsync 版本', optText(server.qsync_version));
-      kvText(srv, 'QPKG 版本', optText(server.qpkg_version));
+      kvText(srv, T('diag.qsync_ver'), optText(server.qsync_version));
+      kvText(srv, T('diag.qpkg_ver'), optText(server.qpkg_version));
       kvText(srv, 'Build', optText(server.build));
-      kvBool(srv, 'qbox CGI', server.qbox_cgi === true, '可用', '不可用');
-      kvBool(srv, 'FCGI', server.fcgi === true, '可用', '不可用');
+      kvBool(srv, 'qbox CGI', server.qbox_cgi === true, T('diag.avail'), T('diag.unavail'));
+      kvBool(srv, 'FCGI', server.fcgi === true, T('diag.avail'), T('diag.unavail'));
       if (server.busy_reason) {
         kvText(srv, 'busy_reason', String(server.busy_reason));
         if (srvWarn) {
           srvWarn.hidden = false;
-          srvWarn.textContent = '⚠ NAS 处于忙状态：' + String(server.busy_reason);
+          srvWarn.textContent = T('diag.nas_busy', { reason: String(server.busy_reason) });
         }
       }
     } else {
-      kvText(srv, '状态', '未登录 / 服务端信息不可用');
+      kvText(srv, T('detail.state'), T('diag.server_unavail'));
     }
     if (st.error) {
       if (srvWarn) {
         srvWarn.hidden = false;
-        srvWarn.textContent = '⚠ daemon 状态读取错误：' + String(st.error);
+        srvWarn.textContent = T('diag.status_read_error', { err: String(st.error) });
       }
     }
 
     // --- 会话
     var sess = $('sess-kv');
     clear(sess);
-    kvText(sess, 'daemon 版本', optText(s.daemon && s.daemon.version));
+    kvText(sess, T('diag.daemon_ver'), optText(s.daemon && s.daemon.version));
     kvText(sess, 'pid', optText(s.daemon && s.daemon.pid));
     kvText(sess, 'uptime', humanDuration(s.daemon ? s.daemon.uptime_secs : (st.ping ? st.ping.uptime_secs : 0)));
     kvText(sess, 'socket', optText(s.daemon && s.daemon.socket));
-    kvBool(sess, 'logged_in', s.logged_in === true, '已登录', '未登录');
+    kvBool(sess, 'logged_in', s.logged_in === true, T('links.login_ok'), T('links.login_none'));
     if (isObj(s.session)) {
       kvText(sess, 'sid', optText(s.session.sid_masked));
       // ★ M22：离线时 daemon 不发 check_alive —— alive=false 且 alive_known=false
       // 是「不知道」，显示「未知」而不是「失活」（后者会误导用户去重登，其实只是网断了）。
       if (!s.session.alive && s.session.alive_known === false) {
-        kvText(sess, 'session alive', '未知（离线未探测）', 'val-dim');
+        kvText(sess, 'session alive', T('diag.unknown_offline'), 'val-dim');
       } else {
-        kvBool(sess, 'session alive', s.session.alive === true, '存活', '失活');
+        kvBool(sess, 'session alive', s.session.alive === true, T('diag.alive'), T('diag.dead'));
       }
     } else {
       kvText(sess, 'session', '—');
@@ -3353,30 +3387,30 @@
     var conn = isObj(s.connectivity) ? s.connectivity : null;
     if (conn) {
       if (conn.known !== true) {
-        kvText(sess, '连通性', '未检测（还没发过网络请求）', 'val-dim');
+        kvText(sess, T('diag.connectivity'), T('diag.conn_untested'), 'val-dim');
       } else if (conn.online !== false) {
-        kvText(sess, '连通性', '在线', 'val-ok');
+        kvText(sess, T('diag.connectivity'), T('diag.online'), 'val-ok');
       } else {
         var offSecs = conn.since_unix ? Math.max(0, Math.floor(Date.now() / 1000) - num(conn.since_unix, 0)) : 0;
-        kvText(sess, '连通性',
-          '离线' + (offSecs > 0 ? '（已 ' + humanDuration(offSecs) + '）' : '')
-          + (conn.last_error ? '：' + String(conn.last_error) : ''), 'val-warn');
+        kvText(sess, T('diag.connectivity'),
+          T('diag.offline') + (offSecs > 0 ? T('diag.offline_for', { dur: humanDuration(offSecs) }) : '')
+          + (conn.last_error ? locColon() + String(conn.last_error) : ''), 'val-warn');
       }
     }
     var offbuf = isObj(s.offline) ? s.offline : null;
     if (offbuf) {
-      kvText(sess, '离线缓冲区',
-        '待上传 ' + num(offbuf.pending_upload, 0)
-        + ' · 待删除 ' + num(offbuf.pending_delete, 0)
-        + ' · 待建目录 ' + num(offbuf.pending_mkdir, 0)
-        + ' · 待改名 ' + num(offbuf.pending_rename, 0)
-        + ' · 待改 mtime ' + num(offbuf.pending_set_mtime, 0),
+      kvText(sess, T('diag.offline_buf'),
+        T('diag.offline_buf_val', {
+          up: num(offbuf.pending_upload, 0), del: num(offbuf.pending_delete, 0),
+          mkdir: num(offbuf.pending_mkdir, 0), rename: num(offbuf.pending_rename, 0),
+          setmtime: num(offbuf.pending_set_mtime, 0)
+        }),
         offbuf.replaying ? 'val-warn' : null);
       if (offbuf.replaying) {
-        kvText(sess, '结构操作', '待回放 / 正在回放（联网后按顺序推回 NAS；期间上传与删除冻结）', 'val-warn');
+        kvText(sess, T('diag.struct_ops'), T('diag.replay_hint'), 'val-warn');
       }
       if (offbuf.last_note) {
-        kvText(sess, '离线原因', String(offbuf.last_note), 'val-warn');
+        kvText(sess, T('diag.offline_reason'), String(offbuf.last_note), 'val-warn');
       }
     }
 
@@ -3388,15 +3422,15 @@
       kvText(cur, 'global_notify', s.cursors.global_notify);
       kvText(cur, 'sync_signal', s.cursors.sync_signal);
     } else {
-      kvText(cur, 'cursors', '不可用');
+      kvText(cur, 'cursors', T('diag.unavail'));
     }
 
     // --- 水合
     var hydro = $('hydro-kv');
     clear(hydro);
     var h = isObj(s.hydro) ? s.hydro : { count: 0, bytes: 0 };
-    kvText(hydro, '水合次数', num(h.count, 0));
-    kvText(hydro, '水合字节', humanSize(h.bytes) + '（' + num(h.bytes, 0) + ' B）');
+    kvText(hydro, T('diag.hydro_count'), num(h.count, 0));
+    kvText(hydro, T('diag.hydro_bytes'), T('diag.bytes_with_raw', { size: humanSize(h.bytes), raw: num(h.bytes, 0) }));
 
     // --- ★ T8：传输中（下载 + 上传）。`undefined/null` = 此刻没有在途作业。
     //   与上面的累计水合计数是**两个口径**：那个是历史总量，这个是此刻在传的。
@@ -3404,11 +3438,12 @@
     clear(tr);
     if (isObj(s.transfers)) {
       var t = s.transfers;
-      kvText(tr, '在传文件', num(t.active, 0) + '（下载 ' + num(t.downloading, 0)
-        + ' · 上传 ' + num(t.uploading, 0) + '）');
-      kvText(tr, '在传字节', humanSize(num(t.done_bytes, 0)) + ' / ' + humanSize(num(t.total_bytes, 0)));
+      kvText(tr, T('diag.transfer_files'), T('diag.transfers_val', {
+        active: num(t.active, 0), down: num(t.downloading, 0), up: num(t.uploading, 0)
+      }));
+      kvText(tr, T('diag.transfer_bytes'), humanSize(num(t.done_bytes, 0)) + ' / ' + humanSize(num(t.total_bytes, 0)));
     } else {
-      kvText(tr, '传输中', '无');
+      kvText(tr, T('diag.transferring'), T('common.none'));
     }
 
     // --- 上传队列
@@ -3418,7 +3453,7 @@
     if (u) {
       show('uploads-active', u.active === true);
       kvText(up, 'pending', num(u.pending, 0));
-      kvText(up, 'active', num(u.active ? 1 : 0, 0) + (u.active ? '（有作业在途）' : ''));
+      kvText(up, 'active', num(u.active ? 1 : 0, 0) + (u.active ? T('diag.job_in_flight') : ''));
       kvText(up, 'done', num(u.done, 0));
       kvText(up, 'failed', num(u.failed, 0), num(u.failed, 0) > 0 ? 'val-err' : null);
       kvText(up, 'retries', num(u.retries, 0), num(u.retries, 0) > 0 ? 'val-warn' : null);
@@ -3437,17 +3472,17 @@
     if (c) {
       kvText(cache, 'cache_mode', optText(c.mode));
       kvText(cache, 'used_bytes', humanSize(c.used_bytes));
-      kvText(cache, '文件数', num(c.hydrated_files, 0) + ' / ' + num(c.total_files, 0) + ' 已水合');
+      kvText(cache, T('diag.file_count'), T('diag.hydrated', { a: num(c.hydrated_files, 0), b: num(c.total_files, 0) }));
       kvText(cache, 'limit', (c.limit_bytes === null || c.limit_bytes === undefined)
-        ? '未设限额' : humanSize(c.limit_bytes));
-      kvText(cache, 'idle_secs', num(c.idle_secs, 0) === 0 ? '未启用定时脱水' : humanDuration(c.idle_secs));
+        ? T('diag.no_limit') : humanSize(c.limit_bytes));
+      kvText(cache, 'idle_secs', num(c.idle_secs, 0) === 0 ? T('diag.no_scheduled_dehydrate') : humanDuration(c.idle_secs));
       kvText(cache, 'dehydrated_total', num(c.dehydrated_total, 0));
       kvText(cache, 'freed_total', humanSize(c.freed_total_bytes));
-      kvText(cache, 'last_sweep_age', num(c.last_sweep_age_secs, 0) === 0 ? '未扫描' : humanDuration(c.last_sweep_age_secs) + '前');
+      kvText(cache, 'last_sweep_age', num(c.last_sweep_age_secs, 0) === 0 ? T('diag.not_scanned') : T('unit.ago', { dur: humanDuration(c.last_sweep_age_secs) }));
       if (c.last_error) {
         kvText(cache, 'last_error', String(c.last_error), 'val-err');
       }
-      kvText(blocked, 'blocked 合计', num(c.blocked_dirty, 0) + num(c.blocked_pinned, 0) + num(c.blocked_open, 0) +
+      kvText(blocked, T('diag.blocked_total'), num(c.blocked_dirty, 0) + num(c.blocked_pinned, 0) + num(c.blocked_open, 0) +
         num(c.blocked_mapped, 0) + num(c.blocked_inflight, 0));
       kvText(blocked, 'dirty', num(c.blocked_dirty, 0));
       kvText(blocked, 'pinned', num(c.blocked_pinned, 0));
@@ -3471,10 +3506,10 @@
     var sy = isObj(s.sync) ? s.sync : null;
     show('sync-missing', !sy);
     if (sy) {
-      kvText(sum, 'enabled', sy.enabled ? '是' : '否', sy.enabled ? 'val-ok' : 'val-warn');
-      kvText(sum, 'interval_secs', num(sy.interval_secs, 0) === 0 ? '暂停轮询' : num(sy.interval_secs, 0) + ' 秒');
+      kvText(sum, 'enabled', sy.enabled ? T('common.yes') : T('common.no'), sy.enabled ? 'val-ok' : 'val-warn');
+      kvText(sum, 'interval_secs', num(sy.interval_secs, 0) === 0 ? T('diag.poll_paused') : T('unit.n_secs', { n: num(sy.interval_secs, 0) }));
       kvText(sum, 'polls', num(sy.polls, 0));
-      kvText(sum, 'last_poll_age', num(sy.last_poll_age_secs, 0) === 0 ? '未轮询' : humanDuration(sy.last_poll_age_secs) + '前');
+      kvText(sum, 'last_poll_age', num(sy.last_poll_age_secs, 0) === 0 ? T('diag.not_polled') : T('unit.ago', { dur: humanDuration(sy.last_poll_age_secs) }));
       kvText(sum, 'refreshed', num(sy.refreshed, 0));
       kvText(sum, 'conflicts', num(sy.conflicts, 0), num(sy.conflicts, 0) > 0 ? 'val-warn' : null);
       kvText(sum, 'uploaded', num(sy.uploaded, 0));
@@ -3482,20 +3517,20 @@
       // ★ `deletes_blocked` 是**累计**计数（真机到过 692742），不是「当前被挡了多少」。
       //   「当前有没有被挡」只看 `delete_block_reason`（有值 = 这一轮有删除被熔断）；
       //   累计值配红字会让人以为现在还在熔断，所以这里不上色。
-      kvText(sum, '删除被挡（累计）', num(sy.deletes_blocked, 0));
+      kvText(sum, T('diag.deletes_blocked_total'), num(sy.deletes_blocked, 0));
       kvText(sum, 'events', num(sy.events, 0));
       kvText(sum, 'baseline_entries', num(sy.baseline_entries, 0));
       // ★ 首次同步 / 太久没同步 → 引擎正在把整棵目录树列一遍（建本地缓存/基线）。
       //   它不是错误，但会让「每轮只扫一小部分」看起来像卡住 —— 明确告诉用户，
       //   并说明完成后自动恢复常规间隔。
       if (sy.full_sync_pending) {
-        kvText(sum, '全量同步', '进行中（首次 / 太久没同步）', 'val-warn');
+        kvText(sum, T('diag.full_sync'), T('diag.full_sync_running'), 'val-warn');
       }
       if (num(sy.last_sync_ok_age_secs, 0) > 0) {
-        kvText(sum, '上次成功同步', humanDuration(sy.last_sync_ok_age_secs) + '前');
+        kvText(sum, T('diag.last_sync_ok'), T('unit.ago', { dur: humanDuration(sy.last_sync_ok_age_secs) }));
       }
       if (sy.last_error) {
-        addAlert('sync-alerts', '同步错误：' + String(sy.last_error));
+        addAlert('sync-alerts', T('diag.sync_error', { msg: String(sy.last_error) }));
       }
       if (sy.delete_block_reason) {
         addAlert('sync-alerts', T('sync.blocked_alert', { reason: String(sy.delete_block_reason) }),
@@ -3510,7 +3545,7 @@
       var note = $('sync-note');
       if (note) {
         note.hidden = !sy.note;
-        note.textContent = sy.note ? ('说明：' + String(sy.note)) : '';
+        note.textContent = sy.note ? (T('tasks.note_prefix') + String(sy.note)) : '';
       }
     } else {
       var note2 = $('sync-note');
@@ -3527,7 +3562,7 @@
     if (!c) {
       fill.style.width = '0%';
       fill.className = 'bar-fill';
-      label.textContent = '缓存数据不可用';
+      label.textContent = T('diag.cache_unavail');
       return;
     }
     var used = num(c.used_bytes, 0);
@@ -3536,14 +3571,14 @@
       fill.style.width = '100%';
       fill.className = 'bar-fill';
       fill.style.opacity = '0.25';
-      label.textContent = '未设限额：已用 ' + humanSize(used);
+      label.textContent = T('diag.no_limit_used', { size: humanSize(used) });
       return;
     }
     fill.style.opacity = '1';
     var pct = Math.min(100, (used / limit) * 100);
     fill.style.width = (isFinite(pct) ? pct.toFixed(1) : '0') + '%';
     fill.className = 'bar-fill' + (pct >= 90 ? ' err' : (pct >= 70 ? ' warn' : ''));
-    label.textContent = humanSize(used) + ' / ' + humanSize(limit) + '（' + pct.toFixed(1) + '%）';
+    label.textContent = humanSize(used) + ' / ' + humanSize(limit) + locParen(pct.toFixed(1) + '%');
   }
 
   // severity: 'error'（默认，红，真失败）| 'warn'（黄，需注意但不致命）。
@@ -3747,7 +3782,7 @@
     if (!tb) { return; }
     clear(tb);
     var list = (mounts || []).filter(isObj);
-    if (countId) { setText(countId, list.length ? '（' + list.length + '）' : ''); }
+    if (countId) { setText(countId, list.length ? locParen(list.length) : ''); }
     if (emptyId) {
       if (state.mountsError) {
         setListState(emptyId, 'error', T('list.error', { msg: state.mountsError }));
@@ -3768,10 +3803,10 @@
         var tdRemote = el('td', 'mono', str(m.remote));
         tr.appendChild(tdRemote);
         var mode = el('td');
-        mode.appendChild(el('span', 'badge ' + (m.readonly ? 'badge-off' : 'badge-on'), m.readonly ? '只读' : '读写'));
+        mode.appendChild(el('span', 'badge ' + (m.readonly ? 'badge-off' : 'badge-on'), m.readonly ? T('task.meta_read_only') : T('task.meta_read_write')));
         tr.appendChild(mode);
         var act = el('td');
-        var btn = el('button', 'mini danger', '卸载');
+        var btn = el('button', 'mini danger', T('mounts.act_unmount'));
         btn.addEventListener('click', function () { doUmount(str(m.mountpoint), btn); });
         act.appendChild(btn);
         tr.appendChild(act);
@@ -3782,7 +3817,7 @@
 
   function doUmount(mountpoint, btn) {
     if (!requireDaemon()) { return; }
-    if (!window.confirm('确定卸载挂载点？\n' + mountpoint)) { return; }
+    if (!window.confirm(T('mounts.confirm_unmount', { path: mountpoint }))) { return; }
     withBusy({ buttons: btn ? [btn] : [] }, function () {
       return ipc({ method: 'umount', mountpoint: mountpoint });
     }).then(function (r) {
@@ -3817,16 +3852,16 @@
 
     var sf = (data.syncing_folders || []).filter(isObj);
     state.rootsLoaded = true;
-    setText('roots-count', sf.length ? '（' + sf.length + '）' : '');
+    setText('roots-count', sf.length ? locParen(sf.length) : '');
     setBusyState('roots-folders', false);
 
     var kv = $('roots-summary-kv');
-    kvText(kv, 'NAS 登记的同步文件夹', sf.length ? (sf.length + ' 个（配对时可下拉选）') : '（无）');
+    kvText(kv, T('roots.summary_label'), sf.length ? T('roots.summary_count', { n: sf.length }) : T('roots.none'));
 
     var note = $('roots-note');
     if (note) {
       note.hidden = !data.note;
-      note.textContent = data.note ? ('说明：' + String(data.note)) : '';
+      note.textContent = data.note ? (T('tasks.note_prefix') + String(data.note)) : '';
     }
 
     if (sf.length) { setListState('roots-folders-empty', 'ready'); }
@@ -3838,9 +3873,9 @@
       var usable = str(f.client_path).trim();
       var raw = str(f.path).trim() || str(f.realpath).trim();
       var txt = str(f.folder) + ' · ' +
-        (usable ? usable : '（不可映射：' + (raw || '?') + '）') +
-        ' · 权限=' + str(f.permission) +
-        (f.read_deletable === true ? ' · 可删' : '');
+        (usable ? usable : T('roots.unmappable', { raw: (raw || '?') })) +
+        T('roots.perm', { perm: str(f.permission) }) +
+        (f.read_deletable === true ? T('roots.deletable') : '');
       folders.appendChild(el('li', null, txt));
     }
   }
@@ -3920,7 +3955,7 @@
         hint.textContent = T('connect.none', { path: str(info.path) });
       }
     }
-    setText('link-path-hint', info ? ('link 文件：' + str(info.path)) : '—');
+    setText('link-path-hint', info ? (T('connect.link_file', { path: str(info.path) })) : '—');
 
     var link = (info && isObj(info.link)) ? info.link : null;
     var editing = str(state.editingLinkId);
@@ -3976,21 +4011,22 @@
     if (!dl) { return; }
     clear(dl);
     if (!info) {
-      kvText(dl, 'app_info', '读取失败');
+      kvText(dl, 'app_info', T('paths.read_failed'));
       return;
     }
     state.home = str(info.home);
-    kvText(dl, 'GUI 版本', str(info.version));
+    kvText(dl, T('paths.gui_version'), str(info.version));
     kvText(dl, 'HOME', str(info.home));
     kvText(dl, 'socket', str(info.socket));
     kvText(dl, 'config_dir', str(info.config_dir));
     kvText(dl, 'data_dir', str(info.data_dir));
     kvText(dl, 'state_dir', str(info.state_dir));
-    kvText(dl, '连接数', ((info.links || []).length) + ' 个'
-      + (((info.links_bad || []).length) ? '（解析失败 ' + (info.links_bad || []).length + ' 个）' : ''));
-    kvText(dl, 'daemon_bin', info.daemon_bin ? str(info.daemon_bin) : '未找到（先 cargo build --workspace）',
+    kvText(dl, T('paths.links'), (info.links_bad || []).length
+      ? T('paths.links_value_bad', { n: (info.links || []).length, bad: (info.links_bad || []).length })
+      : T('paths.links_value', { n: (info.links || []).length }));
+    kvText(dl, 'daemon_bin', info.daemon_bin ? str(info.daemon_bin) : T('paths.daemon_bin_missing'),
       info.daemon_bin ? null : 'val-warn');
-    kvBool(dl, 'daemon_running', info.daemon_running === true, '运行中', '未运行');
+    kvBool(dl, 'daemon_running', info.daemon_running === true, T('paths.daemon_running'), T('paths.daemon_stopped'));
 
     // 挂载点默认值 & 下载默认目录
     var mp = $('m-mountpoint');
@@ -4284,7 +4320,7 @@
     var host = str($('f-host') ? $('f-host').value : '').trim();
     var user = str($('f-user') ? $('f-user').value : '').trim();
     if (!host || !user) {
-      return { error: 'host / user 不能为空' };
+      return { error: T('conn.host_user_required') };
     }
     var input = {
       host: host,
@@ -4316,7 +4352,7 @@
     var lid = str(id);
     return call('link_read', { linkId: lid }).then(function (r) {
       if (!r.ok || !isObj(r.data)) {
-        renderError('login-result', '读取连接配置失败', str(r.error));
+        renderError('login-result', T('conn.read_failed'), str(r.error));
         return r;
       }
       return call('credential_present', { linkId: lid }).then(function (c) {
@@ -4387,10 +4423,10 @@
   function appendOtpRows(rows, d) {
     if (!d) { return; }
     if (d.otp_saved === true) {
-      rows.push(['两步验证', '密钥已保存（之后自动生成验证码）']);
+      rows.push([T('otp.prompt_title'), T('otp.secret_saved')]);
     }
     if (d.otp_note) {
-      rows.push(['两步验证', str(d.otp_note)]);
+      rows.push([T('otp.prompt_title'), str(d.otp_note)]);
     }
   }
 
@@ -4404,12 +4440,12 @@
   function doLinkSave() {
     var built = buildLinkInput(false);
     if (built.error) {
-      renderError('login-result', '参数错误', built.error);
+      renderError('login-result', T('common.invalid_params'), built.error);
       return Promise.resolve({ ok: false, error: built.error });
     }
     return call('link_save', { input: built.input }).then(function (r) {
       if (!r.ok) {
-        renderError('login-result', '保存连接配置失败', str(r.error));
+        renderError('login-result', T('conn.save_failed'), str(r.error));
         logErr('link_save 失败：' + str(r.error));
         return r;
       }
@@ -4418,10 +4454,10 @@
       state.editingLinkId = savedId;
       state.creatingLink = false;   // ★ M16.1：保存成功 → 表单切回「编辑这条连接」
       var rows = [
-        ['连接 id', savedId],
-        ['文件', str(d.path)],
+        [T('conn.col_id'), savedId],
+        [T('search.type_file'), str(d.path)],
         ['NAS', str(d.link && d.link.user) + '@' + str(d.link && d.link.host) + ':' + str(d.link && d.link.port)],
-        ['https', d.link && d.link.https ? '是' : '否']
+        ['https', d.link && d.link.https ? T('common.yes') : T('common.no')]
       ];
       // ★ M40：如实回显「后端真正存下了几条备选路径」—— 用户删掉一行时能一眼确认
       //   它真的没了（空 = 只走主地址），而不是「保存成功」却什么都没变。
@@ -4434,7 +4470,7 @@
       //   「未保存」，并保留输入框内容，让用户能接着点「保存并登录」。
       var pendingOtp = !!str(built.input.otp_secret);
       if (pendingOtp) {
-        rows.push(['两步验证', '未保存 —— 点「保存并登录」才会写入凭据']);
+        rows.push([T('otp.prompt_title'), T('otp.not_saved')]);
         // ★ M17(a)：保存成功后 `loadConnect()` 会重填表单（新建连接尤其会从「新建态」
         //   切到「编辑态」）。预先把「保存后的表单目标」记进 state.otpFormTarget，
         //   免得 fillConnectForm 把刚保留下来的两步验证输入清掉。
@@ -4448,7 +4484,7 @@
         appendOtpRows(rows, d);
       }
       renderResult('login-result', true, T('links.saved'), rows);
-      logOk('连接配置已保存：' + savedId + (pendingOtp ? '（两步验证输入未保存，保留在输入框）' : ''));
+      logOk(T('conn.saved_log', { id: savedId, otp: pendingOtp ? T('otp.not_saved_note') : '' }));
       // ★ M17：没填两步验证时字段用完就清（绝不回显已保存内容）；
       //   填了则**保留**，否则用户接下来点「保存并登录」会发现输入没了。
       if (!pendingOtp) { clearOtpField(); }
@@ -4520,29 +4556,29 @@
   function doLogin() {
     var built = buildLinkInput(true);
     if (built.error) {
-      renderError('login-result', '参数错误', built.error);
+      renderError('login-result', T('common.invalid_params'), built.error);
       return Promise.resolve({ ok: false, error: built.error });
     }
     // ★ M47：口令留空 + 该连接已有凭据 → 放行（后端回退到已保存的口令）。
     //   「重新登录」不再强制重输口令；没有凭据的连接才必须填。
     if (!built.input.password && !state.credPresent) {
-      renderError('login-result', '缺少口令', '请输入口令后再「保存并登录」（口令只用于写入凭据，不会回传）。');
+      renderError('login-result', T('conn.password_missing'), T('conn.password_missing_hint'));
       var pw = $('f-password');
       if (pw) { pw.focus(); }
-      return Promise.resolve({ ok: false, error: '缺少口令' });
+      return Promise.resolve({ ok: false, error: T('conn.password_missing') });
     }
     var wantId = str(built.input.id || '');
     return loginFlowWithOtp(built.input, ['btn-login', 'btn-link-save']).then(function (r) {
       if (!r.ok) {
-        renderError('login-result', '登录流程失败（invoke 被拒）', str(r.error));
+        renderError('login-result', T('conn.login_flow_failed'), str(r.error));
         return r;
       }
       var d = isObj(r.data) ? r.data : {};
       var login = isObj(d.login) ? d.login : null;
       var rows = [
-        ['link 文件', str(d.link_path)],
-        ['凭据文件', str(d.credential_path)],
-        ['daemon 已重启', d.restarted ? '是' : '否']
+        [T('conn.link_file'), str(d.link_path)],
+        [T('conn.credential_file'), str(d.credential_path)],
+        [T('conn.daemon_restarted'), d.restarted ? T('common.yes') : T('common.no')]
       ];
       if (login && isObj(login.data)) {
         rows.push(['sid', str(login.data.sid_masked)]);
@@ -4550,20 +4586,20 @@
         rows.push(['uid', optText(login.data.uid)]);
         // ★ M17：这次登录是否走了两步验证。`two_step=true` = NAS 要求 2SV 且
         //   验证码通过了；false = 账号没开 2SV（或本次未用上）。
-        rows.push(['两步验证', login.data.two_step === true
-          ? '已通过（TOTP）'
-          : '未启用 / 本次未使用']);
+        rows.push([T('otp.prompt_title'), login.data.two_step === true
+          ? T('otp.passed_totp')
+          : T('otp.not_used')]);
       }
       // ★ M17：本次是否保存了密钥 / 填的是不是一次性验证码（密钥本身不回传）。
       appendOtpRows(rows, d);
-      if (d.error) { rows.push(['错误', str(d.error)]); }
+      if (d.error) { rows.push([T('common.error'), str(d.error)]); }
       if (login && isObj(login.error)) {
-        rows.push(['登录错误', str(login.error.kind) + ': ' + str(login.error.message)]);
+        rows.push([T('conn.login_error'), str(login.error.kind) + ': ' + str(login.error.message)]);
       }
       var ok = d.ok === true;
-      renderResult('login-result', ok, ok ? '登录成功' : '登录失败', rows);
+      renderResult('login-result', ok, ok ? T('conn.login_ok') : T('conn.login_failed'), rows);
       if (ok) {
-        logOk('登录成功（' + (wantId || '新连接') + '）');
+        logOk(T('conn.login_ok_log', { label: wantId || T('common.new_connection') }));
         // ★ M17：密钥/验证码用完就清（绝不回显；失败时也清，避免显眼看得到的过期码）。
         clearOtpField();
         return adoptLink(wantId, built.input).then(function () { return loadConnect(); }).then(function () { return r; });
@@ -4612,7 +4648,9 @@
         } else if (d.already) {
           logInfo('连接 ' + linkLabelById(id) + ' 的 qxyncd 已在运行');
         } else {
-          logOk('连接 ' + linkLabelById(id) + ' 的 qxyncd 已启动' + (d.bin ? '：' + str(d.bin) : ''));
+          logOk(d.bin
+            ? T('links.daemon_started_bin', { label: linkLabelById(id), bin: str(d.bin) })
+            : T('links.daemon_started', { label: linkLabelById(id) }));
         }
       }
       return refreshStatus(true).then(function () { return r; });
@@ -4659,7 +4697,7 @@
           okCount++;
         }
       }
-      logOk('全部启动完成：' + okCount + '/' + ls.length + ' 个连接已在运行');
+      logOk(T('links.start_all_ok', { ok: okCount, total: ls.length }));
       return refreshStatus(true).then(function () { return r; });
     });
   }
@@ -4681,8 +4719,10 @@
             logErr('停止 ' + str(ls[i].id) + ' 失败：' + str(ls[i].error));
           }
         }
-        if (!bad) { logOk('全部连接的 daemon 已停止'); }
-        else if (bad < ls.length) { logOk('其余 ' + (ls.length - bad) + ' 个连接的 daemon 已停止'); }
+        if (!bad) { logOk(T('links.stop_all_ok')); }
+        else if (bad < ls.length) {
+          logOk(T('links.stop_all_partial', { n: ls.length - bad }));
+        }
       }
       return refreshStatus(true).then(function () { return r; });
     });
@@ -4707,7 +4747,7 @@
       return call('purge_plan', { scope: 'link', linkId: id });
     }).then(function (r) {
       if (!r.ok) {
-        renderError('login-result', '读取删除计划失败', str(r.error));
+        renderError('login-result', T('purge.plan_read_failed'), str(r.error));
         logErr('读取移除连接计划失败（' + label + '）：' + str(r.error));
         return null;
       }
@@ -4759,11 +4799,11 @@
     if (p) {
       msg = T('purge.done_link', {
         label: id, size: humanSize(p.bytes), files: num(p.files, 0)
-      }) + '（删除任务登记 ' + tasksDeleted + ' 个）';
+      }) + T('links.removed_tasks_note', { n: tasksDeleted });
     } else {
-      msg = '已移除连接 ' + id + '（删除任务登记 ' + tasksDeleted + ' 个；本地数据保留）';
+      msg = T('links.removed_kept_data', { label: id, n: tasksDeleted });
     }
-    logOk(msg + '；本地文件 / NAS 数据未动');
+    logOk(msg + T('links.removed_untouched'));
     if (str(state.editingLinkId) === id) { state.editingLinkId = ''; }
     state.creatingLink = false;   // ★ M16.1：移除后回到「展示当前连接」而不是停在新建态
     // 当前连接被删掉后，refreshStatus 里的 ensureCurrentLink 会自动切到第一个剩余连接
@@ -4784,7 +4824,7 @@
       return call('purge_plan', { scope: 'all' });
     }).then(function (r) {
       if (!r.ok) {
-        renderError('advanced-result', '读取删除计划失败', str(r.error));
+        renderError('advanced-result', T('purge.plan_read_failed'), str(r.error));
         logErr('读取删除计划失败：' + str(r.error));
         return null;
       }
@@ -4810,7 +4850,7 @@
           return call('purge_all', {});
         }).then(function (r2) {
           if (!r2.ok) {
-            renderError('advanced-result', '删除失败', str(r2.error));
+            renderError('advanced-result', T('purge.delete_failed'), str(r2.error));
             logErr('删除本机全部 qxync 数据失败：' + str(r2.error));
             return r2;
           }
@@ -4906,8 +4946,11 @@
   /** ★ M47：立即登录的收尾（成功/失败各记一条日志）。 */
   function finishQuickLogin(id, lr) {
     if (lr && lr.ok) {
-      logOk('登录成功（' + linkLabelById(id) + '）：' + str(lr.data && lr.data.sid_masked) +
-        ' user=' + str(lr.data && lr.data.user));
+      logOk(T('conn.quick_login_ok', {
+        label: linkLabelById(id),
+        sid: str(lr.data && lr.data.sid_masked),
+        user: str(lr.data && lr.data.user)
+      }));
     } else {
       logErr('登录失败（' + linkLabelById(id) + '）：' + str(lr && lr.error));
     }
@@ -4997,9 +5040,9 @@
     for (var i = 0; i < ips.length; i++) {
       var ip = str(ips[i]);
       var sc = str(scopes[i]);
-      out.push(sc ? (ip + '（' + sc + '）') : ip);
+      out.push(sc ? (ip + locParen(sc)) : ip);
     }
-    var text = out.join('，');
+    var text = out.join(T('list.sep_comma'));
     if (ep.resolved_changed === true) { text += ' · ' + T('routes.changed'); }
     return text;
   }
@@ -5024,7 +5067,7 @@
     if (full && num(ep.last_fail_unix, 0) > 0) {
       parts.push(T('routes.last_fail', { when: humanTimeFromEpoch(ep.last_fail_unix) }));
     }
-    return parts.length ? parts.join('；') : '—';
+    return parts.length ? parts.join(T('list.sep_semi')) : '—';
   }
 
   /** 渲染摘要 + 表格 + 四态。`data=null` 只清空（错误态由调用方 setListState 写文案）。 */
@@ -5161,11 +5204,11 @@
     // 一对一：一个挂载点 = 一个 NAS 目录
     var remote = str($('m-remote') ? $('m-remote').value : '/home').trim();
     if (!mp) {
-      renderError('mount-result', '参数错误', '挂载点不能为空');
+      renderError('mount-result', T('common.invalid_params'), T('mount.point_required'));
       return Promise.resolve(null);
     }
     if (!remote) {
-      renderError('mount-result', '参数错误', 'NAS 目录不能为空（默认 /home）');
+      renderError('mount-result', T('common.invalid_params'), T('mount.remote_required'));
       return Promise.resolve(null);
     }
     var req = {
@@ -5186,17 +5229,17 @@
       return ipc(req);
     }).then(function (r) {
       if (r.ok) {
-        renderResult('mount-result', true, '挂载成功', [
-          ['挂载点', mp],
-          ['NAS 目录', remote],
-          ['模式', req.read_write ? '读写' : '只读'],
+        renderResult('mount-result', true, T('mount.ok'), [
+          [T('mount.point'), mp],
+          [T('mount.remote'), remote],
+          [T('mount.mode'), req.read_write ? T('task.meta_read_write') : T('task.meta_read_only')],
           ['cache_mode', req.cache_mode]
         ]);
         refreshMounts();
         refreshStatus(true);
         refreshRoots();
       } else {
-        renderError('mount-result', '挂载失败', str(r.error));
+        renderError('mount-result', T('mount.failed'), str(r.error));
       }
       return r;
     });
@@ -5214,7 +5257,7 @@
       var an = str(a && a.filename);
       var bn = str(b && b.filename);
       try {
-        return an.localeCompare(bn, 'zh-Hans-CN');
+        return an.localeCompare(bn, collLocale());
       } catch (e) {
         return an < bn ? -1 : (an > bn ? 1 : 0);
       }
@@ -5426,12 +5469,12 @@
 
   function doRemovePath(full) {
     if (!requireDaemon()) { return; }
-    if (!window.confirm('确定删除 NAS 上的条目？\n' + full)) { return; }
+    if (!window.confirm(T('files.rm_confirm', { path: full }))) { return; }
     withBusy({ spinners: ['files-busy'] }, function () {
       return ipc({ method: 'rm', dir: state.files.dir, name: pathBase(full) });
     }).then(function (r) {
       if (r.ok) {
-        logOk('已删除：' + full);
+        logOk(T('files.rm_done', { path: full }));
         refreshFiles(state.files.dir);
       } else {
         logErr('rm 失败：' + str(r.error));
@@ -5531,7 +5574,7 @@
           else if (base === 'online') { glyph = '☁'; cls = 'state-online'; kind = 'online'; }
         }
       }
-      if (num(fs.hydrated_bytes, 0) > 0) { titleBits.push(humanSize(num(fs.hydrated_bytes, 0)) + ' 已缓存'); }
+      if (num(fs.hydrated_bytes, 0) > 0) { titleBits.push(humanSize(num(fs.hydrated_bytes, 0)) + T('files.cached_suffix')); }
     } else if (!isDir) {
       titleBits.push(T('state.syncUnknown'));
     }
@@ -5576,7 +5619,7 @@
     }
     if (e.exist === false) {
       tdName.appendChild(document.createTextNode(' '));
-      tdName.appendChild(el('span', 'badge badge-warn', '占位'));
+      tdName.appendChild(el('span', 'badge badge-warn', T('files.placeholder')));
     }
     tr.appendChild(tdName);
 
@@ -5585,7 +5628,7 @@
     tdType.appendChild(document.createTextNode(isDir ? '📁' : '📄'));
     if (isDir && e.have_child === true) {
       var sub = el('span', 'has-child', '▾');
-      sub.title = '有子目录';
+      sub.title = T('files.has_subdirs');
       tdType.appendChild(sub);
     }
     tr.appendChild(tdType);
@@ -5622,7 +5665,7 @@
     var tdPin = el('td', 'col-act');
     var btnMore = el('button', 'mini row-more', '⋯');
     btnMore.type = 'button';
-    btnMore.title = '这一行的操作（也可用右键 / Shift+F10）';
+    btnMore.title = T('files.row_actions');
     btnMore.addEventListener('click', function (ev) {
       ev.preventDefault();
       ev.stopPropagation();
@@ -5647,7 +5690,9 @@
       var d = isObj(r.data) ? r.data : {};
       var got = str(d.pin);
       if (got && selectEl) { selectEl.value = got; }
-      logOk('pin ' + (pinState ? '设置' : '查询') + '：' + path + ' → ' + (got || '—'));
+      logOk(pinState
+        ? T('files.pin_set_log', { path: path, state: got || '—' })
+        : T('files.pin_query_log', { path: path, state: got || '—' }));
       if (r.raw && r.raw.data !== undefined) {
         // pin 查询结果就是 {path, pin}
       }
@@ -5660,7 +5705,9 @@
     var guess = base ? pathJoin(base, e.filename) : e.filename;
     // ★ M26/M33：下载超过 3 秒会在**右下角**浮一张进度卡片（百分比/速度/剩余
     //   时间），快下载与老版本 daemon（不推进度行）零打扰。
-    openModal('下载到本地', 'NAS：' + pathJoin(state.files.dir, e.filename) + '（大文件可能较久；超过 3 秒在右下角显示下载进度）', guess)
+    openModal(T('files.download_title'), T('files.download_message', {
+      path: pathJoin(state.files.dir, e.filename)
+    }), guess)
       .then(function (dest) {
         if (!dest) { return null; }
         var target = str(dest).trim();
@@ -5678,7 +5725,7 @@
           prog.finish(r.ok, r.ok ? null : str(r.error));
           if (r.ok) {
             var d = isObj(r.data) ? r.data : {};
-            logOk('下载完成：' + str(d.dest) + '（' + humanSize(d.bytes) + '）');
+            logOk(T('files.download_done', { path: str(d.dest), size: humanSize(d.bytes) }));
           } else {
             logErr('下载失败：' + str(r.error));
           }
@@ -5709,9 +5756,11 @@
         var d = isObj(r.data) ? r.data : {};
         var done = num(d.dehydrated, 0);
         var reasons = dehydrateReasons(d.blocked);
-        var line = '脱水 ' + path + '：' + done + ' 项，释放 ' + humanSize(d.freed_bytes) +
-          '（当前已用 ' + humanSize(d.used_bytes) + '）';
-        if (reasons) { line += '｜被挡下：' + reasons; }
+        var line = T('files.dehy_line', {
+          path: path, n: done,
+          freed: humanSize(d.freed_bytes), used: humanSize(d.used_bytes)
+        });
+        if (reasons) { line += T('files.dehy_blocked_line', { reasons: reasons }); }
         // ★ 0 项一定要说清为什么：只打「0 项，释放 0 B」等于静默失败
         //   （用户无从判断是保护窗口、是 pinned，还是这个路径压根不在挂载范围内）。
         if (done > 0) {
@@ -5719,7 +5768,7 @@
         } else if (reasons) {
           logErr(line);
         } else {
-          logInfo(line + '（没有可脱水的候选：该路径可能不在任何挂载点的远端根下）');
+          logInfo(line + T('files.dehy_no_candidates'));
         }
       } else {
         logErr('脱水失败：' + str(r.error));
@@ -5743,13 +5792,13 @@
     for (var j = 0; j < out.length; j++) {
       if (uniq.indexOf(out[j]) < 0) { uniq.push(out[j]); }
     }
-    var head = uniq.slice(0, 3).join('、');
-    return uniq.length > 3 ? head+ ' 等 ' + uniq.length + ' 类' : head;
+    var head = uniq.slice(0, 3).join(T('list.sep'));
+    return uniq.length > 3 ? T('files.dehy_more_kinds', { head: head, n: uniq.length }) : head;
   }
 
   function doMkdir() {
     if (!requireLogin()) { return; }
-    openModal('新建目录', '父目录：' + state.files.dir, '')
+    openModal(T('files.mkdir_title'), T('files.mkdir_message', { path: state.files.dir }), '')
       .then(function (name) {
         var n = str(name).trim();
         if (!n) { return null; }
@@ -5761,7 +5810,7 @@
           return ipc({ method: 'mkdir', parent: state.files.dir, name: n });
         }).then(function (r) {
           if (r.ok) {
-            logOk('已创建目录：' + pathJoin(state.files.dir, n));
+            logOk(T('files.mkdir_done', { path: pathJoin(state.files.dir, n) }));
             refreshFiles(state.files.dir);
           } else {
             logErr('mkdir 失败：' + str(r.error));
@@ -5779,12 +5828,12 @@
       return;
     }
     var name = pathBase(full);
-    if (!window.confirm('确定删除 NAS 上的条目？\n' + full)) { return; }
+    if (!window.confirm(T('files.rm_confirm', { path: full }))) { return; }
     withBusy({ spinners: ['files-busy'], buttons: ['btn-rm'] }, function () {
       return ipc({ method: 'rm', dir: state.files.dir, name: name });
     }).then(function (r) {
       if (r.ok) {
-        logOk('已删除：' + full);
+        logOk(T('files.rm_done', { path: full }));
         state.files.selected = null;
         refreshFiles(state.files.dir);
       } else {
@@ -6072,14 +6121,14 @@
     if (!dl) { return; }
     clear(dl);
     if (!sy) {
-      kvText(dl, 'sync', '不可用（daemon 未运行或未上报）');
+      kvText(dl, 'sync', T('sync.unavailable_detail'));
       clear($('sync-cursors-kv'));
       clear($('sync-devices'));
       clearAlerts('sync2-alerts');
       return;
     }
-    kvText(dl, 'enabled', sy.enabled ? '是' : '否', sy.enabled ? 'val-ok' : 'val-warn');
-    kvText(dl, 'interval_secs', num(sy.interval_secs, 0) === 0 ? '0（暂停轮询）' : num(sy.interval_secs, 0));
+    kvText(dl, 'enabled', sy.enabled ? T('common.yes') : T('common.no'), sy.enabled ? 'val-ok' : 'val-warn');
+    kvText(dl, 'interval_secs', num(sy.interval_secs, 0) === 0 ? T('sync.paused_zero') : num(sy.interval_secs, 0));
     kvText(dl, 'polls', num(sy.polls, 0));
     kvText(dl, 'last_poll_age_secs', num(sy.last_poll_age_secs, 0));
     kvText(dl, 'baseline_entries', num(sy.baseline_entries, 0));
@@ -6088,7 +6137,7 @@
     kvText(dl, 'uploaded', num(sy.uploaded, 0));
     kvText(dl, 'deleted', num(sy.deleted, 0));
     // ★ 累计值（不是「当前」）：当前是否被熔断只看下面的 delete_block_reason。
-    kvText(dl, '删除被挡（累计）', num(sy.deletes_blocked, 0));
+    kvText(dl, T('sync.kv_deletes_blocked'), num(sy.deletes_blocked, 0));
     kvText(dl, 'events', num(sy.events, 0));
     kvText(dl, 'devices', (sy.devices || []).length);
     kvText(dl, 'last_error', sy.last_error ? String(sy.last_error) : '—', sy.last_error ? 'val-err' : null);
@@ -6115,9 +6164,9 @@
     }
 
     clearAlerts('sync2-alerts');
-    if (sy.last_error) { addAlert('sync2-alerts', '同步错误：' + String(sy.last_error)); }
+    if (sy.last_error) { addAlert('sync2-alerts', T('sync.error_prefix', { msg: String(sy.last_error) })); }
     // ★ M30：网络失败是「已缓冲，等联网」，不是同步错误 → 单独一行说明（黄色）。
-    if (sy.note) { addAlert('sync2-alerts', '说明：' + String(sy.note), 'warn'); }
+    if (sy.note) { addAlert('sync2-alerts', T('sync.note_prefix', { msg: String(sy.note) }), 'warn'); }
     if (sy.delete_block_reason) {
       addAlert('sync2-alerts', T('sync.blocked_alert', { reason: String(sy.delete_block_reason) }),
         null, [{
@@ -6133,13 +6182,13 @@
     clear(cdl);
     var c = (s && isObj(s.cache)) ? s.cache : null;
     if (!c) {
-      kvText(cdl, 'cache', '不可用');
+      kvText(cdl, 'cache', T('common.unavailable'));
     } else {
       kvText(cdl, 'mode', str(c.mode));
-      kvText(cdl, 'used_bytes', humanSize(c.used_bytes) + '（' + num(c.used_bytes, 0) + ' B）');
+      kvText(cdl, 'used_bytes', humanSize(c.used_bytes) + locParen(num(c.used_bytes, 0) + ' B'));
       kvText(cdl, 'total_files', num(c.total_files, 0));
       kvText(cdl, 'hydrated_files', num(c.hydrated_files, 0));
-      kvText(cdl, 'limit_bytes', (c.limit_bytes === null || c.limit_bytes === undefined) ? '未设限额' : humanSize(c.limit_bytes));
+      kvText(cdl, 'limit_bytes', (c.limit_bytes === null || c.limit_bytes === undefined) ? T('sync.no_limit') : humanSize(c.limit_bytes));
       kvText(cdl, 'idle_secs', num(c.idle_secs, 0));
       kvText(cdl, 'dehydrated_total', num(c.dehydrated_total, 0));
       kvText(cdl, 'freed_total_bytes', humanSize(c.freed_total_bytes));
@@ -6169,9 +6218,12 @@
     }).then(function (r) {
       if (r.ok) {
         var d = isObj(r.data) ? r.data : {};
-        logOk((label || 'sync') + '完成（' + linkLabelById(lid) + '）：refreshed=' + num(d.refreshed, 0) +
-          ' conflicts=' + num(d.conflicts, 0) + ' uploaded=' + num(d.uploaded, 0) +
-          ' deleted=' + num(d.deleted, 0) + ' blocked=' + num(d.deletes_blocked, 0));
+        logOk(T('sync.done_log', {
+          op: label || 'sync', label: linkLabelById(lid),
+          refreshed: num(d.refreshed, 0), conflicts: num(d.conflicts, 0),
+          uploaded: num(d.uploaded, 0), deleted: num(d.deleted, 0),
+          blocked: num(d.deletes_blocked, 0)
+        }));
       } else {
         logErr((label || 'sync') + '失败（' + linkLabelById(lid) + '）：' + str(r.error));
       }
@@ -6198,13 +6250,13 @@
         var d = isObj(r.data) ? r.data : {};
         var targets = (d.targets || []).length;
         var blocked = (d.blocked || []).length;
-        renderResult('dehy-result', true, (label || '脱水') + (d.dry_run ? '（预演，未真正删除）' : ''), [
-          ['脱水项', num(d.dehydrated, 0)],
-          ['释放字节', humanSize(d.freed_bytes)],
-          ['当前已用', humanSize(d.used_bytes)],
-          ['限额', (d.limit_bytes === null || d.limit_bytes === undefined) ? '未设限额' : humanSize(d.limit_bytes)],
-          ['targets', targets + ' 项'],
-          ['被挡下', blocked + ' 项']
+        renderResult('dehy-result', true, (label || T('sync.dehy_title')) + (d.dry_run ? T('sync.dehy_dry_suffix') : ''), [
+          [T('sync.dehy_items'), num(d.dehydrated, 0)],
+          [T('sync.dehy_freed_bytes'), humanSize(d.freed_bytes)],
+          [T('sync.dehy_used'), humanSize(d.used_bytes)],
+          [T('sync.dehy_limit'), (d.limit_bytes === null || d.limit_bytes === undefined) ? T('sync.no_limit') : humanSize(d.limit_bytes)],
+          ['targets', T('sync.count_items', { n: targets })],
+          [T('sync.dehy_blocked'), T('sync.count_items', { n: blocked })]
         ]);
         var list = (d.blocked || []);
         var box = $('dehy-result');
@@ -6218,7 +6270,7 @@
           box.appendChild(ul);
         }
       } else {
-        renderError('dehy-result', (label || '脱水') + '失败', str(r.error));
+        renderError('dehy-result', (label || T('sync.dehy_title')) + T('sync.op_failed_suffix'), str(r.error));
       }
       refreshStatus(true);
       return r;
@@ -6238,32 +6290,34 @@
       return call('cache_verify', { repair: !!repair });
     }).then(function (r) {
       if (!r || r.ok === false) {
-        renderError('verify-result', '校验失败', (r && str(r.error)) || '未知错误');
+        renderError('verify-result', T('cache.verify_failed'), (r && str(r.error)) || T('common.unknown_error'));
         return r;
       }
       var d = (r.data && isObj(r.data)) ? r.data : r;
       if (d.skipped) {
-        renderResult('verify-result', true, '校验', [
-          ['状态', str(d.reason || '缓存目录不存在')]
+        renderResult('verify-result', true, T('cache.verify_label'), [
+          [T('cache.verify_state'), str(d.reason || T('cache.dir_missing'))]
         ]);
         return r;
       }
       var clean = d.clean === true;
-      var label = repair ? '校验并修复' : '校验';
+      var label = repair ? T('cache.verify_repair') : T('cache.verify_label');
       var rows = [
-        ['结论', clean ? '全部通过' : (num(d.bad_files, 0) + ' 个文件有问题')],
-        ['扫过文件', num(d.files_scanned, 0)],
-        ['校验字节', humanSize(d.bytes_verified)],
-        ['耗时', num(d.elapsed_ms, 0) + ' ms']
+        [T('cache.verify_conclusion'), clean
+          ? T('cache.verify_all_ok')
+          : T('cache.verify_bad_files', { n: num(d.bad_files, 0) })],
+        [T('cache.verify_files_scanned'), num(d.files_scanned, 0)],
+        [T('cache.verify_bytes'), humanSize(d.bytes_verified)],
+        [T('cache.verify_elapsed'), num(d.elapsed_ms, 0) + ' ms']
       ];
       if (repair) {
-        rows.push(['修复区间', num(d.repaired_chunks, 0)]);
-        rows.push(['整文件哈希更新', num(d.whole_hashes_written, 0)]);
+        rows.push([T('cache.verify_repaired_chunks'), num(d.repaired_chunks, 0)]);
+        rows.push([T('cache.verify_whole_hashes'), num(d.whole_hashes_written, 0)]);
       }
       // 修完之后不算「失败」：坏区间已经退回按需水合，缓存回到了诚实的状态。
       // 显示红色只会让用户以为修复没生效，反而再去点一次。
-      var title = clean ? label + '（通过）'
-        : (repair ? label + '（已把坏区间退回按需水合）' : label + '（发现损坏）');
+      var title = clean ? label + T('cache.suffix_pass')
+        : (repair ? label + T('cache.suffix_reverted') : label + T('cache.suffix_corrupt'));
       renderResult('verify-result', clean || repair, title, rows);
 
       // 有问题的文件逐个列出，精确到**文件 + 区间** —— 这是用户能自己处理的粒度
@@ -6276,18 +6330,20 @@
         for (var i = 0; i < list.length && i < 30; i++) {
           var f = list[i];
           var why = [];
-          if (f.stale_state) { why.push('位图不可信(' + str(f.stale_state) + ')'); }
-          if (f.missing_sums) { why.push('缺校验和表'); }
+          if (f.stale_state) { why.push(T('cache.stale_state', { state: str(f.stale_state) })); }
+          if (f.missing_sums) { why.push(T('cache.missing_sums')); }
           if (f.bad_chunks && f.bad_chunks.length) {
             var ids = f.bad_chunks.slice(0, 8).map(function (n) { return '#' + n; }).join(' ');
-            why.push(f.bad_chunks.length + ' 个区间损坏: ' + ids +
-              (f.bad_chunks.length > 8 ? ' …' : ''));
+            why.push(T('cache.bad_chunks', {
+              n: f.bad_chunks.length,
+              ids: ids + (f.bad_chunks.length > 8 ? ' …' : '')
+            }));
           }
-          var li = el('li', null, str(f.cache) + ' —— ' + why.join('；'));
+          var li = el('li', null, str(f.cache) + ' —— ' + why.join(T('list.sep_semi')));
           ul.appendChild(li);
         }
         if (list.length > 30) {
-          ul.appendChild(el('li', null, '…还有 ' + (list.length - 30) + ' 个（用 qxync verify --json 看全部）'));
+          ul.appendChild(el('li', null, T('cache.more_files', { n: list.length - 30 })));
         }
         box.appendChild(ul);
       }
@@ -6420,14 +6476,14 @@
       var sy = isObj(st.sync) ? st.sync : null;
       // 离线时 last_error 多半就是那条「网络不可用」—— 已由红点表达，不重复计黄。
       if (sy && (sy.last_error || sy.delete_block_reason)) {
-        warning.push(linkLabelById(targets[i].id) + '：' +
+        warning.push(linkLabelById(targets[i].id) + locColon() +
           str(sy.last_error || sy.delete_block_reason));
       }
     }
     if (offline.length) {
-      call('tray_set_status', { status: 'offline', note: offline.join('、') });
+      call('tray_set_status', { status: 'offline', note: offline.join(locSep('comma')) });
     } else if (warning.length) {
-      call('tray_set_status', { status: 'warning', note: warning.join('；') });
+      call('tray_set_status', { status: 'warning', note: warning.join(locSep('semi')) });
     } else {
       call('tray_set_status', { status: 'ok', note: '' });
     }
@@ -6556,9 +6612,9 @@
   }
 
   function proxyModeLabel(m) {
-    if (m === 'none') { return 'No proxy（无代理）'; }
-    if (m === 'manual') { return 'Manual（手动）'; }
-    return 'Auto-detect（自动检测）';
+    if (m === 'none') { return T('settings.proxy_mode_none'); }
+    if (m === 'manual') { return T('settings.proxy_mode_manual'); }
+    return T('settings.proxy_mode_auto');
   }
 
   /** 全局设置读哪台 daemon：当前连接在跑就用它；否则用第一台运行中的；都没有就试当前
@@ -6581,6 +6637,7 @@
         state.settingsError = str(r.error);
       }
       renderSettings();
+      maybeReloadForLocale(state.settings);
       return r;
     });
   }
@@ -6609,18 +6666,18 @@
       clear(envDl);
       var keys = Object.keys(env);
       if (!keys.length) {
-        kvText(envDl, '环境变量', '（无 http_proxy / https_proxy / all_proxy）');
+        kvText(envDl, T('settings.env_vars'), T('settings.env_none'));
       } else {
         for (var i = 0; i < keys.length; i++) {
           kvText(envDl, keys[i], str(env[keys[i]]));
         }
       }
-      kvText(envDl, '实际代理 URL', (d && d.proxy_url) ? str(d.proxy_url) : '（不走手动代理）');
+      kvText(envDl, T('settings.effective_proxy'), (d && d.proxy_url) ? str(d.proxy_url) : T('settings.proxy_not_manual'));
     }
     setText('proxy-hint', state.settingsError
       ? T('settings.error', { msg: state.settingsError })
       : (d
-        ? ('设置文件：' + str(d.path) + (d.saved ? '（已保存）' : '') + (d.note ? ' · ' + str(d.note) : ''))
+        ? (T('settings.file_line', { path: str(d.path) }) + (d.saved ? T('settings.saved_tag') : '') + (d.note ? T('settings.note_line', { note: str(d.note) }) : ''))
         : T('settings.loading')));
 
     // ---- 个人
@@ -6629,7 +6686,7 @@
     var region = $('s-region'); if (region) { region.value = str(s.region); }
     var ct = $('s-close-tray'); if (ct) { ct.checked = s.close_to_tray !== false; }
     setText('autostart-hint', d
-      ? ('autostart 桌面项：' + str(d.autostart_path) + '（' + (d.autostart_present ? '存在' : '不存在') + '）')
+      ? T('settings.autostart_line', { path: str(d.autostart_path), state: d.autostart_present ? T('settings.autostart_present') : T('settings.autostart_missing') })
       : '—');
 
     // ---- 高级
@@ -6732,6 +6789,33 @@
    *  ★ M16：settings.json 是所有连接共用的**全局**设置，但每个 daemon 各有一份内存态 ——
    *  保存时必须广播给**所有运行中的** daemon（Promise.all），失败逐条提示；
    *  一台都没跑时只留文件，下次 daemon 起来自己会读。 */
+  /**
+   * ★ M50：语言偏好以 daemon 的设置值为准。启动时为了首屏不闪，用的是 localStorage 里
+   * 上一次的偏好；settings 回来后发现不一致 → 记下新偏好并整页 reload 一次
+   * （比逐个重渲染便宜，也不会出现半中半英的中间态）。
+   */
+  function maybeReloadForLocale(d) {
+    if (!I18N || !isFn(I18N.resolveLocale) || !isObj(d)) { return; }
+    var s = isObj(d.settings) ? d.settings : d;
+    var pref = str(s.language);
+    var stored = '';
+    try { stored = window.localStorage.getItem(LOCALE_PREF_KEY) || ''; } catch (e0) { stored = ''; }
+    if (stored !== pref) {
+      try { window.localStorage.setItem(LOCALE_PREF_KEY, pref); } catch (e0) { /* 隐私模式：下次启动退回跟随系统 */ }
+    }
+    var want = I18N.resolveLocale(pref);
+    if (want === I18N.locale()) { return; }
+    // 防 reload 死循环：同一次会话里每个目标语言只自动刷新一次（localStorage 写失败时兜底）。
+    var tried = '';
+    try { tried = window.sessionStorage.getItem(LOCALE_PREF_KEY + '.tried') || ''; } catch (e0) { tried = ''; }
+    if (tried === want) { return; }
+    try { window.sessionStorage.setItem(LOCALE_PREF_KEY + '.tried', want); } catch (e0) { /* 忽略 */ }
+    // 稍等一拍，让「已保存」的结果条先画出来再刷新
+    setTimeout(function () {
+      try { window.location.reload(); } catch (e0) { /* 刷新失败就保持原语言，下次启动生效 */ }
+    }, 250);
+  }
+
   function saveSettings(s, resultBox, okTitle, rows) {
     var done = function (exe) {
       var req = { method: 'settings_save', settings: s };
@@ -6756,6 +6840,7 @@
         }
         if (savedData) { state.settings = savedData; }
         renderSettings();
+        maybeReloadForLocale(savedData || state.settings);
         if (!okCount) {
           // 一台都没写成功：如实报错（不要显示「已保存」）
           renderError(resultBox, T('settings.save_failed'),
@@ -6764,14 +6849,14 @@
           return { ok: false, errors: fails };
         }
         var extra = (rows || []).slice();
-        extra.push(['广播', T('settings.broadcast', { ok: okCount, total: rs.length })]);
+        extra.push([T('settings.row_broadcast'), T('settings.broadcast', { ok: okCount, total: rs.length })]);
         if (fails.length) {
-          extra.push(['失败', fails.map(function (f) {
+          extra.push([T('routes.state_failed'), fails.map(function (f) {
             return linkLabelById(f.id) + ': ' + f.msg;
-          }).join('；')]);
+          }).join(T('list.sep_semi'))]);
         }
         renderResult(resultBox, fails.length === 0, okTitle, extra);
-        logOk(okTitle + '（' + okCount + '/' + rs.length + ' 个运行中的 daemon）');
+        logOk(T('settings.saved_log', { title: okTitle, ok: okCount, total: rs.length }));
         return { ok: fails.length === 0, errors: fails };
       });
     };
@@ -6783,14 +6868,14 @@
   }
 
   function doProxySave() {
-    return saveSettings(collectProxy(currentSettings()), 'proxy-result', '代理设置已保存', [
-      ['模式', proxyModeLabel(str($('p-mode') ? $('p-mode').value : 'auto'))],
-      ['提示', '手动代理对**已建立**的连接要等下次挂载才生效']
+    return saveSettings(collectProxy(currentSettings()), 'proxy-result', T('settings.proxy_saved'), [
+      [T('settings.row_mode'), proxyModeLabel(str($('p-mode') ? $('p-mode').value : 'auto'))],
+      [T('settings.row_hint'), T('settings.proxy_hint')]
     ]);
   }
 
   function doPersonalSave() {
-    return saveSettings(collectPersonal(currentSettings()), 'personal-result', '个人设置已保存', []);
+    return saveSettings(collectPersonal(currentSettings()), 'personal-result', T('settings.personal_saved'), []);
   }
 
   function doAdvancedSave() {
@@ -6810,7 +6895,7 @@
           // 检测本身失败（daemon 没跑 / 老版本 daemon 不认识这个方法）：
           // 不拦保存 —— 让 daemon 侧的门禁（或它的缺席）自己说话。
           logInfo('Baloo 检测不可用（' + str(r.error) + '），直接保存');
-          return saveSettings(s, 'advanced-result', '高级设置已保存', []);
+          return saveSettings(s, 'advanced-result', T('settings.advanced_saved'), []);
         }
         var d = isObj(r.data) ? r.data : {};
         if (d.can_enable !== false) { return doAdvancedSaveNow(s); }
@@ -6830,7 +6915,7 @@
   }
 
   function doAdvancedSaveNow(s) {
-    return saveSettings(s, 'advanced-result', '高级设置已保存', []);
+    return saveSettings(s, 'advanced-result', T('settings.advanced_saved'), []);
   }
 
   /**
@@ -6838,7 +6923,7 @@
    * 返回 Promise<boolean>：true = 终端已弹出（用户跑完命令，可以重试保存）。
    */
   function promptBalooExclude(mounts) {
-    var list = (mounts || []).join('、') || '（无）';
+    var list = (mounts || []).join(T('list.sep')) || T('baloo.none');
     return openConfirm(
       T('baloo.title'),
       T('baloo.why', { mounts: list }),
@@ -6853,7 +6938,7 @@
           return true;
         }
         logErr(T('baloo.open_failed', {
-          err: str(d.error || (r && r.error) || '未知错误'),
+          err: str(d.error || (r && r.error) || T('baloo.unknown_error')),
           cmd: str(d.command || '')
         }));
         return false;
@@ -6871,7 +6956,7 @@
     return ipc({ method: 'baloo_status' }).then(function (r) {
       clear(dl);
       if (!r.ok) {
-        kvText(dl, 'Baloo 检测', '不可用（' + str(r.error) + '）');
+        kvText(dl, T('baloo.detect'), T('baloo.unavailable', { msg: str(r.error) }));
         return r;
       }
       var d = isObj(r.data) ? r.data : {};
@@ -6881,7 +6966,7 @@
         : T('baloo.not_installed'));
       var ms = d.mounts || [];
       if (!ms.length) {
-        kvText(dl, '挂载点', T('baloo.no_mounts'));
+        kvText(dl, T('purge.kind.mounts'), T('baloo.no_mounts'));
       } else {
         for (var i = 0; i < ms.length; i++) {
           var m = ms[i];
@@ -6897,23 +6982,23 @@
       //   字段（undefined）→ 不显示这一行，别把「旧 daemon」误报成「未安装」。
       if (d.overlay_plugin !== undefined) {
         if (isObj(d.overlay_plugin)) {
-          kvText(dl, '角标插件', d.overlay_plugin.effective === true
+          kvText(dl, T('baloo.overlay_plugin'), d.overlay_plugin.effective === true
             ? T('baloo.plugin_yes', { path: str(d.overlay_plugin.path) })
             : T('baloo.plugin_ineffective', { path: str(d.overlay_plugin.path) }));
         } else {
-          kvText(dl, '角标插件', T('baloo.plugin_no'));
+          kvText(dl, T('baloo.overlay_plugin'), T('baloo.plugin_no'));
         }
       }
       if (installed && d.indexing_enabled !== false
           && (d.dolphin_tags === true || d.dolphin_overlay === true)) {
-        kvText(dl, '提示', T('baloo.tags_note'));
+        kvText(dl, T('settings.row_hint'), T('baloo.tags_note'));
       }
       return r;
     });
   }
 
   function doFreeSave() {
-    return saveSettings(collectFree(currentSettings()), 'free-result', '释放空间设置已保存', []).then(function (r) {
+    return saveSettings(collectFree(currentSettings()), 'free-result', T('settings.free_saved'), []).then(function (r) {
       refreshSpace();
       return r;
     });
@@ -6973,7 +7058,7 @@
           }));
         show('log-prune-result', true);
         if (deleted > 0) {
-          logOk('日志清理：删除 ' + deleted + ' 个文件，释放 ' + humanSize(num(d.freed_bytes, 0)));
+          logOk(T('logs.prune_log', { deleted: deleted, freed: humanSize(num(d.freed_bytes, 0)) }));
         }
       }
       return r;
@@ -7057,7 +7142,7 @@
       state.spaceLoading = false;
       if (!r.ok) {
         logErr('读取释放空间状态失败：' + str(r.error));
-        setText('space-reason', '读取失败：' + str(r.error));
+        setText('space-reason', T('list.error', { msg: str(r.error) }));
         return r;
       }
       state.space = isObj(r.data) ? r.data : null;
@@ -7072,35 +7157,34 @@
     if (!dl) { return; }
     clear(dl);
     if (!d) {
-      kvText(dl, '状态', state.spaceLoading ? T('space.loading') : T('space.not_read'));
+      kvText(dl, T('detail.col_state'), state.spaceLoading ? T('space.loading') : T('space.not_read'));
       return;
     }
     var total = num(d.fs_total, 0);
     var avail = num(d.fs_avail, 0);
-    kvText(dl, '量空间', str(d.fs_path));
-    kvText(dl, '文件系统', humanSize(total) + '（可用 ' + humanSize(avail) + '，' + num(d.fs_avail_pct, 0) + '%）');
-    kvText(dl, '缓存占用', humanSize(num(d.cache_used_bytes, 0)));
-    kvText(dl, '本轮判定', (d.would_run ? '会触发' : '不触发') + ' —— ' + str(d.reason));
+    kvText(dl, T('space.fs_label'), str(d.fs_path));
+    kvText(dl, T('space.fs'), T('space.fs_detail', { total: humanSize(total), avail: humanSize(avail), pct: num(d.fs_avail_pct, 0) }));
+    kvText(dl, T('space.cache_used'), humanSize(num(d.cache_used_bytes, 0)));
+    kvText(dl, T('space.decision'), T('space.decision_value', { verdict: d.would_run ? T('space.would_run') : T('space.would_not_run'), reason: str(d.reason) }));
     if (num(d.last_run_unix, 0) > 0) {
       // ★ 用带日期的格式化：只显示 HH:MM:SS 会让人分不清是今天还是上周跑的。
-      kvText(dl, '上次触发', humanTimeFromEpoch(num(d.last_run_unix, 0)));
+      kvText(dl, T('space.last_run'), humanTimeFromEpoch(num(d.last_run_unix, 0)));
     }
     if (d.injected === true) {
-      kvRow(dl, '⚠ 注入', '正在使用 QXNYC_TEST_FAST_STATVFS 注入值（验收模式）', 'val-warn');
+      kvRow(dl, T('space.injected'), T('space.injected_detail'), 'val-warn');
     }
-    setText('space-used-label', '缓存 ' + humanSize(num(d.cache_used_bytes, 0)));
+    setText('space-used-label', T('space.cache_short', { size: humanSize(num(d.cache_used_bytes, 0)) }));
 
     // 进度条按「可用百分比」画：越窄越危险
     var pct = num(d.fs_avail_pct, 100);
     var fill = $('space-bar-fill');
     if (fill) { fill.style.width = Math.max(0, Math.min(100, pct)) + '%'; }
-    setText('space-bar-label', '可用 ' + pct + '% · 缓存 ' + humanSize(num(d.cache_used_bytes, 0)));
-    setText('space-reason', '判定依据：' + str(d.reason) + (d.note ? '　|　' + str(d.note) : ''));
+    setText('space-bar-label', T('space.bar_label', { pct: pct, size: humanSize(num(d.cache_used_bytes, 0)) }));
+    setText('space-reason', T('space.reason_line', { reason: str(d.reason) }) + (d.note ? T('space.note_suffix', { note: str(d.note) }) : ''));
 
     clearAlerts('space-blocked');
     if (isObj(d) && d.blocked && d.blocked.length) {
-      addAlert('space-blocked', '被安全检查链挡下 ' + d.blocked.length + ' 项（例：' +
-        str(d.blocked[0] && d.blocked[0][0]) + ' — ' + str(d.blocked[0] && d.blocked[0][1]) + '）');
+      addAlert('space-blocked', T('space.blocked_alert', { n: d.blocked.length, example: str(d.blocked[0] && d.blocked[0][0]) + ' — ' + str(d.blocked[0] && d.blocked[0][1]) }));
     }
   }
 
@@ -7109,17 +7193,17 @@
       return ipc({ method: 'space', now: true });
     }).then(function (r) {
       if (!r.ok) {
-        renderError('free-result', '立即释放空间失败', str(r.error));
+        renderError('free-result', T('space.free_failed'), str(r.error));
         return r;
       }
       var d = isObj(r.data) ? r.data : {};
       state.space = d;
       renderSpace();
-      renderResult('free-result', true, '立即释放空间完成', [
-        ['脱水', str(num(d.dehydrated, 0)) + ' 个'],
-        ['释放', humanSize(num(d.freed_bytes, 0))],
-        ['被挡下', str((d.blocked || []).length) + ' 个（安全检查链）'],
-        ['缓存现在', humanSize(num(d.cache_used_bytes, 0))]
+      renderResult('free-result', true, T('space.free_done'), [
+        [T('space.row_dehydrated'), T('space.items', { n: num(d.dehydrated, 0) })],
+        [T('space.row_freed'), humanSize(num(d.freed_bytes, 0))],
+        [T('space.row_blocked'), T('space.blocked_count', { n: (d.blocked || []).length })],
+        [T('space.row_cache_now'), humanSize(num(d.cache_used_bytes, 0))]
       ]);
       return r;
     });
@@ -7131,7 +7215,7 @@
     // ★ M16：筛选器挂在**当前连接**的 link 文件上（不是全局）
     return call('link_read', { linkId: currentId() }).then(function (r) {
       if (!r.ok || !isObj(r.data)) {
-        setText('flt-note', '读取连接配置失败：' + str(r.error));
+        setText('flt-note', T('filters.read_link_failed', { msg: str(r.error) }));
         return r;
       }
       state.link = isObj(r.data.link) ? r.data.link : null;
@@ -7151,15 +7235,15 @@
       if (!note) { return r; }
       if (!r.ok) {
         note.hidden = false;
-        note.textContent = '规则读取失败（daemon 未运行？）：' + str(r.error);
+        note.textContent = T('filters.rules_failed', { msg: str(r.error) });
         return r;
       }
       var d = isObj(r.data) ? r.data : {};
       var parts = [
-        '生效 ' + ((d.patterns || []).length) + ' 条规则（挂载点里会被剪掉）',
-        '临时文件过滤 ' + (d.filter_temp ? '开' : '关')
+        T('filters.patterns_active', { n: (d.patterns || []).length }),
+        T('filters.temp_filter', { state: d.filter_temp ? T('filters.switch_on') : T('filters.switch_off') })
       ];
-      if (d.bad && d.bad.length) { parts.push('⚠ 解析不了：' + d.bad.join(', ')); }
+      if (d.bad && d.bad.length) { parts.push(T('filters.bad_rules', { list: d.bad.join(', ') })); }
       note.hidden = false;
       note.textContent = parts.join(' · ');
       return r;
@@ -7177,13 +7261,13 @@
     if (!lines.length) {
       // ⚠ link_save 的语义是「空数组 = 保留旧值」，所以清空要用一条注释行表达
       //   （规则解析器忽略 `#` 开头的行，效果等价于「没有任何排除规则」）。
-      lines = ['# 已清空（GUI）'];
+      lines = [T('filters.cleared_marker')];
     }
     // ★ M16：写回**当前连接**的 link 文件（id 显式传当前连接）
     var link = state.link || currentLinkEntry() || {};
     if (!link.host || !link.user) {
-      renderError('flt-match-result', '无法保存筛选器',
-        '当前连接缺少 host/user：先在「连接」分区保存一次连接配置');
+      renderError('flt-match-result', T('filters.save_failed'),
+        T('filters.no_host_user'));
       return Promise.resolve(null);
     }
     var input = {
@@ -7201,13 +7285,13 @@
       return call('link_save', { input: input });
     }).then(function (r) {
       if (!r.ok) {
-        renderError('flt-match-result', '保存筛选器失败', str(r.error));
+        renderError('flt-match-result', T('filters.save_error'), str(r.error));
         return r;
       }
-      renderResult('flt-match-result', true, '筛选器已保存', [
-        ['规则', lines.join(' , ')],
-        ['文件', str(isObj(r.data) ? r.data.path : '')],
-        ['生效时机', '要在**已挂载**的任务上生效，需要重启 daemon（规则在挂载时注入 FUSE 与同步引擎）']
+      renderResult('flt-match-result', true, T('filters.saved'), [
+        [T('filters.row_rules'), lines.join(' , ')],
+        [T('search.type_file'), str(isObj(r.data) ? r.data.path : '')],
+        [T('filters.row_when'), T('filters.when_note')]
       ]);
       refreshFilters();
       return r;
@@ -7217,26 +7301,26 @@
   function doMatchPreview() {
     var p = str($('flt-match') ? $('flt-match').value : '').trim();
     if (!p) {
-      renderError('flt-match-result', '参数错误', '请输入一条 NAS 绝对路径，例如 /home/qxync-test/secret.bin');
+      renderError('flt-match-result', T('filters.bad_args'), T('filters.match_need_path'));
       return Promise.resolve(null);
     }
     return ipc({ method: 'rules', match_path: p }).then(function (r) {
       if (!r.ok) {
-        renderError('flt-match-result', '判定失败', str(r.error));
+        renderError('flt-match-result', T('filters.match_failed'), str(r.error));
         return r;
       }
       var d = isObj(r.data) ? r.data : {};
-      var verdict = '可见（会同步）';
+      var verdict = T('filters.match_visible');
       if (d.match_hidden === true) {
-        verdict = (d.match_reason === 'temp') ? '隐藏（临时文件规则）' : '隐藏（命中排除规则）';
+        verdict = (d.match_reason === 'temp') ? T('filters.match_hidden_temp') : T('filters.match_hidden_exclude');
       } else if (d.match_root === null || d.match_root === undefined) {
-        verdict = '不在任何要同步的 NAS 目录之内';
+        verdict = T('filters.match_outside');
       }
-      renderResult('flt-match-result', true, '判定：' + verdict, [
-        ['路径', p],
-        ['属于哪个目录', d.match_root ? str(d.match_root) : '（不在任何目录内）'],
-        ['目录内相对路径', d.match_rel ? str(d.match_rel) : '—'],
-        ['原因', str(d.match_reason) || '—']
+      renderResult('flt-match-result', true, T('filters.verdict_line', { verdict: verdict }), [
+        [T('search.sort_path'), p],
+        [T('filters.row_root'), d.match_root ? str(d.match_root) : T('filters.no_root')],
+        [T('filters.row_rel'), d.match_rel ? str(d.match_rel) : '—'],
+        [T('filters.row_reason'), str(d.match_reason) || '—']
       ]);
       return r;
     });
@@ -7245,11 +7329,11 @@
   // ------------------------------------------------------------ 冲突策略 / 待裁决
 
   function conflictLabel(v) {
-    if (v === 'ask') { return '每个文件都问我'; }
-    if (v === 'rename_remote') { return '重命名 NAS 上的文件'; }
-    if (v === 'replace_remote') { return '用本地文件替换 NAS 上的文件（⚠ 会丢 NAS 上的改动）'; }
-    if (v === 'replace_local') { return '用 NAS 上的文件替换本地文件（⚠ 会丢本地改动）'; }
-    return '重命名本地文件（默认，双方都不丢）';
+    if (v === 'ask') { return T('conflict.ask'); }
+    if (v === 'rename_remote') { return T('conflict.rename_remote'); }
+    if (v === 'replace_remote') { return T('conflict.replace_remote'); }
+    if (v === 'replace_local') { return T('conflict.replace_local'); }
+    return T('conflict.rename_local');
   }
 
   /** 所有连接的任务登记（带来源连接）：设置页的冲突策略汇总用。 */
@@ -7274,7 +7358,7 @@
     clear(dl);
     var ts = taskList();
     if (!ts.length) {
-      kvText(dl, '任务', '（还没有任务；策略在任务的「文件夹对设置」里选）');
+      kvText(dl, T('nav.tasks'), T('conflict.no_tasks'));
       return;
     }
     for (var i = 0; i < ts.length; i++) {
@@ -7362,7 +7446,7 @@
     var note = $('decisions-note');
     if (note) {
       note.hidden = !notes.length;
-      note.textContent = notes.join('；');
+      note.textContent = notes.join(T('list.sep_semi'));
     }
     for (var i = 0; i < items.length; i++) {
       box.appendChild(buildDecisionCard(items[i].x, items[i].linkId));
@@ -7380,8 +7464,7 @@
     body.appendChild(linkRow);
     body.appendChild(el('div', 'task-meta', 'NAS ' + str(x.path)));
     body.appendChild(el('div', 'task-meta',
-      '本地 ' + humanSize(num(x.local_size, 0)) + ' / NAS ' + humanSize(num(x.remote_size, 0)) +
-      ' · 发现于 ' + (humanTimeFromEpoch(num(x.created_unix, 0)) || '—')));
+      T('decisions.card_meta', { local: humanSize(num(x.local_size, 0)), remote: humanSize(num(x.remote_size, 0)), when: humanTimeFromEpoch(num(x.created_unix, 0)) || '—' })));
     card.appendChild(body);
 
     var acts = el('div', 'task-actions');
@@ -7421,7 +7504,7 @@
       }
       // 用**路径**而不是内部 id 记日志：id 是路径压平后的内部键，对用户没有意义。
       logOk(T('decisions.resolve_ok', { path: str(x.path), res: resolutionLabel(res) }) +
-        '（' + linkLabelById(lid) + '）');
+        locParen(linkLabelById(lid)));
       refreshDecisions();
       return r;
     });
@@ -7632,7 +7715,7 @@
       var isLocal = str(o.which) === 'local';
       var isRemote = str(o.which) === 'remote';
       var which = isLocal ? T('decisions.side_local')
-        : (isRemote ? T('decisions.side_remote') : '两侧之一');
+        : (isRemote ? T('decisions.side_remote') : T('decisions.side_either'));
       var detail = str(o.detail).trim();
       if (detail.indexOf('内容读不到') >= 0 || detail.indexOf(which) === 0) {
         return detail;   // 已自带侧别/前缀，别重复
@@ -7677,17 +7760,16 @@
     if (!dl) { return; }
     clear(dl);
     if (!d) {
-      kvText(dl, '状态', 'daemon 未运行或未响应');
+      kvText(dl, T('detail.col_state'), T('lan.daemon_down'));
       return;
     }
-    kvBool(dl, '启用', d.enabled === true, '监听中', '未监听');
-    kvText(dl, '绑定地址', d.listen ? str(d.listen) : '（未监听）');
-    kvText(dl, '身份名', str(d.identity));
-    kvText(dl, '配对码', d.pairing_code ? str(d.pairing_code) : '（没有开启配对）');
-    kvText(dl, '已配对设备', str((d.devices || []).length) + ' 台');
-    kvText(dl, '事件', '发出 ' + num(d.events_out, 0) + ' / 收到 ' + num(d.events_in, 0) +
-      ' / 拒绝 ' + num(d.rejected, 0));
-    kvText(dl, 'LAN 命中', num(d.lan_hits, 0) + ' 次，' + humanSize(num(d.lan_bytes, 0)));
+    kvBool(dl, T('lan.enabled'), d.enabled === true, T('lan.listening'), T('lan.status_not_listening'));
+    kvText(dl, T('lan.bind_addr'), d.listen ? str(d.listen) : T('lan.not_listening_short'));
+    kvText(dl, T('lan.identity'), str(d.identity));
+    kvText(dl, T('lan.pairing_code'), d.pairing_code ? str(d.pairing_code) : T('lan.pairing_off'));
+    kvText(dl, T('lan.paired_devices'), T('lan.device_count', { n: (d.devices || []).length }));
+    kvText(dl, T('lan.events'), T('lan.events_value', { sent: num(d.events_out, 0), recv: num(d.events_in, 0), rejected: num(d.rejected, 0) }));
+    kvText(dl, T('lan.hits'), T('lan.hits_value', { n: num(d.lan_hits, 0), size: humanSize(num(d.lan_bytes, 0)) }));
     var link = state.link;
     var listen = $('lan-listen');
     if (listen && link) { listen.value = link.peer_listen ? str(link.peer_listen) : ''; }
@@ -7726,7 +7808,7 @@
   function doLanSave() {
     var link = state.link;
     if (!link || !link.host || !link.user) {
-      renderError('lan-result', '无法保存', '先到「连接」分区保存一次连接配置');
+      renderError('lan-result', T('lan.cannot_save'), T('lan.save_conn_first'));
       return Promise.resolve(null);
     }
     var listen = str($('lan-listen') ? $('lan-listen').value : '').trim();
@@ -7748,13 +7830,13 @@
       return call('link_save', { input: input });
     }).then(function (r) {
       if (!r.ok) {
-        renderError('lan-result', '保存 LAN 设置失败', str(r.error));
+        renderError('lan-result', T('lan.save_failed'), str(r.error));
         return r;
       }
-      renderResult('lan-result', true, 'LAN 设置已保存', [
-        ['监听', listen || '（关闭）'],
-        ['设备名', name || '（主机名）'],
-        ['生效', '需要重启 daemon']
+      renderResult('lan-result', true, T('lan.saved'), [
+        [T('lan.row_listen'), listen || T('lan.listen_off')],
+        [T('lan.row_device_name'), name || T('lan.hostname')],
+        [T('lan.row_effect'), T('lan.restart_needed')]
       ]);
       refreshFilters();
       return r;
@@ -7765,21 +7847,21 @@
     var addr = str($('lan-pair-addr') ? $('lan-pair-addr').value : '').trim();
     var code = str($('lan-pair-code') ? $('lan-pair-code').value : '').trim();
     if (!addr || !code) {
-      renderError('lan-result', '参数错误', '需要「地址 + 配对码」两样：先在对方机器上跑 qxync peer status 拿配对码');
+      renderError('lan-result', T('lan.pair_bad_args'), T('lan.pair_need_args'));
       return Promise.resolve(null);
     }
     return withBusy({ buttons: ['btn-lan-pair'] }, function () {
       return ipc({ method: 'peer', action: 'pair', addr: addr, code: code });
     }).then(function (r) {
       if (!r.ok) {
-        renderError('lan-result', '配对失败', str(r.error));
+        renderError('lan-result', T('lan.pair_failed'), str(r.error));
         return r;
       }
       var d = isObj(r.data) ? r.data : {};
-      renderResult('lan-result', true, '配对成功', [
-        ['设备名', str(d.paired_name)],
-        ['地址', str(d.paired_addr)],
-        ['令牌', str(d.paired_token_masked)]
+      renderResult('lan-result', true, T('lan.pair_ok'), [
+        [T('lan.row_device_name'), str(d.paired_name)],
+        [T('routes.col_addr'), str(d.paired_addr)],
+        [T('lan.row_token'), str(d.paired_token_masked)]
       ]);
       refreshLan();
       return r;
@@ -7793,37 +7875,36 @@
     if (!dl) { return; }
     clear(dl);
     var info = state.appInfo;
-    kvText(dl, '版本', info ? str(info.version) : '—');
-    kvText(dl, '说明', 'FUSE 按需同步 + 常驻守护；界面与术语对齐 Qsync Client 6.1');
-    kvText(dl, '许可', 'MIT OR Apache-2.0');
-    kvText(dl, '路径与日志', '在「诊断 → 状态」的「本机路径 / 运行环境」里');
+    kvText(dl, T('about.version'), info ? str(info.version) : '—');
+    kvText(dl, T('routes.col_note'), T('about.blurb'));
+    kvText(dl, T('about.license'), 'MIT OR Apache-2.0');
+    kvText(dl, T('about.paths'), T('about.paths_where'));
     // ★ M16：关于页显示「当前连接」；daemon 运行数按全部连接聚合。
     var cur = currentLinkEntry();
     if (cur) {
-      kvText(dl, '当前连接', linkBadge(cur));
+      kvText(dl, T('top.switch'), linkBadge(cur));
       kvText(dl, 'NAS', cur.link_exists === false ? T('links.unconfigured')
         : str(cur.user) + '@' + str(cur.host) + ':' + str(cur.port));
     }
     var running = 0;
     var ls = linksList();
     for (var i = 0; i < ls.length; i++) { if (linkDaemonRunning(ls[i])) { running++; } }
-    kvText(dl, 'daemon', running + ' / ' + ls.length + ' 运行中');
-    kvBool(dl, '当前连接的 daemon', !!(currentStatus() && currentStatus().running),
-      '运行中', '未运行');
+    kvText(dl, 'daemon', T('about.daemons_running', { running: running, total: ls.length }));
+    kvBool(dl, T('about.current_daemon'), !!(currentStatus() && currentStatus().running),
+      T('about.running'), T('about.not_running'));
     var note = $('about-m84');
     if (note) {
       if (!state.m84Info) {
-        note.textContent = '托盘/通知/选择器（M8.4）：GUI 侧命令未就绪时这里显示 —';
+        note.textContent = T('about.m84_pending');
       } else {
         // ★ 「建起来」≠「有人画」：这里如实区分三态，别让用户以为托盘一定可见
         var m = state.m84Info;
         var tray;
-        if (m.tray_visible === true) { tray = '可见（面板会画）'; }
-        else if (m.tray_probed !== true) { tray = '探测中…'; }
-        else if (m.tray_created === true) { tray = '不可见（名字注册了但没有面板宿主）'; }
-        else { tray = '不可用（没有 StatusNotifierWatcher）'; }
-        note.textContent = '托盘：' + tray +
-          '　| 关窗：' + (m.close_to_tray ? '收进托盘' : '直接关闭');
+        if (m.tray_visible === true) { tray = T('about.tray_visible'); }
+        else if (m.tray_probed !== true) { tray = T('about.tray_probing'); }
+        else if (m.tray_created === true) { tray = T('about.tray_no_host'); }
+        else { tray = T('about.tray_unavailable'); }
+        note.textContent = T('about.tray_line', { tray: tray, close: m.close_to_tray ? T('about.close_to_tray') : T('about.close_direct') });
       }
     }
   }
@@ -7846,7 +7927,7 @@
       } else if (!r.ok) {
         logErr('打开 ' + target + ' 失败：' + str(r.error));
       } else {
-        logOk('已请求打开：' + target);
+        logOk(T('common.open_requested', { target: target }));
       }
       return r;
     });
@@ -7902,7 +7983,7 @@
           state.settings.settings.desktop_notifications === false) {
         return { ok: true, entries: 1 };   // 用户关掉了通知
       }
-      notifyUser('qxync 同步出错（' + linkLabelById(best.id) + '）',
+      notifyUser(T('notify.sync_error', { label: linkLabelById(best.id) }),
         str(e.path) + ' —— ' + str(e.detail));
       return { ok: true, entries: 1 };
     }, function () { return { ok: false }; });
@@ -7956,8 +8037,8 @@
           state.settings.settings.desktop_notifications === false) {
         return { ok: true, entries: 1 };   // 用户关掉了通知
       }
-      notifyUser('qxync 发现同步冲突（' + linkLabelById(best.id) + '）',
-        str(e.detail) + ' —— 打开主窗口的「冲突中心」处理（谁的改动都不会被覆盖）');
+      notifyUser(T('notify.conflict_title', { label: linkLabelById(best.id) }),
+        str(e.detail) + T('notify.conflict_hint'));
       return { ok: true, entries: 1 };
     }, function () { return { ok: false }; });
   }
@@ -8271,7 +8352,7 @@
         ev.stopPropagation();
         clear($('log-body'));
         state.logCount = 0;
-        setText('log-count', '0 条');
+        setText('log-count', T('log.count', { n: 0 }));
       });
     }
   }
@@ -8441,7 +8522,7 @@
       openTaskForm();
     });
     on('btn-type-backup', 'click', function () {
-      alert('备份任务需要单独的备份引擎，qxync 暂不支持。可以用「同步任务」做单向（仅上传/仅下载）近似。');
+      alert(T('tasks.backup_unsupported'));
     });
     on('btn-type-cancel', 'click', closeTypeChooser);
     on('btn-task-modal-close', 'click', closeTaskForm);
@@ -8450,7 +8531,7 @@
     on('btn-sync-now', 'click', function () {
       var e = state.syncEdit;
       closeSyncModal();
-      if (e) { doSync({ once: true }, [], '立即同步', str(e.linkId)); }
+      if (e) { doSync({ once: true }, [], T('task.act_sync_now'), str(e.linkId)); }
     });
     on('btn-sync-cancel', 'click', closeSyncModal);
     on('btn-sync-modal-close', 'click', closeSyncModal);
@@ -8465,9 +8546,9 @@
     on('btn-open-homepage', 'click', function () { doOpen('url', 'https://github.com/mlzxgzy/qxync'); });
     on('btn-share-station', 'click', function () {
       var u = fileStationUrl();
-      if (!u) { renderError('share-result', '打不开', '还没有连接配置（先在右上角 NAS 菜单里添加）'); return; }
+      if (!u) { renderError('share-result', T('share.cannot_open'), T('share.no_conn_top')); return; }
       doOpen('url', u);
-      renderResult('share-result', true, '已请求打开 File Station', [['URL', u]]);
+      renderResult('share-result', true, T('common.open_requested_filestation'), [['URL', u]]);
     });
     on('btn-env-logdir', 'click', function () {
       var info = state.appInfo;
@@ -8523,7 +8604,7 @@
     });
     on('btn-detail-sync', 'click', function () {
       var v = taskDetailView();
-      if (v) { doSync({ once: true }, ['btn-detail-sync'], '立即同步', str(v.linkId)); }
+      if (v) { doSync({ once: true }, ['btn-detail-sync'], T('task.act_sync_now'), str(v.linkId)); }
     });
     on('btn-detail-gear', 'click', function () {
       var v = taskDetailView();
@@ -8535,7 +8616,7 @@
     });
     on('btn-home-refresh', 'click', function () { refreshStatus(true); refreshMounts(); });
     on('btn-home-sync-now', 'click', function () {
-      doSync({ once: true }, ['btn-home-sync-now'], '立即同步');
+      doSync({ once: true }, ['btn-home-sync-now'], T('task.act_sync_now'));
     });
 
     // 顶部动作（★ M16：作用在**当前连接**上）
@@ -8641,29 +8722,29 @@
     });
 
     // 同步页
-    on('btn-sync-once', 'click', function () { doSync({ once: true }, ['btn-sync-once'], '立即同步'); });
+    on('btn-sync-once', 'click', function () { doSync({ once: true }, ['btn-sync-once'], T('task.act_sync_now')); });
     on('btn-sync-force', 'click', function () { doForceDeletes($('btn-sync-force')); });
-    on('btn-sync-pause', 'click', function () { doSync({ interval_secs: 0 }, ['btn-sync-pause'], '暂停轮询'); });
+    on('btn-sync-pause', 'click', function () { doSync({ interval_secs: 0 }, ['btn-sync-pause'], T('sync.pause_label')); });
     on('btn-sync-interval', 'click', function () {
       var v = num($('sy-interval') ? $('sy-interval').value : 60, 60);
       if (v <= 0) { logErr('轮询间隔必须 > 0（暂停请用「暂停轮询」按钮）'); return; }
-      doSync({ interval_secs: v }, ['btn-sync-interval'], '设置轮询间隔 ' + v + 's');
+      doSync({ interval_secs: v }, ['btn-sync-interval'], T('sync.interval_set', { secs: v }));
     });
 
     on('btn-dehy-dry', 'click', function () {
-      doDehydrate({ dry_run: true, all: true }, '脱水预演');
+      doDehydrate({ dry_run: true, all: true }, T('dehy.dry_run_label'));
     });
     on('btn-dehy-all', 'click', function () {
-      doDehydrate({ dry_run: false, all: true, force: false }, '全部脱水');
+      doDehydrate({ dry_run: false, all: true, force: false }, T('dehy.all_label'));
     });
     on('btn-dehy-limit', 'click', function () {
       var lim = str($('dehy-limit') ? $('dehy-limit').value : '').trim();
       if (!lim) { logErr('请输入限额，例如 512M / 2G / 25%'); return; }
-      doDehydrate({ cache_limit: lim }, '按限额脱水 ' + lim);
+      doDehydrate({ cache_limit: lim }, T('dehy.limit_label', { limit: lim }));
     });
     on('btn-dehy-idle', 'click', function () {
       var idle = num($('dehy-idle') ? $('dehy-idle').value : 0, 0);
-      doDehydrate({ idle_secs: idle }, '释放闲置 ≥ ' + idle + 's');
+      doDehydrate({ idle_secs: idle }, T('dehy.idle_label', { secs: idle }));
     });
     on('btn-verify', 'click', function () { doVerify(false); });
     on('btn-verify-repair', 'click', function () { doVerify(true); });
@@ -8704,15 +8785,15 @@
     on('btn-lan-pair', 'click', function () { doLanPair(); });
     on('btn-about-refresh', 'click', function () { loadConnect(); m84InfoRefresh(); renderAbout(); });
     on('btn-notify-test', 'click', function () {
-      notifyUser('qxync 测试通知', '如果你看到这条，说明桌面通知链路是通的。').then(function (r) {
+      notifyUser(T('notify.test_title'), T('notify.test_body')).then(function (r) {
         if (r.ok && isObj(r.data) && r.data.ok === false) {
-          renderError('advanced-result', '通知未发出', str(r.data.error || r.data.reason));
+          renderError('advanced-result', T('notify.not_sent'), str(r.data.error || r.data.reason));
         } else if (r.ok) {
-          renderResult('advanced-result', true, '已请求发送测试通知', [
-            ['说明', '如果系统没弹窗，检查通知守护进程与「免打扰」设置']
+          renderResult('advanced-result', true, T('notify.test_requested'), [
+            [T('routes.col_note'), T('notify.test_hint')]
           ]);
         } else {
-          renderError('advanced-result', '通知命令不可用', str(r.error));
+          renderError('advanced-result', T('notify.cmd_unavailable'), str(r.error));
         }
       });
     });
@@ -8730,17 +8811,17 @@
     });
     on('btn-open-station', 'click', function () {
       var u = fileStationUrl();
-      if (!u) { renderError('about-result', '打不开', '还没有连接配置（先在「连接」分区保存）'); return; }
+      if (!u) { renderError('about-result', T('about.cannot_open'), T('about.no_conn_save')); return; }
       doOpen('url', u);
-      renderResult('about-result', true, '已请求打开 File Station', [
+      renderResult('about-result', true, T('common.open_requested_filestation'), [
         ['URL', u],
-        ['说明', 'File Station 的 Web 路径在不同 QTS 版本上略有差异，打不开就手动访问 NAS 首页']
+        [T('routes.col_note'), T('about.filestation_hint')]
       ]);
     });
     var unsupported = {
-      'btn-unsupported-thumb': '创建缩略图属于 NAS 侧媒体索引优化，需要引入图像依赖与额外通道 —— 本客户端不做。',
-      'btn-unsupported-backup': '备份任务是 Qsync 6.0 的旗舰功能，但要一整套单向引擎 + 调度器；qxync 的定位是 Linux 按需同步，备份请用 HBS 3 / rsync / restic。',
-      'btn-unsupported-version': '「以前版本 / 还原」依赖 NAS 版本控制，本机实测 versioning_support 恒为 0 —— 已决策不做。'
+      'btn-unsupported-thumb': T('unsupported.thumb'),
+      'btn-unsupported-backup': T('unsupported.backup'),
+      'btn-unsupported-version': T('unsupported.versions')
     };
     Object.keys(unsupported).forEach(function (id) {
       on(id, 'click', function () {
@@ -8781,9 +8862,9 @@
         call('window_show', {});
         switchPage('home');
       } else if (action === 'sync') {
-        trayFanout({ once: true }, '托盘：立即与 NAS 同步');
+        trayFanout({ once: true }, T('tray.sync_now'));
       } else if (action === 'pause') {
-        trayFanout({ interval_secs: 0 }, '托盘：暂停轮询');
+        trayFanout({ interval_secs: 0 }, T('tray.pause_poll'));
       } else if (action === 'settings') {
         call('window_show', {});
         switchPage('settings', null, 'proxy');
@@ -8798,7 +8879,7 @@
   function trayFanout(req, label) {
     var targets = fanoutTargets();
     if (!targets.length || !targets[0].running) {
-      logInfo(label + '：没有运行中的 daemon');
+      logInfo(T('tray.no_daemon', { label: label }));
       return Promise.resolve(null);
     }
     // req 只是 sync 的参数（once / interval_secs），method 必须在这里补上
@@ -8812,9 +8893,9 @@
       var ok = 0;
       for (var i = 0; i < rs.length; i++) {
         if (rs[i].r.ok) { ok++; }
-        else { logErr(label + '（' + linkLabelById(rs[i].id) + '）失败：' + str(rs[i].r.error)); }
+        else { logErr(T('tray.fail', { label: label, link: linkLabelById(rs[i].id), msg: str(rs[i].r.error) })); }
       }
-      logOk(label + '：' + ok + '/' + rs.length + ' 个连接已完成');
+      logOk(T('tray.done', { label: label, ok: ok, total: rs.length }));
       refreshStatus(true);
       return rs;
     });
@@ -8853,6 +8934,15 @@
 
   // ============================================================ 启动
   function boot() {
+    // ★ M50：先定语言（localStorage 里是上次的设置值，没有就跟随系统），再 apply() ——
+    //   否则英文用户会先看到一帧中文；同时把 <html lang> 对上，读屏/拼写检查才不会错。
+    var localePref = '';
+    try { localePref = window.localStorage.getItem(LOCALE_PREF_KEY) || ''; } catch (e0) { localePref = ''; }
+    if (I18N && isFn(I18N.setLocale) && isFn(I18N.resolveLocale)) {
+      I18N.setLocale(I18N.resolveLocale(localePref));
+      document.documentElement.lang = I18N.locale();
+      refreshLocaleTitles();
+    }
     // ★ M8.6：先把静态文案套一遍（表在 i18n.js；DOM 里挂错 key 会在下面报出来）
     if (I18N && isFn(I18N.apply)) {
       I18N.apply(document);
@@ -8883,7 +8973,7 @@
       if (miss.length) {
         logErr('i18n：DOM 里有 ' + miss.length + ' 个 key 不在文案表里 —— ' + miss.join(', '));
       } else if (isFn(I18N.stats)) {
-        logInfo('i18n：' + I18N.locale() + ' 文案表已应用（' + I18N.stats().zh_keys + ' 条，en 预留）');
+        logInfo('i18n：' + I18N.locale() + ' 文案表已应用（zh ' + I18N.stats().zh_keys + ' 条 / en ' + I18N.stats().en_keys + ' 条）');
       }
     }
 

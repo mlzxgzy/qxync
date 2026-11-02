@@ -50,7 +50,7 @@ TEST_LINK="${QXNYC_TEST_LINK:-default}"
 #          fuse / chromium / display / node / python3 / sqlite3 / jq / creds / realnas / fixture
 # 新增套件：加一行 + 在 suite_exec 里加一个分支即可，别再往 CI 里堆一堆 step。
 SUITES=(
-  "cargo-test|unit||900|cargo test --workspace --locked（660 项单测 + 集成测试）"
+  "cargo-test|unit||900|cargo test --workspace --locked（675 项单测 + 集成测试）"
   "cargo-fmt|unit||120|cargo fmt --all --check（格式闸门）"
   "m19-purge|fast|python3|120|M19 删除相关数据（任务/连接/全局，隔离 XDG，不碰 NAS）"
   "m20-offline|fast|python3|180|M20 离线缓冲区 / 离线状态（隔离 XDG + 不可达 NAS）"
@@ -63,6 +63,7 @@ SUITES=(
   "node-m28-tray-status|fast|node|60|M28 托盘状态聚合纯函数单测（源文本级）"
   "gui-task-defaults|gui|chromium,node|180|M18 任务默认路径无头集成（真 app.js + 打桩后端）"
   "gui-purge|gui|chromium,node|180|M19 删除相关数据无头集成（真 app.js + 打桩后端）"
+  "gui-i18n|gui|chromium,node|300|M50 GUI 英文界面 / 语言切换无头验收（真 app.js + 真 i18n.js）"
   "m33-dl-toast-gui|gui|chromium,node|240|M33 下载进度卡片无头浏览器集成（真 app.js）"
   "gui-matrix|gui|creds|900|M4/M8.1/M8.4/M8.6 GUI 矩阵（自检 + 9 目的地真窗口截图）"
   "fuse-matrix|fuse|fuse,creds,fixture|1800|M1 FUSE 只读 + on-demand（真挂载；--big 需手动）"
@@ -151,6 +152,7 @@ suite_exec() {
     gui-task-defaults) bash "$TESTS/gui-task-defaults.sh" ;;
     gui-purge) bash "$TESTS/gui-purge.sh" ;;
     m33-dl-toast-gui) bash "$TESTS/m33-dl-toast-gui.sh" ;;
+    gui-i18n) bash "$TESTS/gui-i18n.sh" ;;
     gui-matrix)
       if [ "$CAP_DISPLAY" = 1 ] && command -v xdotool >/dev/null 2>&1 && command -v import >/dev/null 2>&1; then
         bash "$TESTS/gui-matrix.sh"

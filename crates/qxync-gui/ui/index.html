@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>qxync — QNAP 按需同步</title>
+<title data-i18n="app.title">qxync — QNAP 按需同步</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -13,9 +13,9 @@
 
 <!-- 非 Tauri 环境横幅（app.js 负责显示） -->
 <div id="env-banner" class="env-banner" hidden>
-  <strong>未在 Tauri 中运行</strong>
-  <span>当前页面被当作普通网页打开，<code>window.__TAURI__</code> 不存在，所有操作均不可用。
-  请用 qxync 桌面程序（或 <code>qxync-gui</code>）打开本界面。</span>
+  <strong data-i18n="env.title">未在 Tauri 中运行</strong>
+  <span><span data-i18n="env.run1">当前页面被当作普通网页打开，</span><code>window.__TAURI__</code> <span data-i18n="env.run2">不存在，所有操作均不可用。
+  请用 qxync 桌面程序（或</span> <code>qxync-gui</code><span data-i18n="env.run3">）打开本界面。</span></span>
 </div>
 
 <div class="shell">
@@ -26,7 +26,7 @@
        文字标签默认视觉隐藏（读屏与 tooltip 保留），设置→个人可开「显示导航文字」（P0-05）。 -->
   <aside class="rail">
     <!-- ★ P0-04：自绘品牌标（40×40，不抄 QNAP 图形）。QSync 6 左栏顶部就是 40×40 的 App 标。 -->
-    <div class="rail-logo" title="qxync — QNAP 按需同步" aria-hidden="true">
+    <div class="rail-logo" title="qxync — QNAP 按需同步" aria-hidden="true" data-i18n-title="app.title">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
            stroke-linecap="round" stroke-linejoin="round">
         <path d="M4 12a8 8 0 0 1 13.7-5.6"/><path d="M20 12a8 8 0 0 1-13.7 5.6"/>
@@ -102,7 +102,7 @@
     <header id="topbar" class="topbar">
       <div class="page-head">
         <div class="page-head-text">
-          <h1 class="pagetitle" id="page-title">主页</h1>
+          <h1 class="pagetitle" id="page-title" data-i18n="page.home">主页</h1>
           <!-- ★ P0-08：安静连接行 —— 替代三个工程药丸（官方也是「主机名 + 绿点 + Connected」） -->
           <p class="conn-line" id="conn-line" hidden>
             <span class="conn-dot" id="conn-line-dot"></span>
@@ -135,9 +135,9 @@
 
         <div class="card" id="home-tasks-card">
           <div class="card-head">
-            <h2>同步任务 <span class="count" id="home-task-count"></span></h2>
+            <h2><span data-i18n="tasks.title">同步任务</span> <span class="count" id="home-task-count"></span></h2>
             <div class="card-actions">
-              <button type="button" class="mini" id="btn-home-refresh">刷新</button>
+              <button type="button" class="mini" id="btn-home-refresh" data-i18n="decisions.act_refresh">刷新</button>
               <button type="button" class="mini primary" id="btn-home-add-task" data-i18n="task.act_add">＋ 添加任务</button>
             </div>
           </div>
@@ -164,9 +164,9 @@
         <p class="hint" id="tasks-links-hint"></p>
         <div class="card">
           <div class="card-head">
-            <h2>同步任务 <span class="count" id="tasks-count"></span></h2>
+            <h2><span data-i18n="tasks.title">同步任务</span> <span class="count" id="tasks-count"></span></h2>
             <div class="card-actions">
-              <button type="button" class="mini" id="btn-tasks-refresh">刷新</button>
+              <button type="button" class="mini" id="btn-tasks-refresh" data-i18n="decisions.act_refresh">刷新</button>
               <button type="button" class="mini primary" id="btn-tasks-add" data-i18n="task.act_add_pair">＋ 添加同步任务</button>
             </div>
           </div>
@@ -181,7 +181,7 @@
         <!-- ★ M8.4：冲突策略 =「每个文件都问我」时攒下的待裁决队列 -->
         <details class="card decisions-card" id="decisions-card">
           <summary>
-            <h2>冲突待裁决 <span class="count" id="decisions-count"></span></h2>
+            <h2><span data-i18n="tasks.decisions_title">冲突待裁决</span> <span class="count" id="decisions-count"></span></h2>
           </summary>
           <div class="card-actions">
             <button type="button" class="mini" id="btn-decisions-refresh"
@@ -193,8 +193,8 @@
                apply() 用 textContent 覆盖会吃掉标记（i18n.js 文件头已把「含内联标记的
                混合段落」划出 i18n 范围）；静态中文文案与 i18n.js 的 decisions.hint 保持一致。 -->
           <p class="hint">
-            只有把某个任务的冲突策略设成 <code>ask</code>（每个文件都问我）时才会有条目。
-            待裁决期间两边都不动（谁的改动都不会被覆盖）；裁决后由下一轮同步执行。
+            <span data-i18n="decisions.hint_pre">只有把某个任务的冲突策略设成</span> <code>ask</code><span data-i18n="decisions.hint_post">（每个文件都问我）时才会有条目。
+            待裁决期间两边都不动（谁的改动都不会被覆盖）；裁决后由下一轮同步执行。</span>
           </p>
           <div id="decisions-list" class="task-list"></div>
           <p class="empty-hint" id="decisions-empty" hidden data-state="ready" data-i18n="decisions.empty">没有待裁决的冲突。</p>
@@ -209,8 +209,8 @@
           <button type="button" class="icon-btn" id="btn-task-back"
                   title="返回任务列表" aria-label="返回任务列表" data-i18n-title="detail.back" data-i18n-aria-label="detail.back">↩</button>
           <div class="detail-title-wrap">
-            <p class="crumb" id="detail-crumb">任务</p>
-            <h1 class="pagetitle" id="detail-title">同步任务</h1>
+            <p class="crumb" id="detail-crumb" data-i18n="page.tasks">任务</p>
+            <h1 class="pagetitle" id="detail-title" data-i18n="tasks.title">同步任务</h1>
           </div>
           <div class="detail-actions">
             <button type="button" class="mini" id="btn-detail-sync" data-i18n="detail.sync_now">立即同步一轮</button>
@@ -261,7 +261,7 @@
              （baseline + nodes.local_only），不挂载、不联网、daemon 不在也能用。
              匹配/排序语义在 Rust 侧（qxync_core::search），前端只渲染结果。 -->
         <div class="card">
-          <h2>搜索同步文件</h2>
+          <h2 data-i18n="files.search_title">搜索同步文件</h2>
           <p class="hint" id="search-scope-hint"></p>
           <form id="form-search" class="searchbar" autocomplete="off" role="search">
             <input type="search" id="q-pattern" class="mono" spellcheck="false"
@@ -272,25 +272,25 @@
             <span class="busy" id="search-busy" hidden data-i18n="busy.text">进行中…</span>
           </form>
           <div class="search-filters">
-            <label>限定目录
+            <label><span data-i18n="search.under_label">限定目录</span>
               <input type="text" id="q-under" class="mono" spellcheck="false"
-                     placeholder="不填 = 全部；NAS 路径或挂载点路径">
+                     placeholder="不填 = 全部；NAS 路径或挂载点路径" data-i18n-placeholder="search.under_placeholder">
             </label>
-            <label>类型
+            <label><span data-i18n="search.col_type">类型</span>
               <select id="q-kind">
                 <option value="any" data-i18n="search.kind_any">全部</option>
                 <option value="file" data-i18n="search.kind_file">只要文件</option>
                 <option value="dir" data-i18n="search.kind_dir">只要目录</option>
               </select>
             </label>
-            <label>排序
+            <label><span data-i18n="search.sort_label">排序</span>
               <select id="q-sort">
                 <option value="path" data-i18n="search.sort_path">路径</option>
                 <option value="size" data-i18n="search.sort_size">大小（大的在前）</option>
                 <option value="mtime" data-i18n="search.sort_mtime">修改时间（新的在前）</option>
               </select>
             </label>
-            <label>最多
+            <label><span data-i18n="search.limit_label">最多</span>
               <select id="q-limit">
                 <option value="50">50</option>
                 <option value="100" selected>100</option>
@@ -298,8 +298,8 @@
                 <option value="0" data-i18n="search.limit_all">全部</option>
               </select>
             </label>
-            <label class="check"><input type="checkbox" id="q-glob"> 通配符（<code>*</code> 与 <code>?</code>）</label>
-            <label class="check"><input type="checkbox" id="q-case"> 区分大小写</label>
+            <label class="check"><input type="checkbox" id="q-glob"> <span data-i18n="search.glob">通配符（</span><code>*</code> <span data-i18n="search.glob_and">与</span> <code>?</code><span data-i18n="search.glob_end">）</span></label>
+            <label class="check"><input type="checkbox" id="q-case"> <span data-i18n="search.case">区分大小写</span></label>
           </div>
           <div class="toolbar">
             <span class="toolbar-info" id="search-info">—</span>
@@ -320,27 +320,27 @@
           </div>
           <p class="empty-hint" id="search-empty" hidden data-state="empty"></p>
           <p class="note">
-            数据来自本地状态库（<strong>目录数据库</strong>），所以
-            <strong>不挂载、不联网、daemon 不在也能搜</strong>；远端变化最多滞后一轮同步
-            （默认 30 秒），刚上传成功的文件会立即出现。只匹配<strong>路径与文件名</strong>，
-            <strong>不搜文件内容</strong>。回车即搜；命中行可「定位」到上面的目录浏览，
-            或直接「打开」（映射到挂载点里的本地路径）。
+            <span data-i18n="files.note_db">数据来自本地状态库（</span><strong data-i18n="files.note_db_name">目录数据库</strong><span data-i18n="files.note_so">），所以</span>
+            <strong data-i18n="files.note_offline">不挂载、不联网、daemon 不在也能搜</strong><span data-i18n="files.note_lag">；远端变化最多滞后一轮同步
+            （默认 30 秒），刚上传成功的文件会立即出现。只匹配</span><strong data-i18n="files.note_paths">路径与文件名</strong><span data-i18n="files.note_comma">，</span>
+            <strong data-i18n="files.note_no_content">不搜文件内容</strong><span data-i18n="files.note_enter">。回车即搜；命中行可「定位」到上面的目录浏览，
+            或直接「打开」（映射到挂载点里的本地路径）。</span>
           </p>
         </div>
 
         <div class="card">
-          <h2>NAS 上的目录</h2>
+          <h2 data-i18n="files.dir_title">NAS 上的目录</h2>
           <p class="hint" id="files-link-hint"></p>
           <form id="form-path" class="pathbar" autocomplete="off">
             <input type="text" id="fp-path" value="/home" spellcheck="false" class="mono">
-            <button type="submit" id="btn-path-go">打开</button>
-            <button type="button" id="btn-path-up">上级目录</button>
-            <button type="button" id="btn-path-refresh">刷新</button>
-            <label class="check"><input type="checkbox" id="fp-hide-excluded"> 隐藏 excluded</label>
+            <button type="submit" id="btn-path-go" data-i18n="search.act_open">打开</button>
+            <button type="button" id="btn-path-up" data-i18n="files.up">上级目录</button>
+            <button type="button" id="btn-path-refresh" data-i18n="decisions.act_refresh">刷新</button>
+            <label class="check"><input type="checkbox" id="fp-hide-excluded"> <span data-i18n="files.hide_excluded">隐藏 excluded</span></label>
           </form>
           <div class="toolbar">
-            <button type="button" id="btn-mkdir">新建目录</button>
-            <button type="button" id="btn-rm" class="danger">删除选中</button>
+            <button type="button" id="btn-mkdir" data-i18n="files.mkdir">新建目录</button>
+            <button type="button" id="btn-rm" class="danger" data-i18n="files.rm">删除选中</button>
             <span class="toolbar-info" id="files-info">—</span>
             <span class="busy" id="files-busy" hidden data-i18n="busy.text">进行中…</span>
           </div>
@@ -349,14 +349,14 @@
             <table class="tbl tbl-files">
               <thead>
                 <tr>
-                  <th class="col-sel">选</th>
+                  <th class="col-sel" data-i18n="files.col_sel">选</th>
                   <!-- ★ P2-19：列顺序对齐官方：名称 / 类型 / 大小 / 修改时间 / 状态 / 操作 -->
-                  <th class="col-name">名称</th>
-                  <th class="col-type">类型</th>
-                  <th class="col-size">大小</th>
-                  <th class="col-time">修改时间</th>
-                  <th class="col-state">状态</th>
-                  <th class="col-act">操作</th>
+                  <th class="col-name" data-i18n="files.col_name">名称</th>
+                  <th class="col-type" data-i18n="search.col_type">类型</th>
+                  <th class="col-size" data-i18n="search.col_size">大小</th>
+                  <th class="col-time" data-i18n="search.col_time">修改时间</th>
+                  <th class="col-state" data-i18n="detail.col_state">状态</th>
+                  <th class="col-act" data-i18n="search.col_act">操作</th>
                 </tr>
               </thead>
               <tbody id="files-tbody"></tbody>
@@ -364,12 +364,12 @@
           </div>
           <p class="empty-hint" id="files-empty" hidden data-state="ready" data-i18n="files.empty">目录为空，或尚未加载。</p>
           <p class="note">
-            <strong>状态</strong>列只用一个图标表达状态（悬停看全部细节），对应 Qsync 的「节省空间模式」三态：
-            <span class="badge badge-online">仅在线</span>（占位符，没有本地内容）·
-            <span class="badge badge-local">本地可用</span>（已缓存）·
-            <span class="badge badge-always">始终可用</span>（<code>pin=pinned</code>，永不自动释放）。
-            行尾<strong>⋯</strong>或<strong>右键</strong>任意一行都能打开操作菜单
-            （查询 / 设置 pin、释放空间、下载、删除、复制路径）。
+            <strong data-i18n="detail.col_state">状态</strong><span data-i18n="files.note_state">列只用一个图标表达状态（悬停看全部细节），对应 Qsync 的「节省空间模式」三态：</span>
+            <span class="badge badge-online" data-i18n="state.online">仅在线</span><span data-i18n="files.note_online">（占位符，没有本地内容）·</span>
+            <span class="badge badge-local" data-i18n="state.local">本地可用</span><span data-i18n="files.note_local">（已缓存）·</span>
+            <span class="badge badge-always" data-i18n="state.always">始终可用</span><span data-i18n="files.note_open">（</span><code>pin=pinned</code><span data-i18n="files.note_always">，永不自动释放）。
+            行尾</span><strong>⋯</strong><span data-i18n="files.note_or">或</span><strong data-i18n="files.note_rightclick">右键</strong><span data-i18n="files.note_menu">任意一行都能打开操作菜单
+            （查询 / 设置 pin、释放空间、下载、删除、复制路径）。</span>
           </p>
         </div>
       </section>
@@ -378,7 +378,7 @@
       <section class="page" id="page-share">
         <div class="card">
           <div class="card-head">
-            <h2>分享中心</h2>
+            <h2 data-i18n="share.title">分享中心</h2>
           </div>
           <div class="empty-state" data-keep>
             <svg class="empty-art" viewBox="0 0 96 72" fill="none" stroke="currentColor"
@@ -386,15 +386,15 @@
               <circle cx="68" cy="16" r="9"/><circle cx="24" cy="36" r="9"/><circle cx="68" cy="56" r="9"/>
               <path d="M32 31.5l27-11M32 40.5l27 11"/>
             </svg>
-            <p class="empty-title">这个版本没有分享中心</p>
-            <p class="empty-desc">
+            <p class="empty-title" data-i18n="share.empty_title">这个版本没有分享中心</p>
+            <p class="empty-desc" data-i18n="share.empty_desc">
               Qsync 6 的「分享」依赖 Qsync Central 的分享链接服务；qxync 目前只做本机按需同步，
               没有账号体系与分享 API，所以不做一个点进去空白的页面。
             </p>
             <div class="btn-row">
-              <button type="button" class="primary" id="btn-share-station">在 File Station 打开</button>
+              <button type="button" class="primary" id="btn-share-station" data-i18n="share.open_fs">在 File Station 打开</button>
             </div>
-            <p class="hint">需要从浏览器把 NAS 文件分享给别人时，用 File Station 的「分享链接」；本机同步状态在「任务」页。</p>
+            <p class="hint" data-i18n="share.hint">需要从浏览器把 NAS 文件分享给别人时，用 File Station 的「分享链接」；本机同步状态在「任务」页。</p>
           </div>
           <div id="share-result" class="result" hidden></div>
         </div>
@@ -404,37 +404,37 @@
       <section class="page" id="page-journal">
         <div class="card">
           <div class="card-head">
-            <h2>文件更新中心 <span class="count" id="journal-count"></span></h2>
+            <h2><span data-i18n="page.journal">文件更新中心</span> <span class="count" id="journal-count"></span></h2>
             <div class="card-actions">
-              <button type="button" class="mini" id="btn-journal-refresh">刷新</button>
-              <button type="button" class="mini danger" id="btn-journal-clear">清空日志</button>
+              <button type="button" class="mini" id="btn-journal-refresh" data-i18n="decisions.act_refresh">刷新</button>
+              <button type="button" class="mini danger" id="btn-journal-clear" data-i18n="journal.clear">清空日志</button>
             </div>
           </div>
           <p class="hint" id="journal-link-hint"></p>
           <div class="toolbar journal-toolbar">
-            <input type="search" id="j-query" class="mono" placeholder="按文件名 / 说明搜索" spellcheck="false">
+            <input type="search" id="j-query" class="mono" placeholder="按文件名 / 说明搜索" spellcheck="false" data-i18n-placeholder="journal.filter_placeholder">
             <select id="j-level">
-              <option value="all">全部活动</option>
-              <option value="ok">成功</option>
-              <option value="warn">警告（网络）</option>
-              <option value="error">失败</option>
-              <option value="blocked">被挡下</option>
+              <option value="all" data-i18n="journal.level_all">全部活动</option>
+              <option value="ok" data-i18n="journal.level_ok">成功</option>
+              <option value="warn" data-i18n="journal.level_warn">警告（网络）</option>
+              <option value="error" data-i18n="routes.state_failed">失败</option>
+              <option value="blocked" data-i18n="journal.level_blocked">被挡下</option>
             </select>
-            <label class="inline-num">条数 <input type="number" id="j-limit" min="1" max="10000" step="50" value="200"></label>
-            <button type="button" id="btn-journal-clear-filters">清除筛选</button>
+            <label class="inline-num"><span data-i18n="journal.count_label">条数</span> <input type="number" id="j-limit" min="1" max="10000" step="50" value="200"></label>
+            <button type="button" id="btn-journal-clear-filters" data-i18n="journal.clear_filters">清除筛选</button>
             <span class="busy" id="journal-busy" hidden data-i18n="busy.text">进行中…</span>
           </div>
           <table class="tbl tbl-journal">
             <thead>
               <tr>
-                <th class="col-file">文件</th>
+                <th class="col-file" data-i18n="nav.files">文件</th>
                 <th class="col-kind">
-                  <button type="button" class="th-sort" id="j-sort-kind">活动 <span class="sort-mark" id="j-sort-kind-mark"></span></button>
+                  <button type="button" class="th-sort" id="j-sort-kind"><span data-i18n="journal.col_kind">活动</span> <span class="sort-mark" id="j-sort-kind-mark"></span></button>
                 </th>
                 <th class="col-time">
-                  <button type="button" class="th-sort" id="j-sort-time" aria-sort="descending">时间 <span class="sort-mark" id="j-sort-time-mark">↓</span></button>
+                  <button type="button" class="th-sort" id="j-sort-time" aria-sort="descending"><span data-i18n="common.time">时间</span> <span class="sort-mark" id="j-sort-time-mark">↓</span></button>
                 </th>
-                <th class="col-desc">说明</th>
+                <th class="col-desc" data-i18n="routes.col_note">说明</th>
               </tr>
             </thead>
             <tbody id="journal-tbody"></tbody>
@@ -450,20 +450,20 @@
       <section class="page" id="page-errors">
         <div class="card">
           <div class="card-head">
-            <h2>错误列表 <span class="count" id="errors-count"></span></h2>
+            <h2><span data-i18n="page.errors">错误列表</span> <span class="count" id="errors-count"></span></h2>
             <div class="card-actions">
-              <button type="button" class="mini" id="btn-errors-refresh">刷新</button>
+              <button type="button" class="mini" id="btn-errors-refresh" data-i18n="decisions.act_refresh">刷新</button>
             </div>
           </div>
           <p class="hint" id="errors-link-hint"></p>
           <table class="tbl tbl-errors">
             <thead>
               <tr>
-                <th class="col-file">文件</th>
-                <th class="col-task">任务</th>
-                <th class="col-reason">原因</th>
-                <th class="col-time">时间</th>
-                <th class="col-act">操作</th>
+                <th class="col-file" data-i18n="nav.files">文件</th>
+                <th class="col-task" data-i18n="page.tasks">任务</th>
+                <th class="col-reason" data-i18n="errors.col_reason">原因</th>
+                <th class="col-time" data-i18n="common.time">时间</th>
+                <th class="col-act" data-i18n="search.col_act">操作</th>
               </tr>
             </thead>
             <tbody id="errors-list"></tbody>
@@ -490,39 +490,39 @@
         <!-- ---------------- 设置 2：代理（Qsync「代理」tab） ---------------- -->
         <div class="settings-sec" id="sec-proxy" role="tabpanel" aria-labelledby="sec-tab-proxy">
           <div class="card">
-            <h2>代理 <span class="badge" id="proxy-mode-badge"></span></h2>
+            <h2><span data-i18n="sec.proxy">代理</span> <span class="badge" id="proxy-mode-badge"></span></h2>
             <p class="hint">
-              <code>Auto-detect</code>（官方推荐）= 跟随 <code>http_proxy</code>/<code>https_proxy</code> 环境变量；
-              <code>No proxy</code> = 显式不做代理（注意：reqwest 默认会读环境变量，所以「无代理」必须显式关掉）；
-              <code>Manual</code> = 指定服务器（可带认证）。
+              <code>Auto-detect</code><span data-i18n="proxy.mode_auto">（官方推荐）= 跟随</span> <code>http_proxy</code>/<code>https_proxy</code> <span data-i18n="proxy.mode_env">环境变量；</span>
+              <code>No proxy</code> <span data-i18n="proxy.mode_none">= 显式不做代理（注意：reqwest 默认会读环境变量，所以「无代理」必须显式关掉）；</span>
+              <code>Manual</code> <span data-i18n="proxy.mode_manual">= 指定服务器（可带认证）。</span>
             </p>
             <div class="form">
-              <label>模式
+              <label><span data-i18n="common.mode">模式</span>
                 <select id="p-mode">
-                  <option value="auto">Auto-detect（自动检测，官方推荐）</option>
-                  <option value="none">No proxy（无代理）</option>
-                  <option value="manual">Manual（手动）</option>
+                  <option value="auto" data-i18n="proxy.opt_auto">Auto-detect（自动检测，官方推荐）</option>
+                  <option value="none" data-i18n="proxy.opt_none">No proxy（无代理）</option>
+                  <option value="manual" data-i18n="proxy.opt_manual">Manual（手动）</option>
                 </select>
               </label>
               <div id="p-manual-wrap">
                 <div class="row-2">
-                  <label>服务器（IP 或 URL）
-                    <input type="text" id="p-server" class="mono" spellcheck="false" placeholder="proxy.corp 或 http://proxy.corp">
+                  <label><span data-i18n="proxy.server">服务器（IP 或 URL）</span>
+                    <input type="text" id="p-server" class="mono" spellcheck="false" placeholder="proxy.corp 或 http://proxy.corp" data-i18n-placeholder="proxy.server_placeholder">
                   </label>
-                  <label>端口（URL 里已写端口可留空）
+                  <label><span data-i18n="proxy.port">端口（URL 里已写端口可留空）</span>
                     <input type="number" id="p-port" min="1" max="65535" step="1" placeholder="3128">
                   </label>
                 </div>
-                <label class="check"><input type="checkbox" id="p-auth"> 代理服务器需要口令（Proxy server requires a password）</label>
+                <label class="check"><input type="checkbox" id="p-auth"> <span data-i18n="proxy.auth">代理服务器需要口令（Proxy server requires a password）</span></label>
                 <div class="row-2" id="p-cred-wrap">
-                  <label>用户名 <input type="text" id="p-user" spellcheck="false" autocomplete="username"></label>
-                  <label>口令 <input type="password" id="p-password" autocomplete="current-password" placeholder="留空则不改动已存口令"></label>
+                  <label><span data-i18n="conn.user">用户名</span> <input type="text" id="p-user" spellcheck="false" autocomplete="username"></label>
+                  <label><span data-i18n="conn.password">口令</span> <input type="password" id="p-password" autocomplete="current-password" placeholder="留空则不改动已存口令" data-i18n-placeholder="proxy.password_placeholder"></label>
                 </div>
               </div>
               <dl class="kv mono" id="proxy-env-kv"></dl>
               <div class="btn-row">
-                <button type="button" id="btn-proxy-save" class="primary">保存代理设置</button>
-                <button type="button" id="btn-settings-refresh">重新读取</button>
+                <button type="button" id="btn-proxy-save" class="primary" data-i18n="proxy.save">保存代理设置</button>
+                <button type="button" id="btn-settings-refresh" data-i18n="common.reload">重新读取</button>
               </div>
               <p class="hint" id="proxy-hint">—</p>
               <div id="proxy-result" class="result" hidden></div>
@@ -533,34 +533,35 @@
         <!-- ---------------- 设置 4：个人（Qsync「个人」tab） ---------------- -->
         <div class="settings-sec" id="sec-personal" role="tabpanel" aria-labelledby="sec-tab-personal">
           <div class="card">
-            <h2>个人</h2>
+            <h2 data-i18n="sec.personal">个人</h2>
             <div class="form">
-              <label class="check"><input type="checkbox" id="s-startup"> 开机自启（Launch Qsync at startup）</label>
+              <label class="check"><input type="checkbox" id="s-startup"> <span data-i18n="personal.autostart">开机自启（Launch Qsync at startup）</span></label>
               <p class="hint" id="autostart-hint">—</p>
               <div class="row-2">
-                <label>语言
+                <label><span data-i18n="personal.language">语言</span>
                   <select id="s-lang">
-                    <option value="">跟随系统</option>
-                    <option value="zh-CN">简体中文（zh-CN）</option>
+                    <option value="" data-i18n="lang.follow_system">跟随系统</option>
+                    <option value="en" data-i18n="lang.en">English</option>
+                    <option value="zh-CN" data-i18n="lang.zh">简体中文（zh-CN）</option>
                   </select>
                 </label>
-                <label>地区（Select the correct region to ensure better connectivity）
+                <label><span data-i18n="personal.region">地区（Select the correct region to ensure better connectivity）</span>
                   <select id="s-region">
-                    <option value="auto">自动</option>
-                    <option value="cn">中国大陆（cn）</option>
-                    <option value="us">美国（us）</option>
-                    <option value="eu">欧洲（eu）</option>
+                    <option value="auto" data-i18n="personal.region_auto">自动</option>
+                    <option value="cn" data-i18n="personal.region_cn">中国大陆（cn）</option>
+                    <option value="us" data-i18n="personal.region_us">美国（us）</option>
+                    <option value="eu" data-i18n="personal.region_eu">欧洲（eu）</option>
                   </select>
                 </label>
               </div>
-              <label class="check"><input type="checkbox" id="s-rail-labels" data-i18n="personal.rail_labels"> 显示导航文字（默认关闭，贴近 Qsync 6 的纯图标栏）</label>
-              <label class="check"><input type="checkbox" id="s-close-tray"> 关闭主窗口时最小化到托盘</label>
-              <p class="hint">
+              <label class="check"><input type="checkbox" id="s-rail-labels"> <span data-i18n="personal.rail_labels">显示导航文字（默认关闭，贴近 Qsync 6 的纯图标栏）</span></label>
+              <label class="check"><input type="checkbox" id="s-close-tray"> <span data-i18n="personal.close_to_tray">关闭主窗口时最小化到托盘</span></label>
+              <p class="hint" data-i18n="personal.close_to_tray_hint">
                 托盘不可见时这个开关不会生效：没有系统托盘（纯 XEmbed 桌面，或 GNOME 未启用
                 AppIndicator 扩展）时关闭窗口会真的退出，免得窗口藏起来找不回。
               </p>
               <div class="btn-row">
-                <button type="button" id="btn-personal-save" class="primary">保存个人设置</button>
+                <button type="button" id="btn-personal-save" class="primary" data-i18n="personal.save">保存个人设置</button>
               </div>
               <div id="personal-result" class="result" hidden></div>
             </div>
@@ -570,57 +571,57 @@
         <!-- ---------------- 设置 5：高级（Qsync「高级」tab） ---------------- -->
         <div class="settings-sec" id="sec-advanced" role="tabpanel" aria-labelledby="sec-tab-advanced">
           <div class="card">
-            <h2>高级</h2>
+            <h2 data-i18n="sec.advanced">高级</h2>
             <div class="form">
-              <label class="check"><input type="checkbox" id="s-debug-log"> 启用调试日志（Enable debug log，⚠ 影响同步性能）</label>
+              <label class="check"><input type="checkbox" id="s-debug-log"> <span data-i18n="adv.debug_log">启用调试日志（Enable debug log，⚠ 影响同步性能）</span></label>
               <p class="hint">
-                日志级别由环境变量 <code>RUST_LOG</code> 控制；轮转与占用见下方「日志与轮转」。
-                这个开关是界面侧的记录位（框起来方便排障）。
+                <span data-i18n="adv.debug_log_env">日志级别由环境变量</span> <code>RUST_LOG</code> <span data-i18n="adv.debug_log_env2">控制；轮转与占用见下方「日志与轮转」。
+                这个开关是界面侧的记录位（框起来方便排障）。</span>
               </p>
-              <label class="check"><input type="checkbox" id="s-notifications"> 显示桌面通知（Show desktop notifications）</label>
-              <p class="hint">同步出错时发一条系统通知；关掉就完全不发。</p>
+              <label class="check"><input type="checkbox" id="s-notifications"> <span data-i18n="adv.notifications">显示桌面通知（Show desktop notifications）</span></label>
+              <p class="hint" data-i18n="adv.notifications_hint">同步出错时发一条系统通知；关掉就完全不发。</p>
 
               <!-- ★ P2-17：官方 Advanced 四项 —— 调试日志 / 日志清理 / 桌面通知 / 自动更新 / LAN -->
-              <h3 class="sub">日志</h3>
+              <h3 class="sub" data-i18n="sec.log">日志</h3>
               <div class="btn-row">
-                <button type="button" id="btn-adv-log-clear">清理旧日志</button>
-                <button type="button" id="btn-adv-log-open">打开日志目录</button>
+                <button type="button" id="btn-adv-log-clear" data-i18n="adv.log_prune">清理旧日志</button>
+                <button type="button" id="btn-adv-log-open" data-i18n="adv.log_open">打开日志目录</button>
               </div>
-              <p class="hint">清理按下方「日志与轮转」里的保留策略执行；占用与文件表也在那一块。</p>
+              <p class="hint" data-i18n="adv.log_prune_hint">清理按下方「日志与轮转」里的保留策略执行；占用与文件表也在那一块。</p>
 
-              <label class="check"><input type="checkbox" id="s-auto-update" disabled> 自动检查更新</label>
-              <p class="hint">当前版本从源码分发，没有在线更新通道（置灰不是故障）。</p>
+              <label class="check"><input type="checkbox" id="s-auto-update" disabled> <span data-i18n="adv.auto_update">自动检查更新</span></label>
+              <p class="hint" data-i18n="adv.auto_update_hint">当前版本从源码分发，没有在线更新通道（置灰不是故障）。</p>
 
-              <h3 class="sub">LAN 同步</h3>
+              <h3 class="sub" data-i18n="adv.lan_sync">LAN 同步</h3>
               <div class="adv-lan-row">
-                <span class="hint">同一账号的设备在同一局域网内直传，失败自动回落 NAS。</span>
-                <button type="button" class="mini" id="btn-adv-lan">LAN 设置…</button>
+                <span class="hint" data-i18n="adv.lan_hint">同一账号的设备在同一局域网内直传，失败自动回落 NAS。</span>
+                <button type="button" class="mini" id="btn-adv-lan" data-i18n="adv.lan_settings">LAN 设置…</button>
               </div>
 
               <!-- ★ M23/M24/M25：Dolphin 集成 —— 两条独立通道：Tags 列（user.xdg.tags，无需插件）与文件角标（user.qxync.overlay，需装 qxync-dolphin-overlay 插件包） -->
-              <label class="check"><input type="checkbox" id="s-dolphin-tags"> 在 Dolphin 里显示水合状态（Tags 列）</label>
-              <label class="check"><input type="checkbox" id="s-dolphin-overlay"> 在文件图标上显示状态角标（需装 qxync-dolphin-overlay 插件包）</label>
-              <p class="hint" data-i18n="adv.dolphin_hint">
-                两个开关相互独立，可只开一个，默认都关。Tags 列：把图标字符（✓ 已水合 / ☁ 仅在线 / ◐ 部分本地）
-                写进 user.xdg.tags，Dolphin 内置列直接显示，不需要装任何插件。文件角标：需要装
-                <code>qxync-dolphin-overlay</code> 插件包（KOverlayIconPlugin，只支持 KDE Dolphin），
+              <label class="check"><input type="checkbox" id="s-dolphin-tags"> <span data-i18n="adv.dolphin_tags">在 Dolphin 里显示水合状态（Tags 列）</span></label>
+              <label class="check"><input type="checkbox" id="s-dolphin-overlay"> <span data-i18n="adv.dolphin_overlay">在文件图标上显示状态角标（需装 qxync-dolphin-overlay 插件包）</span></label>
+              <p class="hint">
+                <span data-i18n="adv.dolphin_hint_pre">两个开关相互独立，可只开一个，默认都关。Tags 列：把图标字符（✓ 已水合 / ☁ 仅在线 / ◐ 部分本地）
+                写进 user.xdg.tags，Dolphin 内置列直接显示，不需要装任何插件。文件角标：需要装</span>
+                <code>qxync-dolphin-overlay</code> <span data-i18n="adv.dolphin_hint_post">插件包（KOverlayIconPlugin，只支持 KDE Dolphin），
                 Dolphin 才会在文件图标上画彩色角标（绿对钩 / 蓝云），读的是 user.qxync.overlay ——
                 装没装、会不会加载，看下面检测表里的「角标插件」一行。
                 两者前置条件相同：挂载点必须已排除出 Baloo 索引（否则索引器会把整个 NAS 拉到本地）。
-                状态都不实时刷新（F5 / 重进目录后更新）。
+                状态都不实时刷新（F5 / 重进目录后更新）。</span>
               </p>
               <dl class="kv" id="dolphin-kv"></dl>
               <div class="btn-row">
-                <button type="button" id="btn-advanced-save" class="primary">保存高级设置</button>
-                <button type="button" id="btn-notify-test">发一条测试通知</button>
-                <button type="button" class="ghost" id="btn-baloo-recheck">重新检测 Baloo</button>
+                <button type="button" id="btn-advanced-save" class="primary" data-i18n="adv.save">保存高级设置</button>
+                <button type="button" id="btn-notify-test" data-i18n="adv.notify_test">发一条测试通知</button>
+                <button type="button" class="ghost" id="btn-baloo-recheck" data-i18n="adv.baloo_recheck">重新检测 Baloo</button>
               </div>
               <div id="advanced-result" class="result" hidden></div>
-              <h3 class="sub">明确不做（点了会说明原因）</h3>
+              <h3 class="sub" data-i18n="adv.not_doing">明确不做（点了会说明原因）</h3>
               <div class="btn-row">
-                <button type="button" class="ghost" id="btn-unsupported-thumb">创建缩略图</button>
-                <button type="button" class="ghost" id="btn-unsupported-backup">备份任务</button>
-                <button type="button" class="ghost" id="btn-unsupported-version">以前版本 / 还原</button>
+                <button type="button" class="ghost" id="btn-unsupported-thumb" data-i18n="adv.unsupported_thumb">创建缩略图</button>
+                <button type="button" class="ghost" id="btn-unsupported-backup" data-i18n="type.backup">备份任务</button>
+                <button type="button" class="ghost" id="btn-unsupported-version" data-i18n="adv.unsupported_version">以前版本 / 还原</button>
               </div>
               <p class="note" id="unsupported-note" hidden></p>
             </div>
@@ -628,43 +629,43 @@
 
         <!-- ---------------- 设置 3：同步与筛选（Qsync「筛选器设置」） ---------------- -->
         <details class="settings-sub" id="sec-sync">
-          <summary>同步与筛选</summary>
+          <summary data-i18n="sec.sync">同步与筛选</summary>
           <div class="card">
-            <h2>筛选器设置（Filter settings）</h2>
+            <h2 data-i18n="filters.title">筛选器设置（Filter settings）</h2>
             <p class="hint">
-              通配符规则，每行一条（<code>thumbs.db</code> / <code>*.crdownload</code> / <code>.*</code> / <code>/cache/</code>）。
-              以 <code>/</code> 结尾的规则会<strong>剪掉整棵子树</strong>（这一点 qxync 比 Qsync 6.x 强，不要退化）。
-              规则改完要重启 daemon 才对挂载点生效（同步引擎与 FUSE 在启动时注入规则）。
+              <span data-i18n="filters.hint">通配符规则，每行一条（</span><code>thumbs.db</code> / <code>*.crdownload</code> / <code>.*</code> / <code>/cache/</code><span data-i18n="filters.hint2">）。
+              以</span> <code>/</code> <span data-i18n="filters.hint3">结尾的规则会</span><strong data-i18n="filters.hint_prune">剪掉整棵子树</strong><span data-i18n="filters.hint4">（这一点 qxync 比 Qsync 6.x 强，不要退化）。
+              规则改完要重启 daemon 才对挂载点生效（同步引擎与 FUSE 在启动时注入规则）。</span>
             </p>
-            <label>排除规则（exclude）
+            <label><span data-i18n="filters.exclude">排除规则（exclude）</span>
               <textarea id="flt-lines" rows="6" class="mono" spellcheck="false"
                         placeholder="*.iso&#10;/cache/&#10;thumbs.db"></textarea>
             </label>
-            <label class="check"><input type="checkbox" id="flt-filter-temp"> 过滤临时文件（*.crdownload / ~$* / .goutputstream-* / *.qxync-part）</label>
+            <label class="check"><input type="checkbox" id="flt-filter-temp"> <span data-i18n="filters.temp">过滤临时文件（*.crdownload / ~$* / .goutputstream-* / *.qxync-part）</span></label>
             <div class="btn-row">
-              <button type="button" id="btn-flt-save" class="primary">保存筛选器</button>
-              <button type="button" id="btn-flt-reload">重新读取</button>
+              <button type="button" id="btn-flt-save" class="primary" data-i18n="filters.save">保存筛选器</button>
+              <button type="button" id="btn-flt-reload" data-i18n="common.reload">重新读取</button>
             </div>
-            <h3 class="sub">实时预览（判定一条 NAS 路径）</h3>
+            <h3 class="sub" data-i18n="filters.preview_title">实时预览（判定一条 NAS 路径）</h3>
             <div class="toolbar">
               <input type="text" id="flt-match" class="mono" spellcheck="false" placeholder="/home/qxync-test/secret.bin">
-              <button type="button" id="btn-flt-match">判定</button>
+              <button type="button" id="btn-flt-match" data-i18n="filters.test">判定</button>
             </div>
             <div id="flt-match-result" class="result" hidden></div>
             <p class="note" id="flt-note" hidden></p>
           </div>
 
           <div class="card">
-            <h2>冲突策略（Conflict policies）</h2>
+            <h2 data-i18n="conflict.title">冲突策略（Conflict policies）</h2>
             <p class="hint">
-              策略挂在<strong>任务</strong>上（不是全局）。没配过的任务默认 <code>rename_local</code>，也就是 M2c 一直以来的行为
-              「NAS 上的文件占原名、本地内容另存 <code>xxx (conflicted copy from …)</code>」。
-              <code>replace_*</code> 两个选项会<strong>丢一边的改动</strong>，界面上有显式警告。
+              <span data-i18n="conflict.hint">策略挂在</span><strong data-i18n="page.tasks">任务</strong><span data-i18n="conflict.hint2">上（不是全局）。没配过的任务默认</span> <code>rename_local</code><span data-i18n="conflict.hint3">，也就是 M2c 一直以来的行为
+              「NAS 上的文件占原名、本地内容另存</span> <code>xxx (conflicted copy from …)</code><span data-i18n="conflict.hint_close">」。</span>
+              <code>replace_*</code> <span data-i18n="conflict.hint4">两个选项会</span><strong data-i18n="conflict.hint_discard">丢一边的改动</strong><span data-i18n="conflict.hint5">，界面上有显式警告。</span>
             </p>
             <dl class="kv kv-inline" id="conflict-kv"></dl>
             <p class="hint">
-              每个任务的策略在「任务」页的<strong>文件夹对设置</strong>里改；
-              「每个文件都问我」的待裁决项也在任务页顶部处理。
+              <span data-i18n="conflict.hint_task">每个任务的策略在「任务」页的</span><strong data-i18n="task.form_title">文件夹对设置</strong><span data-i18n="conflict.hint_task2">里改；
+              「每个文件都问我」的待裁决项也在任务页顶部处理。</span>
             </p>
           </div>
                 </details>
@@ -674,35 +675,35 @@
              数据全部来自 daemon 的 `Request::Logs`（读它自己的 `<state>/log`），
              GUI 不自己扫目录 —— 否则两台 daemon + GUI 会各说各话。 -->
         <details class="settings-sub" id="sec-log">
-          <summary>日志与轮转</summary>
+          <summary data-i18n="log.section">日志与轮转</summary>
           <div class="card">
-            <h2>日志 <span class="count" id="log-usage-label">—</span></h2>
+            <h2><span data-i18n="sec.log">日志</span> <span class="count" id="log-usage-label">—</span></h2>
             <p class="hint">
-              日志目录 <code class="mono" id="log-dir">—</code>：这里既有 daemon 的
-              <code>qxyncd.log.*</code>，也有本界面的 <code>qxync-gui.log.*</code>（同一套策略）。
-              单个文件写满就切段（<code>xxx.log.日期.序号</code>），旧的再按天数与总占用删掉。
+              <span data-i18n="log.dir_label">日志目录</span> <code class="mono" id="log-dir">—</code><span data-i18n="log.dir_hint">：这里既有 daemon 的</span>
+              <code>qxyncd.log.*</code><span data-i18n="log.dir_hint2">，也有本界面的</span> <code>qxync-gui.log.*</code><span data-i18n="log.dir_hint3">（同一套策略）。
+              单个文件写满就切段（</span><code data-i18n="log.code_pattern">xxx.log.日期.序号</code><span data-i18n="log.dir_hint4">），旧的再按天数与总占用删掉。</span>
             </p>
             <div class="form">
               <div class="row-3">
-                <label>单个文件上限
+                <label><span data-i18n="log.max_file">单个文件上限</span>
                   <span class="inline-num"><input type="number" id="f-log-max-file-mb" min="0" max="4096" step="1" value="32"> MiB</span>
                 </label>
-                <label>保留天数
-                  <span class="inline-num"><input type="number" id="f-log-keep-days" min="0" max="3650" step="1" value="14"> 天</span>
+                <label><span data-i18n="log.keep_days">保留天数</span>
+                  <span class="inline-num"><input type="number" id="f-log-keep-days" min="0" max="3650" step="1" value="14"> <span data-i18n="unit.days">天</span></span>
                 </label>
-                <label>日志总占用上限
+                <label><span data-i18n="log.max_total">日志总占用上限</span>
                   <span class="inline-num"><input type="number" id="f-log-max-total-mb" min="0" max="102400" step="1" value="256"> MiB</span>
                 </label>
               </div>
               <p class="hint">
-                三个数字的 <b>0</b> 含义各不相同：单文件上限 0 = 不按大小切段；保留天数 0 = 不按天数删；
-                总占用 0 = 不限总量。保存后 daemon <strong>立即</strong>应用新策略并顺手清一次。
-                每个「前缀族」（daemon / GUI 各一族）里最新的那个文件永远保留 —— 它就是正在写的那个。
+                <span data-i18n="log.zero_hint">三个数字的</span> <b>0</b> <span data-i18n="log.zero_hint2">含义各不相同：单文件上限 0 = 不按大小切段；保留天数 0 = 不按天数删；
+                总占用 0 = 不限总量。保存后 daemon</span> <strong data-i18n="log.zero_hint_now">立即</strong><span data-i18n="log.zero_hint3">应用新策略并顺手清一次。
+                每个「前缀族」（daemon / GUI 各一族）里最新的那个文件永远保留 —— 它就是正在写的那个。</span>
               </p>
               <div class="btn-row">
-                <button type="button" id="btn-log-save" class="primary">保存日志策略</button>
-                <button type="button" id="btn-log-prune">立即清理</button>
-                <button type="button" id="btn-log-refresh">刷新</button>
+                <button type="button" id="btn-log-save" class="primary" data-i18n="log.save">保存日志策略</button>
+                <button type="button" id="btn-log-prune" data-i18n="log.prune_now">立即清理</button>
+                <button type="button" id="btn-log-refresh" data-i18n="decisions.act_refresh">刷新</button>
                 <span class="busy" id="log-busy" hidden data-i18n="busy.text">进行中…</span>
               </div>
               <p class="hint" id="log-prune-result" hidden></p>
@@ -713,15 +714,15 @@
                 <table class="tbl" id="log-files">
                   <thead>
                     <tr>
-                      <th>文件</th>
-                      <th class="col-size">大小</th>
-                      <th class="col-time">修改时间</th>
+                      <th data-i18n="nav.files">文件</th>
+                      <th class="col-size" data-i18n="search.col_size">大小</th>
+                      <th class="col-time" data-i18n="search.col_time">修改时间</th>
                     </tr>
                   </thead>
                   <tbody id="log-files-tbody"></tbody>
                 </table>
               </div>
-              <p class="empty-hint" id="log-files-empty" hidden data-state="ready">尚未读取日志目录。</p>
+              <p class="empty-hint" id="log-files-empty" hidden data-state="ready" data-i18n="log.files_empty">尚未读取日志目录。</p>
               <div id="log-result" class="result" hidden></div>
             </div>
           </div>
@@ -729,39 +730,39 @@
 
         <!-- ---------------- 设置 8：LAN 加速（Qsync「Enable LAN sync」，qxync 是自研协议） ---------------- -->
         <details class="settings-sub" id="sec-lan">
-          <summary>LAN 同步</summary>
+          <summary data-i18n="adv.lan_sync">LAN 同步</summary>
           <div class="card">
-            <h2>LAN 加速（LAN sync）</h2>
+            <h2 data-i18n="lan.title">LAN 加速（LAN sync）</h2>
             <p class="hint">
-              qxync 的 LAN 通道是<strong>自研协议</strong>（与官方 Windows 客户端的 LAN 二进制通道不互通，已决策不做）。
+              <span data-i18n="lan.intro">qxync 的 LAN 通道是</span><strong data-i18n="lan.protocol">自研协议</strong><span data-i18n="lan.intro2">（与官方 Windows 客户端的 LAN 二进制通道不互通，已决策不做）。
               它的作用是：同一账号的另一台 qxync 设备上已有内容时，水合优先走局域网直传，失败自动回落 NAS。
-              默认<strong>不监听</strong>（要显式打开）；配对用的是明文 TCP + 共享令牌，只在可信局域网里用。
+              默认</span><strong data-i18n="lan.not_listening">不监听</strong><span data-i18n="lan.intro3">（要显式打开）；配对用的是明文 TCP + 共享令牌，只在可信局域网里用。</span>
             </p>
             <div class="form">
               <div class="row-2">
-                <label>监听地址（<code>0.0.0.0:9840</code> 表示所有网卡；留空 = 关闭）
+                <label><span data-i18n="lan.listen">监听地址（</span><code>0.0.0.0:9840</code> <span data-i18n="lan.listen2">表示所有网卡；留空 = 关闭）</span>
                   <input type="text" id="lan-listen" class="mono" spellcheck="false" placeholder="0.0.0.0:9840">
                 </label>
-                <label>此设备名称（对端看到的名字）
-                  <input type="text" id="lan-name" class="mono" spellcheck="false" placeholder="（缺省 = 主机名）">
+                <label><span data-i18n="lan.name">此设备名称（对端看到的名字）</span>
+                  <input type="text" id="lan-name" class="mono" spellcheck="false" placeholder="（缺省 = 主机名）" data-i18n-placeholder="lan.name_placeholder">
                 </label>
               </div>
               <div class="btn-row">
-                <button type="button" id="btn-lan-save" class="primary">保存 LAN 设置</button>
-                <button type="button" id="btn-lan-status">刷新对等状态</button>
+                <button type="button" id="btn-lan-save" class="primary" data-i18n="lan.save">保存 LAN 设置</button>
+                <button type="button" id="btn-lan-status" data-i18n="lan.refresh_peers">刷新对等状态</button>
               </div>
-              <p class="hint">监听地址改动要<strong>重启 daemon</strong> 才生效（保存后可以在「诊断 → 挂载」里停止再启动）。</p>
+              <p class="hint"><span data-i18n="lan.restart_hint">监听地址改动要</span><strong data-i18n="lan.restart_daemon">重启 daemon</strong> <span data-i18n="lan.restart_hint2">才生效（保存后可以在「诊断 → 挂载」里停止再启动）。</span></p>
               <dl class="kv" id="lan-status-kv"></dl>
-              <h3 class="sub">配对一台设备</h3>
+              <h3 class="sub" data-i18n="lan.pair_title">配对一台设备</h3>
               <div class="toolbar">
                 <input type="text" id="lan-pair-addr" class="mono" spellcheck="false" placeholder="192.168.1.5:9840">
-                <input type="text" id="lan-pair-code" class="mono" spellcheck="false" placeholder="对方 status 里的 6 位配对码" size="24">
-                <button type="button" id="btn-lan-pair">配对</button>
+                <input type="text" id="lan-pair-code" class="mono" spellcheck="false" placeholder="对方 status 里的 6 位配对码" size="24" data-i18n-placeholder="lan.pair_code_placeholder">
+                <button type="button" id="btn-lan-pair" data-i18n="lan.pair">配对</button>
               </div>
-              <h3 class="sub">已配对设备</h3>
+              <h3 class="sub" data-i18n="lan.devices_title">已配对设备</h3>
               <ul class="plain-list mono" id="lan-devices"></ul>
               <p class="empty-hint" id="lan-devices-empty" hidden data-state="ready" data-i18n="lan.devices_empty">还没有配对的设备。</p>
-              <h3 class="sub">最近收到的对端事件</h3>
+              <h3 class="sub" data-i18n="lan.events_title">最近收到的对端事件</h3>
               <ul class="plain-list mono" id="lan-events"></ul>
               <p class="empty-hint" id="lan-events-empty" hidden data-state="ready" data-i18n="lan.events_empty">还没有收到对端事件。</p>
               <div id="lan-result" class="result" hidden></div>
@@ -785,19 +786,19 @@
         <!-- ---------------- 设置 7：释放空间（Qsync「释放空间」tab） ---------------- -->
         <div class="settings-sec" id="sec-free" role="tabpanel" aria-labelledby="sec-tab-free">
           <div class="card">
-            <h2>释放空间 <span class="count" id="space-used-label"></span></h2>
+            <h2><span data-i18n="sec.free">释放空间</span> <span class="count" id="space-used-label"></span></h2>
             <div class="form">
-              <label class="check"><input type="checkbox" id="fs-auto"> 自动释放空间（Free up space automatically）</label>
+              <label class="check"><input type="checkbox" id="fs-auto"> <span data-i18n="free.auto">自动释放空间（Free up space automatically）</span></label>
               <div class="row-checks" id="fs-mode-row">
-                <label class="check"><input type="radio" name="fs-mode" id="fs-mode-pct" value="below_pct"> 当本地可用空间少于
+                <label class="check"><input type="radio" name="fs-mode" id="fs-mode-pct" value="below_pct"> <span data-i18n="free.mode_pct">当本地可用空间少于</span>
                   <input type="number" id="fs-below-pct" min="1" max="99" step="1" value="10" class="inline-num"> %</label>
-                <label class="check"><input type="radio" name="fs-mode" id="fs-mode-freq" value="frequency"> 按频率，每
-                  <input type="number" id="fs-every-hours" min="1" max="720" step="1" value="24" class="inline-num"> 小时</label>
+                <label class="check"><input type="radio" name="fs-mode" id="fs-mode-freq" value="frequency"> <span data-i18n="free.mode_freq">按频率，每</span>
+                  <input type="number" id="fs-every-hours" min="1" max="720" step="1" value="24" class="inline-num"> <span data-i18n="unit.hours">小时</span></label>
               </div>
               <div class="btn-row">
-                <button type="button" id="btn-free-save" class="primary">保存释放空间设置</button>
-                <button type="button" id="btn-free-now">立即释放空间</button>
-                <button type="button" id="btn-space-refresh">刷新用量</button>
+                <button type="button" id="btn-free-save" class="primary" data-i18n="free.save">保存释放空间设置</button>
+                <button type="button" id="btn-free-now" data-i18n="free.now">立即释放空间</button>
+                <button type="button" id="btn-space-refresh" data-i18n="free.refresh">刷新用量</button>
               </div>
               <dl class="kv" id="space-kv"></dl>
               <div class="bar-wrap">
@@ -807,8 +808,8 @@
               <p class="hint" id="space-reason">—</p>
               <div id="space-blocked" class="alert-stack"></div>
               <p class="note">
-                脱水永远走 M3 的安全检查链：有未上传改动 / 待上传 / <code>pin=pinned</code> / <code>excluded</code> /
-                打开中 / 被 mmap / 正在传输 —— 任一命中就<strong>跳过并计入「被挡下」</strong>，与手动脱水完全同一条路。
+                <span data-i18n="free.note">脱水永远走 M3 的安全检查链：有未上传改动 / 待上传 /</span> <code>pin=pinned</code> / <code>excluded</code> <span data-i18n="free.note2">/
+                打开中 / 被 mmap / 正在传输 —— 任一命中就</span><strong data-i18n="free.note_skip">跳过并计入「被挡下」</strong><span data-i18n="free.note3">，与手动脱水完全同一条路。</span>
               </p>
               <div id="free-result" class="result" hidden></div>
             </div>
@@ -833,20 +834,20 @@
           <!-- ★ P0-06：原顶栏的工程信息收在这里（id 全部保留，renderTop/验收不受影响）。
                普通页面不再出现 pid / uptime / socket / session / 启停 daemon。 -->
           <div class="card" id="diag-runtime">
-            <h2>运行控制 <span class="count">诊断用</span></h2>
-            <p class="hint">日常不需要这些按钮：连接 NAS 时主窗口会自动拉起 daemon。这里保留启动/停止/登录、当前连接切换，以及 pid / uptime / socket / session 等排障信息。</p>
+            <h2><span data-i18n="diag.runtime">运行控制</span> <span class="count" data-i18n="diag.for_debug">诊断用</span></h2>
+            <p class="hint" data-i18n="diag.runtime_hint">日常不需要这些按钮：连接 NAS 时主窗口会自动拉起 daemon。这里保留启动/停止/登录、当前连接切换，以及 pid / uptime / socket / session 等排障信息。</p>
             <div class="runtime-row">
               <span id="chip-daemon" class="chip chip-unknown" role="status" data-i18n="top.daemon_checking">qxyncd：检测中…</span>
-              <span id="chip-login" class="chip chip-unknown">登录：—</span>
+              <span id="chip-login" class="chip chip-unknown" data-i18n="top.login_dash">登录：—</span>
               <span class="grow"></span>
-              <button type="button" id="btn-daemon-start">启动 daemon</button>
-              <button type="button" id="btn-daemon-stop">停止 daemon</button>
-              <button type="button" id="btn-quick-login" class="primary">立即登录</button>
+              <button type="button" id="btn-daemon-start" data-i18n="common.start_daemon">启动 daemon</button>
+              <button type="button" id="btn-daemon-stop" data-i18n="common.stop_daemon">停止 daemon</button>
+              <button type="button" id="btn-quick-login" class="primary" data-i18n="diag.login_now">立即登录</button>
             </div>
             <div class="topbar-meta mono">
-              <span id="meta-daemon">daemon：—</span>
-              <span id="meta-conn">连接：—</span>
-              <span id="meta-session">session：—</span>
+              <span id="meta-daemon" data-i18n="common.daemon_dash">daemon：—</span>
+              <span id="meta-conn" data-i18n="top.conn_dash">连接：—</span>
+              <span id="meta-session" data-i18n="top.session_dash">session：—</span>
             </div>
             <div class="runtime-row">
               <label class="conn-picker">
@@ -861,8 +862,8 @@
 
           <!-- ★ P1-06：累计同步计数从主页搬到这里（官方主页不展示累计数）。 -->
           <div class="card" id="diag-sync-summary">
-            <h2>累计同步（按连接）</h2>
-            <p class="hint">自 daemon 启动只增不清：轮询 / 上传 / 删除 / 冲突。主页只保留任务与状态。</p>
+            <h2 data-i18n="diag.sync_summary">累计同步（按连接）</h2>
+            <p class="hint" data-i18n="diag.sync_summary_hint">自 daemon 启动只增不清：轮询 / 上传 / 删除 / 冲突。主页只保留任务与状态。</p>
             <dl class="kv kv-inline" id="home-sync-kv"></dl>
           </div>
 
@@ -872,50 +873,50 @@
             <p class="hint" data-i18n="log.diag_hint">界面的每次命令在这里记一行（保留 200 条）。默认不显示，排障时可以打开。</p>
             <div class="runtime-row">
               <button type="button" id="btn-diag-log" data-i18n="log.open">打开操作日志</button>
-              <span class="count" id="diag-log-count">0 条</span>
+              <span class="count" id="diag-log-count" data-i18n="diag.log_count">0 条</span>
             </div>
           </div>
           <div class="card">
-            <h2>本机路径 / 运行环境</h2>
+            <h2 data-i18n="diag.paths_title">本机路径 / 运行环境</h2>
             <dl class="kv mono" id="paths-kv"></dl>
             <div class="btn-row">
-              <button type="button" class="mini" id="btn-app-info-refresh">刷新</button>
-              <button type="button" class="mini" id="btn-env-logdir">打开日志目录</button>
-              <button type="button" class="mini" id="btn-env-config">打开配置目录</button>
+              <button type="button" class="mini" id="btn-app-info-refresh" data-i18n="decisions.act_refresh">刷新</button>
+              <button type="button" class="mini" id="btn-env-logdir" data-i18n="adv.log_open">打开日志目录</button>
+              <button type="button" class="mini" id="btn-env-config" data-i18n="diag.open_config">打开配置目录</button>
             </div>
             <p class="hint" id="link-path-hint">—</p>
           </div>
 
           <div class="grid-2">
             <div class="card">
-              <h2>服务端信息</h2>
+              <h2 data-i18n="diag.server_title">服务端信息</h2>
               <div id="srv-warn" class="warn" hidden></div>
               <dl class="kv" id="srv-kv"></dl>
             </div>
 
             <div class="card">
-              <h2>本次会话</h2>
+              <h2 data-i18n="diag.session_title">本次会话</h2>
               <dl class="kv" id="sess-kv"></dl>
-              <h3 class="sub">游标（config / notify / global_notify）</h3>
+              <h3 class="sub" data-i18n="diag.cursors_title">游标（config / notify / global_notify）</h3>
               <dl class="kv mono" id="cursors-kv"></dl>
             </div>
           </div>
 
           <div class="grid-3">
             <div class="card">
-              <h2>水合统计</h2>
+              <h2 data-i18n="diag.hydration_title">水合统计</h2>
               <dl class="kv" id="hydro-kv"></dl>
               <!-- ★ M15/T8：下载 + 上传的**在途**汇总（与上面的累计水合计数不同口径） -->
               <dl class="kv" id="transfers-kv"></dl>
             </div>
 
             <div class="card">
-              <h2>上传队列 <span id="uploads-active" class="badge-live" hidden>进行中</span></h2>
+              <h2><span data-i18n="diag.uploads_title">上传队列</span> <span id="uploads-active" class="badge-live" hidden data-i18n="diag.uploads_active">进行中</span></h2>
               <dl class="kv" id="uploads-kv"></dl>
             </div>
 
             <div class="card">
-              <h2>缓存 / 脱水</h2>
+              <h2 data-i18n="diag.cache_title">缓存 / 脱水</h2>
               <dl class="kv" id="cache-kv"></dl>
               <div class="bar-wrap" id="cache-bar-wrap">
                 <div class="bar"><div class="bar-fill" id="cache-bar-fill" style="width:0%"></div></div>
@@ -926,29 +927,29 @@
           </div>
 
           <div class="card">
-            <h2>挂载点 <span class="count" id="mounts-status-count"></span>
-              <button type="button" class="mini" id="btn-status-mounts-refresh">刷新</button>
+            <h2><span data-i18n="purge.kind.mounts">挂载点</span> <span class="count" id="mounts-status-count"></span>
+              <button type="button" class="mini" id="btn-status-mounts-refresh" data-i18n="decisions.act_refresh">刷新</button>
             </h2>
             <table class="tbl" id="tbl-status-mounts">
-              <thead><tr><th>挂载点</th><th>NAS 目录</th><th>模式</th><th class="col-act">操作</th></tr></thead>
+              <thead><tr><th data-i18n="purge.kind.mounts">挂载点</th><th data-i18n="mounts.col_remote">NAS 目录</th><th data-i18n="common.mode">模式</th><th class="col-act" data-i18n="search.col_act">操作</th></tr></thead>
               <tbody></tbody>
             </table>
             <p class="empty-hint" id="status-mounts-empty" hidden data-state="ready" data-i18n="mounts.empty">暂无挂载。</p>
           </div>
 
           <div class="card">
-            <h2>NAS 上的同步文件夹 <span class="count" id="roots-count"></span>
-              <button type="button" class="mini" id="btn-roots-refresh">刷新</button>
+            <h2><span data-i18n="diag.roots_title">NAS 上的同步文件夹</span> <span class="count" id="roots-count"></span>
+              <button type="button" class="mini" id="btn-roots-refresh" data-i18n="decisions.act_refresh">刷新</button>
             </h2>
             <dl class="kv mono" id="roots-summary-kv"></dl>
             <p class="note" id="roots-note" hidden></p>
-            <h3 class="sub">NAS 同步文件夹</h3>
+            <h3 class="sub" data-i18n="task.nas_syncing_folder">NAS 同步文件夹</h3>
             <ul class="root-list mono" id="roots-folders"></ul>
             <p class="empty-hint" id="roots-folders-empty" hidden data-state="ready" data-i18n="roots.folders_empty">NAS 未登记 Qsync 同步文件夹</p>
           </div>
 
           <div class="card">
-            <h2>最近一次同步摘要</h2>
+            <h2 data-i18n="diag.last_sync_title">最近一次同步摘要</h2>
             <div id="sync-alerts" class="alert-stack"></div>
             <dl class="kv kv-inline" id="sync-summary-kv"></dl>
             <p class="note" id="sync-note" hidden></p>
@@ -959,48 +960,48 @@
         <!-- ---------------- 诊断子页 2：挂载 ---------------- -->
         <section class="panel" id="panel-mounts" role="tabpanel" aria-labelledby="diag-tab-mounts">
           <div class="card">
-            <h2>当前挂载 <span class="count" id="mounts-count"></span>
-              <button type="button" class="mini" id="btn-mounts-refresh">刷新</button>
+            <h2><span data-i18n="mounts.current">当前挂载</span> <span class="count" id="mounts-count"></span>
+              <button type="button" class="mini" id="btn-mounts-refresh" data-i18n="decisions.act_refresh">刷新</button>
             </h2>
             <table class="tbl" id="tbl-mounts">
-              <thead><tr><th>挂载点</th><th>NAS 目录</th><th>模式</th><th class="col-act">操作</th></tr></thead>
+              <thead><tr><th data-i18n="purge.kind.mounts">挂载点</th><th data-i18n="mounts.col_remote">NAS 目录</th><th data-i18n="common.mode">模式</th><th class="col-act" data-i18n="search.col_act">操作</th></tr></thead>
               <tbody></tbody>
             </table>
             <p class="empty-hint" id="mounts-empty" hidden data-state="ready" data-i18n="mounts.empty">暂无挂载。</p>
           </div>
 
           <div class="card">
-            <h2>新建挂载</h2>
+            <h2 data-i18n="mounts.new">新建挂载</h2>
             <form id="form-mount" class="form" autocomplete="off">
-              <label>挂载点（本地目录，会被创建）
+              <label><span data-i18n="mounts.mountpoint">挂载点（本地目录，会被创建）</span>
                 <input type="text" id="m-mountpoint" spellcheck="false" class="mono">
               </label>
-              <label>NAS 上的目录（一对一：一个挂载点 = 一个 NAS 目录）
+              <label><span data-i18n="mounts.remote">NAS 上的目录（一对一：一个挂载点 = 一个 NAS 目录）</span>
                 <input type="text" id="m-remote" class="mono" spellcheck="false" placeholder="/home" value="/home">
               </label>
               <div class="row-2">
-                <label>缓存模式
+                <label><span data-i18n="detail.mode">缓存模式</span>
                   <select id="m-cache-mode">
-                    <option value="pagecache">pagecache（默认）</option>
-                    <option value="direct">direct（绕过 page cache，不可 mmap）</option>
+                    <option value="pagecache" data-i18n="mounts.cache_pagecache">pagecache（默认）</option>
+                    <option value="direct" data-i18n="mounts.cache_direct">direct（绕过 page cache，不可 mmap）</option>
                   </select>
                 </label>
-                <label>并发线程数 threads
+                <label><span data-i18n="mounts.threads">并发线程数 threads</span>
                   <input type="number" id="m-threads" min="1" max="64" step="1" value="4">
                 </label>
               </div>
               <div class="row-3">
-                <label>水合超时（秒）
+                <label><span data-i18n="mounts.hydrate_timeout">水合超时（秒）</span>
                   <input type="number" id="m-hydrate-timeout" min="1" step="1" value="600">
                 </label>
-                <label>删除熔断阈值 delete_limit
+                <label><span data-i18n="mounts.delete_limit">删除熔断阈值 delete_limit</span>
                   <input type="number" id="m-delete-limit" min="0" step="1" value="100">
                 </label>
-                <label class="check"><input type="checkbox" id="m-read-write"> 读写挂载（否则只读；能否写入由 NAS 决定：未登记为 Qsync 同步文件夹的共享文件夹会被服务端拒绝 status:20）</label>
+                <label class="check"><input type="checkbox" id="m-read-write"> <span data-i18n="mounts.read_write">读写挂载（否则只读；能否写入由 NAS 决定：未登记为 Qsync 同步文件夹的共享文件夹会被服务端拒绝 status:20）</span></label>
               </div>
-              <label class="check"><input type="checkbox" id="m-auto-unmount" checked> 异常退出时自动卸载 auto_unmount</label>
+              <label class="check"><input type="checkbox" id="m-auto-unmount" checked> <span data-i18n="mounts.auto_unmount">异常退出时自动卸载 auto_unmount</span></label>
               <div class="btn-row">
-                <button type="submit" id="btn-mount" class="primary">挂载</button>
+                <button type="submit" id="btn-mount" class="primary" data-i18n="task.act_mount">挂载</button>
                 <span class="busy" id="mount-busy" hidden data-i18n="busy.text">进行中…</span>
               </div>
             </form>
@@ -1011,32 +1012,32 @@
         <!-- ---------------- 诊断子页 3：同步 / 缓存 ---------------- -->
         <section class="panel" id="panel-sync" role="tabpanel" aria-labelledby="diag-tab-sync">
           <div class="card">
-            <h2>同步状态（SyncInfo）</h2>
+            <h2 data-i18n="diag.sync_state_title">同步状态（SyncInfo）</h2>
             <div class="btn-row">
-              <button type="button" id="btn-sync-once" class="primary">立即同步</button>
-              <button type="button" id="btn-sync-force" class="danger">强制放行删除</button>
-              <button type="button" id="btn-sync-pause">暂停轮询</button>
-              <label class="inline-num">间隔秒数 <input type="number" id="sy-interval" min="1" step="1" value="60"></label>
-              <button type="button" id="btn-sync-interval">设置轮询间隔</button>
+              <button type="button" id="btn-sync-once" class="primary" data-i18n="task.act_sync_now">立即同步</button>
+              <button type="button" id="btn-sync-force" class="danger" data-i18n="diag.force_deletes">强制放行删除</button>
+              <button type="button" id="btn-sync-pause" data-i18n="diag.pause_polling">暂停轮询</button>
+              <label class="inline-num"><span data-i18n="diag.interval_secs">间隔秒数</span> <input type="number" id="sy-interval" min="1" step="1" value="60"></label>
+              <button type="button" id="btn-sync-interval" data-i18n="diag.set_interval">设置轮询间隔</button>
               <span class="busy" id="sync-busy" hidden data-i18n="busy.text">进行中…</span>
             </div>
             <div id="sync2-alerts" class="alert-stack"></div>
             <dl class="kv kv-inline" id="sync-full-kv"></dl>
-            <h3 class="sub">游标</h3>
+            <h3 class="sub" data-i18n="diag.cursors">游标</h3>
             <dl class="kv kv-inline mono" id="sync-cursors-kv"></dl>
-            <h3 class="sub">事件设备（uid:次数）</h3>
+            <h3 class="sub" data-i18n="diag.devices_title">事件设备（uid:次数）</h3>
             <ul class="plain-list mono" id="sync-devices"></ul>
           </div>
 
           <div class="card">
-            <h2>缓存 / 脱水（CacheInfo）</h2>
+            <h2 data-i18n="diag.cache_info_title">缓存 / 脱水（CacheInfo）</h2>
             <div class="btn-row">
-              <button type="button" id="btn-dehy-dry">脱水（预演）</button>
-              <button type="button" id="btn-dehy-all">全部脱水</button>
-              <label class="inline-num">限额 <input type="text" id="dehy-limit" placeholder="512M / 2G / 25%" class="mono" size="8"></label>
-              <button type="button" id="btn-dehy-limit">按限额脱水</button>
-              <label class="inline-num">闲置秒 <input type="number" id="dehy-idle" min="0" step="1" value="3600"></label>
-              <button type="button" id="btn-dehy-idle">释放闲置</button>
+              <button type="button" id="btn-dehy-dry" data-i18n="diag.dehy_dry">脱水（预演）</button>
+              <button type="button" id="btn-dehy-all" data-i18n="diag.dehy_all">全部脱水</button>
+              <label class="inline-num"><span data-i18n="diag.limit">限额</span> <input type="text" id="dehy-limit" placeholder="512M / 2G / 25%" class="mono" size="8"></label>
+              <button type="button" id="btn-dehy-limit" data-i18n="diag.dehy_limit">按限额脱水</button>
+              <label class="inline-num"><span data-i18n="diag.idle_secs">闲置秒</span> <input type="number" id="dehy-idle" min="0" step="1" value="3600"></label>
+              <button type="button" id="btn-dehy-idle" data-i18n="diag.free_idle">释放闲置</button>
               <span class="busy" id="dehy-busy" hidden data-i18n="busy.text">进行中…</span>
             </div>
             <dl class="kv kv-inline" id="cache-full-kv"></dl>
@@ -1099,26 +1100,26 @@
       <!-- ★ P1-11：同步设置（快速改冲突策略 / 节省空间 / 智能删除 + 立即同步） -->
       <div class="modal" id="sync-modal" hidden>
         <div class="modal-card sync-modal-card" role="dialog" aria-modal="true" aria-labelledby="sync-modal-title">
-          <button type="button" class="modal-x" id="btn-sync-modal-close" aria-label="关闭">×</button>
-          <h2 id="sync-modal-title">同步设置 · <span id="sync-modal-name">—</span></h2>
-          <label>冲突策略
+          <button type="button" class="modal-x" id="btn-sync-modal-close" aria-label="关闭" data-i18n-aria-label="log.close">×</button>
+          <h2 id="sync-modal-title"><span data-i18n="sync_modal.title">同步设置 ·</span> <span id="sync-modal-name">—</span></h2>
+          <label><span data-i18n="detail.conflict">冲突策略</span>
             <select id="s-conflict">
-              <option value="rename_local">重命名本地文件（默认；NAS 占原名，本地另存副本）</option>
-              <option value="ask">每个文件都问我（进待裁决队列）</option>
-              <option value="rename_remote">重命名 NAS 上的文件（本地占原名）</option>
-              <option value="replace_remote">用本地替换 NAS（⚠ NAS 上那份会丢）</option>
-              <option value="replace_local">用 NAS 替换本地（⚠ 本地那份会丢）</option>
+              <option value="rename_local" data-i18n="sync_modal.conflict_rename_local">重命名本地文件（默认；NAS 占原名，本地另存副本）</option>
+              <option value="ask" data-i18n="conflict.opt_ask">每个文件都问我（进待裁决队列）</option>
+              <option value="rename_remote" data-i18n="sync_modal.conflict_rename_remote">重命名 NAS 上的文件（本地占原名）</option>
+              <option value="replace_remote" data-i18n="sync_modal.conflict_replace_remote">用本地替换 NAS（⚠ NAS 上那份会丢）</option>
+              <option value="replace_local" data-i18n="sync_modal.conflict_replace_local">用 NAS 替换本地（⚠ 本地那份会丢）</option>
             </select>
           </label>
           <div class="row-checks">
-            <label class="check"><input type="checkbox" id="s-space-saving"> 节省空间模式（按需同步）</label>
-            <label class="check"><input type="checkbox" id="s-smart-delete"> 智能删除（待确认删除）</label>
+            <label class="check"><input type="checkbox" id="s-space-saving"> <span data-i18n="sync_modal.space_saving">节省空间模式（按需同步）</span></label>
+            <label class="check"><input type="checkbox" id="s-smart-delete"> <span data-i18n="sync_modal.smart_delete">智能删除（待确认删除）</span></label>
           </div>
-          <p class="hint">节省空间模式与智能删除互斥：开启节省空间时，智能删除会被关闭（后端语义）。</p>
+          <p class="hint" data-i18n="sync_modal.hint">节省空间模式与智能删除互斥：开启节省空间时，智能删除会被关闭（后端语义）。</p>
           <div class="btn-row">
-            <button type="button" id="btn-sync-save" class="primary">保存</button>
-            <button type="button" id="btn-sync-now">立即同步一轮</button>
-            <button type="button" id="btn-sync-cancel">取消</button>
+            <button type="button" id="btn-sync-save" class="primary" data-i18n="common.save">保存</button>
+            <button type="button" id="btn-sync-now" data-i18n="detail.sync_now">立即同步一轮</button>
+            <button type="button" id="btn-sync-cancel" data-i18n="modal.cancel">取消</button>
           </div>
           <div id="sync-result" class="result" hidden></div>
         </div>
@@ -1127,22 +1128,22 @@
       <!-- ★ P1-08：添加任务先选类型；官方备份任务列表在 qxync 这里没有对应能力，明确置灰。 -->
       <div class="modal" id="type-modal" hidden>
         <div class="modal-card type-modal-card" role="dialog" aria-modal="true" aria-labelledby="type-title">
-          <h2 id="type-title">选择任务类型</h2>
-          <p class="hint">同步任务让本地文件夹与 NAS 文件夹保持一致；备份任务需要单独的备份引擎，qxync 暂不支持。</p>
+          <h2 id="type-title" data-i18n="type.title">选择任务类型</h2>
+          <p class="hint" data-i18n="type.hint">同步任务让本地文件夹与 NAS 文件夹保持一致；备份任务需要单独的备份引擎，qxync 暂不支持。</p>
           <div class="type-grid">
             <button type="button" class="type-card" id="btn-type-sync">
               <span class="type-ico" aria-hidden="true">⇄</span>
-              <strong>同步任务</strong>
-              <span class="type-desc">本地 ⇄ NAS；双向，或仅上传 / 仅下载</span>
+              <strong data-i18n="tasks.title">同步任务</strong>
+              <span class="type-desc" data-i18n="type.sync_desc">本地 ⇄ NAS；双向，或仅上传 / 仅下载</span>
             </button>
             <button type="button" class="type-card type-card-off" id="btn-type-backup" disabled aria-disabled="true">
               <span class="type-ico" aria-hidden="true">⤒</span>
-              <strong>备份任务</strong>
-              <span class="type-desc">暂不支持（没有备份引擎）</span>
+              <strong data-i18n="type.backup">备份任务</strong>
+              <span class="type-desc" data-i18n="type.backup_desc">暂不支持（没有备份引擎）</span>
             </button>
           </div>
           <div class="btn-row">
-            <button type="button" id="btn-type-cancel">取消</button>
+            <button type="button" id="btn-type-cancel" data-i18n="modal.cancel">取消</button>
           </div>
         </div>
       </div>
@@ -1150,106 +1151,106 @@
       <!-- ★ P1-09：创建同步任务 / P1-13：文件夹对设置，共用同一个模态表单 -->
       <div class="modal" id="task-modal" hidden>
         <div class="modal-card task-modal-card" role="dialog" aria-modal="true" aria-labelledby="task-form-title">
-          <button type="button" class="modal-x" id="btn-task-modal-close" aria-label="关闭">×</button>
+          <button type="button" class="modal-x" id="btn-task-modal-close" aria-label="关闭" data-i18n-aria-label="log.close">×</button>
         <div class="card" id="task-form-card" hidden>
-          <h2 id="task-form-title">文件夹对设置</h2>
+          <h2 id="task-form-title" data-i18n="task.form_title">文件夹对设置</h2>
           <form id="form-task" class="form" autocomplete="off">
             <!-- ★ M16：这条任务登记在哪个连接上（新建默认当前连接；编辑时只读） -->
-            <label>NAS 连接
+            <label><span data-i18n="conn_menu.title">NAS 连接</span>
               <select id="t-link" class="mono"></select>
             </label>
             <p class="hint" id="t-link-hint" hidden></p>
             <div class="pair-summary">
               <div class="pair-sum-item">
-                <span class="pair-sum-k">本地文件夹</span>
+                <span class="pair-sum-k" data-i18n="detail.local">本地文件夹</span>
                 <code class="pair-sum-v" id="t-pair-local">—</code>
               </div>
               <div class="pair-sum-item">
-                <span class="pair-sum-k">NAS 文件夹</span>
+                <span class="pair-sum-k" data-i18n="detail.remote">NAS 文件夹</span>
                 <code class="pair-sum-v" id="t-pair-remote">—</code>
               </div>
             </div>
             <!-- ★ M18：先选 NAS 文件夹 —— 任务 id 与两条本地路径都由它派生 -->
-            <label>NAS 文件夹（一对一映射）
+            <label><span data-i18n="task.nas_folder">NAS 文件夹（一对一映射）</span>
               <span class="select-row">
                 <select id="t-nas-folder" class="mono"></select>
-                <button type="button" class="mini" id="btn-nas-browse">浏览…</button>
+                <button type="button" class="mini" id="btn-nas-browse" data-i18n="task.browse">浏览…</button>
               </span>
             </label>
-            <label id="t-nas-manual-wrap" hidden>手动输入 NAS 路径
+            <label id="t-nas-manual-wrap" hidden><span data-i18n="task.nas_manual_label">手动输入 NAS 路径</span>
               <input type="text" id="t-nas-manual" class="mono" spellcheck="false"
                      placeholder="/home/.Qsync">
             </label>
-            <p class="hint">
+            <p class="hint" data-i18n="task.pair_hint">
               一个任务 = 一个本地文件夹 ⇄ 一个 NAS 文件夹。要同步更多文件夹，请新建任务。
               能不能写入由 NAS 决定：没在 Qsync 里登记为同步文件夹的共享目录可能被服务端拒绝。
             </p>
             <details class="form-adv" id="task-adv">
-              <summary>高级：任务 ID / 本地路径 / 缓存 / 方向</summary>
+              <summary data-i18n="task.advanced">高级：任务 ID / 本地路径 / 缓存 / 方向</summary>
             <div class="row-2 row-wide">
-              <label>任务 id（也是文件名）
+              <label><span data-i18n="task.id">任务 id（也是文件名）</span>
                 <input type="text" id="t-id" class="mono" spellcheck="false"
                        placeholder="home">
               </label>
-              <label>缓存模式
+              <label><span data-i18n="detail.mode">缓存模式</span>
                 <select id="t-cache-mode">
-                  <option value="pagecache">pagecache（默认）</option>
-                  <option value="direct">direct（绕过 page cache，不可 mmap）</option>
+                  <option value="pagecache" data-i18n="mounts.cache_pagecache">pagecache（默认）</option>
+                  <option value="direct" data-i18n="mounts.cache_direct">direct（绕过 page cache，不可 mmap）</option>
                 </select>
               </label>
             </div>
-            <label>本地文件夹（挂载点，绝对路径）
+            <label><span data-i18n="task.mountpoint">本地文件夹（挂载点，绝对路径）</span>
               <input type="text" id="t-mountpoint" class="mono" spellcheck="false"
-                     placeholder="默认 ~/qxync/&lt;连接 id&gt;/&lt;任务 id&gt;">
+                     placeholder="默认 ~/qxync/&lt;连接 id&gt;/&lt;任务 id&gt;" data-i18n-placeholder="task.mountpoint_placeholder">
             </label>
             <p class="hint" id="t-defaults-hint">
-              ★ 默认值按「<strong>连接 + NAS 文件夹</strong>」自动生成，不会再出现两条任务
-              id / 路径一模一样的情况：任务 id 取文件夹名（<code>/home</code> →
-              <code>home</code>，重名自动加 <code>-2</code>）；本地文件夹 =
-              <code>~/qxync/&lt;连接 id&gt;/&lt;任务 id&gt;</code>；水合缓存 =
-              <code>&lt;data_dir&gt;/cache/tasks/&lt;连接 id&gt;/&lt;任务 id&gt;</code>。
-              手动改过的字段不再被自动覆盖，想恢复点
-              <button type="button" class="mini" id="btn-task-defaults">重置为默认路径</button>。
+              <span data-i18n="task.defaults">★ 默认值按「</span><strong data-i18n="task.defaults_pair">连接 + NAS 文件夹</strong><span data-i18n="task.defaults2">」自动生成，不会再出现两条任务
+              id / 路径一模一样的情况：任务 id 取文件夹名（</span><code>/home</code> →
+              <code>home</code><span data-i18n="task.defaults3">，重名自动加</span> <code>-2</code><span data-i18n="task.defaults4">）；本地文件夹 =</span>
+              <code data-i18n="task.code_local">~/qxync/&lt;连接 id&gt;/&lt;任务 id&gt;</code><span data-i18n="task.defaults5">；水合缓存 =</span>
+              <code data-i18n="task.code_cache">&lt;data_dir&gt;/cache/tasks/&lt;连接 id&gt;/&lt;任务 id&gt;</code><span data-i18n="task.defaults6">。
+              手动改过的字段不再被自动覆盖，想恢复点</span>
+              <button type="button" class="mini" id="btn-task-defaults" data-i18n="task.reset_defaults">重置为默认路径</button><span data-i18n="punct.period">。</span>
             </p>
-            <label>水合缓存目录（留空 = 按连接共享；默认按任务隔离）
+            <label><span data-i18n="task.cache_dir">水合缓存目录（留空 = 按连接共享；默认按任务隔离）</span>
               <input type="text" id="t-cache-dir" class="mono" spellcheck="false"
-                     placeholder="留空 = 按连接共享；实际缓存会再拼一层连接的命名空间">
+                     placeholder="留空 = 按连接共享；实际缓存会再拼一层连接的命名空间" data-i18n-placeholder="task.cache_dir_placeholder">
             </label>
-              <label>同步方向（记录；1-way 的实际执行在 M9）
+              <label><span data-i18n="task.direction">同步方向（记录；1-way 的实际执行在 M9）</span>
                 <select id="t-direction">
-                  <option value="2way">双向（2-way）</option>
-                  <option value="1way-up">仅上传（1-way up）</option>
-                  <option value="1way-down">仅下载（1-way down）</option>
+                  <option value="2way" data-i18n="task.dir_2way">双向（2-way）</option>
+                  <option value="1way-up" data-i18n="task.dir_up">仅上传（1-way up）</option>
+                  <option value="1way-down" data-i18n="task.dir_down">仅下载（1-way down）</option>
                 </select>
               </label>
             </details>
 
             <div class="row-wide">
-              <label>冲突策略（Conflict policies）
+              <label><span data-i18n="conflict.title">冲突策略（Conflict policies）</span>
                 <select id="t-conflict">
-                  <option value="rename_local">重命名本地文件（默认；NAS 上的文件占原名，本地另存冲突副本）</option>
-                  <option value="ask">每个文件都问我（进待裁决队列）</option>
-                  <option value="rename_remote">重命名 NAS 上的文件（本地内容占原名）</option>
-                  <option value="replace_remote">用本地文件替换 NAS 上的文件（⚠ NAS 上那份会丢）</option>
-                  <option value="replace_local">用 NAS 上的文件替换本地文件（⚠ 本地那份会丢）</option>
+                  <option value="rename_local" data-i18n="task.conflict_rename_local">重命名本地文件（默认；NAS 上的文件占原名，本地另存冲突副本）</option>
+                  <option value="ask" data-i18n="conflict.opt_ask">每个文件都问我（进待裁决队列）</option>
+                  <option value="rename_remote" data-i18n="task.conflict_rename_remote">重命名 NAS 上的文件（本地内容占原名）</option>
+                  <option value="replace_remote" data-i18n="task.conflict_replace_remote">用本地文件替换 NAS 上的文件（⚠ NAS 上那份会丢）</option>
+                  <option value="replace_local" data-i18n="task.conflict_replace_local">用 NAS 上的文件替换本地文件（⚠ 本地那份会丢）</option>
                 </select>
               </label>
             </div>
             <div class="row-checks">
-              <label class="check"><input type="checkbox" id="t-space-saving"> 节省空间模式（按需同步 / 可脱水）</label>
-              <label class="check"><input type="checkbox" id="t-smart-delete"> 智能删除（≈ 待确认删除；与节省空间模式互斥）</label>
+              <label class="check"><input type="checkbox" id="t-space-saving"> <span data-i18n="task.space_saving">节省空间模式（按需同步 / 可脱水）</span></label>
+              <label class="check"><input type="checkbox" id="t-smart-delete"> <span data-i18n="task.smart_delete">智能删除（≈ 待确认删除；与节省空间模式互斥）</span></label>
             </div>
             <div class="row-checks">
-              <label class="check"><input type="checkbox" id="t-read-write"> 读写（默认只读）</label>
-              <label class="check"><input type="checkbox" id="t-do-mount" checked> 保存后立即挂载</label>
+              <label class="check"><input type="checkbox" id="t-read-write"> <span data-i18n="task.read_write">读写（默认只读）</span></label>
+              <label class="check"><input type="checkbox" id="t-do-mount" checked> <span data-i18n="task.do_mount">保存后立即挂载</span></label>
             </div>
-            <p class="hint">
+            <p class="hint" data-i18n="task.save_hint">
               保存只登记参数，不动 NAS 上的任何数据。选择性同步（只同步部分子文件夹）暂不支持，
               可以拆成多个任务近似。
             </p>
             <div class="btn-row">
-              <button type="submit" id="btn-task-save" class="primary">保存任务</button>
-              <button type="button" id="btn-task-cancel">取消</button>
+              <button type="submit" id="btn-task-save" class="primary" data-i18n="task.save">保存任务</button>
+              <button type="button" id="btn-task-cancel" data-i18n="modal.cancel">取消</button>
               <span class="busy" id="task-busy" hidden data-i18n="busy.text">进行中…</span>
             </div>
           </form>
@@ -1261,14 +1262,14 @@
       <!-- ★ P2-10：连接管理（原「设置→连接」）从设置 tab 移到右上角 NAS 菜单打开的模态 -->
       <div class="modal" id="conn-modal" hidden>
         <div class="modal-card modal-wide conn-modal-card" role="dialog" aria-modal="true" aria-labelledby="conn-modal-title">
-          <button type="button" class="modal-x" id="btn-conn-modal-close" aria-label="关闭">×</button>
-          <h2 id="conn-modal-title">NAS 连接</h2>
-          <p class="hint">添加 / 编辑 / 启停 NAS 连接。当前连接决定「文件」「诊断」页显示哪台 NAS。</p>
+          <button type="button" class="modal-x" id="btn-conn-modal-close" aria-label="关闭" data-i18n-aria-label="log.close">×</button>
+          <h2 id="conn-modal-title" data-i18n="conn_menu.title">NAS 连接</h2>
+          <p class="hint" data-i18n="conn.modal_hint">添加 / 编辑 / 启停 NAS 连接。当前连接决定「文件」「诊断」页显示哪台 NAS。</p>
         <!-- ---------------- 设置 1：连接 ---------------- -->
         <div class="settings-sec active conn-modal-body" id="sec-connect">
           <!-- ★ M16：多 NAS 连接列表（当前连接 / 启停 / 编辑 / 移除） -->
           <div class="card" id="links-card">
-            <h2>NAS 连接 <span class="count" id="links-count"></span>
+            <h2><span data-i18n="conn_menu.title">NAS 连接</span> <span class="count" id="links-count"></span>
               <button type="button" class="mini" id="btn-links-refresh" data-i18n="links.refresh">刷新</button>
               <button type="button" class="mini" id="btn-links-start-all" data-i18n="links.start_all">全部启动</button>
               <button type="button" class="mini" id="btn-links-stop-all" data-i18n="links.stop_all">全部停止</button>
@@ -1282,23 +1283,23 @@
 
           <div class="grid-2">
             <div class="card" id="link-form-card">
-              <h2>连接配置</h2>
+              <h2 data-i18n="purge.kind.link">连接配置</h2>
               <h3 class="sub" id="conn-form-title" data-i18n="conn.form_title_new">添加 NAS 连接</h3>
               <p class="hint" id="conn-edit-hint" hidden></p>
-              <p class="hint" id="connect-hint">加载中…</p>
-              <p class="hint mono" id="cred-hint">凭据：—</p>
+              <p class="hint" id="connect-hint" data-i18n="common.loading">加载中…</p>
+              <p class="hint mono" id="cred-hint" data-i18n="conn.cred_dash">凭据：—</p>
 
               <form id="form-connect" class="form" autocomplete="off">
                 <!-- ★ M16：编辑态的连接 id（新建时留空，后端自动生成 default/nas2/nas3…） -->
                 <input type="hidden" id="f-link-id" value="">
-                <label>主机 / NAS 地址
-                  <input type="text" id="f-host" placeholder="nas.local 或 192.168.1.10" spellcheck="false">
+                <label><span data-i18n="conn.host">主机 / NAS 地址</span>
+                  <input type="text" id="f-host" placeholder="nas.local 或 192.168.1.10" spellcheck="false" data-i18n-placeholder="conn.host_placeholder">
                 </label>
                 <div class="row-2">
-                  <label>端口
+                  <label><span data-i18n="conn.port">端口</span>
                     <input type="number" id="f-port" min="1" max="65535" step="1" placeholder="9834">
                   </label>
-                  <label>登录用户
+                  <label><span data-i18n="conn.login_user">登录用户</span>
                     <input type="text" id="f-user" spellcheck="false" autocomplete="username">
                   </label>
                 </div>
@@ -1312,24 +1313,24 @@
                             placeholder="家里 LAN = http://192.168.1.10:9834&#10;公网 DDNS = https://nas.example.com"></textarea>
                 </label>
                 <p class="hint" data-i18n="conn.endpoints_hint">额外路径按书写顺序先尝试，全部不通才落到主地址；主地址是缓存 / 凭据的锚点，日常不要改它。留空 = 只走主地址。</p>
-                <label>口令
-                  <input type="password" id="f-password" autocomplete="current-password" placeholder="留空则用已保存的口令">
+                <label><span data-i18n="conn.password">口令</span>
+                  <input type="password" id="f-password" autocomplete="current-password" placeholder="留空则用已保存的口令" data-i18n-placeholder="conn.password_placeholder">
                 </label>
-                <label>两步验证（可选）
+                <label><span data-i18n="conn.otp">两步验证（可选）</span>
                   <input type="password" id="f-otp-secret" autocomplete="off"
-                         placeholder="TOTP 密钥（Base32）或 6 位验证码；留空则保持不变">
+                         placeholder="TOTP 密钥（Base32）或 6 位验证码；留空则保持不变" data-i18n-placeholder="conn.otp_placeholder">
                 </label>
                 <p class="hint" data-i18n="connect.otp_hint">开了两步验证才需要：填 TOTP 密钥会保存下来，之后登录/重登自动生成验证码；填 6 位验证码只用于本次登录。没填时若 NAS 要求验证码，登录中会单独弹框询问，无需重新输入口令。密钥与口令一样保存在 0600 凭据文件里。</p>
                 <div class="row-checks">
-                  <label class="check"><input type="checkbox" id="f-https" checked> 使用 HTTPS</label>
-                  <label class="check"><input type="checkbox" id="f-insecure"> 自签证书：跳过 TLS 校验</label>
-                  <label class="check"><input type="checkbox" id="f-ipv4-only"> 仅 IPv4</label>
+                  <label class="check"><input type="checkbox" id="f-https" checked> <span data-i18n="conn.https">使用 HTTPS</span></label>
+                  <label class="check"><input type="checkbox" id="f-insecure"> <span data-i18n="conn.insecure">自签证书：跳过 TLS 校验</span></label>
+                  <label class="check"><input type="checkbox" id="f-ipv4-only"> <span data-i18n="conn.ipv4_only">仅 IPv4</span></label>
                 </div>
                 <div class="btn-row">
-                  <button type="submit" id="btn-link-save">保存连接配置</button>
-                  <button type="button" id="btn-login" class="primary">保存并登录</button>
-                  <button type="button" id="btn-connect-start">启动 daemon</button>
-                  <button type="button" id="btn-connect-stop">停止 daemon</button>
+                  <button type="submit" id="btn-link-save" data-i18n="conn.save">保存连接配置</button>
+                  <button type="button" id="btn-login" class="primary" data-i18n="conn.save_login">保存并登录</button>
+                  <button type="button" id="btn-connect-start" data-i18n="common.start_daemon">启动 daemon</button>
+                  <button type="button" id="btn-connect-stop" data-i18n="common.stop_daemon">停止 daemon</button>
                 </div>
                 <div class="btn-row" id="conn-edit-actions" hidden>
                   <button type="button" class="danger" id="btn-link-delete" data-i18n="conn.remove">移除这个连接</button>
@@ -1349,66 +1350,66 @@
       <!-- ★ P2-11/P3-02：帮助 / 关于（左栏 ⓘ）—— 关于内容从设置 tab 移来 -->
       <div class="modal" id="help-modal" hidden>
         <div class="modal-card modal-wide help-modal-card" role="dialog" aria-modal="true" aria-labelledby="help-modal-title">
-          <button type="button" class="modal-x" id="btn-help-modal-close" aria-label="关闭">×</button>
-          <h2 id="help-modal-title">帮助与关于</h2>
+          <button type="button" class="modal-x" id="btn-help-modal-close" aria-label="关闭" data-i18n-aria-label="log.close">×</button>
+          <h2 id="help-modal-title" data-i18n="help.title">帮助与关于</h2>
           <div class="help-menu">
-            <button type="button" class="help-item" id="btn-help-about">关于 qxync</button>
-            <button type="button" class="help-item" id="btn-help-quickstart">快速入门</button>
-            <button type="button" class="help-item" id="btn-help-whatsnew">新增功能</button>
-            <button type="button" class="help-item" id="btn-help-license">开源声明</button>
-            <button type="button" class="help-item" id="btn-help-online">在线文档</button>
+            <button type="button" class="help-item" id="btn-help-about" data-i18n="about.title">关于 qxync</button>
+            <button type="button" class="help-item" id="btn-help-quickstart" data-i18n="help.quickstart">快速入门</button>
+            <button type="button" class="help-item" id="btn-help-whatsnew" data-i18n="help.whatsnew">新增功能</button>
+            <button type="button" class="help-item" id="btn-help-license" data-i18n="help.license">开源声明</button>
+            <button type="button" class="help-item" id="btn-help-online" data-i18n="help.online">在线文档</button>
           </div>
           <div id="help-about-panel">
         <!-- ---------------- P3-10：关于只留版本/许可/运行概览，路径类信息进诊断 ---------------- -->
         <div class="settings-sec active help-modal-body" id="sec-about">
           <div class="card">
-            <h2>关于 qxync</h2>
+            <h2 data-i18n="about.title">关于 qxync</h2>
             <dl class="kv" id="about-kv"></dl>
             <p class="hint" id="about-m84">—</p>
             <div class="btn-row">
-              <button type="button" id="btn-about-refresh">刷新</button>
-              <button type="button" id="btn-open-homepage">打开项目主页</button>
+              <button type="button" id="btn-about-refresh" data-i18n="decisions.act_refresh">刷新</button>
+              <button type="button" id="btn-open-homepage" data-i18n="about.open_homepage">打开项目主页</button>
             </div>
             <div id="about-result" class="result" hidden></div>
-            <h3 class="sub">本客户端明确不做的事（避免用户以为「界面没找到」）</h3>
+            <h3 class="sub" data-i18n="about.not_doing">本客户端明确不做的事（避免用户以为「界面没找到」）</h3>
             <ul class="plain-list">
-              <li>备份任务 / 时间点还原（官方 6.0 旗舰功能，qxync 定位是 Linux 按需同步）</li>
-              <li>以前版本还原（NAS 版本控制在本机实测不可用）</li>
-              <li>团队文件夹 / 分享链接（依赖 Qsync Central，线格式未还原）</li>
-              <li>创建缩略图 / USB 导入</li>
-              <li>与官方 Windows 客户端的 LAN 二进制通道互通</li>
+              <li data-i18n="about.not_backup">备份任务 / 时间点还原（官方 6.0 旗舰功能，qxync 定位是 Linux 按需同步）</li>
+              <li data-i18n="about.not_versions">以前版本还原（NAS 版本控制在本机实测不可用）</li>
+              <li data-i18n="about.not_share">团队文件夹 / 分享链接（依赖 Qsync Central，线格式未还原）</li>
+              <li data-i18n="about.not_thumb">创建缩略图 / USB 导入</li>
+              <li data-i18n="about.not_lan">与官方 Windows 客户端的 LAN 二进制通道互通</li>
             </ul>
           </div>
         </div>
           </div>
           <div id="help-quickstart-panel" hidden>
             <ol class="plain-list">
-              <li>在右上角 NAS 菜单里「添加 NAS…」，填地址、用户、口令。</li>
-              <li>在「任务列表」点「＋ 添加任务」，选一个 NAS 文件夹配成本地文件夹对。</li>
-              <li>首次同步完成后，文件会按需出现在本地挂载点里。</li>
+              <li data-i18n="help.step1">在右上角 NAS 菜单里「添加 NAS…」，填地址、用户、口令。</li>
+              <li data-i18n="help.step2">在「任务列表」点「＋ 添加任务」，选一个 NAS 文件夹配成本地文件夹对。</li>
+              <li data-i18n="help.step3">首次同步完成后，文件会按需出现在本地挂载点里。</li>
             </ol>
           </div>
           <div id="help-whatsnew-panel" hidden>
-            <h3 class="sub">2026-11 界面全面贴合 Qsync Client 6</h3>
+            <h3 class="sub" data-i18n="whatsnew.title">2026-11 界面全面贴合 Qsync Client 6</h3>
             <ul class="plain-list">
-              <li>主页/任务改成官方式平铺任务卡；新增任务详情二级页（本地/NAS 双卡 + 一对一文件夹对）。</li>
-              <li>左栏纯图标 +「显示导航文字」开关；顶栏只留页面标题与安静的连接状态。</li>
-              <li>设置收成 4 个分区；连接管理进右上角 NAS 菜单；关于进左栏帮助。</li>
-              <li>文件更新中心四列对齐；错误列表独立成页并按任务分组，支持定位/复制/看日志。</li>
-              <li>文件目录表列顺序对齐；状态压成单图标，悬停看细节。</li>
+              <li data-i18n="whatsnew.item1">主页/任务改成官方式平铺任务卡；新增任务详情二级页（本地/NAS 双卡 + 一对一文件夹对）。</li>
+              <li data-i18n="whatsnew.item2">左栏纯图标 +「显示导航文字」开关；顶栏只留页面标题与安静的连接状态。</li>
+              <li data-i18n="whatsnew.item3">设置收成 4 个分区；连接管理进右上角 NAS 菜单；关于进左栏帮助。</li>
+              <li data-i18n="whatsnew.item4">文件更新中心四列对齐；错误列表独立成页并按任务分组，支持定位/复制/看日志。</li>
+              <li data-i18n="whatsnew.item5">文件目录表列顺序对齐；状态压成单图标，悬停看细节。</li>
             </ul>
           </div>
           <div id="help-license-panel" hidden>
             <h3 class="sub">qxync</h3>
-            <p class="hint">以 MIT 或 Apache-2.0 双许可发布（任选其一）。完整文本在仓库根目录
-              <code>LICENSE-MIT</code> / <code>LICENSE-APACHE</code>。</p>
-            <h3 class="sub">主要开源组件</h3>
+            <p class="hint"><span data-i18n="help.license_hint">以 MIT 或 Apache-2.0 双许可发布（任选其一）。完整文本在仓库根目录</span>
+              <code>LICENSE-MIT</code> / <code>LICENSE-APACHE</code><span data-i18n="punct.period">。</span></p>
+            <h3 class="sub" data-i18n="help.components">主要开源组件</h3>
             <ul class="plain-list">
-              <li>Rust 生态：tokio / fuser / serde / tracing 等（各自许可，见 Cargo.lock）。</li>
-              <li>Tauri 2（窗口壳）、WebKitGTK（渲染）、GTK 3（原生控件）。</li>
-              <li>界面为自绘 HTML/CSS/JS，不包含 QNAP 的图标或插图资源。</li>
+              <li data-i18n="help.comp_rust">Rust 生态：tokio / fuser / serde / tracing 等（各自许可，见 Cargo.lock）。</li>
+              <li data-i18n="help.comp_tauri">Tauri 2（窗口壳）、WebKitGTK（渲染）、GTK 3（原生控件）。</li>
+              <li data-i18n="help.comp_ui">界面为自绘 HTML/CSS/JS，不包含 QNAP 的图标或插图资源。</li>
             </ul>
-            <p class="hint">「Qsync」「QNAP」是其权利人的商标；本项目与 QNAP 无隶属关系。</p>
+            <p class="hint" data-i18n="help.trademark">「Qsync」「QNAP」是其权利人的商标；本项目与 QNAP 无隶属关系。</p>
           </div>
         </div>
       </div>
@@ -1416,16 +1417,16 @@
       <!-- ★ P3-03：首次运行引导（无连接时出现一次，可跳过；帮助里可重开） -->
       <div class="modal" id="firstrun" hidden>
         <div class="modal-card firstrun-card" role="dialog" aria-modal="true" aria-labelledby="firstrun-title">
-          <h2 id="firstrun-title">欢迎使用 qxync</h2>
-          <p class="hint">三步开始：连接 NAS → 建同步任务 → 文件按需出现在本地。</p>
+          <h2 id="firstrun-title" data-i18n="firstrun.title">欢迎使用 qxync</h2>
+          <p class="hint" data-i18n="firstrun.hint">三步开始：连接 NAS → 建同步任务 → 文件按需出现在本地。</p>
           <ol class="firstrun-steps">
-            <li><strong>连接 NAS</strong><span>右上角 NAS 菜单 →「添加 NAS…」，填地址、用户、口令。</span></li>
-            <li><strong>建同步任务</strong><span>「任务」页 →「＋ 添加任务」，选一个 NAS 文件夹配一个本地文件夹。</span></li>
-            <li><strong>开始使用</strong><span>任务卡上点「立即同步」；之后文件按需出现在挂载点里。</span></li>
+            <li><strong data-i18n="firstrun.connect">连接 NAS</strong><span data-i18n="firstrun.step1">右上角 NAS 菜单 →「添加 NAS…」，填地址、用户、口令。</span></li>
+            <li><strong data-i18n="firstrun.step2_title">建同步任务</strong><span data-i18n="firstrun.step2">「任务」页 →「＋ 添加任务」，选一个 NAS 文件夹配一个本地文件夹。</span></li>
+            <li><strong data-i18n="firstrun.step3_title">开始使用</strong><span data-i18n="firstrun.step3">任务卡上点「立即同步」；之后文件按需出现在挂载点里。</span></li>
           </ol>
           <div class="btn-row">
-            <button type="button" class="primary" id="btn-firstrun-start">连接 NAS</button>
-            <button type="button" class="ghost" id="btn-firstrun-skip">跳过</button>
+            <button type="button" class="primary" id="btn-firstrun-start" data-i18n="firstrun.connect">连接 NAS</button>
+            <button type="button" class="ghost" id="btn-firstrun-skip" data-i18n="firstrun.skip">跳过</button>
           </div>
         </div>
       </div>
@@ -1452,7 +1453,7 @@
 <!-- ============================= 文件页行右键菜单（M8.4） =============================
      对齐 Qsync 的「节省空间模式 ▸ 始终保留在此设备 / 释放空间」。用自绘菜单而不是
      系统菜单：前端零依赖、验收矩阵能直接断言条目；所有字符串来自 daemon，绝不拼 innerHTML。 -->
-<div id="task-menu" class="ctx-menu" role="menu" aria-label="任务操作" hidden>
+<div id="task-menu" class="ctx-menu" role="menu" aria-label="任务操作" hidden data-i18n-aria-label="menu.task_aria">
   <div class="ctx-title" id="task-menu-title">—</div>
   <button type="button" class="ctx-item" data-act="sync" role="menuitem" data-i18n="detail.sync_once">立即同步一轮</button>
   <button type="button" class="ctx-item" data-act="open" role="menuitem" data-i18n="task.act_open_dir">打开本地目录</button>
@@ -1460,13 +1461,13 @@
   <button type="button" class="ctx-item" data-act="settings" role="menuitem" data-i18n="task.act_settings">同步设置…</button>
   <button type="button" class="ctx-item danger" data-act="delete" role="menuitem" data-i18n="detail.delete">删除任务…</button>
 </div>
-<div id="conn-menu" class="ctx-menu" role="menu" aria-label="NAS 连接" hidden>
-  <div class="ctx-title">NAS 连接</div>
-  <button type="button" class="ctx-item" data-act="add" role="menuitem">＋ 添加 NAS…</button>
-  <button type="button" class="ctx-item" data-act="manage" role="menuitem">管理连接…</button>
-  <button type="button" class="ctx-item" data-act="test" role="menuitem">连接测试</button>
+<div id="conn-menu" class="ctx-menu" role="menu" aria-label="NAS 连接" hidden data-i18n-aria-label="conn_menu.title">
+  <div class="ctx-title" data-i18n="conn_menu.title">NAS 连接</div>
+  <button type="button" class="ctx-item" data-act="add" role="menuitem" data-i18n="menu.add_nas">＋ 添加 NAS…</button>
+  <button type="button" class="ctx-item" data-act="manage" role="menuitem" data-i18n="menu.manage_conn">管理连接…</button>
+  <button type="button" class="ctx-item" data-act="test" role="menuitem" data-i18n="menu.conn_test">连接测试</button>
 </div>
-<div id="row-menu" class="ctx-menu" role="menu" aria-label="文件操作" hidden>
+<div id="row-menu" class="ctx-menu" role="menu" aria-label="文件操作" hidden data-i18n-aria-label="menu.file_aria">
   <div class="ctx-title" id="row-menu-title">—</div>
   <button type="button" class="ctx-item" role="menuitem" data-act="pinquery" data-i18n="menu.pinquery">🔍 查询 pin 状态</button>
   <div class="ctx-sep" role="separator"></div>
@@ -1531,7 +1532,7 @@
     <p id="purge-opt-hint" class="hint" hidden></p>
     <div class="btn-row">
       <button type="button" id="purge-ok" class="primary danger" data-i18n="purge.confirm_delete">删除</button>
-      <button type="button" id="purge-registration" hidden>仅删除任务登记（保留两侧文件）</button>
+      <button type="button" id="purge-registration" hidden data-i18n="purge.opt_registration">仅删除任务登记（保留两侧文件）</button>
       <button type="button" id="purge-cancel" data-i18n="modal.cancel">取消</button>
     </div>
   </div>

@@ -851,7 +851,8 @@ pub fn ui_spec() -> Value {
         }
     }
 
-    // 2) i18n：`T('key')` 与 `data-i18n*` 用到的 key 必须都在 zh-CN 表里；en 预留（空表）
+    // 2) i18n：ZH 是源表，EN 必须**全量覆盖** ZH；`T('key')` 与 `data-i18n*` 用到的 key
+    //    两边都得有；EN 里不允许出现中文（回落到 zh-CN 的静默半成品视为失败）。
     let zh = table_keys(&i18n, "var ZH = {");
     let en = table_keys(&i18n, "var EN = {");
     let used = quoted_keys(&app, "T('", '\'');
@@ -866,6 +867,27 @@ pub fn ui_spec() -> Value {
     }
     let missing_used: Vec<String> = used.iter().filter(|k| !zh.contains(k)).cloned().collect();
     let missing_dom: Vec<String> = dom.iter().filter(|k| !zh.contains(k)).cloned().collect();
+    // ★ M50：英文补全 —— EN 必须覆盖 ZH 全部键（不只覆盖用到的），且 EN 值里不许有中文。
+    let missing_en: Vec<String> = zh.iter().filter(|k| !en.contains(k)).cloned().collect();
+    let missing_en_used: Vec<String> = used.iter().filter(|k| !en.contains(k)).cloned().collect();
+    let missing_en_dom: Vec<String> = dom.iter().filter(|k| !en.contains(k)).cloned().collect();
+    let en_block = table_block(&i18n, "var EN = {");
+    let en_has_cjk = has_cjk(en_block);
+    // ★ M50：语言切换必须真的接上（设置 → 个人 → 语言；跟随系统 / English / 简体中文）。
+    let locale_wiring = json!({
+        "detect": i18n.contains("function systemLocale"),
+        "set_locale": app.contains("I18N.setLocale("),
+        "persist": app.contains("qxync.locale"),
+        "html_lang": app.contains("documentElement.lang"),
+        "en_option": index.contains("<option value=\"en\""),
+        "lang_keys": index.contains("data-i18n=\"lang.follow_system\"")
+            && index.contains("data-i18n=\"lang.zh\"")
+            && index.contains("data-i18n=\"lang.en\""),
+    });
+    let locale_ok = locale_wiring
+        .as_object()
+        .map(|m| m.values().all(|v| v.as_bool() == Some(true)))
+        .unwrap_or(false);
 
     // 3) 键盘可达性 / 视觉规范（token 必须在浅色与深色两份里都定义）
     let a11y = json!({
@@ -898,9 +920,14 @@ pub fn ui_spec() -> Value {
         && states["markers"].as_u64().unwrap_or(0) >= 8
         && states["screens"].as_u64().unwrap_or(0) >= 8;
 
-    let en_reserved = i18n.contains("var EN = {");
-    let i18n_ok =
-        missing_used.is_empty() && missing_dom.is_empty() && zh.len() >= 100 && en_reserved;
+    let i18n_ok = missing_used.is_empty()
+        && missing_dom.is_empty()
+        && missing_en.is_empty()
+        && missing_en_used.is_empty()
+        && missing_en_dom.is_empty()
+        && !en_has_cjk
+        && locale_ok
+        && zh.len() >= 100;
 
     // 5) ★ M18：任务默认路径 —— 纯函数资源必须**先于 app.js** 装载，且 app.js 真的用了它。
     //    漏装载 / 装载顺序反了，新任务表单就会退回「三处默认值都一样」
@@ -1067,7 +1094,11 @@ pub fn ui_spec() -> Value {
             "ok": i18n_ok,
             "zh_keys": zh.len(),
             "en_keys": en.len(),
-            "en_reserved": en_reserved,
+            "en_missing": missing_en,
+            "en_missing_used": missing_en_used,
+            "en_missing_dom": missing_en_dom,
+            "en_has_cjk": en_has_cjk,
+            "locale": locale_wiring,
             "used_keys": used.len(),
             "dom_keys": dom.len(),
             "missing_used": missing_used,
@@ -1186,6 +1217,25 @@ fn table_keys(src: &str, marker: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// 取一张文案表（`var ZH = {` / `var EN = {`）的块内容，用于值级校验（如 EN 不许有中文）。
+fn table_block<'a>(src: &'a str, marker: &str) -> &'a str {
+    let start = match src.find(marker) {
+        Some(i) => i + marker.len(),
+        None => return "",
+    };
+    let end = src[start..]
+        .find("\n  };")
+        .map(|i| start + i)
+        .unwrap_or(src.len());
+    &src[start..end]
+}
+
+/// CJK（含全角标点）：英文文案表里出现任何一个都算没翻译干净。
+fn has_cjk(s: &str) -> bool {
+    s.chars()
+        .any(|c| matches!(c as u32, 0x2E80..=0x9FFF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF))
 }
 
 /// 扫 `needle`（自带开引号）后面的字符串内容，例如 `T('` → `key`、`data-i18n="` → `key`。
@@ -1417,6 +1467,36 @@ mod tests {
         assert!(
             i18n["missing_dom"].as_array().is_some_and(|a| a.is_empty()),
             "index.html 的 data-i18n 键必须在 ZH 表里：{i18n:#}"
+        );
+        // ★ M50：英文补全 —— ZH 的每个键都必须有 EN，用到的键尤其不能缺；EN 里不许有中文；
+        //    语言切换的 wiring 必须真的接上（否则设置里的「语言」又会是摆设）。
+        assert!(
+            i18n["en_missing"].as_array().is_some_and(|a| a.is_empty()),
+            "EN 表必须覆盖 ZH 全部键：{i18n:#}"
+        );
+        assert!(
+            i18n["en_missing_used"]
+                .as_array()
+                .is_some_and(|a| a.is_empty()),
+            "app.js 用到的键必须在 EN 表里：{i18n:#}"
+        );
+        assert!(
+            i18n["en_missing_dom"]
+                .as_array()
+                .is_some_and(|a| a.is_empty()),
+            "index.html 用到的键必须在 EN 表里：{i18n:#}"
+        );
+        assert_eq!(
+            i18n["en_has_cjk"],
+            serde_json::Value::Bool(false),
+            "EN 里不能有中文：{i18n:#}"
+        );
+        assert!(
+            i18n["locale"]
+                .as_object()
+                .is_some_and(|m| m.values().all(|v| v.as_bool() == Some(true))),
+            "语言切换 wiring 不完整：{}",
+            i18n["locale"]
         );
         assert_eq!(s["html_sinks"].as_array().map(Vec::len), Some(0));
         assert_eq!(s["ok"], serde_json::Value::Bool(true), "ui_spec: {s:#}");

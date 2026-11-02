@@ -55,6 +55,10 @@ and `qxync-gui` (desktop GUI).
 - **LAN direct**: qxync↔qxync transfers directly on the same LAN, with silent fallback to the NAS
 - **Desktop GUI**: an overview, task list, file browser, update center, error list, settings and
   diagnostics, plus tray, notifications and autostart
+- **Bilingual UI (English / Simplified Chinese)**: choose "Follow system / English / 简体中文" under
+  Settings → Personal → Language and the whole window switches immediately; the choice lives in the
+  daemon settings, so the CLI and the GUI share one preference (`qxync settings --set language=en`
+  changes it too)
 - **Logs cannot run away**: logs rotate by day **and by size** (32 MiB per file by default);
   files older than 14 days or beyond 256 MiB are pruned automatically. `qxync log` shows usage,
   `qxync log --prune` cleans now, and Settings → Logs in the GUI edits the same policy
@@ -264,7 +268,10 @@ qxync-gui
 On first launch, fill in the NAS address, account and password under **设置 → 连接**
 (*Settings → Connections*) and log in, then click **启动 daemon** (*Start daemon*) in the top bar.
 If systemd already started the daemon, you can skip that last step.
-The GUI currently ships Chinese UI strings only — see "Known limitations".
+
+The UI is **bilingual**, following the system language by default; switch it under
+**Settings → Personal → Language** ("Follow system / English / 简体中文") and it changes immediately.
+Diagnostics logs and daemon / CLI output are still Chinese — see "Known limitations".
 
 ### 5. Common commands
 
@@ -326,8 +333,10 @@ Breaking changes when upgrading from 0.1.x (named `qsync`) or 0.2.x (multi-root 
   bare GNOME / old Xfce·MATE panels (XEmbed only) do not show a tray icon (install
   [`snixembed`](https://sr.ht/~steef/snixembed/) to bridge an old-style tray). When the tray is not
   visible, closing the window really closes it — it is never hidden in a tray nobody draws.
-- **The GUI is currently Chinese-only**: the `en` string table covers only a few
-  two-step-verification messages; every other UI string is Chinese.
+- **Lower-level strings are still Chinese**: the UI itself is fully bilingual (Settings → Personal →
+  Language), but the GUI diagnostics log and all daemon / CLI output remain Chinese — in the English
+  UI, the closer a message is to the low-level machinery, the more likely it still appears in
+  Chinese. Localising those is left for later.
 - **No trash bin on the mount point**: moving files to the trash is rejected, so deleting really
   deletes (the remote delete is pushed by a background queue and guarded by a bulk-delete circuit
   breaker).

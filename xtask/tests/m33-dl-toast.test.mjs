@@ -7,6 +7,8 @@
  * 被测对象是 crates/qxync-gui/ui/app.js 里的 `makeDownloadProgress` / `removeDlCard`
  * （内联函数，没法 require），从源文本里抠出来在受控环境里执行 —— 与 M26/M28 的
  * 测试同一套路：抠真实函数、注入假时钟/假 DOM，不另写一份逻辑（另写的会漂移）。
+ * ★ M50：文案已进 `ui/i18n.js` 文案表，这里把**真表**也装进 node（不复制中文串），
+ * 注入的 `T` 就是真 `QXNYC_I18N.t`（默认 zh-CN）—— 改文案不会让断言漂移。
  *
  * 覆盖（M26 的时序规则原样保留 + M33 的卡片行为）：
  *   1. 3 秒静默期：静默期内 update 不建卡片（快下载零打扰）。
@@ -24,6 +26,14 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
 const src = readFileSync(new URL('../../crates/qxync-gui/ui/app.js', import.meta.url), 'utf8');
+
+// ★ M50：装真文案表（IIFE 只挂 window，不碰 DOM；默认 locale 是 zh-CN）。
+const i18nSrc = readFileSync(new URL('../../crates/qxync-gui/ui/i18n.js', import.meta.url), 'utf8');
+const i18nWindow = {};
+new Function('window', 'document', 'localStorage', 'navigator', i18nSrc)(
+  i18nWindow, undefined, undefined, undefined);
+const I18N = i18nWindow.QXNYC_I18N;
+assert.ok(I18N && typeof I18N.t === 'function', 'i18n.js 没挂出 QXNYC_I18N');
 
 /** 从 app.js 源文本里抠一个函数（function name(...) { ... }），花括号配平。 */
 function extractFunction(name) {
@@ -79,7 +89,9 @@ const deps = {
   humanSize: (n) => Math.round(n) + 'B',
   fmtEta: (s) => Math.round(s) + 's',
   str: (v) => String(v ?? ''),
-  T: (k) => ({ 'dl.done': '下载完成', 'dl.fail': '下载失败', 'dl.click_close': '点击关闭' }[k] || k),
+  T: I18N.t,
+  // ★ M50：app.js 里按界面语言切标点的 helper（真实现见 app.js locColon）
+  locColon: () => (I18N.locale() === 'en' ? ': ' : '：'),
 };
 
 const makeDownloadProgress = new Function(
@@ -132,7 +144,8 @@ t('静默期后第一次 update 建卡片并画进度', () => {
   assert.ok(text.includes('5000B/10000B'), '已下载/总量应出现');
   // 速度 = (5000-1000)B / (3100-1000)ms = 4000/2.1s ≈ 1905 B/s
   assert.ok(text.includes('1905B/s'), '滑窗速度应出现: ' + text);
-  assert.ok(text.includes('剩余'), '有速度且未完成时应给剩余时间');
+  assert.ok(text.includes(I18N.t('dl.eta_left', { eta: '3s' })),
+    '有速度且未完成时应给剩余时间: ' + text);
   assert.equal(built[0].fill.style.width, '50.0%', '进度条宽度 = 百分比');
 });
 
@@ -169,7 +182,8 @@ t('未知总量（total=0）：进度条挂 indet，文案不带百分比', () =
   assert.equal(built.length, 1);
   assert.ok(built[0].fill._classes.has('f:indet'), '未知总量应挂 indet 类');
   assert.ok(!built[0].line.textContent.includes('%'), '未知总量不该有百分比');
-  assert.ok(built[0].line.textContent.includes('已下载'), '应显示已下载字节数');
+  assert.equal(built[0].line.textContent,
+    I18N.t('dl.downloaded', { size: '1234B', speed: '0B' }), '应显示已下载字节数');
   clock = 3700; p.update(2000, 4000);   // 拿到总量 → 摘 indet、画百分比
   assert.ok(!built[0].fill._classes.has('f:indet'), '拿到总量后应摘掉 indet');
   assert.ok(built[0].line.textContent.includes('50.0%'));
@@ -183,7 +197,8 @@ t('finish(true)：done 类 + 下载完成 + 2500ms 自动移除 + 点击关闭',
   const card = built[0];
   clock = 3600; p.finish(true);
   assert.ok(card.card._classes.has('done'), '成功应挂 done 类');
-  assert.equal(card.line.textContent, '✅ 下载完成 · 4000B', '文案应为下载完成 + 最终字节数');
+  assert.equal(card.line.textContent, '✅ ' + I18N.t('dl.done') + ' · 4000B',
+    '文案应为下载完成 + 最终字节数');
   assert.equal(timeouts.length, 1, '应安排一次自动移除');
   assert.equal(timeouts[0].ms, 2500, '成功停留 2.5s');
   assert.equal(typeof card.card.onclick, 'function', '点击关闭应已挂上');
@@ -200,7 +215,7 @@ t('finish(false)：err 类 + 错误文案 + 6000ms 移除', () => {
   const card = built[0];
   clock = 3600; p.finish(false, '连接被重置');
   assert.ok(card.card._classes.has('err'), '失败应挂 err 类');
-  assert.ok(card.line.textContent.includes('下载失败'), '文案应为下载失败');
+  assert.ok(card.line.textContent.includes(I18N.t('dl.fail')), '文案应为下载失败');
   assert.ok(card.line.textContent.includes('连接被重置'), '应带上错误信息');
   assert.equal(card.line.title, '连接被重置', '长错误靠 title 提示');
   assert.equal(timeouts[0].ms, 6000, '失败停留 6s（够看清错误）');
@@ -216,7 +231,8 @@ t('finish 幂等；finish 后 update 被忽略', () => {
   clock = 3700; p.finish(false, '再来一次');
   clock = 3800; p.update(1999, 2000);
   assert.equal(timeouts.length, 1, '二次 finish 不该再安排移除');
-  assert.equal(card.line.textContent, '✅ 下载完成 · 1000B', '后续 update/finish 不改文案');
+  assert.equal(card.line.textContent, '✅ ' + I18N.t('dl.done') + ' · 1000B',
+    '后续 update/finish 不改文案');
   assert.ok(card.card._classes.has('done') && !card.card._classes.has('err'));
 });
 
@@ -246,6 +262,26 @@ t('removeDlCard：最后一张移除后容器 hidden；空句柄不炸', () => {
   removeDlCard(null);                              // 空句柄不炸
   removeDlCard({ card: {} });                      // 没有 parentNode 不炸
   removeDlCard({ card: { parentNode: null } });    // parentNode 为 null 不炸
+});
+
+// ---------------------------------------------------------------- ⑪ 英文界面标点
+t('英文界面：下载卡片文案不带全角标点', () => {
+  reset();
+  I18N.setLocale('en');
+  try {
+    const p = makeDownloadProgress('en.bin');
+    clock = 1000; p.update(1000, 10000);   // 静默期内采样进滑窗（算速度用）
+    clock = 3500; p.update(5000, 10000);   // 3.5s → 建卡；速度 = 4000/2.5s = 1600B/s
+    const text = built[0].line.textContent;
+    assert.ok(!/[：，。；！？（）]/.test(text), '英文进度文案不该有全角标点: ' + text);
+    assert.ok(text.includes(' left'), '英文界面应显示剩余时间: ' + text);
+    clock = 3600; p.finish(false, 'reset by peer');
+    const failText = built[0].line.textContent;
+    assert.ok(!/[：，。；！？（）]/.test(failText), '英文失败文案不该有全角标点: ' + failText);
+    assert.ok(failText.includes(': reset by peer'), '英文错误后缀应是 ASCII 冒号: ' + failText);
+  } finally {
+    I18N.setLocale('zh-CN');
+  }
 });
 
 // ---------------------------------------------------------------- 汇总

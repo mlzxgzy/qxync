@@ -5,6 +5,45 @@
 
 [English](CHANGELOG.en.md) · [README](README.md) · [验收记录](docs/验收记录.md)
 
+## [0.10.0] - 2026-11-02
+
+### 新增
+
+- **GUI 完整英文界面 + 语言设置真正生效**：以前 `en` 文案表只覆盖两步验证相关的几条，
+  其余界面一律中文，「设置 → 个人 → 语言」也只是个不生效的下拉。现在：
+  ① `ui/i18n.js` 的 `en` 表与 `zh-CN` 表**同键数（全量镜像）**—— `index.html` 的全部用户可见文案
+  （含 `title` / `placeholder` / `aria-label` 与代码示例 token）改挂 `data-i18n*`，
+  `app.js` 的动态文案（状态、报错、确认框、日志面板里的操作日志、表格列头等）改走 `T()`；
+  ② 设置 → 个人 → 语言 三选一：**跟随系统 / English / 简体中文（zh-CN）**，保存后界面即时切到
+  该语言（实现上是整页刷新一次，避免半中半英的中间态）；`<html lang>` 同步更新；
+  ③ 语言偏好存 daemon 的 `settings.language`（CLI 与 GUI 共用同一份，
+  `qxync settings --set language=en` 也能改），GUI 启动时先按本机上次的偏好渲染第一帧（不闪中文），
+  settings 回来后以 daemon 为准；
+  ④ 跟随系统按系统/浏览器语言判断：`zh*` → 简体中文、`en*` → English、其它回落简体中文。
+  仍然**不引入任何 i18n 框架或新依赖**，仍是 textContent-only（无 `innerHTML`）。
+  验收：`cargo test -p qxync-gui` 28 passed（`ui_spec` 含新增英文断言）、
+  `cargo test --workspace --locked` 675 passed / 0 failed / 24 ignored、
+  `xtask/tests/gui-i18n.sh` 中英两种语言全过；详见 [验收记录](docs/验收记录.md) 的 M50 段。
+
+### 变更
+
+- **英文界面有静态守卫（`ui_spec`）**：`crates/qxync-gui/src/lib.rs` 的 `ui_spec()` 新增断言 ——
+  EN 必须覆盖 ZH 全部键、EN 的值里不许有中文、`app.js` / `index.html` 用到的键两边都得有、
+  语言 wiring（检测 / 设置 / 持久化 / `<html lang>` / English 选项 / 选项文案）必须齐全。
+  任一条不满足，`cargo test -p qxync-gui` 直接变红 —— 防止以后改界面又退回「英文只是摆设」。
+  另新增无头验收 `xtask/tests/gui-i18n.sh`（真 `app.js` + 真 `i18n.js`，chromium `--dump-dom`
+  中英两种语言各跑一次）。
+- **Release 正文改为英文优先**：`.github/workflows/release.yml` 的「选 Release 正文」步骤改为
+  按顺序取 `docs/发布说明-<tag>.en.md` → `docs/发布说明-<tag>.md`（中文）→ GitHub 自动生成的
+  Notes；以后每个版本的发布说明**先写英文**，中文版继续留在仓库里（规则见发版清单 §3.4）。
+  v0.9.2 在规则落地前已经发布（正文是中文），**从 v0.10.0 起生效（本版正文即英文）**。
+
+### 已知限制
+
+- **底层文案仍是中文**：GUI 的诊断日志（`logErr` / `logInfo` / `logLine` / `logWarn` /
+  `logDebug`）与 daemon / CLI 输出没有跟着进文案表 —— 英文界面下，越接近底层的错误与日志
+  越可能看到中文。这部分留待后续里程碑。
+
 ## [0.9.2] - 2026-11-02
 
 ### 修复
@@ -2131,6 +2170,7 @@ NAS 设置名 `QSYNC_FOLDERPAIR_USE_SPACE_SAVING`、Windows 客户端注册表�
 - 验收结论从 README 抽出为 [`docs/验收记录.md`](docs/验收记录.md)。
 - 采用 **MIT OR Apache-2.0** 双许可（`LICENSE-MIT` / `LICENSE-APACHE`）。
 
+[0.10.0]: https://github.com/mlzxgzy/qxync/compare/v0.9.2...v0.10.0
 [0.9.2]: https://github.com/mlzxgzy/qxync/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/mlzxgzy/qxync/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/mlzxgzy/qxync/compare/v0.8.3...v0.9.0

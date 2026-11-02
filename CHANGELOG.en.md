@@ -5,6 +5,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [中文](CHANGELOG.md) · [README](README.en.md) · [Acceptance log](docs/验收记录.md)
 
+## [0.10.0] - 2026-11-02
+
+### Added
+
+- **A complete English UI, and the language setting now actually works**: the `en` table used to
+  cover only a handful of two-step-verification strings, everything else stayed Chinese, and
+  Settings → Personal → Language was a dropdown that did nothing. Now:
+  (1) the `en` table mirrors the `zh-CN` table key for key (a full mirror) — every user-visible
+  string in `index.html` (including `title` / `placeholder` / `aria-label` and the sample tokens in
+  code snippets) carries a `data-i18n*` hook, and every dynamic string in `app.js` (statuses,
+  errors, confirmations, the operation log inside the log panel, table headers, …) goes through
+  `T()`;
+  (2) Settings → Personal → Language offers three choices: **Follow system / English /
+  简体中文 (zh-CN)**; saving switches the UI immediately (implemented as one full page reload, so
+  there is never a half-Chinese/half-English frame) and `<html lang>` follows;
+  (3) the preference lives in the daemon's `settings.language` (the CLI and the GUI share one
+  preference, and `qxync settings --set language=en` changes it too); the GUI renders its first
+  frame from this machine's last cached preference (no Chinese flash) and then defers to the daemon
+  setting once settings arrive;
+  (4) "follow system" looks at the system/browser language: `zh*` → Simplified Chinese,
+  `en*` → English, anything else falls back to Simplified Chinese.
+  Still **no i18n framework and no new dependency**, still textContent-only (no `innerHTML`).
+  Verified: `cargo test -p qxync-gui` 28 passed (`ui_spec` with the new English assertions),
+  `cargo test --workspace --locked` 675 passed / 0 failed / 24 ignored, and
+  `xtask/tests/gui-i18n.sh` green in both languages; see the M50 section of the
+  [acceptance log](docs/验收记录.md).
+
+### Changed
+
+- **A static guard for the English UI (`ui_spec`)**: `ui_spec()` in
+  `crates/qxync-gui/src/lib.rs` gained assertions — EN must cover every ZH key, EN values may not
+  contain CJK characters, every key used by `app.js` / `index.html` must exist in both tables, and
+  the language wiring (detection / setting / persistence / `<html lang>` / the English option / the
+  option labels) must be complete. If any one of them fails, `cargo test -p qxync-gui` turns red —
+  so a future UI change cannot quietly fall back to "English is just decoration". A headless check
+  was added as well: `xtask/tests/gui-i18n.sh` (real `app.js` + real `i18n.js`, chromium
+  `--dump-dom`, once per language).
+- **Release bodies are now English-first**: the "pick the Release body" step in
+  `.github/workflows/release.yml` now tries `docs/发布说明-<tag>.en.md` first, then the Chinese
+  `docs/发布说明-<tag>.md`, and only then GitHub's generated notes; every release's notes are
+  written in English first, with the Chinese version kept in the repo (the rule is documented in
+  §3.4 of the release checklist). v0.9.2 was published before this rule landed (its body is
+  Chinese); it **applies from v0.10.0 on (this release's body is English)**.
+
+### Known limitations
+
+- **Lower-level strings are still Chinese**: the GUI diagnostics log
+  (`logErr` / `logInfo` / `logLine` / `logWarn` / `logDebug`) and all daemon / CLI output never
+  went into the string table — in the English UI, the closer a message is to the low-level
+  machinery, the more likely it still appears in Chinese. Localising those is left for a later
+  milestone.
+
 ## [0.9.2] - 2026-11-02
 
 ### Fixed
@@ -2695,6 +2747,7 @@ Verified on **QNAP TS-464C / QTS 5.2.9 / Qsync QPKG 5.0.0.7 (build 20260723)**.
 - Acceptance results were split out of the README into [`docs/验收记录.md`](docs/验收记录.md).
 - Dual-licensed under **MIT OR Apache-2.0** (`LICENSE-MIT` / `LICENSE-APACHE`).
 
+[0.10.0]: https://github.com/mlzxgzy/qxync/compare/v0.9.2...v0.10.0
 [0.9.2]: https://github.com/mlzxgzy/qxync/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/mlzxgzy/qxync/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/mlzxgzy/qxync/compare/v0.8.3...v0.9.0

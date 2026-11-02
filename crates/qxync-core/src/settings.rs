@@ -244,7 +244,9 @@ pub struct Settings {
     /// `Enable debug log`（⚠ 影响性能；只影响 daemon/GUI 的日志级别）。
     #[serde(default)]
     pub debug_log: bool,
-    /// 语言（`""` = 跟随系统；本轮只记录，文案仍只有 zh-CN）。
+    /// 界面语言（★ M50）：`""` = 跟随系统（zh* → zh-CN，en* → en），
+    /// `zh-CN` / `en` = 强制。daemon 只存值；文案表在 GUI 侧 `ui/i18n.js`，
+    /// GUI 读到这个值后切换语言（与 CLI/其它设备共享同一份设置）。
     #[serde(default)]
     pub language: String,
     /// 地区（`Select the correct region to ensure better connectivity`；只记录）。
